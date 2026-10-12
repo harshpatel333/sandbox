@@ -130,3 +130,70 @@ func TestIntegration_BillingRollupCompletenessDoesNotExhaustAttempts(t *testing.
 		}
 	}
 }
+
+func TestIntegration_BillingRollupUnknownStorageDoesNotStarveQueue(t *testing.T) {
+	ctx := t.Context()
+	team, _ := seedTeamAndKey(t)
+	enableBillingHourlyRollups(t, ctx, team)
+	hostID := "rollup-unknown-" + uuid.NewString()
+	start := time.Now().UTC().Truncate(time.Hour).Add(-4 * time.Hour)
+	// A sandbox on a manifest-less template build has no recorded size, so
+	// its hour can never roll up until the artifact is reconciled.
+	template, sandbox := uuid.New(), uuid.New()
+	storageExec(t, `INSERT INTO template(id,team_id,name,status,build_spec,vcpu,memory_mib,disk_mib,rootfs_path)
+		VALUES($1,$2,'unknown-template','ready','{}',1,1024,1024,'/templates/'||$1::uuid::text||'/base.ext4')`, template, team)
+	storageExec(t, `INSERT INTO sandbox(id,team_id,name,status,vcpu_count,memory_mib,host_id,template_id,base_path,created_at,destroyed_at)
+		SELECT $1,$2,'unknown-sandbox','deleted',1,1024,$4,id,rootfs_path,$5,$6 FROM template WHERE id=$3`,
+		sandbox, team, template, hostID, start, start.Add(time.Hour))
+	storageExec(t, `INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at,ended_at,end_reason)
+		VALUES($1,$2,$3,0,$4,$5,'deleted')`, sandbox, team, hostID, start, start.Add(time.Hour))
+
+	poolConfig := testPool.Config()
+	poolConfig.MaxConns = 1
+	poolConfig.MinConns = 0
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if _, err := pool.Exec(ctx, `CREATE TEMP TABLE billing_rollup_job
+		(LIKE public.billing_rollup_job INCLUDING ALL)`); err != nil {
+		t.Fatal(err)
+	}
+	var unknownJob, newerJob uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO billing_rollup_job(team_id,hour_start,hour_end,status,next_attempt_at)
+		VALUES($1,$2,$3,'pending',now()-interval '2 hours') RETURNING id`, team, start, start.Add(time.Hour)).Scan(&unknownJob); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO billing_rollup_job(team_id,hour_start,hour_end,status,next_attempt_at)
+		VALUES($1,$2,$3,'pending',now()-interval '1 hour') RETURNING id`, team, start.Add(time.Hour), start.Add(2*time.Hour)).Scan(&newerJob); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := billing.HourlyRollupConfig{BatchSize: 1, MaxAttempts: 5, LockDuration: time.Minute}
+	billing.ProcessJobsForTest(ctx, pool, db.New(pool), cfg, "unknown-worker")
+	var status, lastError string
+	var attempts int
+	var backedOff bool
+	if err := pool.QueryRow(ctx, `SELECT status, attempt_count, COALESCE(last_error,''), next_attempt_at > now()+interval '10 minutes'
+		FROM billing_rollup_job WHERE id=$1`, unknownJob).Scan(&status, &attempts, &lastError, &backedOff); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || attempts != 0 || lastError != "storage usage unknown" || !backedOff {
+		t.Fatalf("unknown job status=%s attempts=%d error=%q backedOff=%t; want pending, no attempt spent, labeled and backed off",
+			status, attempts, lastError, backedOff)
+	}
+
+	// Once its backoff lapses the unresolved old hour must queue behind work
+	// that has waited longer, not reclaim the head of the queue.
+	if _, err := pool.Exec(ctx, `UPDATE billing_rollup_job SET next_attempt_at=now() WHERE id=$1`, unknownJob); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := billing.ClaimJobsForTest(ctx, pool, cfg, "unknown-worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != newerJob {
+		t.Fatalf("claimed %+v; want the newer job %s that has waited longer", jobs, newerJob)
+	}
+}
