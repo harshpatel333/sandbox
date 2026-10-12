@@ -29,6 +29,8 @@ func TestIntegration_BillingRollupCompletenessDoesNotExhaustAttempts(t *testing.
 				ON CONFLICT (team_id, key) DO UPDATE SET enabled=true`, teamID); err != nil {
 					t.Fatalf("enable hourly rollups: %v", err)
 				}
+				// Only billable storage holds an hour for its reports.
+				seedStorageActivation(t, teamID, time.Now().Add(-48*time.Hour))
 
 				// Give this worker a private queue while exercising the real report
 				// completeness gate and hourly usage query against the fixture.
@@ -137,6 +139,8 @@ func TestIntegration_BillingRollupUnknownStorageDoesNotStarveQueue(t *testing.T)
 	enableBillingHourlyRollups(t, ctx, team)
 	hostID := "rollup-unknown-" + uuid.NewString()
 	start := time.Now().UTC().Truncate(time.Hour).Add(-4 * time.Hour)
+	// Only billable storage holds an hour for an unknown size.
+	seedStorageActivation(t, team, start.Add(-time.Hour))
 	// A sandbox on a manifest-less template build has no recorded size, so
 	// its hour can never roll up until the artifact is reconciled.
 	template, sandbox := uuid.New(), uuid.New()
@@ -195,5 +199,78 @@ func TestIntegration_BillingRollupUnknownStorageDoesNotStarveQueue(t *testing.T)
 	}
 	if len(jobs) != 1 || jobs[0].ID != newerJob {
 		t.Fatalf("claimed %+v; want the newer job %s that has waited longer", jobs, newerJob)
+	}
+}
+
+func TestIntegration_BillingRollupUnbilledStorageDoesNotHoldCompute(t *testing.T) {
+	ctx := t.Context()
+	fixture := newStorageReportFixture(t, "active", false)
+	teamID := sandboxTeamID(t, fixture.sandboxID)
+	enableBillingHourlyRollups(t, ctx, teamID)
+
+	poolConfig := testPool.Config()
+	poolConfig.MaxConns = 1
+	poolConfig.MinConns = 0
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if _, err := pool.Exec(ctx, `CREATE TEMP TABLE billing_rollup_job
+		(LIKE public.billing_rollup_job INCLUDING ALL)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// An unresolved report keeps the team's storage incomplete for the hour.
+	reportID := uuid.New()
+	var receivedAt time.Time
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO host_storage_report(host_id, incarnation_id, report_id, ingest_seq, payload, next_attempt_at)
+		VALUES ($1, $2::uuid, $3, 1, '[]'::jsonb, now()+interval '1 hour')
+		RETURNING received_at`, fixture.hostID, fixture.incarnation, reportID).Scan(&receivedAt); err != nil {
+		t.Fatal(err)
+	}
+	hourStart := receivedAt.UTC().Truncate(time.Hour)
+	var jobID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO billing_rollup_job(team_id,hour_start,hour_end,status)
+		VALUES($1,$2,$3,'pending') RETURNING id`, teamID, hourStart, hourStart.Add(time.Hour)).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	cfg := billing.HourlyRollupConfig{BatchSize: 1, MaxAttempts: 5, LockDuration: time.Minute}
+	process := func() (string, bool, bool) {
+		billing.ProcessJobsForTest(ctx, pool, db.New(pool), cfg, "unbilled-worker")
+		var status string
+		var recorded, measured bool
+		if err := pool.QueryRow(ctx, `SELECT j.status, h.team_id IS NOT NULL, h.storage_mib_seconds IS NOT NULL
+			FROM billing_rollup_job j LEFT JOIN team_billing_usage_hourly h ON h.team_id=j.team_id AND h.hour_start=j.hour_start
+			WHERE j.id=$1`, jobID).Scan(&status, &recorded, &measured); err != nil {
+			t.Fatal(err)
+		}
+		return status, recorded, measured
+	}
+
+	if status, recorded, measured := process(); status != "pending" || !recorded || measured {
+		t.Fatalf("pending reports: status=%s recorded=%t measured=%t; want compute recorded, storage unmeasured (NULL, not 0) and the job deferred",
+			status, recorded, measured)
+	}
+	// Unmeasured, unbillable storage must not null out the hour's spend.
+	var priced bool
+	if err := testPool.QueryRow(ctx, `SELECT spend_usd IS NOT NULL FROM analytics.team_hourly_spend
+		WHERE team_name=(SELECT name FROM team WHERE id=$1) AND hour_start=$2`, teamID, hourStart).Scan(&priced); err != nil {
+		t.Fatal(err)
+	}
+	if !priced {
+		t.Fatal("hourly spend is NULL for an hour with unmeasured, unbillable storage")
+	}
+
+	// Once the reports land, the deferred job itself fills in the storage.
+	if _, err := testPool.Exec(ctx, `UPDATE host_storage_report SET state='processed', payload=NULL, processed_at=now() WHERE report_id=$1`, reportID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE billing_rollup_job SET next_attempt_at=now() WHERE id=$1`, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if status, recorded, measured := process(); status != "completed" || !recorded || !measured {
+		t.Fatalf("after reports: status=%s recorded=%t measured=%t; want storage measured", status, recorded, measured)
 	}
 }

@@ -277,6 +277,49 @@ SET hour_end = EXCLUDED.hour_end,
     updated_at = now()
 RETURNING *;
 
+-- name: UpsertTeamBillingUsageHourCompute :one
+-- Compute only. A new hour's storage is NULL until measured; a refreshed hour
+-- keeps its previously measured storage.
+WITH compute AS (
+    SELECT
+        COALESCE(SUM(
+            EXTRACT(EPOCH FROM (
+                LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
+                - GREATEST(i.started_at, sqlc.arg(hour_start))
+            )) * i.vcpu_count
+        ), 0)::numeric AS vcpu_seconds,
+        COALESCE(SUM(
+            EXTRACT(EPOCH FROM (
+                LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
+                - GREATEST(i.started_at, sqlc.arg(hour_start))
+            )) * i.memory_mib
+        ), 0)::numeric AS memory_mib_seconds
+    FROM sandbox_compute_billing_interval i
+    WHERE i.team_id = sqlc.arg(team_id)
+      AND i.started_at < sqlc.arg(hour_end)
+      AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
+      AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
+)
+INSERT INTO team_billing_usage_hourly (
+    team_id, hour_start, hour_end,
+    vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+)
+SELECT
+    sqlc.arg(team_id)::uuid,
+    sqlc.arg(hour_start)::timestamptz,
+    sqlc.arg(hour_end)::timestamptz,
+    compute.vcpu_seconds,
+    compute.memory_mib_seconds,
+    NULL::numeric
+FROM compute
+WHERE feature_enabled('billing_hourly_rollups', sqlc.arg(team_id)::uuid)
+ON CONFLICT (team_id, hour_start) DO UPDATE
+SET hour_end = EXCLUDED.hour_end,
+    vcpu_seconds = EXCLUDED.vcpu_seconds,
+    memory_mib_seconds = EXCLUDED.memory_mib_seconds,
+    updated_at = now()
+RETURNING *;
+
 -- name: ListTeamBillingUsageHourly :many
 SELECT *
 FROM team_billing_usage_hourly
