@@ -253,6 +253,15 @@ func TestIntegration_BillingRollupUnbilledStorageDoesNotHoldCompute(t *testing.T
 		t.Fatalf("pending reports: status=%s recorded=%t measured=%t; want compute recorded with storage unmeasured (NULL, not 0)",
 			status, recorded, measured)
 	}
+	// Unmeasured, unbillable storage must not null out the hour's spend.
+	var priced bool
+	if err := testPool.QueryRow(ctx, `SELECT spend_usd IS NOT NULL FROM analytics.team_hourly_spend
+		WHERE team_name=(SELECT name FROM team WHERE id=$1) AND hour_start=$2`, teamID, hourStart).Scan(&priced); err != nil {
+		t.Fatal(err)
+	}
+	if !priced {
+		t.Fatal("hourly spend is NULL for an hour with unmeasured, unbillable storage")
+	}
 
 	// Once the reports land, a refresh fills in the storage it skipped.
 	if _, err := testPool.Exec(ctx, `UPDATE host_storage_report SET state='processed', payload=NULL, processed_at=now() WHERE report_id=$1`, reportID); err != nil {
