@@ -4179,6 +4179,71 @@ func (q *Queries) UpsertTeamBillingUsageHour(ctx context.Context, arg UpsertTeam
 	return i, err
 }
 
+const upsertTeamBillingUsageHourCompute = `-- name: UpsertTeamBillingUsageHourCompute :one
+WITH compute AS (
+    SELECT
+        COALESCE(SUM(
+            EXTRACT(EPOCH FROM (
+                LEAST(COALESCE(i.ended_at, billing_request_now()), $3)
+                - GREATEST(i.started_at, $2)
+            )) * i.vcpu_count
+        ), 0)::numeric AS vcpu_seconds,
+        COALESCE(SUM(
+            EXTRACT(EPOCH FROM (
+                LEAST(COALESCE(i.ended_at, billing_request_now()), $3)
+                - GREATEST(i.started_at, $2)
+            )) * i.memory_mib
+        ), 0)::numeric AS memory_mib_seconds
+    FROM sandbox_compute_billing_interval i
+    WHERE i.team_id = $1
+      AND i.started_at < $3
+      AND $2 < LEAST(billing_request_now(), $3)
+      AND COALESCE(i.ended_at, LEAST(billing_request_now(), $3)) > $2
+)
+INSERT INTO team_billing_usage_hourly (
+    team_id, hour_start, hour_end,
+    vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+)
+SELECT
+    $1::uuid,
+    $2::timestamptz,
+    $3::timestamptz,
+    compute.vcpu_seconds,
+    compute.memory_mib_seconds,
+    NULL::numeric
+FROM compute
+WHERE feature_enabled('billing_hourly_rollups', $1::uuid)
+ON CONFLICT (team_id, hour_start) DO UPDATE
+SET hour_end = EXCLUDED.hour_end,
+    vcpu_seconds = EXCLUDED.vcpu_seconds,
+    memory_mib_seconds = EXCLUDED.memory_mib_seconds,
+    updated_at = now()
+RETURNING team_id, hour_start, hour_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, updated_at
+`
+
+type UpsertTeamBillingUsageHourComputeParams struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	HourStart time.Time `json:"hour_start"`
+	HourEnd   time.Time `json:"hour_end"`
+}
+
+// Compute only. A new hour's storage is NULL until measured; a refreshed hour
+// keeps its previously measured storage.
+func (q *Queries) UpsertTeamBillingUsageHourCompute(ctx context.Context, arg UpsertTeamBillingUsageHourComputeParams) (TeamBillingUsageHourly, error) {
+	row := q.db.QueryRow(ctx, upsertTeamBillingUsageHourCompute, arg.TeamID, arg.HourStart, arg.HourEnd)
+	var i TeamBillingUsageHourly
+	err := row.Scan(
+		&i.TeamID,
+		&i.HourStart,
+		&i.HourEnd,
+		&i.VcpuSeconds,
+		&i.MemoryMibSeconds,
+		&i.StorageMibSeconds,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const upsertTeamTrialRunway = `-- name: UpsertTeamTrialRunway :exec
 INSERT INTO team_trial_runway (team_id, lifecycle_key, state, observed_at)
 SELECT $1, $2::text, $3::text, $4::timestamptz
