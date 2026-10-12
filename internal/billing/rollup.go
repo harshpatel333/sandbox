@@ -261,8 +261,15 @@ func upsertCompleteRollupUsage(ctx context.Context, pool *pgxpool.Pool, q *db.Qu
 			return flagErr
 		}
 		if enabled {
-			// Receipts are fenced and completeness passed, so the row was
-			// withheld because storage_mib_seconds is unknown.
+			// Owner creation isn't fenced, so a new obligation can commit
+			// between the gate and the upsert; only a complete hour is unknown.
+			complete, err := storageReportsCompleteThrough(ctx, tx, job.TeamID, job.HourEnd)
+			if err != nil {
+				return fmt.Errorf("check storage report completeness: %w", err)
+			}
+			if !complete {
+				return ErrStorageReportsIncomplete
+			}
 			return errStorageUsageUnknown
 		}
 		err = nil
