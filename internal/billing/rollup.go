@@ -28,7 +28,14 @@ const (
 	defaultHourlyRollupBatchSize             = 100
 	defaultHourlyRollupMaxAttempts           = 5
 	defaultHourlyRollupWorkers               = 1
+
+	storageReportsIncompleteRetry = 30 * time.Second
+	storageUsageUnknownRetry      = 15 * time.Minute
 )
+
+// errStorageUsageUnknown means an owned artifact has no recorded size. Unlike
+// a report in flight, it resolves only through reconciliation, so it backs off.
+var errStorageUsageUnknown = errors.New("storage usage unknown")
 
 type HourlyRollupConfig struct {
 	SchedulerInterval     time.Duration
@@ -207,7 +214,10 @@ func processJob(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg Hour
 
 	err = upsertCompleteRollupUsage(ctx, pool, q, job)
 	if errors.Is(err, ErrStorageReportsIncomplete) {
-		return deferIncompleteRollupJob(ctx, pool, job.ID, workerID)
+		return deferRollupJob(ctx, pool, job.ID, workerID, err, "storage reports incomplete", storageReportsIncompleteRetry)
+	}
+	if errors.Is(err, errStorageUsageUnknown) {
+		return deferRollupJob(ctx, pool, job.ID, workerID, err, "storage usage unknown", storageUsageUnknownRetry)
 	}
 	if err != nil {
 		nextAttemptAt := time.Now().UTC().Add(backoff(job.AttemptCount))
@@ -251,9 +261,16 @@ func upsertCompleteRollupUsage(ctx context.Context, pool *pgxpool.Pool, q *db.Qu
 			return flagErr
 		}
 		if enabled {
-			// The upsert's snapshot was incomplete even if a worker has now
-			// committed. Retry the aggregation instead of completing an empty job.
-			return ErrStorageReportsIncomplete
+			// Owner creation isn't fenced, so a new obligation can commit
+			// between the gate and the upsert; only a complete hour is unknown.
+			complete, err := storageReportsCompleteThrough(ctx, tx, job.TeamID, job.HourEnd)
+			if err != nil {
+				return fmt.Errorf("check storage report completeness: %w", err)
+			}
+			if !complete {
+				return ErrStorageReportsIncomplete
+			}
+			return errStorageUsageUnknown
 		}
 		err = nil
 	}
@@ -263,25 +280,25 @@ func upsertCompleteRollupUsage(ctx context.Context, pool *pgxpool.Pool, q *db.Qu
 	return tx.Commit(ctx)
 }
 
-func deferIncompleteRollupJob(ctx context.Context, pool *pgxpool.Pool, jobID uuid.UUID, workerID string) error {
-	// Claiming reserves one attempt; waiting for accepted storage reports is
-	// not a failed rollup and must not consume its retry budget.
+func deferRollupJob(ctx context.Context, pool *pgxpool.Pool, jobID uuid.UUID, workerID string, cause error, reason string, delay time.Duration) error {
+	// Claiming reserves one attempt; waiting on storage measurements is not a
+	// failed rollup and must not consume its retry budget.
 	const query = `
 UPDATE billing_rollup_job
 SET status = 'pending',
     attempt_count = GREATEST(attempt_count - 1, 0),
     locked_by = NULL,
     locked_until = NULL,
-    next_attempt_at = now() + interval '30 seconds',
-    last_error = 'storage reports incomplete',
+    next_attempt_at = now() + $3 * interval '1 second',
+    last_error = $4,
     updated_at = now()
 WHERE id = $1
   AND locked_by = $2`
-	_, err := pool.Exec(ctx, query, jobID, workerID)
+	_, err := pool.Exec(ctx, query, jobID, workerID, delay.Seconds(), reason)
 	if err != nil {
 		return err
 	}
-	return ErrStorageReportsIncomplete
+	return cause
 }
 
 func claimSchedulerLease(ctx context.Context, pool *pgxpool.Pool, workerID string, lockedUntil time.Time) (bool, error) {
@@ -654,7 +671,9 @@ WITH candidate AS (
               AND locked_until <= now()
           )
       )
-    ORDER BY hour_start ASC, updated_at ASC
+    -- Deferred jobs requeue behind work that has waited longer; ordering by
+    -- hour_start let unresolvable old hours starve every newer job.
+    ORDER BY next_attempt_at ASC, hour_start ASC
     LIMIT $2
     FOR UPDATE SKIP LOCKED
 )
