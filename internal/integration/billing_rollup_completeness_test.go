@@ -249,8 +249,8 @@ func TestIntegration_BillingRollupUnbilledStorageDoesNotHoldCompute(t *testing.T
 		return status, recorded, measured
 	}
 
-	if status, recorded, measured := process(); status != "completed" || !recorded || measured {
-		t.Fatalf("pending reports: status=%s recorded=%t measured=%t; want compute recorded with storage unmeasured (NULL, not 0)",
+	if status, recorded, measured := process(); status != "pending" || !recorded || measured {
+		t.Fatalf("pending reports: status=%s recorded=%t measured=%t; want compute recorded, storage unmeasured (NULL, not 0) and the job deferred",
 			status, recorded, measured)
 	}
 	// Unmeasured, unbillable storage must not null out the hour's spend.
@@ -263,11 +263,11 @@ func TestIntegration_BillingRollupUnbilledStorageDoesNotHoldCompute(t *testing.T
 		t.Fatal("hourly spend is NULL for an hour with unmeasured, unbillable storage")
 	}
 
-	// Once the reports land, a refresh fills in the storage it skipped.
+	// Once the reports land, the deferred job itself fills in the storage.
 	if _, err := testPool.Exec(ctx, `UPDATE host_storage_report SET state='processed', payload=NULL, processed_at=now() WHERE report_id=$1`, reportID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE billing_rollup_job SET status='pending', next_attempt_at=now() WHERE id=$1`, jobID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE billing_rollup_job SET next_attempt_at=now() WHERE id=$1`, jobID); err != nil {
 		t.Fatal(err)
 	}
 	if status, recorded, measured := process(); status != "completed" || !recorded || !measured {

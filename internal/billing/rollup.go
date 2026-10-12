@@ -260,7 +260,13 @@ func upsertUnbilledStorageRollupUsage(ctx context.Context, pool *pgxpool.Pool, q
 	if err != nil {
 		return err
 	}
-	if err := measureUnbilledRollupStorage(ctx, pool, job); err != nil {
+	err = measureUnbilledRollupStorage(ctx, pool, job)
+	if errors.Is(err, ErrStorageReportsIncomplete) {
+		// Compute is recorded; keep the job deferred so storage is measured once
+		// its reports land. Hours outside the rolling window are never revisited.
+		return err
+	}
+	if err != nil {
 		log.Debug().Err(err).Str("team_id", job.TeamID.String()).Time("hour_start", job.HourStart).
 			Msg("unbilled hourly storage left unmeasured")
 	}
