@@ -1538,9 +1538,18 @@ SELECT u.bucket_start::timestamptz AS period_start, u.bucket_end::timestamptz AS
  u.vcpu_seconds::numeric AS vcpu_seconds,
  (u.memory_mib_seconds/1024.0)::numeric AS memory_gib_seconds,
  (u.storage_mib_seconds/1024.0)::numeric AS storage_gib_seconds,
+ u.storage_direct::boolean AS storage_direct,
  (billable_storage_mib_seconds(sqlc.arg(team_id),u.bucket_start::timestamptz,u.bucket_end::timestamptz)/1024.0)::numeric AS billable_storage_gib_seconds
-FROM billing_usage_from_rollups(sqlc.arg(team_id)::uuid,sqlc.arg(period_starts)::timestamptz[],sqlc.arg(period_ends)::timestamptz[],sqlc.arg(floor_legacy_artifacts)::boolean) u
+FROM billing_usage_from_rollups(sqlc.arg(team_id)::uuid,sqlc.arg(period_starts)::timestamptz[],sqlc.arg(period_ends)::timestamptz[]) u
 ORDER BY 1;
+
+-- name: GetTeamTrackedStorageSeries :many
+-- Direct tracked storage for buckets saved rollups cannot answer exactly.
+SELECT starts.bucket_start::timestamptz AS period_start,
+ (storage_mib_seconds(sqlc.arg(team_id)::uuid,starts.bucket_start,ends.bucket_end,sqlc.arg(floor_legacy_artifacts)::boolean)/1024.0)::numeric AS storage_gib_seconds
+FROM unnest(sqlc.arg(period_starts)::timestamptz[]) WITH ORDINALITY starts(bucket_start,n)
+JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
+ORDER BY starts.n;
 
 -- name: GetTeamTrialRunway :one
 WITH lifecycle AS (

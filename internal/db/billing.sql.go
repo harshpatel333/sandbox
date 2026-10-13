@@ -1591,16 +1591,16 @@ SELECT u.bucket_start::timestamptz AS period_start, u.bucket_end::timestamptz AS
  u.vcpu_seconds::numeric AS vcpu_seconds,
  (u.memory_mib_seconds/1024.0)::numeric AS memory_gib_seconds,
  (u.storage_mib_seconds/1024.0)::numeric AS storage_gib_seconds,
+ u.storage_direct::boolean AS storage_direct,
  (billable_storage_mib_seconds($1,u.bucket_start::timestamptz,u.bucket_end::timestamptz)/1024.0)::numeric AS billable_storage_gib_seconds
-FROM billing_usage_from_rollups($1::uuid,$2::timestamptz[],$3::timestamptz[],$4::boolean) u
+FROM billing_usage_from_rollups($1::uuid,$2::timestamptz[],$3::timestamptz[]) u
 ORDER BY 1
 `
 
 type GetTeamBillingUsageFromRollupsParams struct {
-	TeamID               uuid.UUID   `json:"team_id"`
-	PeriodStarts         []time.Time `json:"period_starts"`
-	PeriodEnds           []time.Time `json:"period_ends"`
-	FloorLegacyArtifacts bool        `json:"floor_legacy_artifacts"`
+	TeamID       uuid.UUID   `json:"team_id"`
+	PeriodStarts []time.Time `json:"period_starts"`
+	PeriodEnds   []time.Time `json:"period_ends"`
 }
 
 type GetTeamBillingUsageFromRollupsRow struct {
@@ -1609,18 +1609,14 @@ type GetTeamBillingUsageFromRollupsRow struct {
 	VcpuSeconds               pgtype.Numeric `json:"vcpu_seconds"`
 	MemoryGibSeconds          pgtype.Numeric `json:"memory_gib_seconds"`
 	StorageGibSeconds         pgtype.Numeric `json:"storage_gib_seconds"`
+	StorageDirect             bool           `json:"storage_direct"`
 	BillableStorageGibSeconds pgtype.Numeric `json:"billable_storage_gib_seconds"`
 }
 
 // Usage per bucket for billing pages: saved hourly rollups for settled hours,
 // intervals for the rest. Billable storage stays exact and live.
 func (q *Queries) GetTeamBillingUsageFromRollups(ctx context.Context, arg GetTeamBillingUsageFromRollupsParams) ([]GetTeamBillingUsageFromRollupsRow, error) {
-	rows, err := q.db.Query(ctx, getTeamBillingUsageFromRollups,
-		arg.TeamID,
-		arg.PeriodStarts,
-		arg.PeriodEnds,
-		arg.FloorLegacyArtifacts,
-	)
+	rows, err := q.db.Query(ctx, getTeamBillingUsageFromRollups, arg.TeamID, arg.PeriodStarts, arg.PeriodEnds)
 	if err != nil {
 		return nil, err
 	}
@@ -1634,6 +1630,7 @@ func (q *Queries) GetTeamBillingUsageFromRollups(ctx context.Context, arg GetTea
 			&i.VcpuSeconds,
 			&i.MemoryGibSeconds,
 			&i.StorageGibSeconds,
+			&i.StorageDirect,
 			&i.BillableStorageGibSeconds,
 		); err != nil {
 			return nil, err
@@ -1762,6 +1759,52 @@ func (q *Queries) GetTeamCreditBalance(ctx context.Context, teamID uuid.UUID) (p
 	var balance_usd pgtype.Numeric
 	err := row.Scan(&balance_usd)
 	return balance_usd, err
+}
+
+const getTeamTrackedStorageSeries = `-- name: GetTeamTrackedStorageSeries :many
+SELECT starts.bucket_start::timestamptz AS period_start,
+ (storage_mib_seconds($1::uuid,starts.bucket_start,ends.bucket_end,$2::boolean)/1024.0)::numeric AS storage_gib_seconds
+FROM unnest($3::timestamptz[]) WITH ORDINALITY starts(bucket_start,n)
+JOIN unnest($4::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
+ORDER BY starts.n
+`
+
+type GetTeamTrackedStorageSeriesParams struct {
+	TeamID               uuid.UUID   `json:"team_id"`
+	FloorLegacyArtifacts bool        `json:"floor_legacy_artifacts"`
+	PeriodStarts         []time.Time `json:"period_starts"`
+	PeriodEnds           []time.Time `json:"period_ends"`
+}
+
+type GetTeamTrackedStorageSeriesRow struct {
+	PeriodStart       time.Time      `json:"period_start"`
+	StorageGibSeconds pgtype.Numeric `json:"storage_gib_seconds"`
+}
+
+// Direct tracked storage for buckets saved rollups cannot answer exactly.
+func (q *Queries) GetTeamTrackedStorageSeries(ctx context.Context, arg GetTeamTrackedStorageSeriesParams) ([]GetTeamTrackedStorageSeriesRow, error) {
+	rows, err := q.db.Query(ctx, getTeamTrackedStorageSeries,
+		arg.TeamID,
+		arg.FloorLegacyArtifacts,
+		arg.PeriodStarts,
+		arg.PeriodEnds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetTeamTrackedStorageSeriesRow{}
+	for rows.Next() {
+		var i GetTeamTrackedStorageSeriesRow
+		if err := rows.Scan(&i.PeriodStart, &i.StorageGibSeconds); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getTeamTrialBalance = `-- name: GetTeamTrialBalance :one

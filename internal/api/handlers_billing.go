@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -20,6 +21,55 @@ import (
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+// Direct tracked storage covers a team's whole retained history and can
+// outlast the console's request timeout for large teams. Past this budget its
+// query is cancelled and the page reports the figure as unknown; billable
+// storage is unaffected.
+const defaultTrackedStorageBudget = 3 * time.Second
+
+func (h *Handlers) trackedStorageBudget() time.Duration {
+	if h.TrackedStorageBudget > 0 {
+		return h.TrackedStorageBudget
+	}
+	return defaultTrackedStorageBudget
+}
+
+// fillDirectTrackedStorage computes storage for buckets saved rollups could not
+// answer exactly, leaving them unknown when that misses its budget.
+func (h *Handlers) fillDirectTrackedStorage(ctx context.Context, teamID uuid.UUID, rows []db.GetTeamBillingUsageFromRollupsRow, floorLegacyArtifacts bool) {
+	var idx []int
+	var starts, ends []time.Time
+	for i, row := range rows {
+		if row.StorageDirect {
+			idx = append(idx, i)
+			starts, ends = append(starts, row.PeriodStart), append(ends, row.PeriodEnd)
+		}
+	}
+	if len(idx) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, h.trackedStorageBudget())
+	defer cancel()
+	storage, err := h.DB.GetTeamTrackedStorageSeries(ctx, db.GetTeamTrackedStorageSeriesParams{
+		TeamID: teamID, FloorLegacyArtifacts: floorLegacyArtifacts, PeriodStarts: starts, PeriodEnds: ends,
+	})
+	if err == nil && len(storage) != len(idx) {
+		err = fmt.Errorf("tracked storage returned %d buckets, want %d", len(storage), len(idx))
+	}
+	if err != nil {
+		evt := log.Error()
+		if ctx.Err() != nil {
+			// Over budget or abandoned by the client: expected for large teams.
+			evt = log.Info()
+		}
+		evt.Err(err).Str("team_id", teamID.String()).Msg("tracked storage reported unknown")
+		return
+	}
+	for k, i := range idx {
+		rows[i].StorageGibSeconds = storage[k].StorageGibSeconds
+	}
+}
 
 const (
 	publicPricingPlanKey       = "payg"
@@ -225,8 +275,6 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			TeamID:       teamID,
 			PeriodStarts: []time.Time{periodStart},
 			PeriodEnds:   []time.Time{periodEnd},
-			// The summary has always floored legacy artifact storage.
-			FloorLegacyArtifacts: true,
 		})
 		if err == nil && len(usageRows) != 1 {
 			err = fmt.Errorf("usage returned %d rows, want 1", len(usageRows))
@@ -271,6 +319,8 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	// The summary has always floored legacy artifact storage.
+	h.fillDirectTrackedStorage(c.Request.Context(), teamID, usageRows, true)
 	usage := usageRows[0]
 	// Missing pre-activation storage measurements cannot change payable totals.
 	// Keep tracked usage unknown while still requiring complete billable usage.
@@ -602,11 +652,12 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 	}
 	// Aggregate all buckets in one bounded set-oriented query; do not invoke the
 	// full-team usage scan independently for each bucket.
-	usageRows, e := h.DB.GetTeamBillingUsageFromRollups(ctx, db.GetTeamBillingUsageFromRollupsParams{TeamID: teamID, PeriodStarts: starts, PeriodEnds: ends, FloorLegacyArtifacts: false})
+	usageRows, e := h.DB.GetTeamBillingUsageFromRollups(ctx, db.GetTeamBillingUsageFromRollupsParams{TeamID: teamID, PeriodStarts: starts, PeriodEnds: ends})
 	if e != nil || len(usageRows) != len(buckets) {
 		respondError(c, ErrInternal)
 		return
 	}
+	h.fillDirectTrackedStorage(ctx, teamID, usageRows, false)
 	for i, b := range buckets {
 		u := usageRows[i]
 		cpu, cpuErr := numericFloat64(u.VcpuSeconds)

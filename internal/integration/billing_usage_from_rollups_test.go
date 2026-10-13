@@ -69,8 +69,8 @@ func TestIntegration_BillingUsageFromRollupsMatchesIntervals(t *testing.T) {
 	}
 
 	type bucket struct {
-		vcpuSame, memorySame, storageSame bool
-		rolled, live                      *string
+		vcpuSame, memorySame, storageSame, direct bool
+		rolled, live                              *string
 	}
 	compare := func(starts, ends []time.Time) []bucket {
 		t.Helper()
@@ -88,7 +88,7 @@ l AS (
   storage_mib_seconds($1, b.bs, b.be, false) storage
  FROM b)
 SELECT r.vcpu_seconds = l.vcpu, r.memory_mib_seconds = l.memory,
- r.storage_mib_seconds IS NOT DISTINCT FROM l.storage, r.storage_mib_seconds::text, l.storage::text
+ r.storage_mib_seconds IS NOT DISTINCT FROM l.storage, r.storage_direct, r.storage_mib_seconds::text, l.storage::text
 FROM l JOIN r ON r.bucket_start = l.bs ORDER BY l.bs`, team, starts, ends)
 		if err != nil {
 			t.Fatal(err)
@@ -97,7 +97,7 @@ FROM l JOIN r ON r.bucket_start = l.bs ORDER BY l.bs`, team, starts, ends)
 		var out []bucket
 		for rows.Next() {
 			var b bucket
-			if err := rows.Scan(&b.vcpuSame, &b.memorySame, &b.storageSame, &b.rolled, &b.live); err != nil {
+			if err := rows.Scan(&b.vcpuSame, &b.memorySame, &b.storageSame, &b.direct, &b.rolled, &b.live); err != nil {
 				t.Fatal(err)
 			}
 			out = append(out, b)
@@ -120,8 +120,8 @@ FROM l JOIN r ON r.bucket_start = l.bs ORDER BY l.bs`, team, starts, ends)
 		starts, ends = append(starts, hour), append(ends, hour.Add(time.Hour))
 	}
 	for i, b := range compare(starts, ends) {
-		if !b.vcpuSame || !b.memorySame {
-			t.Fatalf("hour %s: compute differs from intervals", starts[i])
+		if !b.vcpuSame || !b.memorySame || b.direct {
+			t.Fatalf("hour %s: compute same=%t/%t direct=%t; want exact compute from saved hours", starts[i], b.vcpuSame, b.memorySame, b.direct)
 		}
 		if starts[i].Equal(now.Truncate(time.Hour)) {
 			if b.rolled != nil {
@@ -131,12 +131,14 @@ FROM l JOIN r ON r.bucket_start = l.bs ORDER BY l.bs`, team, starts, ends)
 			t.Fatalf("hour %s: storage %s, intervals %s", starts[i], text(b.rolled), text(b.live))
 		}
 	}
-	// Edges cutting hours, and a range reaching before rollup coverage.
+	// Edges cutting hours, and a range reaching before rollup coverage, leave
+	// storage to the direct calculation.
 	for i, b := range compare(
 		[]time.Time{base.Add(15 * time.Minute), base.Add(-24 * time.Hour)},
 		[]time.Time{now, base.Add(24 * time.Hour)}) {
-		if !b.vcpuSame || !b.memorySame {
-			t.Fatalf("range %d: compute differs from intervals", i)
+		if !b.vcpuSame || !b.memorySame || !b.direct || b.rolled != nil {
+			t.Fatalf("range %d: compute same=%t/%t direct=%t storage=%s; want exact compute and storage left to the direct path",
+				i, b.vcpuSame, b.memorySame, b.direct, text(b.rolled))
 		}
 	}
 

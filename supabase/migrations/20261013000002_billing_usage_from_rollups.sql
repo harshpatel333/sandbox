@@ -4,10 +4,11 @@
 -- enqueue it and did not; everything else (the current hour, bucket edges,
 -- hours still awaiting a rollup, time before rollup coverage) is computed
 -- from the intervals active in those windows. Storage is informational: the
--- sum of measured hours, unknown when a settled hour has no measurement.
-CREATE OR REPLACE FUNCTION billing_usage_from_rollups(p_team uuid, p_starts timestamptz[], p_ends timestamptz[], p_floor_legacy_artifacts boolean DEFAULT false)
+-- sum of measured hours, unknown when a settled hour has no measurement, and
+-- flagged for direct calculation where saved hours cannot give it exactly.
+CREATE OR REPLACE FUNCTION billing_usage_from_rollups(p_team uuid, p_starts timestamptz[], p_ends timestamptz[])
 RETURNS TABLE(bucket_start timestamptz, bucket_end timestamptz,
-              vcpu_seconds numeric, memory_mib_seconds numeric, storage_mib_seconds numeric)
+              vcpu_seconds numeric, memory_mib_seconds numeric, storage_mib_seconds numeric, storage_direct boolean)
 LANGUAGE sql STABLE AS $$
 WITH params AS MATERIALIZED (
  SELECT billing_request_now() now_,
@@ -68,34 +69,34 @@ WITH params AS MATERIALIZED (
  JOIN live_intervals i ON i.started_at < lw.we AND COALESCE(i.ended_at, p.now_) > lw.ws
  GROUP BY lw.bucket_start
 ), storage AS (
- SELECT b.bucket_start,
-  -- A bucket starting in the hour still in progress has nothing saved yet.
-  -- A team without rollups keeps the direct calculation. A bucket starting
-  -- in the hour still in progress has nothing saved yet.
-  CASE WHEN p.covered_from IS NULL THEN storage_mib_seconds(p_team, b.bucket_start, b.bucket_end, p_floor_legacy_artifacts)
-       WHEN b.bucket_start < p.covered_from
+ SELECT b.bucket_start, d.direct,
+  CASE WHEN d.direct
+         -- A bucket starting in the hour still in progress has nothing saved yet.
          OR (b.bucket_start >= p.cut AND b.bucket_start < p.now_)
          OR EXISTS (SELECT 1 FROM classified c WHERE c.bucket_start = b.bucket_start
                     AND c.source = 'live' AND c.hour_start < p.settled)
          OR EXISTS (SELECT 1 FROM team_billing_usage_hourly r
-                    WHERE r.team_id = p_team AND r.hour_start >= date_trunc('hour', b.bucket_start)
+                    WHERE r.team_id = p_team AND r.hour_start >= b.bucket_start
                       AND r.hour_start < LEAST(b.bucket_end, p.settled) AND r.storage_mib_seconds IS NULL)
        THEN NULL
        ELSE COALESCE((
-         SELECT SUM(r.storage_mib_seconds
-                    * EXTRACT(EPOCH FROM (LEAST(r.hour_end, b.bucket_end) - GREATEST(r.hour_start, b.bucket_start))) / 3600)
-         FROM team_billing_usage_hourly r
-         WHERE r.team_id = p_team AND r.hour_start >= date_trunc('hour', b.bucket_start)
+         SELECT SUM(r.storage_mib_seconds) FROM team_billing_usage_hourly r
+         WHERE r.team_id = p_team AND r.hour_start >= b.bucket_start
            AND r.hour_start < LEAST(b.bucket_end, p.cut) AND r.storage_mib_seconds IS NOT NULL), 0)
   END storage_mib_seconds
  FROM buckets b CROSS JOIN params p
+ -- Saved hours are exact only for whole hours inside rollup coverage. Other
+ -- buckets are flagged for the caller to compute directly under its budget.
+ CROSS JOIN LATERAL (SELECT p.covered_from IS NULL OR b.bucket_start < p.covered_from
+   OR date_trunc('hour', b.bucket_start) <> b.bucket_start
+   OR (date_trunc('hour', b.bucket_end) <> b.bucket_end AND b.bucket_end <= p.now_) AS direct) d
 )
 SELECT b.bucket_start, b.bucket_end,
  COALESCE((SELECT SUM(c.vcpu_seconds) FROM classified c WHERE c.bucket_start = b.bucket_start AND c.source = 'recorded'), 0)
    + COALESCE(lc.vcpu, 0),
  COALESCE((SELECT SUM(c.memory_mib_seconds) FROM classified c WHERE c.bucket_start = b.bucket_start AND c.source = 'recorded'), 0)
    + COALESCE(lc.memory, 0),
- s.storage_mib_seconds
+ s.storage_mib_seconds, s.direct
 FROM buckets b
 JOIN storage s USING (bucket_start)
 LEFT JOIN live_compute lc USING (bucket_start)
