@@ -22,6 +22,7 @@ func (e *AppError) Error() string {
 var (
 	ErrSandboxNotFound = &AppError{Code: "not_found", Message: "Sandbox not found", HTTPStatus: http.StatusNotFound}
 	ErrInvalidState    = &AppError{Code: "conflict", Message: "Sandbox is not in a valid state for this operation", HTTPStatus: http.StatusConflict}
+	ErrSandboxPausing  = &AppError{Code: "sandbox_pausing", Message: "Sandbox is still pausing; retry shortly", HTTPStatus: http.StatusConflict}
 	ErrBadRequest      = &AppError{Code: "bad_request", Message: "Invalid request", HTTPStatus: http.StatusBadRequest}
 	ErrUnauthorized    = &AppError{Code: "unauthorized", Message: "Invalid or missing X-API-Key header", HTTPStatus: http.StatusUnauthorized}
 	ErrForbidden       = &AppError{Code: "forbidden", Message: "You do not have permission to perform this action", HTTPStatus: http.StatusForbidden}
