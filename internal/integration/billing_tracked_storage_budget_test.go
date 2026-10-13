@@ -15,8 +15,9 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-// Tracked storage can outlast a page request for large teams. Past its budget
-// the billing pages must still load with charges and report storage unknown.
+// Without saved rollups, tracked storage is computed directly and can outlast
+// a page request for large teams. Past its budget the billing pages must still
+// load with charges and report storage unknown.
 func TestIntegration_BillingPagesReportTrackedStorageUnknownPastBudget(t *testing.T) {
 	team, key, _ := seedTeamAndKeyWithRole(t, "viewer")
 	start := time.Now().UTC().Truncate(time.Hour).Add(-4 * time.Hour)

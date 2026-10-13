@@ -274,7 +274,8 @@ func upsertUnbilledStorageRollupUsage(ctx context.Context, pool *pgxpool.Pool, q
 }
 
 // measureUnbilledRollupStorage skips the receipt fence: the value is not
-// billed, and holding host locks here would stall report ingestion.
+// billed, and holding host locks here would stall report ingestion. It leaves
+// updated_at alone: readers take updated_at as the compute capture time.
 func measureUnbilledRollupStorage(ctx context.Context, pool *pgxpool.Pool, job rollupJob) error {
 	ctx, cancel := context.WithTimeout(ctx, unbilledStorageBudget)
 	defer cancel()
@@ -287,8 +288,7 @@ func measureUnbilledRollupStorage(ctx context.Context, pool *pgxpool.Pool, job r
 	}
 	_, err := pool.Exec(ctx, `
 UPDATE team_billing_usage_hourly h
-SET storage_mib_seconds = m.storage_mib_seconds,
-    updated_at = now()
+SET storage_mib_seconds = m.storage_mib_seconds
 FROM (SELECT storage_mib_seconds($1::uuid, $2::timestamptz, $3::timestamptz) AS storage_mib_seconds) m
 WHERE h.team_id = $1 AND h.hour_start = $2 AND m.storage_mib_seconds IS NOT NULL`, job.TeamID, job.HourStart, job.HourEnd)
 	return err
