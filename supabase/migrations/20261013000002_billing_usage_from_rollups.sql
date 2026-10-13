@@ -6,6 +6,8 @@
 -- the bucket's measured hours, the current hour as of its latest rollup;
 -- unknown when a saved hour has no measurement; and flagged for the caller to
 -- compute directly when the bucket cuts an hour or any of its hours is unsaved.
+-- Saved hours floor legacy artifact storage per hour, so a rollup-backed total
+-- can sit below a direct unfloored one by under one MiB-second per hour.
 CREATE OR REPLACE FUNCTION billing_usage_from_rollups(p_team uuid, p_starts timestamptz[], p_ends timestamptz[])
 RETURNS TABLE(bucket_start timestamptz, bucket_end timestamptz,
               vcpu_seconds numeric, memory_mib_seconds numeric, storage_mib_seconds numeric, storage_direct boolean)
