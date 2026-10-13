@@ -796,6 +796,8 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 				result = telemetry.SettleResultSettled
 			}
 			recordActivateSettleWait(c, &sandbox, result, pauseWaitStart, pauseReads+1)
+			// Reported once: a settle into 'resuming' keeps this loop re-reading.
+			pauseReads = 0
 		}
 		switch sandbox.Status {
 		case db.SandboxStatusActive:
