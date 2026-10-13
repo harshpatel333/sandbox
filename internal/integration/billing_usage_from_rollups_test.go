@@ -167,6 +167,10 @@ FROM l JOIN r ON r.bucket_start = l.bs ORDER BY l.bs`, team, starts, ends)
 	// A row captured before its hour ended holds a partial hour.
 	storageExec(t, `UPDATE team_billing_usage_hourly SET vcpu_seconds=vcpu_seconds/2, memory_mib_seconds=memory_mib_seconds/2,
 		updated_at=hour_end-interval '2 minutes' WHERE team_id=$1 AND hour_start=$2`, team, base.Add(4*time.Hour))
+	// A storage measurement landing after the hour must not vouch for that compute.
+	if err := billing.MeasureUnbilledStorageForTest(ctx, pool, team, base.Add(4*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 	got := compare([]time.Time{base, base.Add(time.Hour), base.Add(2 * time.Hour), base.Add(3 * time.Hour), base.Add(4 * time.Hour)},
 		[]time.Time{base.Add(time.Hour), base.Add(2 * time.Hour), base.Add(3 * time.Hour), base.Add(4 * time.Hour), base.Add(5 * time.Hour)})
 	for i, b := range got[1:] {
