@@ -55,7 +55,12 @@ func TestIntegration_BillingUsageFromRollupsMatchesIntervals(t *testing.T) {
 	if _, err := pool.Exec(ctx, `CREATE TEMP TABLE billing_rollup_job (LIKE public.billing_rollup_job INCLUDING ALL)`); err != nil {
 		t.Fatal(err)
 	}
-	for hour := base; hour.Before(now.Truncate(time.Hour)); hour = hour.Add(time.Hour) {
+	// Rollups and comparisons share one instant so the open interval and the
+	// hour in progress compare exactly.
+	if _, err := pool.Exec(ctx, `SELECT set_config('superserve.billing_now', $1, false)`, now.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	for hour := base; !hour.After(now.Truncate(time.Hour)); hour = hour.Add(time.Hour) {
 		if _, err := pool.Exec(ctx, `INSERT INTO billing_rollup_job(team_id,hour_start,hour_end,status) VALUES($1,$2,$3,'pending')`,
 			team, hour, hour.Add(time.Hour)); err != nil {
 			t.Fatal(err)
@@ -123,13 +128,13 @@ FROM l JOIN r ON r.bucket_start = l.bs ORDER BY l.bs`, team, starts, ends)
 		if !b.vcpuSame || !b.memorySame || b.direct {
 			t.Fatalf("hour %s: compute same=%t/%t direct=%t; want exact compute from saved hours", starts[i], b.vcpuSame, b.memorySame, b.direct)
 		}
-		if starts[i].Equal(now.Truncate(time.Hour)) {
-			if b.rolled != nil {
-				t.Fatalf("hour in progress: storage %s, want unknown until it is rolled up", text(b.rolled))
-			}
-		} else if !b.storageSame {
+		if !b.storageSame {
 			t.Fatalf("hour %s: storage %s, intervals %s", starts[i], text(b.rolled), text(b.live))
 		}
+	}
+	// A period spanning the hour in progress includes its latest rollup.
+	if b := compare([]time.Time{base}, []time.Time{base.Add(24 * time.Hour)})[0]; !b.vcpuSame || !b.memorySame || !b.storageSame || b.direct {
+		t.Fatalf("spanning period: compute same=%t/%t storage %s vs %s direct=%t", b.vcpuSame, b.memorySame, text(b.rolled), text(b.live), b.direct)
 	}
 	// Edges cutting hours, and a range reaching before rollup coverage, leave
 	// storage to the direct calculation.
@@ -149,7 +154,14 @@ FROM l JOIN r ON r.bucket_start = l.bs ORDER BY l.bs`, team, starts, ends)
 	if _, err := pool.Exec(ctx, `UPDATE billing_rollup_job SET status='pending' WHERE team_id=$1 AND hour_start=$2`, team, base.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	got := compare([]time.Time{base, base.Add(time.Hour), base.Add(2 * time.Hour)}, []time.Time{base.Add(time.Hour), base.Add(2 * time.Hour), base.Add(3 * time.Hour)})
+	// An hour with usage but neither a row nor a job (rollups switched off or
+	// an enqueue that failed) must not read as empty.
+	storageExec(t, `DELETE FROM team_billing_usage_hourly WHERE team_id=$1 AND hour_start=$2`, team, base.Add(3*time.Hour))
+	if _, err := pool.Exec(ctx, `DELETE FROM billing_rollup_job WHERE team_id=$1 AND hour_start=$2`, team, base.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got := compare([]time.Time{base, base.Add(time.Hour), base.Add(2 * time.Hour), base.Add(3 * time.Hour)},
+		[]time.Time{base.Add(time.Hour), base.Add(2 * time.Hour), base.Add(3 * time.Hour), base.Add(4 * time.Hour)})
 	for i, b := range got[1:] {
 		if !b.vcpuSame || !b.memorySame || b.rolled != nil {
 			t.Fatalf("degraded hour %d: compute same=%t/%t storage=%s; want exact compute and unknown storage",

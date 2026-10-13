@@ -1,54 +1,44 @@
 -- Billing pages read usage from saved hourly rollups instead of recomputing
--- it from every interval on each request. A full past hour comes from its
--- rollup row, or is empty when the scheduler has provably had the chance to
--- enqueue it and did not; everything else (the current hour, bucket edges,
--- hours still awaiting a rollup, time before rollup coverage) is computed
--- from the intervals active in those windows. Storage is informational: the
--- sum of measured hours, unknown when a settled hour has no measurement, and
--- flagged for direct calculation where saved hours cannot give it exactly.
+-- it from every interval on each request. Compute for a full past hour comes
+-- from its rollup row; everything else (the current hour, bucket edges and
+-- any hour without a row, whose absence proves nothing) is computed from the
+-- intervals active in those windows. Storage is informational: the sum of
+-- the bucket's measured hours, the current hour as of its latest rollup;
+-- unknown when a saved hour has no measurement; and flagged for the caller to
+-- compute directly when the bucket cuts an hour or any of its hours is unsaved.
 CREATE OR REPLACE FUNCTION billing_usage_from_rollups(p_team uuid, p_starts timestamptz[], p_ends timestamptz[])
 RETURNS TABLE(bucket_start timestamptz, bucket_end timestamptz,
               vcpu_seconds numeric, memory_mib_seconds numeric, storage_mib_seconds numeric, storage_direct boolean)
 LANGUAGE sql STABLE AS $$
 WITH params AS MATERIALIZED (
- SELECT billing_request_now() now_,
-  date_trunc('hour', billing_request_now()) cut,
-  -- An hour with intervals is enqueued within minutes of ending, by the
-  -- rolling window for the last day and by the backfill cursor before it.
-  date_trunc('hour', billing_request_now()) - interval '1 hour' settled,
-  date_trunc('hour', billing_request_now()) - interval '23 hours' rolling_from,
-  (SELECT next_hour_start FROM billing_rollup_team_backfill_state WHERE team_id = p_team) backfilled_until,
-  CASE WHEN feature_enabled('billing_hourly_rollups', p_team)
-       THEN (SELECT min(hour_start) FROM team_billing_usage_hourly WHERE team_id = p_team) END covered_from
+ SELECT billing_request_now() now_, date_trunc('hour', billing_request_now()) cut,
+  feature_enabled('billing_hourly_rollups', p_team) enabled
 ), buckets AS MATERIALIZED (
- SELECT s.bucket_start, e.bucket_end
+ SELECT s.bucket_start, e.bucket_end,
+  tstzrange(s.bucket_start, GREATEST(s.bucket_start, LEAST(e.bucket_end, p.now_)), '[)') elapsed
  FROM unnest(p_starts) WITH ORDINALITY s(bucket_start, n)
  JOIN unnest(p_ends) WITH ORDINALITY e(bucket_end, n) USING (n)
+ CROSS JOIN params p
 ), hours AS MATERIALIZED (
- SELECT b.bucket_start, h.hour_start
+ -- Every hour the bucket's elapsed time touches, with its rollup row if saved.
+ SELECT b.bucket_start, h.hour_start, r.vcpu_seconds, r.memory_mib_seconds, r.storage_mib_seconds,
+  r.team_id IS NOT NULL AND p.enabled saved
  FROM buckets b CROSS JOIN params p
- CROSS JOIN LATERAL generate_series(
-   date_trunc('hour', b.bucket_start)
-     + CASE WHEN date_trunc('hour', b.bucket_start) < b.bucket_start THEN interval '1 hour' ELSE interval '0' END,
-   LEAST(b.bucket_end, p.cut) - interval '1 hour', interval '1 hour') h(hour_start)
- WHERE h.hour_start >= p.covered_from
-), classified AS MATERIALIZED (
- SELECT x.bucket_start, x.hour_start, r.vcpu_seconds, r.memory_mib_seconds,
-  CASE WHEN r.team_id IS NOT NULL THEN 'recorded'
-       WHEN j.team_id IS NULL AND x.hour_start < p.settled
-        AND (x.hour_start >= p.rolling_from OR x.hour_start < p.backfilled_until) THEN 'empty'
-       ELSE 'live' END source
- FROM hours x CROSS JOIN params p
- LEFT JOIN team_billing_usage_hourly r ON r.team_id = p_team AND r.hour_start = x.hour_start
- LEFT JOIN billing_rollup_job j ON j.team_id = p_team AND j.hour_start = x.hour_start
+ CROSS JOIN LATERAL generate_series(date_trunc('hour', lower(b.elapsed)), upper(b.elapsed) - interval '1 microsecond', interval '1 hour') h(hour_start)
+ LEFT JOIN team_billing_usage_hourly r ON r.team_id = p_team AND r.hour_start = h.hour_start
+ WHERE NOT isempty(b.elapsed)
+), recorded AS MATERIALIZED (
+ SELECT h.* FROM hours h CROSS JOIN params p
+ JOIN buckets b USING (bucket_start)
+ WHERE h.saved AND h.hour_start < p.cut
+   AND tstzrange(h.hour_start, h.hour_start + interval '1 hour', '[)') <@ b.elapsed
 ), live_windows AS MATERIALIZED (
  SELECT b.bucket_start, lower(w) ws, upper(w) we
- FROM buckets b CROSS JOIN params p
+ FROM buckets b
  CROSS JOIN LATERAL unnest(
-   tstzmultirange(tstzrange(b.bucket_start, GREATEST(b.bucket_start, LEAST(b.bucket_end, p.now_)), '[)'))
-   - COALESCE((SELECT range_agg(tstzrange(c.hour_start, c.hour_start + interval '1 hour', '[)'))
-               FROM classified c WHERE c.bucket_start = b.bucket_start AND c.source <> 'live'),
-              '{}'::tstzmultirange)) w
+   tstzmultirange(b.elapsed)
+   - COALESCE((SELECT range_agg(tstzrange(r.hour_start, r.hour_start + interval '1 hour', '[)'))
+               FROM recorded r WHERE r.bucket_start = b.bucket_start), '{}'::tstzmultirange)) w
 ), live_bounds AS MATERIALIZED (
  SELECT min(ws) lo, max(we) hi FROM live_windows
 ), live_intervals AS MATERIALIZED (
@@ -69,34 +59,21 @@ WITH params AS MATERIALIZED (
  JOIN live_intervals i ON i.started_at < lw.we AND COALESCE(i.ended_at, p.now_) > lw.ws
  GROUP BY lw.bucket_start
 ), storage AS (
- SELECT b.bucket_start, d.direct,
-  CASE WHEN d.direct
-         -- A bucket starting in the hour still in progress has nothing saved yet.
-         OR (b.bucket_start >= p.cut AND b.bucket_start < p.now_)
-         OR EXISTS (SELECT 1 FROM classified c WHERE c.bucket_start = b.bucket_start
-                    AND c.source = 'live' AND c.hour_start < p.settled)
-         OR EXISTS (SELECT 1 FROM team_billing_usage_hourly r
-                    WHERE r.team_id = p_team AND r.hour_start >= b.bucket_start
-                      AND r.hour_start < LEAST(b.bucket_end, p.settled) AND r.storage_mib_seconds IS NULL)
-       THEN NULL
-       ELSE COALESCE((
-         SELECT SUM(r.storage_mib_seconds) FROM team_billing_usage_hourly r
-         WHERE r.team_id = p_team AND r.hour_start >= b.bucket_start
-           AND r.hour_start < LEAST(b.bucket_end, p.cut) AND r.storage_mib_seconds IS NOT NULL), 0)
-  END storage_mib_seconds
+ SELECT b.bucket_start,
+  COALESCE(bool_or(h.saved AND h.storage_mib_seconds IS NULL), false) unmeasured,
+  date_trunc('hour', b.bucket_start) <> b.bucket_start
+   OR (date_trunc('hour', b.bucket_end) <> b.bucket_end AND b.bucket_end <= p.now_)
+   OR COALESCE(bool_or(NOT h.saved), false) direct,
+  COALESCE(SUM(h.storage_mib_seconds), 0) total
  FROM buckets b CROSS JOIN params p
- -- Saved hours are exact only for whole hours inside rollup coverage. Other
- -- buckets are flagged for the caller to compute directly under its budget.
- CROSS JOIN LATERAL (SELECT p.covered_from IS NULL OR b.bucket_start < p.covered_from
-   OR date_trunc('hour', b.bucket_start) <> b.bucket_start
-   OR (date_trunc('hour', b.bucket_end) <> b.bucket_end AND b.bucket_end <= p.now_) AS direct) d
+ LEFT JOIN hours h USING (bucket_start)
+ GROUP BY b.bucket_start, b.bucket_end, p.now_
 )
 SELECT b.bucket_start, b.bucket_end,
- COALESCE((SELECT SUM(c.vcpu_seconds) FROM classified c WHERE c.bucket_start = b.bucket_start AND c.source = 'recorded'), 0)
-   + COALESCE(lc.vcpu, 0),
- COALESCE((SELECT SUM(c.memory_mib_seconds) FROM classified c WHERE c.bucket_start = b.bucket_start AND c.source = 'recorded'), 0)
-   + COALESCE(lc.memory, 0),
- s.storage_mib_seconds, s.direct
+ COALESCE((SELECT SUM(r.vcpu_seconds) FROM recorded r WHERE r.bucket_start = b.bucket_start), 0) + COALESCE(lc.vcpu, 0),
+ COALESCE((SELECT SUM(r.memory_mib_seconds) FROM recorded r WHERE r.bucket_start = b.bucket_start), 0) + COALESCE(lc.memory, 0),
+ CASE WHEN s.unmeasured OR s.direct THEN NULL ELSE s.total END,
+ s.direct AND NOT s.unmeasured
 FROM buckets b
 JOIN storage s USING (bucket_start)
 LEFT JOIN live_compute lc USING (bucket_start)
