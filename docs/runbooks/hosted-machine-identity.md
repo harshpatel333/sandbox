@@ -38,10 +38,12 @@ its live team and owner association through the restricted database role after
 verifying the request token. This supports proxy-first upgrades without treating
 the creator as ownership proof. Only confirmed absence establishes ordinary ownership. These
 reads have a 500ms deadline, share a bounded five-second cache, and never run
-per frame or during VM startup. Missing configuration or lookup failure denies
-access; explicit or contradictory machine attestations cannot be downgraded.
-Configure `PROXY_DATABASE_URL` on serving proxies before rollout, including
-proxies with peer routing disabled. Authorized team API keys receive a typed `mcap.v1` child with
+per frame or during VM startup. A lookup failure denies access; explicit or
+contradictory machine attestations cannot be downgraded. A proxy with no
+ownership database treats these records as ordinary: it cannot pass machine
+readiness, so no machine-owned sandbox is served through it. Configure
+`PROXY_DATABASE_URL` on every serving proxy, including proxies with peer routing
+disabled, before enabling issuance. Authorized team API keys receive a typed `mcap.v1` child with
 `caller_kind=api_key`, the verified `parent_credential_id`, team, operation
 subset, and `sandbox-proxy` audience. Expiry is capped at the earlier of fifteen
 minutes and the parent key expiry. An API key creator is not a verified human

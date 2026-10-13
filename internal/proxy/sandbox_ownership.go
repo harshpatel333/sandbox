@@ -127,6 +127,13 @@ func (h *Handler) attestUnclassifiedSandbox(ctx context.Context, sandboxID strin
 			return info, nil
 		}
 	}
+	// A proxy without its ownership database can never pass machine-identity
+	// readiness, and issuance requires every serving proxy to pass it, so no
+	// machine-owned sandbox is served here: legacy records stay reachable.
+	if h.sandboxOwnership == nil || !configuredMachineReadinessPool(h.sandboxOwnership.pool) {
+		info.OwnershipState = auth.OwnershipOrdinary
+		return info, nil
+	}
 	principal, err := h.sandboxOwnership.lookup(ctx, sandboxID, info.TeamID)
 	if err != nil {
 		return info, err

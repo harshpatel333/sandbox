@@ -94,6 +94,27 @@ func TestOwnerlessLegacySandboxAdmissionRequiresDurableProof(t *testing.T) {
 	}
 }
 
+func TestOwnerlessLegacySandboxWithoutOwnershipDatabaseStaysOrdinary(t *testing.T) {
+	seed := []byte("ownership-fallback-test-signing-key-00")
+	sandbox, team := uuid.NewString(), uuid.NewString()
+	server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attestPreviewProtocol(w)
+		_ = json.NewEncoder(w).Encode(map[string]any{"vm_ip": "10.0.0.2", "status": "running", "team_id": team, "ownership_state": "unknown"})
+	}))
+	defer server.Close()
+	for name, h := range map[string]*Handler{
+		"no ownership store": NewHandler(nil, NewVMDResolver(server.URL), zerolog.Nop()).WithAuth(seed),
+		"store without pool": NewHandler(nil, NewVMDResolver(server.URL), zerolog.Nop()).WithAuth(seed).WithSandboxOwnership(NewCachedSandboxOwnership(nil)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			info, failure := h.authorizeSandboxRequest(context.Background(), auth.ComputeAccessToken(seed, sandbox), sandbox)
+			if failure != nil || info.OwnershipState != auth.OwnershipOrdinary {
+				t.Fatalf("info = %#v, failure = %#v", info, failure)
+			}
+		})
+	}
+}
+
 func TestSandboxOwnershipCacheBoundedFreshness(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		db := &sandboxOwnerTestDB{delay: time.Millisecond}
