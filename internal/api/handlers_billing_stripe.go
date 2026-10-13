@@ -3890,7 +3890,7 @@ func (h *Handlers) readBillingSnapshot(ctx context.Context, teamID uuid.UUID, pe
 		return usage, period, nil
 	}
 
-	usageRow, err := h.DB.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
+	chargeable, err := h.DB.GetTeamBillingChargeableUsage(ctx, db.GetTeamBillingChargeableUsageParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
@@ -3899,7 +3899,14 @@ func (h *Handlers) readBillingSnapshot(ctx context.Context, teamID uuid.UUID, pe
 		return db.TeamBillingUsage{}, db.TeamBillingPeriod{}, err
 	}
 
-	usage, err := billingTeamUsageFromReadRow(usageRow)
+	usage, err := billingTeamUsageFromReadRow(db.GetTeamBillingUsageRow{
+		TeamID:                    teamID,
+		PeriodStart:               periodStart,
+		PeriodEnd:                 periodEnd,
+		VcpuSeconds:               chargeable.VcpuSeconds,
+		MemoryGibSeconds:          chargeable.MemoryGibSeconds,
+		BillableStorageGibSeconds: chargeable.BillableStorageGibSeconds,
+	})
 	if err != nil {
 		return db.TeamBillingUsage{}, db.TeamBillingPeriod{}, err
 	}
@@ -3944,7 +3951,9 @@ func billingTeamUsageFromUpsertRow(usage db.UpsertTeamBillingUsageRow) db.TeamBi
 }
 
 func billingTeamUsageFromReadRow(usage db.GetTeamBillingUsageRow) (db.TeamBillingUsage, error) {
-	if !usage.StorageGibSeconds.Valid || !usage.BillableStorageGibSeconds.Valid {
+	// Only billable storage is charged; tracked storage is informational and
+	// may be unknown while rollups catch up.
+	if !usage.BillableStorageGibSeconds.Valid {
 		return db.TeamBillingUsage{}, billing.ErrStorageUsageUnavailable
 	}
 	memoryGibSeconds, err := numericFloat64(usage.MemoryGibSeconds)

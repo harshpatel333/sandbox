@@ -191,6 +191,9 @@ type Handlers struct {
 	// answers; zero means the default. The sweeper finishes whatever did
 	// not fit.
 	TeardownInlineBudget time.Duration
+	// TrackedStorageBudget bounds the informational storage figure on billing
+	// pages; zero means the default.
+	TrackedStorageBudget time.Duration
 	// inlineTeardowns caps how many inline reclaims may hold a vmd RPC at
 	// once on this replica; a delete that finds it full leaves its reclaim
 	// to the sweeper. Lazily set up so struct-literal construction in tests
