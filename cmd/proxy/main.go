@@ -92,7 +92,13 @@ func run() error {
 	if routingEnabled != "" && routingEnabled != "0" && routingEnabled != "1" {
 		log.Fatal().Msg("PEER_ROUTING_ENABLED must be empty, 0, or 1")
 	}
-	dbPool, err := newOwnershipPool(ctx, routingEnabled == "1" || os.Getenv("PROXY_DATABASE_URL") != "", os.Getenv("PROXY_DATABASE_URL"))
+	// Without routing the database only serves machine identity, which must not
+	// hold up serving; a short bound caps an unreachable database at boot.
+	bootstrapTimeout := time.Second
+	if routingEnabled == "1" {
+		bootstrapTimeout = 5 * time.Second
+	}
+	dbPool, err := newOwnershipPool(ctx, routingEnabled == "1" || os.Getenv("PROXY_DATABASE_URL") != "", os.Getenv("PROXY_DATABASE_URL"), bootstrapTimeout)
 	if err != nil && routingEnabled == "1" {
 		log.Fatal().Err(err).Msg("init ownership database")
 	} else if err != nil {
@@ -447,7 +453,7 @@ type proxyHealthResponse struct {
 	MachineIdentityRevision string   `json:"machine_identity_revision"`
 }
 
-func newOwnershipPool(ctx context.Context, enabled bool, databaseURL string) (*pgxpool.Pool, error) {
+func newOwnershipPool(ctx context.Context, enabled bool, databaseURL string, bootstrapTimeout time.Duration) (*pgxpool.Pool, error) {
 	if !enabled {
 		return nil, nil
 	}
@@ -463,7 +469,7 @@ func newOwnershipPool(ctx context.Context, enabled bool, databaseURL string) (*p
 		return nil, err
 	}
 	// Validate persistence before accepting routed traffic.
-	bootstrapCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	bootstrapCtx, cancel := context.WithTimeout(ctx, bootstrapTimeout)
 	defer cancel()
 	if err := pool.Ping(bootstrapCtx); err != nil {
 		pool.Close()
