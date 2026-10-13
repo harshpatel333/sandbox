@@ -121,6 +121,12 @@ func (h *Handler) attestUnclassifiedSandbox(ctx context.Context, sandboxID strin
 	if info.OwnershipState != auth.OwnershipUnknown || info.MachineOwned || info.MachineOwnerPrincipalID != "" {
 		return info, nil
 	}
+	// An old vmd stores the API's ordinary create/resume marker verbatim as the
+	// creator; only the exact ordinary marker is trusted, never a machine one.
+	if info.OwnerID == "ordinary:attested" {
+		info.OwnerID, info.OwnershipState = "", auth.OwnershipOrdinary
+		return info, nil
+	}
 	if info.OwnerID != "" {
 		creator, err := uuid.Parse(info.OwnerID)
 		if !info.legacyOwnershipState || err != nil || creator == uuid.Nil {

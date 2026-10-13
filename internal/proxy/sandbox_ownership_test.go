@@ -115,6 +115,43 @@ func TestOwnerlessLegacySandboxWithoutOwnershipDatabaseStaysOrdinary(t *testing.
 	}
 }
 
+func TestOldVMDOwnerMarkers(t *testing.T) {
+	seed := []byte("ownership-fallback-test-signing-key-00")
+	sandbox, team := uuid.NewString(), uuid.NewString()
+	for _, tc := range []struct {
+		owner string
+		want  int
+	}{
+		{"ordinary:attested", 200},
+		{"machine:" + uuid.NewString(), 401},
+		{"ordinary:other", 401},
+	} {
+		t.Run(tc.owner, func(t *testing.T) {
+			// An old vmd omits ownership_state and echoes the API's marker as owner_id.
+			server := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attestPreviewProtocol(w)
+				_ = json.NewEncoder(w).Encode(map[string]any{"vm_ip": "10.0.0.2", "status": "running", "team_id": team, "owner_id": tc.owner})
+			}))
+			defer server.Close()
+			db := &sandboxOwnerTestDB{}
+			store := NewCachedSandboxOwnership(nil)
+			store.pool = db
+			h := NewHandler(nil, NewVMDResolver(server.URL), zerolog.Nop()).WithAuth(seed).WithSandboxOwnership(store)
+			info, failure := h.authorizeSandboxRequest(context.Background(), auth.ComputeAccessToken(seed, sandbox), sandbox)
+			code := 200
+			if failure != nil {
+				code = failure.Status
+			}
+			if code != tc.want || db.calls.Load() != 0 {
+				t.Fatalf("status = %d, reads = %d, failure = %#v", code, db.calls.Load(), failure)
+			}
+			if code == 200 && (info.OwnershipState != auth.OwnershipOrdinary || info.OwnerID != "") {
+				t.Fatalf("ordinary result = %#v", info)
+			}
+		})
+	}
+}
+
 func TestSandboxOwnershipCacheBoundedFreshness(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		db := &sandboxOwnerTestDB{delay: time.Millisecond}

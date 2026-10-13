@@ -63,12 +63,15 @@ func (h *Handler) MachineIdentityReady(ctx context.Context) bool {
 		}
 		state.mu.Unlock()
 		started := time.Now()
+		// A caller that leaves must not fail the probe its waiters share.
+		sharedCtx, cancelShared := context.WithTimeout(context.WithoutCancel(ctx), machineReadinessTimeout)
+		defer cancelShared()
 		var unused bool
-		ready := authority.pool.QueryRow(probeCtx, machineAuthorityReadinessSQL).Scan(&unused) == nil
+		ready := authority.pool.QueryRow(sharedCtx, machineAuthorityReadinessSQL).Scan(&unused) == nil
 		if ready {
-			ready = h.sandboxOwnership.pool.QueryRow(probeCtx, machineOwnershipReadinessSQL).Scan(&unused) == nil
+			ready = h.sandboxOwnership.pool.QueryRow(sharedCtx, machineOwnershipReadinessSQL).Scan(&unused) == nil
 		}
-		ready = ready && probeCtx.Err() == nil && time.Since(started) < machineReadinessTimeout
+		ready = ready && sharedCtx.Err() == nil && time.Since(started) < machineReadinessTimeout
 		state.mu.Lock()
 		state.ready, state.expiresAt = ready, started.Add(machineReadinessTTL)
 		state.mu.Unlock()

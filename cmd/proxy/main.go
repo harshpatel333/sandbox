@@ -93,8 +93,13 @@ func run() error {
 		log.Fatal().Msg("PEER_ROUTING_ENABLED must be empty, 0, or 1")
 	}
 	dbPool, err := newOwnershipPool(ctx, routingEnabled == "1" || os.Getenv("PROXY_DATABASE_URL") != "", os.Getenv("PROXY_DATABASE_URL"))
-	if err != nil {
+	if err != nil && routingEnabled == "1" {
 		log.Fatal().Err(err).Msg("init ownership database")
+	} else if err != nil {
+		// Routing needs the database; machine identity alone must not stop a
+		// proxy that served without it. Unready proxies keep sandboxes ordinary.
+		log.Error().Err(err).Msg("ownership database unavailable; machine identity disabled")
+		dbPool = nil
 	}
 	localHostID := os.Getenv("HOST_ID")
 	var ownership proxy.OwnershipResolver

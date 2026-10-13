@@ -172,3 +172,15 @@ func TestMachineReadinessProtocolSentOnInstanceLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMachineReadinessSurvivesFirstCallerLeaving(t *testing.T) {
+	store := &machineReadinessDB{}
+	h := machineReadinessHandler(store)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// The departed caller sees false, but the shared probe still completes.
+	h.MachineIdentityReady(ctx)
+	if !h.MachineIdentityReady(context.Background()) {
+		t.Fatal("a departed caller cached an unready result")
+	}
+}
