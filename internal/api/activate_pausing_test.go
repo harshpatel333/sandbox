@@ -96,6 +96,13 @@ func TestActivateSandbox_PersistentPausing_409(t *testing.T) {
 	if took := time.Since(start); took > 2*time.Second {
 		t.Fatalf("activate held the request for %v; the wait must be bounded", took)
 	}
+	// Busy is told from failed by its own code, and is retryable.
+	if code := parseJSON(t, w)["error"].(map[string]any)["code"]; code != "sandbox_pausing" {
+		t.Errorf("error code = %v, want sandbox_pausing", code)
+	}
+	if w.Header().Get("Retry-After") != "1" {
+		t.Errorf("Retry-After = %q, want 1", w.Header().Get("Retry-After"))
+	}
 }
 
 // A failed sandbox is refused at once: callers tell a failed VM from a busy

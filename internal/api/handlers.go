@@ -845,18 +845,25 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 				case <-c.Request.Context().Done():
 					timer.Stop()
 					recordActivateSettleWait(c, &sandbox, telemetry.SettleResultCanceled, pauseWaitStart, pauseReads)
-					respondError(c, ErrInvalidState)
+					respondStillPausing(c)
 					return nil, ""
 				}
 			}
 			recordActivateSettleWait(c, &sandbox, telemetry.SettleResultTimeout, pauseWaitStart, pauseReads)
-			respondError(c, ErrInvalidState)
+			respondStillPausing(c)
 			return nil, ""
 		default:
 			respondError(c, ErrInvalidState)
 			return nil, ""
 		}
 	}
+}
+
+// respondStillPausing answers a pause that outlived the settle window: a
+// conflict the caller can tell from a failed sandbox, and retry.
+func respondStillPausing(c *gin.Context) {
+	c.Header("Retry-After", "1")
+	respondError(c, ErrSandboxPausing)
 }
 
 // recordActivateSettleWait reports a wait for a pause in flight on the
@@ -1683,6 +1690,10 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 			// A settle-window 409 is the slowest lookup there is; it must
 			// land there, not vanish into a claim that never happened.
 			tLookupDone = time.Time{}
+			if sandbox.Status == db.SandboxStatusPausing {
+				respondStillPausing(c)
+				return false
+			}
 			respondError(c, ErrInvalidState)
 			return false
 		}
