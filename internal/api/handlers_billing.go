@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -21,58 +20,6 @@ import (
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
-
-// Tracked storage covers a team's whole retained history and can outlast the
-// console's request timeout for large teams. Past this budget its query is
-// cancelled and the page reports the figure as unknown; billable storage is
-// unaffected.
-const defaultTrackedStorageBudget = 3 * time.Second
-
-func (h *Handlers) trackedStorageBudget() time.Duration {
-	if h.TrackedStorageBudget > 0 {
-		return h.TrackedStorageBudget
-	}
-	return defaultTrackedStorageBudget
-}
-
-func (h *Handlers) trackedStorageGibSeconds(ctx context.Context, teamID uuid.UUID, start, end time.Time) pgtype.Numeric {
-	ctx, cancel := context.WithTimeout(ctx, h.trackedStorageBudget())
-	defer cancel()
-	storage, err := h.DB.GetTeamTrackedStorage(ctx, db.GetTeamTrackedStorageParams{TeamID: teamID, PeriodStart: start, PeriodEnd: end})
-	if err != nil {
-		logTrackedStorageUnknown(ctx, teamID, err)
-		return pgtype.Numeric{}
-	}
-	return storage
-}
-
-// trackedStorageSeries returns one value per bucket, all unknown on failure.
-func (h *Handlers) trackedStorageSeries(ctx context.Context, teamID uuid.UUID, starts, ends []time.Time) []pgtype.Numeric {
-	storage := make([]pgtype.Numeric, len(starts))
-	ctx, cancel := context.WithTimeout(ctx, h.trackedStorageBudget())
-	defer cancel()
-	rows, err := h.DB.GetTeamTrackedStorageSeries(ctx, db.GetTeamTrackedStorageSeriesParams{TeamID: teamID, PeriodStarts: starts, PeriodEnds: ends})
-	if err == nil && len(rows) != len(starts) {
-		err = fmt.Errorf("tracked storage returned %d buckets, want %d", len(rows), len(starts))
-	}
-	if err != nil {
-		logTrackedStorageUnknown(ctx, teamID, err)
-		return storage
-	}
-	for i, row := range rows {
-		storage[i] = row.StorageGibSeconds
-	}
-	return storage
-}
-
-func logTrackedStorageUnknown(ctx context.Context, teamID uuid.UUID, err error) {
-	evt := log.Error()
-	if ctx.Err() != nil {
-		// Over budget or abandoned by the client: expected for large teams.
-		evt = log.Info()
-	}
-	evt.Err(err).Str("team_id", teamID.String()).Msg("tracked storage reported unknown")
-}
 
 const (
 	publicPricingPlanKey       = "payg"
@@ -256,7 +203,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	}
 
 	var (
-		chargeable    db.GetTeamBillingChargeableUsageRow
+		usageRows     []db.GetTeamBillingUsageFromRollupsRow
 		pricingRows   []db.ListActivePricingRatesForTeamCurrentRow
 		creditBalance pgtype.Numeric
 		trialBalance  db.GetTeamTrialBalanceRow
@@ -269,20 +216,21 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	// the active-subscription predicate so canceled accounts can still use
 	// checkout/portal semantics based on their current status.
 	hasStripeCreditState := billingAccountHasStripeCreditState(account)
-	trackedStorage := make(chan pgtype.Numeric, 1)
-	go func() {
-		trackedStorage <- h.trackedStorageGibSeconds(c.Request.Context(), teamID, periodStart, periodEnd)
-	}()
 	g.Go(func() error {
 		// Usage remains required for every account: Stripe owns credit state after
 		// activation, but current charges and the resource breakdown still come
-		// from the live Superserve usage rollup.
+		// from the Superserve usage rollup.
 		var err error
-		chargeable, err = h.DB.GetTeamBillingChargeableUsage(ctx, db.GetTeamBillingChargeableUsageParams{
-			TeamID:      teamID,
-			PeriodStart: periodStart,
-			PeriodEnd:   periodEnd,
+		usageRows, err = h.DB.GetTeamBillingUsageFromRollups(ctx, db.GetTeamBillingUsageFromRollupsParams{
+			TeamID:       teamID,
+			PeriodStarts: []time.Time{periodStart},
+			PeriodEnds:   []time.Time{periodEnd},
+			// The summary has always floored legacy artifact storage.
+			FloorLegacyArtifacts: true,
 		})
+		if err == nil && len(usageRows) != 1 {
+			err = fmt.Errorf("usage returned %d rows, want 1", len(usageRows))
+		}
 		if err != nil {
 			return fmt.Errorf("get team billing usage: %w", err)
 		}
@@ -323,15 +271,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	usage := db.GetTeamBillingUsageRow{
-		TeamID:                    teamID,
-		PeriodStart:               periodStart,
-		PeriodEnd:                 periodEnd,
-		VcpuSeconds:               chargeable.VcpuSeconds,
-		MemoryGibSeconds:          chargeable.MemoryGibSeconds,
-		StorageGibSeconds:         <-trackedStorage,
-		BillableStorageGibSeconds: chargeable.BillableStorageGibSeconds,
-	}
+	usage := usageRows[0]
 	// Missing pre-activation storage measurements cannot change payable totals.
 	// Keep tracked usage unknown while still requiring complete billable usage.
 	if !usage.BillableStorageGibSeconds.Valid {
@@ -662,19 +602,16 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 	}
 	// Aggregate all buckets in one bounded set-oriented query; do not invoke the
 	// full-team usage scan independently for each bucket.
-	trackedStorage := make(chan []pgtype.Numeric, 1)
-	go func() { trackedStorage <- h.trackedStorageSeries(ctx, teamID, starts, ends) }()
-	usageRows, e := h.DB.GetTeamBillingChargeableUsageSeries(ctx, db.GetTeamBillingChargeableUsageSeriesParams{TeamID: teamID, PeriodStarts: starts, PeriodEnds: ends})
+	usageRows, e := h.DB.GetTeamBillingUsageFromRollups(ctx, db.GetTeamBillingUsageFromRollupsParams{TeamID: teamID, PeriodStarts: starts, PeriodEnds: ends, FloorLegacyArtifacts: false})
 	if e != nil || len(usageRows) != len(buckets) {
 		respondError(c, ErrInternal)
 		return
 	}
-	storageRows := <-trackedStorage
 	for i, b := range buckets {
 		u := usageRows[i]
 		cpu, cpuErr := numericFloat64(u.VcpuSeconds)
 		mem, memErr := numericFloat64(u.MemoryGibSeconds)
-		storage, storageErr := nullableNumericFloat64(storageRows[i])
+		storage, storageErr := nullableNumericFloat64(u.StorageGibSeconds)
 		payableStorage, payableStorageErr := numericFloat64(u.BillableStorageGibSeconds)
 		if cpuErr != nil || memErr != nil {
 			respondError(c, ErrInternal)

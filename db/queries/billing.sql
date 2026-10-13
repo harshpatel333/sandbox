@@ -110,9 +110,8 @@ SELECT
 FROM compute, storage;
 
 -- name: GetTeamBillingChargeableUsage :one
--- Compute and billable storage clipped to [period_start, period_end). Tracked
--- storage is read separately (GetTeamTrackedStorage) because its calculation
--- can outlast a page request for large teams.
+-- Compute and billable storage clipped to [period_start, period_end), for
+-- readers that charge or preview charges and need no tracked storage.
 WITH compute AS (
     SELECT
         COALESCE(SUM(
@@ -138,9 +137,6 @@ SELECT
     (compute.memory_mib_seconds / 1024.0)::numeric AS memory_gib_seconds,
     (billable_storage_mib_seconds(sqlc.arg(team_id),sqlc.arg(period_start),sqlc.arg(period_end))/1024.0)::numeric AS billable_storage_gib_seconds
 FROM compute;
-
--- name: GetTeamTrackedStorage :one
-SELECT (storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz)/1024.0)::numeric AS storage_gib_seconds;
 
 -- name: GetActiveTeamBillingPeriod :one
 SELECT *
@@ -1535,36 +1531,16 @@ SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end 
 FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start;
 
 
--- name: GetTeamBillingChargeableUsageSeries :many
--- Compute and billable storage per bucket; tracked storage comes from
--- GetTeamTrackedStorageSeries under its own time budget.
-WITH buckets AS (
- SELECT starts.bucket_start, ends.bucket_end
- FROM unnest(sqlc.arg(period_starts)::timestamptz[]) WITH ORDINALITY starts(bucket_start,n)
-JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
-), bounds AS (
- SELECT min(bucket_start) AS range_start, max(bucket_end) AS range_end FROM buckets
-), compute_intervals AS (
- SELECT i.* FROM sandbox_compute_billing_interval i CROSS JOIN bounds r
- WHERE i.team_id=sqlc.arg(team_id) AND i.started_at < LEAST(now(),r.range_end)
-   AND COALESCE(i.ended_at,now()) > r.range_start
-), compute AS (
- SELECT b.bucket_start,b.bucket_end,
-   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.vcpu_count),0)::numeric vcpu_seconds,
-   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.memory_mib),0)::numeric memory_mib_seconds
- FROM buckets b LEFT JOIN compute_intervals i ON
-  i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
- GROUP BY b.bucket_start,b.bucket_end
-)
-SELECT c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(billable_storage_mib_seconds(sqlc.arg(team_id),c.bucket_start,c.bucket_end)/1024.0)::numeric billable_storage_gib_seconds
-FROM compute c ORDER BY c.bucket_start;
-
--- name: GetTeamTrackedStorageSeries :many
-SELECT starts.bucket_start::timestamptz AS period_start,
- (storage_mib_seconds(sqlc.arg(team_id)::uuid,starts.bucket_start,ends.bucket_end,false)/1024.0)::numeric AS storage_gib_seconds
-FROM unnest(sqlc.arg(period_starts)::timestamptz[]) WITH ORDINALITY starts(bucket_start,n)
-JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
-ORDER BY starts.bucket_start;
+-- name: GetTeamBillingUsageFromRollups :many
+-- Usage per bucket for billing pages: saved hourly rollups for settled hours,
+-- intervals for the rest. Billable storage stays exact and live.
+SELECT u.bucket_start::timestamptz AS period_start, u.bucket_end::timestamptz AS period_end,
+ u.vcpu_seconds::numeric AS vcpu_seconds,
+ (u.memory_mib_seconds/1024.0)::numeric AS memory_gib_seconds,
+ (u.storage_mib_seconds/1024.0)::numeric AS storage_gib_seconds,
+ (billable_storage_mib_seconds(sqlc.arg(team_id),u.bucket_start::timestamptz,u.bucket_end::timestamptz)/1024.0)::numeric AS billable_storage_gib_seconds
+FROM billing_usage_from_rollups(sqlc.arg(team_id)::uuid,sqlc.arg(period_starts)::timestamptz[],sqlc.arg(period_ends)::timestamptz[],sqlc.arg(floor_legacy_artifacts)::boolean) u
+ORDER BY 1;
 
 -- name: GetTeamTrialRunway :one
 WITH lifecycle AS (

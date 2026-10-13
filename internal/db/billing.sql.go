@@ -1392,79 +1392,13 @@ type GetTeamBillingChargeableUsageRow struct {
 	BillableStorageGibSeconds pgtype.Numeric `json:"billable_storage_gib_seconds"`
 }
 
-// Compute and billable storage clipped to [period_start, period_end). Tracked
-// storage is read separately (GetTeamTrackedStorage) because its calculation
-// can outlast a page request for large teams.
+// Compute and billable storage clipped to [period_start, period_end), for
+// readers that charge or preview charges and need no tracked storage.
 func (q *Queries) GetTeamBillingChargeableUsage(ctx context.Context, arg GetTeamBillingChargeableUsageParams) (GetTeamBillingChargeableUsageRow, error) {
 	row := q.db.QueryRow(ctx, getTeamBillingChargeableUsage, arg.TeamID, arg.PeriodStart, arg.PeriodEnd)
 	var i GetTeamBillingChargeableUsageRow
 	err := row.Scan(&i.VcpuSeconds, &i.MemoryGibSeconds, &i.BillableStorageGibSeconds)
 	return i, err
-}
-
-const getTeamBillingChargeableUsageSeries = `-- name: GetTeamBillingChargeableUsageSeries :many
-WITH buckets AS (
- SELECT starts.bucket_start, ends.bucket_end
- FROM unnest($2::timestamptz[]) WITH ORDINALITY starts(bucket_start,n)
-JOIN unnest($3::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
-), bounds AS (
- SELECT min(bucket_start) AS range_start, max(bucket_end) AS range_end FROM buckets
-), compute_intervals AS (
- SELECT i.id, i.sandbox_id, i.team_id, i.vcpu_count, i.memory_mib, i.started_at, i.ended_at, i.end_reason FROM sandbox_compute_billing_interval i CROSS JOIN bounds r
- WHERE i.team_id=$1 AND i.started_at < LEAST(now(),r.range_end)
-   AND COALESCE(i.ended_at,now()) > r.range_start
-), compute AS (
- SELECT b.bucket_start,b.bucket_end,
-   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.vcpu_count),0)::numeric vcpu_seconds,
-   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.memory_mib),0)::numeric memory_mib_seconds
- FROM buckets b LEFT JOIN compute_intervals i ON
-  i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
- GROUP BY b.bucket_start,b.bucket_end
-)
-SELECT c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(billable_storage_mib_seconds($1,c.bucket_start,c.bucket_end)/1024.0)::numeric billable_storage_gib_seconds
-FROM compute c ORDER BY c.bucket_start
-`
-
-type GetTeamBillingChargeableUsageSeriesParams struct {
-	TeamID       uuid.UUID   `json:"team_id"`
-	PeriodStarts []time.Time `json:"period_starts"`
-	PeriodEnds   []time.Time `json:"period_ends"`
-}
-
-type GetTeamBillingChargeableUsageSeriesRow struct {
-	PeriodStart               interface{}    `json:"period_start"`
-	PeriodEnd                 interface{}    `json:"period_end"`
-	VcpuSeconds               pgtype.Numeric `json:"vcpu_seconds"`
-	MemoryGibSeconds          pgtype.Numeric `json:"memory_gib_seconds"`
-	BillableStorageGibSeconds pgtype.Numeric `json:"billable_storage_gib_seconds"`
-}
-
-// Compute and billable storage per bucket; tracked storage comes from
-// GetTeamTrackedStorageSeries under its own time budget.
-func (q *Queries) GetTeamBillingChargeableUsageSeries(ctx context.Context, arg GetTeamBillingChargeableUsageSeriesParams) ([]GetTeamBillingChargeableUsageSeriesRow, error) {
-	rows, err := q.db.Query(ctx, getTeamBillingChargeableUsageSeries, arg.TeamID, arg.PeriodStarts, arg.PeriodEnds)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []GetTeamBillingChargeableUsageSeriesRow{}
-	for rows.Next() {
-		var i GetTeamBillingChargeableUsageSeriesRow
-		if err := rows.Scan(
-			&i.PeriodStart,
-			&i.PeriodEnd,
-			&i.VcpuSeconds,
-			&i.MemoryGibSeconds,
-			&i.BillableStorageGibSeconds,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
 }
 
 const getTeamBillingCheckoutForRecovery = `-- name: GetTeamBillingCheckoutForRecovery :one
@@ -1652,6 +1586,66 @@ func (q *Queries) GetTeamBillingUsage(ctx context.Context, arg GetTeamBillingUsa
 	return i, err
 }
 
+const getTeamBillingUsageFromRollups = `-- name: GetTeamBillingUsageFromRollups :many
+SELECT u.bucket_start::timestamptz AS period_start, u.bucket_end::timestamptz AS period_end,
+ u.vcpu_seconds::numeric AS vcpu_seconds,
+ (u.memory_mib_seconds/1024.0)::numeric AS memory_gib_seconds,
+ (u.storage_mib_seconds/1024.0)::numeric AS storage_gib_seconds,
+ (billable_storage_mib_seconds($1,u.bucket_start::timestamptz,u.bucket_end::timestamptz)/1024.0)::numeric AS billable_storage_gib_seconds
+FROM billing_usage_from_rollups($1::uuid,$2::timestamptz[],$3::timestamptz[],$4::boolean) u
+ORDER BY 1
+`
+
+type GetTeamBillingUsageFromRollupsParams struct {
+	TeamID               uuid.UUID   `json:"team_id"`
+	PeriodStarts         []time.Time `json:"period_starts"`
+	PeriodEnds           []time.Time `json:"period_ends"`
+	FloorLegacyArtifacts bool        `json:"floor_legacy_artifacts"`
+}
+
+type GetTeamBillingUsageFromRollupsRow struct {
+	PeriodStart               time.Time      `json:"period_start"`
+	PeriodEnd                 time.Time      `json:"period_end"`
+	VcpuSeconds               pgtype.Numeric `json:"vcpu_seconds"`
+	MemoryGibSeconds          pgtype.Numeric `json:"memory_gib_seconds"`
+	StorageGibSeconds         pgtype.Numeric `json:"storage_gib_seconds"`
+	BillableStorageGibSeconds pgtype.Numeric `json:"billable_storage_gib_seconds"`
+}
+
+// Usage per bucket for billing pages: saved hourly rollups for settled hours,
+// intervals for the rest. Billable storage stays exact and live.
+func (q *Queries) GetTeamBillingUsageFromRollups(ctx context.Context, arg GetTeamBillingUsageFromRollupsParams) ([]GetTeamBillingUsageFromRollupsRow, error) {
+	rows, err := q.db.Query(ctx, getTeamBillingUsageFromRollups,
+		arg.TeamID,
+		arg.PeriodStarts,
+		arg.PeriodEnds,
+		arg.FloorLegacyArtifacts,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetTeamBillingUsageFromRollupsRow{}
+	for rows.Next() {
+		var i GetTeamBillingUsageFromRollupsRow
+		if err := rows.Scan(
+			&i.PeriodStart,
+			&i.PeriodEnd,
+			&i.VcpuSeconds,
+			&i.MemoryGibSeconds,
+			&i.StorageGibSeconds,
+			&i.BillableStorageGibSeconds,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getTeamBillingUsageRollup = `-- name: GetTeamBillingUsageRollup :one
 SELECT team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds, finalized_at, exported_at, updated_at
 FROM team_billing_usage
@@ -1768,62 +1762,6 @@ func (q *Queries) GetTeamCreditBalance(ctx context.Context, teamID uuid.UUID) (p
 	var balance_usd pgtype.Numeric
 	err := row.Scan(&balance_usd)
 	return balance_usd, err
-}
-
-const getTeamTrackedStorage = `-- name: GetTeamTrackedStorage :one
-SELECT (storage_mib_seconds($1::uuid,$2::timestamptz,$3::timestamptz)/1024.0)::numeric AS storage_gib_seconds
-`
-
-type GetTeamTrackedStorageParams struct {
-	TeamID      uuid.UUID `json:"team_id"`
-	PeriodStart time.Time `json:"period_start"`
-	PeriodEnd   time.Time `json:"period_end"`
-}
-
-func (q *Queries) GetTeamTrackedStorage(ctx context.Context, arg GetTeamTrackedStorageParams) (pgtype.Numeric, error) {
-	row := q.db.QueryRow(ctx, getTeamTrackedStorage, arg.TeamID, arg.PeriodStart, arg.PeriodEnd)
-	var storage_gib_seconds pgtype.Numeric
-	err := row.Scan(&storage_gib_seconds)
-	return storage_gib_seconds, err
-}
-
-const getTeamTrackedStorageSeries = `-- name: GetTeamTrackedStorageSeries :many
-SELECT starts.bucket_start::timestamptz AS period_start,
- (storage_mib_seconds($1::uuid,starts.bucket_start,ends.bucket_end,false)/1024.0)::numeric AS storage_gib_seconds
-FROM unnest($2::timestamptz[]) WITH ORDINALITY starts(bucket_start,n)
-JOIN unnest($3::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
-ORDER BY starts.bucket_start
-`
-
-type GetTeamTrackedStorageSeriesParams struct {
-	TeamID       uuid.UUID   `json:"team_id"`
-	PeriodStarts []time.Time `json:"period_starts"`
-	PeriodEnds   []time.Time `json:"period_ends"`
-}
-
-type GetTeamTrackedStorageSeriesRow struct {
-	PeriodStart       time.Time      `json:"period_start"`
-	StorageGibSeconds pgtype.Numeric `json:"storage_gib_seconds"`
-}
-
-func (q *Queries) GetTeamTrackedStorageSeries(ctx context.Context, arg GetTeamTrackedStorageSeriesParams) ([]GetTeamTrackedStorageSeriesRow, error) {
-	rows, err := q.db.Query(ctx, getTeamTrackedStorageSeries, arg.TeamID, arg.PeriodStarts, arg.PeriodEnds)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []GetTeamTrackedStorageSeriesRow{}
-	for rows.Next() {
-		var i GetTeamTrackedStorageSeriesRow
-		if err := rows.Scan(&i.PeriodStart, &i.StorageGibSeconds); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
 }
 
 const getTeamTrialBalance = `-- name: GetTeamTrialBalance :one
