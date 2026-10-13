@@ -76,7 +76,6 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 		}
 	}()
 
-	token := r.Header.Get(accessTokenHeader)
 	info, ok := h.authorizeBoxdRequest(w, r, instanceID, "exec")
 	// Stamped on every outcome: the 401 and the auth failure must land in
 	// the auth series too, not just the proxied path.
@@ -84,13 +83,6 @@ func (h *Handler) serveExecCommon(w http.ResponseWriter, r *http.Request, instan
 	if !ok {
 		return
 	}
-	boundRequest, cleanup, sessionOK := h.bindMachineRequest(w, r, token)
-	if !sessionOK {
-		(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
-		return
-	}
-	defer cleanup()
-	r = boundRequest
 	h.captureUsage(instanceID, "command_run", info)
 
 	transport := h.transports.get(instanceID, info)
