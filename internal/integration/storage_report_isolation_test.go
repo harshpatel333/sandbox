@@ -572,9 +572,9 @@ func TestIntegration_BillingRollupDisabledTeamCompletesUnresolvedStorageJob(t *t
 	fixture := newStorageReportFixture(t, "active", false)
 	ctx := context.Background()
 	teamID := sandboxTeamID(t, fixture.sandboxID)
-	// The test worker claims the globally earliest pending job. Use a fixed
-	// epoch hour so unrelated jobs left by other integration cases cannot
-	// starve this targeted assertion when BatchSize is one.
+	// The test worker claims the globally earliest due job. Use a fixed
+	// epoch hour and due time so unrelated jobs left by other integration
+	// cases cannot starve this targeted assertion when BatchSize is one.
 	hourStart := time.Unix(0, 0).UTC()
 	hourEnd := hourStart.Add(time.Hour)
 
@@ -597,6 +597,9 @@ func TestIntegration_BillingRollupDisabledTeamCompletesUnresolvedStorageJob(t *t
 		t.Fatalf("insert unresolved storage report: %v", err)
 	}
 	jobID := insertBillingRollupJob(t, ctx, teamID, hourStart, hourEnd, "pending", "", time.Time{}, 0)
+	if _, err := testPool.Exec(ctx, `UPDATE billing_rollup_job SET next_attempt_at = $2 WHERE id = $1`, jobID, hourStart); err != nil {
+		t.Fatalf("make disabled rollup job earliest due: %v", err)
+	}
 
 	billing.ProcessJobsForTest(ctx, testPool, testQueries, billing.HourlyRollupConfig{
 		BatchSize:    1,
