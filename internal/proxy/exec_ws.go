@@ -13,7 +13,6 @@ import (
 	"github.com/coder/websocket"
 	"github.com/rs/zerolog"
 
-	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
 	"github.com/superserve-ai/sandbox/proto/boxdpb/boxdpbconnect"
@@ -183,22 +182,9 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 	tAuthDone = time.Now()
 	if fail != nil {
 		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("exec/ws: auth failed")
-		retainVerifiedCaller(r, fail.Caller)
 		fail.write(w)
 		return
 	}
-	retainVerifiedCaller(r, info.MachineCaller)
-	if !verifyMachineProxyOperation(token, h.seedKey, instanceID, r.Method, execConnectPath) {
-		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted", Code: "operation_denied", Caller: info.MachineCaller}).write(w)
-		return
-	}
-	bridgeCtx, cleanup, ok := h.machineSessionContext(r.Context(), token)
-	if !ok {
-		(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
-		return
-	}
-	defer cleanup()
-	bridgeCtx = withMachineCapability(bridgeCtx, token, h.seedKey)
 	h.captureUsage(instanceID, "command_run", info)
 
 	acceptOpts := &websocket.AcceptOptions{
@@ -225,7 +211,7 @@ func (h *Handler) serveExecWS(w http.ResponseWriter, r *http.Request, instanceID
 	baseURL := fmt.Sprintf("http://%s:%d", info.VMIP, boxdPort)
 	procClient := boxdpbconnect.NewProcessServiceClient(httpClient, baseURL)
 
-	h.bridgeExecWS(bridgeCtx, ws, procClient, instanceID)
+	h.bridgeExecWS(r.Context(), ws, procClient, instanceID)
 }
 
 // bridgeExecWS pumps frames between the WebSocket and boxd until either side
@@ -394,11 +380,6 @@ func (h *Handler) bridgeExecWS(ctx context.Context, ws *websocket.Conn, procClie
 			// frames (e.g. a signal). Acceptable for interactive stdin.
 			switch typ {
 			case websocket.MessageBinary:
-				if !machineOperationAllowed(bridgeCtx, auth.MachineOperationCommandWrite) {
-					l.Warn().Msg("exec/ws: stdin denied by machine capability")
-					cancel()
-					return
-				}
 				if len(data) == 0 || data[0] != execChStdin {
 					continue // empty or unknown channel
 				}
@@ -438,10 +419,6 @@ func (h *Handler) handleExecControl(ctx context.Context, client boxdpbconnect.Pr
 		}
 
 	case "signal":
-		if !machineOperationAllowed(ctx, auth.MachineOperationCommandSignal) {
-			l.Warn().Msg("exec/ws: signal denied by machine capability")
-			return
-		}
 		signum, ok := execSignalNameToNumber(msg.Name)
 		if !ok {
 			l.Warn().Str("name", msg.Name).Msg("exec/ws: unknown signal name")

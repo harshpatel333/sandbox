@@ -40,26 +40,6 @@ func (h *Handler) WithAuth(seedKey []byte) *Handler {
 	return h
 }
 
-// WithMachineAuthority installs the durable revocation resolver used for
-// lineage-bound machine capabilities. Omitting it keeps ordinary sandbox
-// tokens working but makes every machine capability fail closed.
-func (h *Handler) WithMachineAuthority(authority any) *Handler {
-	switch value := authority.(type) {
-	case auth.RevocationAuthority:
-		h.machineAuthority = value
-		h.machineAuthoritySnapshotter = nil
-	case *CachedMachineAuthority:
-		h.machineAuthority = value.Lookup
-		h.machineAuthoritySnapshotter = value
-		h.machineAuthorityInvalidator = value
-	default:
-		h.machineAuthority = nil
-		h.machineAuthoritySnapshotter = nil
-		h.machineAuthorityInvalidator = nil
-	}
-	return h
-}
-
 // WithTerminal enables the /terminal WebSocket bridge. Requires
 // WithAuth to have been called first.
 func (h *Handler) WithTerminal(allowedOrigins []string) *Handler {
@@ -212,22 +192,9 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 	info, fail := h.authorizeSandboxRequest(r.Context(), token, instanceID)
 	if fail != nil {
 		h.log.Warn().Str("sandbox_id", instanceID).Int("status", fail.Status).Msg("terminal: auth failed")
-		retainVerifiedCaller(r, fail.Caller)
 		fail.write(w)
 		return
 	}
-	retainVerifiedCaller(r, info.MachineCaller)
-	if !verifyMachineProxyOperation(token, h.seedKey, instanceID, r.Method, terminalPath) {
-		(&authzFailure{Status: http.StatusForbidden, Message: "machine operation not permitted", Code: "operation_denied", Caller: info.MachineCaller}).write(w)
-		return
-	}
-	bridgeCtx, cleanup, ok := h.machineSessionContext(r.Context(), token)
-	if !ok {
-		(&authzFailure{Status: http.StatusServiceUnavailable, Message: "machine authority unavailable"}).write(w)
-		return
-	}
-	defer cleanup()
-	bridgeCtx = withMachineCapability(bridgeCtx, token, h.seedKey)
 	h.captureUsage(instanceID, "terminal_opened", info)
 
 	// From here on, errors go back through the WebSocket (if the upgrade
@@ -277,7 +244,8 @@ func (h *Handler) serveTerminal(w http.ResponseWriter, r *http.Request, instance
 
 	// Tie the bridge lifetime to the request context so shutdowns
 	// propagate cleanly. The WS will be closed in bridgeTerminal.
-	h.bridgeTerminal(bridgeCtx, ws, procClient, instanceID)
+	ctx := r.Context()
+	h.bridgeTerminal(ctx, ws, procClient, instanceID)
 }
 
 // bridgeTerminal is the long-lived function that pumps bytes between the
@@ -434,11 +402,6 @@ func (h *Handler) bridgeTerminal(ctx context.Context, ws *websocket.Conn, procCl
 
 			switch typ {
 			case websocket.MessageBinary:
-				if !machineOperationAllowed(bridgeCtx, auth.MachineOperationCommandWrite) {
-					l.Warn().Msg("terminal: input denied by machine capability")
-					cancel()
-					return
-				}
 				_, err := procClient.SendInput(bridgeCtx, connect.NewRequest(&pb.SendInputRequest{
 					Pid:  pid,
 					Data: data,
@@ -483,10 +446,6 @@ func (h *Handler) handleControlMessage(ctx context.Context, client boxdpbconnect
 		}
 
 	case "signal":
-		if !machineOperationAllowed(ctx, auth.MachineOperationCommandSignal) {
-			l.Warn().Msg("terminal: signal denied by machine capability")
-			return
-		}
 		signum, ok := signalNameToNumber(msg.Name)
 		if !ok {
 			l.Warn().Str("name", msg.Name).Msg("terminal: unknown signal name")
