@@ -768,6 +768,12 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		return nil, ""
 	}
 	deadline := time.Now().Add(activateSettleWindow)
+	// A pause the owner was just told succeeded may still be finalizing. It
+	// is waited out as an explicit resume waits, so the caller gets a running
+	// sandbox. Only 'pausing' waits: a failed sandbox keeps its 409, which is
+	// how callers tell failed from busy.
+	var pausingDeadline, pauseWaitStart time.Time
+	pausePoll, pauseReads := pausingSettlePollStart, 0
 	for {
 		row, err := h.DB.GetSandboxWithPreviewPolicyForRouting(c.Request.Context(), db.GetSandboxWithPreviewPolicyForRoutingParams{
 			ID:     sandboxID,
@@ -784,6 +790,15 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		}
 		sandbox := row.Sandbox
 		c.Set("routing_observed_at", row.RoutingObservedAt)
+		if pauseReads > 0 && sandbox.Status != db.SandboxStatusPausing {
+			result := telemetry.SettleResultDiverged
+			if sandbox.Status == db.SandboxStatusPaused {
+				result = telemetry.SettleResultSettled
+			}
+			recordActivateSettleWait(c, &sandbox, result, pauseWaitStart, pauseReads+1)
+			// Reported once: a settle into 'resuming' keeps this loop re-reading.
+			pauseReads = 0
+		}
 		switch sandbox.Status {
 		case db.SandboxStatusActive:
 			return &sandbox, row.Access
@@ -816,11 +831,51 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			}
 			respondError(c, ErrInvalidState)
 			return nil, ""
+		case db.SandboxStatusPausing:
+			if pauseReads == 0 {
+				pausingDeadline, pauseWaitStart = time.Now().Add(pausingSettleWindow), time.Now()
+			}
+			pauseReads++
+			if time.Now().Before(pausingDeadline) {
+				// Context-aware, as the resume's wait: a client that has gone
+				// is released at cancellation rather than at the next poll.
+				timer := time.NewTimer(pausePoll)
+				select {
+				case <-timer.C:
+					pausePoll = nextSettlePollInterval(pausePoll)
+					continue
+				case <-c.Request.Context().Done():
+					timer.Stop()
+					recordActivateSettleWait(c, &sandbox, telemetry.SettleResultCanceled, pauseWaitStart, pauseReads)
+					respondStillPausing(c)
+					return nil, ""
+				}
+			}
+			recordActivateSettleWait(c, &sandbox, telemetry.SettleResultTimeout, pauseWaitStart, pauseReads)
+			respondStillPausing(c)
+			return nil, ""
 		default:
 			respondError(c, ErrInvalidState)
 			return nil, ""
 		}
 	}
+}
+
+// respondStillPausing answers a pause that outlived the settle window: a
+// conflict the caller can tell from a failed sandbox, and retry.
+func respondStillPausing(c *gin.Context) {
+	c.Header("Retry-After", "1")
+	respondError(c, ErrSandboxPausing)
+}
+
+// recordActivateSettleWait reports a wait for a pause in flight on the
+// resume settle series: an activate is a resume with a lookup in front.
+func recordActivateSettleWait(c *gin.Context, sandbox *db.Sandbox, result string, start time.Time, reads int) {
+	waited := time.Since(start)
+	l := sandboxLogger(sandbox.ID.String(), sandbox.HostID)
+	l.Warn().Dur("waited", waited).Int("reads", reads).Str("result", result).
+		Msg("activate waited for a pause in flight to settle")
+	RecordResumeSettleWait(c.Request.Context(), result, sandbox.HostID, waited, reads)
 }
 
 // resumePausedSandbox restores the VM, reapplies network config, and flips
@@ -1637,6 +1692,10 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 			// A settle-window 409 is the slowest lookup there is; it must
 			// land there, not vanish into a claim that never happened.
 			tLookupDone = time.Time{}
+			if sandbox.Status == db.SandboxStatusPausing {
+				respondStillPausing(c)
+				return false
+			}
 			respondError(c, ErrInvalidState)
 			return false
 		}
