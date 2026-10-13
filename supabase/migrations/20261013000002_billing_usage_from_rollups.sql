@@ -23,8 +23,10 @@ WITH params AS MATERIALIZED (
  CROSS JOIN params p
 ), hours AS MATERIALIZED (
  -- Every hour the bucket's elapsed time touches, with its rollup row if saved.
+ -- A past hour's row counts only once written after the hour ended; one
+ -- captured earlier holds a partial hour until the scheduler refreshes it.
  SELECT b.bucket_start, h.hour_start, r.vcpu_seconds, r.memory_mib_seconds, r.storage_mib_seconds,
-  r.team_id IS NOT NULL AND p.enabled saved
+  r.team_id IS NOT NULL AND p.enabled AND (r.updated_at >= r.hour_end OR h.hour_start = p.cut) saved
  FROM buckets b CROSS JOIN params p
  CROSS JOIN LATERAL generate_series(date_trunc('hour', lower(b.elapsed)), upper(b.elapsed) - interval '1 microsecond', interval '1 hour') h(hour_start)
  LEFT JOIN team_billing_usage_hourly r ON r.team_id = p_team AND r.hour_start = h.hour_start

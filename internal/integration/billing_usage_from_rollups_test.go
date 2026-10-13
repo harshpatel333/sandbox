@@ -160,8 +160,11 @@ FROM l JOIN r ON r.bucket_start = l.bs ORDER BY l.bs`, team, starts, ends)
 	if _, err := pool.Exec(ctx, `DELETE FROM billing_rollup_job WHERE team_id=$1 AND hour_start=$2`, team, base.Add(3*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	got := compare([]time.Time{base, base.Add(time.Hour), base.Add(2 * time.Hour), base.Add(3 * time.Hour)},
-		[]time.Time{base.Add(time.Hour), base.Add(2 * time.Hour), base.Add(3 * time.Hour), base.Add(4 * time.Hour)})
+	// A row captured before its hour ended holds a partial hour.
+	storageExec(t, `UPDATE team_billing_usage_hourly SET vcpu_seconds=vcpu_seconds/2, memory_mib_seconds=memory_mib_seconds/2,
+		updated_at=hour_end-interval '2 minutes' WHERE team_id=$1 AND hour_start=$2`, team, base.Add(4*time.Hour))
+	got := compare([]time.Time{base, base.Add(time.Hour), base.Add(2 * time.Hour), base.Add(3 * time.Hour), base.Add(4 * time.Hour)},
+		[]time.Time{base.Add(time.Hour), base.Add(2 * time.Hour), base.Add(3 * time.Hour), base.Add(4 * time.Hour), base.Add(5 * time.Hour)})
 	for i, b := range got[1:] {
 		if !b.vcpuSame || !b.memorySame || b.rolled != nil {
 			t.Fatalf("degraded hour %d: compute same=%t/%t storage=%s; want exact compute and unknown storage",
