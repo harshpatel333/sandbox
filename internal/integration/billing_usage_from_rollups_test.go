@@ -60,6 +60,10 @@ func TestIntegration_BillingUsageFromRollupsMatchesIntervals(t *testing.T) {
 	if _, err := pool.Exec(ctx, `SELECT set_config('superserve.billing_now', $1, false)`, now.Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
+	// Rollup hours are UTC hours; a fractional-offset session must still match them.
+	if _, err := pool.Exec(ctx, `SET TimeZone = 'Asia/Kolkata'`); err != nil {
+		t.Fatal(err)
+	}
 	for hour := base; !hour.After(now.Truncate(time.Hour)); hour = hour.Add(time.Hour) {
 		if _, err := pool.Exec(ctx, `INSERT INTO billing_rollup_job(team_id,hour_start,hour_end,status) VALUES($1,$2,$3,'pending')`,
 			team, hour, hour.Add(time.Hour)); err != nil {

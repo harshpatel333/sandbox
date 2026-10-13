@@ -13,7 +13,8 @@ RETURNS TABLE(bucket_start timestamptz, bucket_end timestamptz,
               vcpu_seconds numeric, memory_mib_seconds numeric, storage_mib_seconds numeric, storage_direct boolean)
 LANGUAGE sql STABLE AS $$
 WITH params AS MATERIALIZED (
- SELECT billing_request_now() now_, date_trunc('hour', billing_request_now()) cut,
+ -- Rollup hours are UTC hours whatever the session TimeZone.
+ SELECT billing_request_now() now_, date_trunc('hour', billing_request_now(), 'UTC') cut,
   feature_enabled('billing_hourly_rollups', p_team) enabled
 ), buckets AS MATERIALIZED (
  SELECT s.bucket_start, e.bucket_end,
@@ -28,7 +29,7 @@ WITH params AS MATERIALIZED (
  SELECT b.bucket_start, h.hour_start, r.vcpu_seconds, r.memory_mib_seconds, r.storage_mib_seconds,
   r.team_id IS NOT NULL AND p.enabled AND (r.updated_at >= r.hour_end OR h.hour_start = p.cut) saved
  FROM buckets b CROSS JOIN params p
- CROSS JOIN LATERAL generate_series(date_trunc('hour', lower(b.elapsed)), upper(b.elapsed) - interval '1 microsecond', interval '1 hour') h(hour_start)
+ CROSS JOIN LATERAL generate_series(date_trunc('hour', lower(b.elapsed), 'UTC'), upper(b.elapsed) - interval '1 microsecond', interval '1 hour') h(hour_start)
  LEFT JOIN team_billing_usage_hourly r ON r.team_id = p_team AND r.hour_start = h.hour_start
  WHERE NOT isempty(b.elapsed)
 ), recorded AS MATERIALIZED (
@@ -65,8 +66,8 @@ WITH params AS MATERIALIZED (
 ), storage AS (
  SELECT b.bucket_start,
   COALESCE(bool_or(h.saved AND h.storage_mib_seconds IS NULL), false) unmeasured,
-  date_trunc('hour', b.bucket_start) <> b.bucket_start
-   OR (date_trunc('hour', b.bucket_end) <> b.bucket_end AND b.bucket_end <= p.now_)
+  date_trunc('hour', b.bucket_start, 'UTC') <> b.bucket_start
+   OR (date_trunc('hour', b.bucket_end, 'UTC') <> b.bucket_end AND b.bucket_end <= p.now_)
    OR COALESCE(bool_or(NOT h.saved), false) direct,
   COALESCE(SUM(h.storage_mib_seconds), 0) total
  FROM buckets b CROSS JOIN params p
