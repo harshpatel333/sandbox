@@ -61,6 +61,8 @@ func (b invoiceBase) stripSubscription(sub invoiceSubscription) (invoiceSubscrip
 	return sub, nil
 }
 func (b invoiceBase) expectedFee(boundary time.Time) (int64, int64, int64, error) {
+	b.Anchor = b.Anchor.UTC()
+	boundary = boundary.UTC()
 	if b.Price == "" || (b.TerminatedAt > 0 && boundary.Unix() >= b.TerminatedAt) {
 		return 0, 0, 0, nil
 	}

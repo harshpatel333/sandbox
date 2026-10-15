@@ -39,6 +39,31 @@ func TestProAnnualFeeSchedule(t *testing.T) {
 		t.Fatalf("wrong annual boundaries: %d %d %d %v", amount, start, end, err)
 	}
 }
+
+func TestProFeeScheduleIgnoresTimestampLocation(t *testing.T) {
+	for _, tc := range []struct {
+		name, anchor, boundary, end string
+		months                      int32
+	}{
+		{"monthly renewal", "2026-09-15T20:46:30Z", "2026-10-15T20:46:30Z", "2026-11-15T20:46:30Z", 1},
+		{"month-end clamping", "2026-01-31T01:30:00Z", "2026-02-28T01:30:00Z", "2026-03-31T01:30:00Z", 1},
+		{"annual leap day", "2024-02-29T23:30:00Z", "2025-02-28T23:30:00Z", "2026-02-28T23:30:00Z", 12},
+	} {
+		for _, offset := range []int{-5 * 3600, 9 * 3600} {
+			t.Run(fmt.Sprintf("%s/%d", tc.name, offset), func(t *testing.T) {
+				anchor, _ := time.Parse(time.RFC3339, tc.anchor)
+				boundary, _ := time.Parse(time.RFC3339, tc.boundary)
+				end, _ := time.Parse(time.RFC3339, tc.end)
+				zone := time.FixedZone("stored timestamp", offset)
+				b := invoiceBase{Price: "price_base", Amount: 120000, Months: tc.months, Anchor: anchor.In(zone)}
+				amount, gotStart, gotEnd, err := b.expectedFee(boundary.In(zone))
+				if err != nil || amount != b.Amount || gotStart != boundary.Unix() || gotEnd != end.Unix() {
+					t.Fatalf("fee period changed with timestamp location: amount=%d start=%d end=%d err=%v", amount, gotStart, gotEnd, err)
+				}
+			})
+		}
+	}
+}
 func TestProInvoiceRequiresCashEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
