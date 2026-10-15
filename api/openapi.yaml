@@ -3179,6 +3179,7 @@ components:
         - billing_period
         - pricing_tier
         - trial
+        - plan
         - calculated_at
       properties:
         mode:
@@ -3256,10 +3257,87 @@ components:
           $ref: "#/components/schemas/BillingSummaryPricingTier"
         trial:
           $ref: "#/components/schemas/BillingTrialBalance"
+        plan:
+          $ref: "#/components/schemas/BillingSummaryPlan"
         calculated_at:
           type: string
           format: date-time
           description: Timestamp when this live billing summary was calculated.
+
+    BillingSummaryPlan:
+      type: object
+      description: >-
+        The team's commercial plan. Separate from pricing_tier, which is the
+        usage rate card every plan shares. Teams without a paid plan are Free.
+        Remaining credit, including Pro's included usage, is reported by the
+        Stripe credit fields.
+      required:
+        - key
+        - name
+        - status
+        - price_usd
+        - billing_interval_months
+        - starts_at
+        - ends_at
+        - included_usage
+      properties:
+        key:
+          type: string
+          description: free, pro_monthly, or pro_annual.
+          example: pro_annual
+        name:
+          type: string
+          example: Pro Annual
+        status:
+          type: string
+          enum: [active, pending]
+          description: pending until the plan's first payment is confirmed.
+        price_usd:
+          type: number
+          format: double
+          nullable: true
+          description: Fixed plan price charged each billing interval; null for Free.
+        billing_interval_months:
+          type: integer
+          nullable: true
+          description: Months between plan charges; null for Free.
+        starts_at:
+          type: string
+          format: date-time
+          nullable: true
+        ends_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: End of the plan term; null when it continues until cancelled.
+        included_usage:
+          $ref: "#/components/schemas/BillingSummaryIncludedUsage"
+
+    BillingSummaryIncludedUsage:
+      type: object
+      nullable: true
+      description: >-
+        Usage included with the plan for the current monthly period. Unused
+        amounts expire at period_end. Null when the plan includes no usage this
+        period.
+      required: [amount_usd, period_start, period_end, status]
+      properties:
+        amount_usd:
+          type: number
+          format: double
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [issued, pending, not_issued]
+          description: >-
+            issued once the credit is on the account; pending while it is being
+            granted; not_issued when it has not been granted, for example while
+            a payment is outstanding.
 
     BillingSummaryPermissions:
       type: object

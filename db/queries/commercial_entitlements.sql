@@ -151,3 +151,18 @@ JOIN billing_contract_payment p ON p.contract_id = c.id
     AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
 ON CONFLICT (team_id, kind, period_start) DO NOTHING
 RETURNING *;
+
+-- name: GetCurrentCommercialPlan :one
+WITH contract AS MATERIALIZED (
+    SELECT b.* FROM billing_commercial_contract b WHERE b.team_id = sqlc.arg(team_id) AND b.status <> 'ended'
+), period AS MATERIALIZED (
+    SELECT c.id AS contract_id, p.period_start::timestamptz AS period_start,
+        p.period_end::timestamptz AS period_end, p.amount_cents::bigint AS amount_cents
+    FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) AS p(period_start, period_end, amount_cents)
+)
+SELECT c.offer_key, c.status, c.starts_at, c.ends_at, c.charge_amount_cents, c.charge_interval_months,
+    period.period_start, period.period_end, period.amount_cents AS period_amount_cents, e.state AS entitlement_state
+FROM contract c
+LEFT JOIN period ON period.contract_id = c.id
+LEFT JOIN billing_usage_entitlement e ON e.team_id = c.team_id AND e.contract_id = c.id
+    AND e.kind = c.entitlement_kind AND e.period_start = period.period_start;
