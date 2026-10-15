@@ -31,7 +31,7 @@ type machineAdministrationAuthority interface {
 	RotateCredentialFenced(context.Context, uuid.UUID, uuid.UUID, string, int64, uuid.UUID) (auth.MachineCredential, error)
 	RestorePrincipalFenced(context.Context, uuid.UUID, string, int64, uuid.UUID) (auth.MachineCredential, error)
 	RevokeCredential(context.Context, uuid.UUID, string) error
-	DisablePrincipalFenced(context.Context, uuid.UUID, int64, uuid.UUID) error
+	DisablePrincipalCredentialFenced(context.Context, uuid.UUID, int64, uuid.UUID, *uuid.UUID) error
 }
 
 var _ machineAdministrationAuthority = (*DBMachineAuthority)(nil)
@@ -375,8 +375,9 @@ func (h *Handlers) DisableMachinePrincipal(c *gin.Context) {
 		return
 	}
 	var request struct {
-		OperationID        uuid.UUID `json:"operation_id"`
-		ExpectedGeneration int64     `json:"expected_generation"`
+		OperationID          uuid.UUID  `json:"operation_id"`
+		ExpectedGeneration   int64      `json:"expected_generation"`
+		ExpectedCredentialID *uuid.UUID `json:"expected_credential_id"`
 	}
 	if !decodeMachineAdministration(c, &request) {
 		return
@@ -385,7 +386,11 @@ func (h *Handlers) DisableMachinePrincipal(c *gin.Context) {
 		respondErrorMsg(c, "invalid_request", "A valid operation ID and positive expected generation are required.", http.StatusBadRequest)
 		return
 	}
-	if err := a.DisablePrincipalFenced(c.Request.Context(), id, request.ExpectedGeneration, request.OperationID); err != nil {
+	if request.ExpectedCredentialID != nil && *request.ExpectedCredentialID == uuid.Nil {
+		respondErrorMsg(c, "invalid_request", "A valid expected credential ID is required.", http.StatusBadRequest)
+		return
+	}
+	if err := a.DisablePrincipalCredentialFenced(c.Request.Context(), id, request.ExpectedGeneration, request.OperationID, request.ExpectedCredentialID); err != nil {
 		machineAdministrationError(c, err)
 		return
 	}

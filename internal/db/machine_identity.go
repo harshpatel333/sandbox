@@ -82,6 +82,7 @@ type LifecycleOptions struct {
 	ExpectedGeneration      *int64
 	OperationID             uuid.UUID
 	ReplacementCredentialID *uuid.UUID
+	ExpectedCredentialID    *uuid.UUID
 	// GeneratedExpiry excludes the server-generated expiry from caller input identity.
 	// Its first committed value is retained in the operation result on every retry.
 	GeneratedExpiry bool
@@ -372,7 +373,14 @@ func (q *Queries) DisableMachinePrincipalFenced(ctx context.Context, id uuid.UUI
 	if err != nil {
 		return err
 	}
-	digest := lifecycleInputDigest("disable", id, uuid.Nil, nil, time.Time{}, nil, "", *fence.ExpectedGeneration, uuid.Nil, false)
+	expectedCredential := uuid.Nil
+	if fence.ExpectedCredentialID != nil {
+		expectedCredential = *fence.ExpectedCredentialID
+		if expectedCredential == uuid.Nil {
+			return ErrMachineLifecycleConflict
+		}
+	}
+	digest := lifecycleInputDigest("disable", id, uuid.Nil, nil, time.Time{}, nil, "", *fence.ExpectedGeneration, expectedCredential, false)
 	tx, err := q.beginLifecycle(ctx)
 	if err != nil {
 		return err
@@ -397,6 +405,14 @@ func (q *Queries) DisableMachinePrincipalFenced(ctx context.Context, id uuid.UUI
 	}
 	if status != "active" || generation != *fence.ExpectedGeneration {
 		return pgx.ErrNoRows
+	}
+	// Rotation preserves principal generation but revokes its predecessor.
+	// Check the observed credential under the same principal-first lock order.
+	if fence.ExpectedCredentialID != nil {
+		var credentialGeneration int64
+		if err := tx.QueryRow(ctx, `SELECT revocation_generation FROM machine_credential WHERE id=$1 AND principal_id=$2 AND state='active' AND revocation_generation=$3 FOR UPDATE`, expectedCredential, id, generation).Scan(&credentialGeneration); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO machine_lifecycle_operation(principal_id,operation_id,operation_kind,expected_generation,input_digest) VALUES($1,$2,'disable',$3,$4)`, id, fence.OperationID, *fence.ExpectedGeneration, digest); err != nil {
 		return err

@@ -80,8 +80,11 @@ func (f *machineAdminFixture) RevokeCredential(ctx context.Context, credential u
 	f.replacementID = credential
 	return f.called(ctx, "revoke")
 }
-func (f *machineAdminFixture) DisablePrincipalFenced(ctx context.Context, principal uuid.UUID, generation int64, operation uuid.UUID) error {
+func (f *machineAdminFixture) DisablePrincipalCredentialFenced(ctx context.Context, principal uuid.UUID, generation int64, operation uuid.UUID, expectedCredential *uuid.UUID) error {
 	f.principalID, f.generation, f.operationID = principal, generation, operation
+	if expectedCredential != nil {
+		f.replacementID = *expectedCredential
+	}
 	return f.called(ctx, "disable")
 }
 
@@ -342,6 +345,17 @@ func TestMachineAdministrationDisableRequiresFence(t *testing.T) {
 	}
 	if len(fixture.calls) != 0 {
 		t.Fatal("unfenced disable reached authority")
+	}
+	for _, id := range []string{uuid.Nil.String(), "invalid"} {
+		response := machineAdminRequest(router, "POST", path, `{"operation_id":"`+operation+`","expected_generation":1,"expected_credential_id":"`+id+`"}`, "test-operator-only", false)
+		if response.Code != http.StatusBadRequest || len(fixture.calls) != 0 {
+			t.Fatalf("invalid credential fence reached authority: %d", response.Code)
+		}
+	}
+	credential := uuid.New()
+	response := machineAdminRequest(router, "POST", path, `{"operation_id":"`+operation+`","expected_generation":1,"expected_credential_id":"`+credential.String()+`"}`, "test-operator-only", false)
+	if response.Code != http.StatusNoContent || fixture.replacementID != credential {
+		t.Fatalf("credential fence not dispatched: %d", response.Code)
 	}
 	for _, failure := range []error{db.ErrMachineLifecycleConflict, pgx.ErrNoRows} {
 		fixture.err = failure

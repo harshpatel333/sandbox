@@ -128,7 +128,7 @@ All routes below are under `/internal/machine-identity`:
 | `POST /principals/{principal_id}/credentials/issue` | Fenced credential request; returns credential metadata. |
 | `POST /principals/{principal_id}/credentials/rotate` | Fenced credential request plus `replacement_credential_id`; replaces only that credential. |
 | `POST /principals/{principal_id}/credentials/restore` | Fenced credential request; restores the same principal within its recovery window. |
-| `POST /principals/{principal_id}/disable` | JSON `operation_id` and `expected_generation`; disables the principal and its credentials once for that fence; returns 204. |
+| `POST /principals/{principal_id}/disable` | JSON `operation_id`, `expected_generation`, and optional `expected_credential_id`; disables the principal and its credentials once for that fence; returns 204. |
 | `POST /credentials/{credential_id}/revoke` | Revokes that credential; returns 204. |
 | `POST /principals/{principal_id}/credentials/revoke` | JSON `credential_id`, `expected_generation`; revokes only that principal's matching credential generation, returning 204. Missing targets or binding/generation conflicts return 409. |
 
@@ -157,6 +157,15 @@ the target metadata; a 404 or 409 is not successful revocation evidence. Reads
 and scoped revocation remain available with issuance disabled. Metadata is an
 observation, not a credential validity check: stored `active` may be expired or
 belong to a disabled or newer-generation principal.
+
+Consumers disabling from an observed credential must send `expected_credential_id`.
+It must still be active and belong to that principal and generation when the
+transaction locks the principal, otherwise disable returns 409. This closes a
+rotation-after-read race even when rotation preserves the principal generation.
+The credential ID is part of the operation's immutable input: changing or omitting
+it on retry conflicts. An exact successful replay remains 204 after revocation or
+restore without disabling the restored generation. Omission retains legacy
+principal-wide behavior; a fenced disable also revokes active sibling credentials.
 
 Issue, rotation and restoration derive the result lineage from their operation
 ID. Rotation revokes the previous credential without changing its lineage, then
