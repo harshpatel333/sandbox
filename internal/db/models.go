@@ -891,6 +891,14 @@ type Permission struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+type PlanLimit struct {
+	OfferKey             string `json:"offer_key"`
+	MaxSandboxes         int32  `json:"max_sandboxes"`
+	MaxTemplateVcpu      *int32 `json:"max_template_vcpu"`
+	MaxTemplateMemoryMib *int32 `json:"max_template_memory_mib"`
+	MaxTemplateDiskMib   *int32 `json:"max_template_disk_mib"`
+}
+
 type PricingPlan struct {
 	Key       string    `json:"key"`
 	Name      string    `json:"name"`
@@ -1457,6 +1465,7 @@ type Team struct {
 	MaxSnapshots           int32  `json:"max_snapshots"`
 	MaxSnapshotsPerSandbox int32  `json:"max_snapshots_per_sandbox"`
 	MaxSnapshotsInFlight   int32  `json:"max_snapshots_in_flight"`
+	LimitsCustomized       bool   `json:"limits_customized"`
 }
 
 type TeamActiveSandboxCount struct {

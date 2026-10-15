@@ -519,6 +519,20 @@ func (q *Queries) EndCommercialContract(ctx context.Context, arg EndCommercialCo
 	return i, err
 }
 
+const endLapsedCommercialContracts = `-- name: EndLapsedCommercialContracts :execrows
+UPDATE billing_commercial_contract SET status = 'ended', revision = revision + 1
+WHERE status <> 'ended' AND ends_at IS NOT NULL AND ends_at <= clock_timestamp()
+`
+
+// A fixed term ends at ends_at; nothing else transitions it, so this sweep does.
+func (q *Queries) EndLapsedCommercialContracts(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, endLapsedCommercialContracts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getCommercialBasePayment = `-- name: GetCommercialBasePayment :one
 SELECT id, team_id, contract_id, invoice_id, payment_reference, customer_id, subscription_id, base_price_id, service_period_start, service_period_end, base_amount_paid_cents, invoice_amount_paid_cents, invoice_amount_remaining_cents, currency, paid_at, verified_at, evidence FROM billing_contract_payment WHERE team_id = $1
     AND contract_id = $2 AND invoice_id = $3
