@@ -72,20 +72,22 @@ func TestProInvoiceRequiresCashEvidence(t *testing.T) {
 		outOfBand        bool
 		starting         int64
 		want             bool
+		creditAmount     int64
 	}{
-		{"paid", 120000, "succeeded", "cus_example", false, 0, true},
-		{"carried usage balance", 120030, "succeeded", "cus_example", false, 30, true},
-		{"no cash", 0, "succeeded", "cus_example", false, 0, false},
-		{"pending cash", 120000, "processing", "cus_example", false, 0, false},
-		{"wrong payer", 120000, "succeeded", "cus_other", false, 0, false},
-		{"out of band", 120000, "succeeded", "cus_example", true, 0, false},
+		{"paid", 120000, "succeeded", "cus_example", false, 0, true, 0},
+		{"discounted base", 120000, "succeeded", "cus_example", false, 0, false, 1},
+		{"carried usage balance", 120030, "succeeded", "cus_example", false, 30, true, 0},
+		{"no cash", 0, "succeeded", "cus_example", false, 0, false, 0},
+		{"pending cash", 120000, "processing", "cus_example", false, 0, false, 0},
+		{"wrong payer", 120000, "succeeded", "cus_other", false, 0, false, 0},
+		{"out of band", 120000, "succeeded", "cus_example", true, 0, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch r.URL.Path {
 				case "/v1/invoices/in_example":
-					fmt.Fprintf(w, `{"id":"in_example","customer":"cus_example","status":"paid","currency":"usd","total":120000,"amount_due":%d,"starting_balance":%d,"ending_balance":0,"amount_paid":%d,"amount_remaining":0,"paid_out_of_band":%t,"status_transitions":{"paid_at":100},"parent":{"subscription_details":{"subscription":"sub_example"}},"lines":{"data":[{"quantity":1,"amount":120000,"currency":"usd","period":{"start":100,"end":200},"pricing":{"price_details":{"price":"price_base"}},"parent":{"subscription_item_details":{"subscription":"sub_example"}}}]}}`, 120000+tc.starting, tc.starting, 120000+tc.starting, tc.outOfBand)
+					fmt.Fprintf(w, `{"id":"in_example","customer":"cus_example","status":"paid","currency":"usd","total":120000,"amount_due":%d,"starting_balance":%d,"ending_balance":0,"amount_paid":%d,"amount_remaining":0,"paid_out_of_band":%t,"status_transitions":{"paid_at":100},"parent":{"subscription_details":{"subscription":"sub_example"}},"lines":{"data":[{"quantity":1,"amount":120000,"currency":"usd","pretax_credit_amounts":[{"type":"discount","amount":%d}],"period":{"start":100,"end":200},"pricing":{"price_details":{"price":"price_base"}},"parent":{"subscription_item_details":{"subscription":"sub_example"}}}]}}`, 120000+tc.starting, tc.starting, 120000+tc.starting, tc.outOfBand, tc.creditAmount)
 				case "/v1/invoice_payments":
 					fmt.Fprintf(w, `{"data":[{"id":"inpay_example","invoice":"in_example","status":"paid","currency":"usd","amount_paid":%d,"payment":{"type":"payment_intent","payment_intent":"pi_example"}}]}`, tc.amount)
 				case "/v1/payment_intents/pi_example":
@@ -143,15 +145,29 @@ func TestProNegativeRoundingExcludesLicensedProduct(t *testing.T) {
 		t.Fatalf("rounding scope: %v %v", products, err)
 	}
 	var posted bool
+	created := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/invoices/in_mixed":
 			_ = json.NewEncoder(w).Encode(inv)
 		case "/v1/coupons/rounding_in_mixed":
-			http.NotFound(w, r)
+			if !posted {
+				http.NotFound(w, r)
+				return
+			}
+			if r.URL.Query().Get("expand[]") != "applies_to" {
+				fmt.Fprint(w, `{"id":"rounding_in_mixed","amount_off":1,"currency":"usd"}`)
+				return
+			}
+			fmt.Fprint(w, `{"id":"rounding_in_mixed","amount_off":1,"currency":"usd","applies_to":{"products":["prod_usage"]}}`)
 		case "/v1/coupons":
 			_ = r.ParseForm()
 			posted = true
+			created++
+			if r.Form.Get("expand[]") != "applies_to" {
+				fmt.Fprint(w, `{"id":"rounding_in_mixed","amount_off":1,"currency":"usd"}`)
+				return
+			}
 			if got := r.Form["applies_to[products][]"]; len(got) != 1 || got[0] != "prod_usage" {
 				t.Errorf("discount reaches base product: %v", got)
 			}
@@ -165,9 +181,16 @@ func TestProNegativeRoundingExcludesLicensedProduct(t *testing.T) {
 	if err := c.applyInvoiceDiscount(t.Context(), inv.ID, 1, "rounding", products...); err != nil || !posted {
 		t.Fatalf("scoped adjustment: %v", err)
 	}
+	if err := c.applyInvoiceDiscount(t.Context(), inv.ID, 1, "rounding", products...); err != nil || created != 1 {
+		t.Fatalf("scoped coupon recovery: creates=%d err=%v", created, err)
+	}
 	b := invoiceBase{Price: "price_base", Amount: 120000}
 	if err := b.validateLine(inv.Lines.Data[0], "sub_example", 100, 200); err != nil {
 		t.Fatal(err)
+	}
+	inv.Lines.Data[0].PretaxCredits = []StripeInvoicePretaxCredit{{Type: "discount", Amount: 0}}
+	if err := b.validateLine(inv.Lines.Data[0], "sub_example", 100, 200); err != nil {
+		t.Fatalf("zero discount on excluded base: %v", err)
 	}
 	inv.Lines.Data[0].PretaxCredits = []StripeInvoicePretaxCredit{{Type: "discount", Amount: 1}}
 	if err := b.validateLine(inv.Lines.Data[0], "sub_example", 100, 200); err == nil {

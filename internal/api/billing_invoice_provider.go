@@ -347,12 +347,13 @@ func (c *stripeHTTPClient) applyInvoiceDiscount(ctx context.Context, invoiceID s
 	}
 	// A deterministic coupon ID makes creation recoverable after Stripe expires
 	// request idempotency. Never replace an existing coupon with another amount.
-	err = c.doForm(ctx, http.MethodGet, "/v1/coupons/"+url.PathEscape(couponID), nil, &coupon, "")
+	couponPath := "/v1/coupons/" + url.PathEscape(couponID) + "?expand[]=applies_to"
+	err = c.doForm(ctx, http.MethodGet, couponPath, nil, &coupon, "")
 	if err != nil {
-		if !strings.HasPrefix(err.Error(), "stripe GET /v1/coupons/"+url.PathEscape(couponID)+" returned 404:") {
+		if !strings.HasPrefix(err.Error(), "stripe GET "+couponPath+" returned 404:") {
 			return err
 		}
-		form := url.Values{"id": {couponID}, "amount_off": {strconv.FormatInt(cents, 10)}, "currency": {"usd"}, "duration": {"once"}, "name": {"Rounding adjustment"}}
+		form := url.Values{"id": {couponID}, "amount_off": {strconv.FormatInt(cents, 10)}, "currency": {"usd"}, "duration": {"once"}, "name": {"Rounding adjustment"}, "expand[]": {"applies_to"}}
 		for _, product := range products {
 			form.Add("applies_to[products][]", product)
 		}

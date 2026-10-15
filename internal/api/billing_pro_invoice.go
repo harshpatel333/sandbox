@@ -86,11 +86,26 @@ func (b invoiceBase) expectedFee(boundary time.Time) (int64, int64, int64, error
 }
 func (b invoiceBase) validateLine(line StripeInvoiceAmountLine, subscription string, start, end int64) error {
 	parent := line.Parent.SubscriptionItemDetails
-	if parent == nil || parent.Subscription != subscription || parent.Proration || line.Currency != "usd" || line.Amount != b.Amount || line.Quantity != 1 || line.Pricing.UnitAmountDecimal != fmt.Sprint(b.Amount) || len(line.Discounts) != 0 || len(line.PretaxCredits) != 0 || line.Period.Start != start || line.Period.End != end {
+	if parent == nil || parent.Subscription != subscription || parent.Proration || line.Currency != "usd" || line.Amount != b.Amount || line.Quantity != 1 || line.Pricing.UnitAmountDecimal != fmt.Sprint(b.Amount) || baseLineHasCredits(line) || line.Period.Start != start || line.Period.End != end {
 		return errors.New("licensed invoice line differs from contract")
 	}
 	return nil
 }
+
+// Product-scoped invoice discounts can leave zero-valued discount entries on
+// excluded lines. They do not reduce the licensed fee.
+func baseLineHasCredits(line StripeInvoiceAmountLine) bool {
+	if len(line.Discounts) != 0 {
+		return true
+	}
+	for _, credit := range line.PretaxCredits {
+		if credit.Type != "discount" || credit.Amount != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func verifyInvoicePlanSettlement(inv StripeInvoiceAmounts, plan billing.InvoiceClosePlan, before, after int64) error {
 	if plan.BaseCents == 0 {
 		return VerifyBillingInvoiceSettlement(inv, plan.ExpectedCents, before, after)
