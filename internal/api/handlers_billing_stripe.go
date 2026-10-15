@@ -401,7 +401,7 @@ func (c *stripeHTTPClient) CreateBillingCreditGrant(ctx context.Context, params 
 // GetCustomerCreditBalance reads Stripe's authoritative aggregate credit balance.
 func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, customerID string) (StripeCreditBalance, error) {
 	var resp struct {
-		Balances []struct {
+		Balances *[]struct {
 			AvailableBalance struct {
 				Monetary *struct {
 					Currency string `json:"currency"`
@@ -419,9 +419,14 @@ func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, custome
 	if err := c.doForm(ctx, http.MethodGet, path, nil, &resp, ""); err != nil {
 		return StripeCreditBalance{}, err
 	}
+	if resp.Balances == nil {
+		return StripeCreditBalance{}, fmt.Errorf("stripe credit balance summary omitted balances")
+	}
 	var cents int64
-	seenUSD := false
-	for _, b := range resp.Balances {
+	// Stripe returns one entry per grant currency, so a customer with no
+	// applicable grants has an empty list: a known zero, not a failed read.
+	seenUSD := len(*resp.Balances) == 0
+	for _, b := range *resp.Balances {
 		// Stripe may omit the monetary object when a balance is not
 		// representable. Treat that as an unavailable read, not as a known
 		// zero: decoding a missing object into a value struct would silently
