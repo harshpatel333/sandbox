@@ -178,6 +178,19 @@ The independent `usage_entitlement_backlog` sampler updates
 `state=entitlement_due`. The count includes jobs over one minute late and is
 capped at 1,000 (a value of 1,000 means at least that many); age is uncapped.
 Alert on sustained overdue age and sampler errors, including issuer stalls. The
+independent `entitlement_coverage_sample` audit scans active Pro contracts in
+indexed 1,000-contract pages, at most one page per second, while issuance is
+enabled. After each complete sweep it publishes the same backlog metrics with
+`state=entitlement_paid_missing`: paid current periods missing a confirmed grant
+for more than 15 minutes, measured from the later of period start and payment.
+It includes missing or incorrectly deferred work items and excludes debt observed
+within the last minute. `state=entitlement_debt_unknown` is the subset without
+a current clean-debt observation; stale debt cannot silently suppress an alert.
+These are recovery candidates, not authorization to issue credit. Counts cap at
+1,000 and ages remain uncapped. Alert on either nonzero missing coverage or audit
+errors; use the maximum across replicas, not the sum. Sweeps pause 30 seconds
+after completion; detection delay grows by one second per 1,000 contracts.
+The audit makes no provider calls and never replaces the issuance checks. The
 worker emits an error with the contract ID after five minutes of failure, or
 immediately when an unresolved grant has less than 15 minutes until expiry;
 repeat alerts are limited to once per hour. Route these errors to the billing

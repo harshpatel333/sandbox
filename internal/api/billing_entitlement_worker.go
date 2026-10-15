@@ -32,6 +32,7 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 		return
 	}
 	workers := 8
+	h.startEntitlementCoverageMonitoring(ctx)
 	if h.Config != nil && h.Config.BillingEntitlementWorkers >= 2 {
 		workers = min(h.Config.BillingEntitlementWorkers, 32)
 	}

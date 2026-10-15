@@ -12,6 +12,7 @@ CREATE INDEX billing_entitlement_work_due ON billing_entitlement_work(next_check
 CREATE INDEX billing_entitlement_work_fresh ON billing_entitlement_work(next_check_at,contract_id) WHERE failures=0;
 CREATE INDEX billing_entitlement_work_retry ON billing_entitlement_work(next_check_at,contract_id) WHERE failures>0;
 CREATE INDEX billing_entitlement_unresolved ON billing_usage_entitlement(contract_id,period_start) WHERE state <> 'issued';
+CREATE INDEX billing_entitlement_audit_contract ON billing_commercial_contract(id) WHERE status='active' AND offer_key IN ('pro_monthly','pro_annual');
 CREATE TABLE billing_entitlement_withheld (
  contract_id uuid NOT NULL REFERENCES billing_commercial_contract(id),
  period_start timestamptz NOT NULL, period_end timestamptz NOT NULL,

@@ -786,3 +786,58 @@ func TestInvoiceCreditScanRestartsForReinstatedZeroBalance(t *testing.T) {
 		t.Fatal("reinstated credit omitted", grants, err)
 	}
 }
+
+func TestEntitlementCoverageAuditWithoutScheduledWork(t *testing.T) {
+	f := newEntitlementFixture(t)
+	read := func() entitlementCoverageSample {
+		t.Helper()
+		var after uuid.UUID
+		for {
+			rows, err := f.h.entitlementCoveragePage(t.Context(), after, time.Now(), 7)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range rows {
+				if row.Contract == f.c.ID {
+					return row
+				}
+				after = row.Contract
+			}
+			if len(rows) < 7 {
+				t.Fatal("audit omitted active contract")
+			}
+		}
+	}
+	if _, err := f.h.Pool.Exec(t.Context(), `DELETE FROM billing_entitlement_work WHERE contract_id=$1`, f.c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if row := read(); row.Age <= 15*60 || !row.Unknown {
+		t.Fatalf("missing work and absent fresh collection evidence concealed paid period: %+v", row)
+	}
+	f.debt.Store(true)
+	if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if row := read(); row.Age != 0 {
+		t.Fatalf("fresh verified debt was not excluded: %+v", row)
+	}
+	if _, err := f.h.Pool.Exec(t.Context(), `UPDATE billing_entitlement_withheld SET observed_at=clock_timestamp()-interval '2 minutes' WHERE contract_id=$1`, f.c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if row := read(); row.Age <= 15*60 || !row.Unknown {
+		t.Fatalf("stale debt concealed missing paid allowance: %+v", row)
+	}
+	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO billing_entitlement_work(contract_id,next_check_at) VALUES($1,clock_timestamp()+interval '1 year')`, f.c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if row := read(); row.Age <= 15*60 {
+		t.Fatalf("deferred work concealed missing paid allowance: %+v", row)
+	}
+	f.debt.Store(false)
+	if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err != nil {
+		t.Fatal(err)
+	}
+	if row := read(); row.Age != 0 {
+		t.Fatalf("confirmed issuance did not clear audit: %+v", row)
+	}
+}
