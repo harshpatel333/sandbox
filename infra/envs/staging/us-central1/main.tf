@@ -616,13 +616,13 @@ module "sandbox_host_b" {
   }
 }
 
-# The second host's own background-data disk, same shape as the first's.
+# The second host's data disk was expanded to 1000 GB; preserve its capacity.
 resource "google_compute_disk" "sandbox_data_b" {
   project = local.project_id
   name    = "superserve-vmd-staging-2-sandbox-data"
   zone    = local.zone
   type    = "pd-balanced"
-  size    = 500
+  size    = 1000
 
   labels = merge(local.common_labels, {
     component = "vmd"
