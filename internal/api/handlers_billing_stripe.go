@@ -144,17 +144,18 @@ type StripeBillingCreditGrant struct {
 }
 
 type StripeCreateCheckoutSessionParams struct {
-	BasePriceID       string
-	ResourceTerms     []StripeCheckoutResourceTerms `json:",omitempty"`
-	Flexible          bool
-	CustomerID        string
-	SuccessURL        string
-	CancelURL         string
-	ClientReferenceID string
-	Metadata          map[string]string
-	PriceIDs          []string
-	IdempotencyKey    string
-	ExpiresAt         *time.Time
+	BasePriceID              string
+	DeferredResourcePriceIDs []string                      `json:",omitempty"`
+	ResourceTerms            []StripeCheckoutResourceTerms `json:",omitempty"`
+	Flexible                 bool
+	CustomerID               string
+	SuccessURL               string
+	CancelURL                string
+	ClientReferenceID        string
+	Metadata                 map[string]string
+	PriceIDs                 []string
+	IdempotencyKey           string
+	ExpiresAt                *time.Time
 }
 
 type StripeCheckoutSession struct {

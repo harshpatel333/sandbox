@@ -142,6 +142,12 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		return
 	}
 	params := StripeCreateCheckoutSessionParams{CustomerID: customer, SuccessURL: success, CancelURL: cancelURL, ClientReferenceID: team.String(), PriceIDs: prices, BasePriceID: offer.Price, Flexible: true, ResourceTerms: terms}
+	if offer.Months == 12 {
+		// Checkout cannot mix annual fees with monthly usage. Keep the actual
+		// request frozen so older replicas also replay the base-only session.
+		params.PriceIDs = nil
+		params.DeferredResourcePriceIDs = prices
+	}
 	ctx := c.Request.Context()
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {

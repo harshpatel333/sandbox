@@ -15,6 +15,8 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
+var errProResourcesPending = errors.New("paid purchase is awaiting monthly usage attachment")
+
 var errProEnrollmentPending = errors.New("paid purchase is awaiting invoice enrollment")
 
 type proPaidInvoice struct {
@@ -173,7 +175,7 @@ func (c *stripeHTTPClient) proInvoices(ctx context.Context, customer, sub, curso
 	return ids, next, nil
 }
 
-func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub invoiceSubscription, receipts []proPaymentEvidence, terminalClosed bool) error {
+func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub invoiceSubscription, receipts []proPaymentEvidence, terminalClosed, resourcesReady bool) error {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -199,7 +201,12 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 		return err
 	}
 	offer.Price = choice.Price
-	start, end, err := proMeteredPeriod(sub, offer)
+	var start, end int64
+	if resourcesReady {
+		start, end, err = proMeteredPeriod(sub, offer)
+	} else {
+		_, err = (invoiceBase{Price: offer.Price, Amount: offer.Amount, Months: offer.Months}).stripSubscription(sub)
+	}
 	if err != nil {
 		return err
 	}
@@ -227,7 +234,7 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 	if a.CommercialBillingAnchor.Valid && a.CommercialBillingAnchor.Time.Unix() != anchor {
 		return errors.New("Pro anniversary changed")
 	}
-	_, err = tx.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status=$3,current_period_start=$4,current_period_end=$5,commercial_billing_anchor=COALESCE(commercial_billing_anchor,$6),cancel_at_period_end=$7 WHERE team_id=$1`, choice.Team, sub.ID, sub.Status, time.Unix(start, 0), time.Unix(end, 0), time.Unix(anchor, 0), sub.CancelAtPeriodEnd)
+	_, err = tx.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status=$3,current_period_start=CASE WHEN $8 THEN $4 ELSE current_period_start END,current_period_end=CASE WHEN $8 THEN $5 ELSE current_period_end END,commercial_billing_anchor=COALESCE(commercial_billing_anchor,$6),cancel_at_period_end=$7 WHERE team_id=$1`, choice.Team, sub.ID, sub.Status, time.Unix(start, 0), time.Unix(end, 0), time.Unix(anchor, 0), sub.CancelAtPeriodEnd || sub.CancelAt > 0, resourcesReady)
 	if err != nil {
 		return err
 	}
@@ -294,6 +301,15 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 			return err
 		}
 		return recoveryErr
+	}
+	if !resourcesReady {
+		if _, err = tx.Exec(ctx, `UPDATE billing_signup_choice SET last_error=$2,next_check_at=clock_timestamp()+interval '2 minutes' WHERE team_id=$1`, choice.Team, errProResourcesPending.Error()); err != nil {
+			return err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return err
+		}
+		return errProResourcesPending
 	}
 	if terminal && !unexpired && terminalClosed {
 		_, err = q.EndCommercialContract(ctx, db.EndCommercialContractParams{TeamID: choice.Team, ContractID: contract.ID, ExpectedRevision: contract.Revision})

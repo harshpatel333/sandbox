@@ -222,12 +222,6 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 		return "", err
 	}
 	offer.Price = choice.Price
-	if _, _, err = proMeteredPeriod(sub, offer); err != nil {
-		return "", err
-	}
-	if err = h.validateProResourceIdentities(ctx, team, sub, params); err != nil {
-		return "", err
-	}
 	ids, nextCursor, err := client.proInvoices(ctx, session.CustomerID, sub.ID, derefString(choice.InvoiceCursor))
 	if err != nil {
 		return "", err
@@ -316,6 +310,19 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 			return "", err
 		}
 	}
+	var resourceErr error
+	if len(params.DeferredResourcePriceIDs) != 0 {
+		sub, resourceErr = client.ensureProDeferredResources(ctx, sub, params, receipts)
+	}
+	resourcesReady := resourceErr == nil
+	if resourcesReady {
+		if _, _, err = proMeteredPeriod(sub, offer); err != nil {
+			return "", err
+		}
+		if err = h.validateProResourceIdentities(ctx, team, sub, params); err != nil {
+			return "", err
+		}
+	}
 	terminalClosed := false
 	if (sub.Status == "canceled" || sub.Status == "incomplete_expired") && nextCursor == "" && len(verificationErrors) == 0 {
 		terminalClosed, err = h.proInvoicesClosed(ctx, client, team, sub.Customer, sub.ID, verifiedIDs)
@@ -323,7 +330,7 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 			return "", err
 		}
 	}
-	err = h.persistProPayments(ctx, choice, sub, receipts, terminalClosed)
+	err = h.persistProPayments(ctx, choice, sub, receipts, terminalClosed, resourcesReady)
 	if errors.Is(err, errProEnrollmentPending) {
 		// Payment is already durable. Provider or local enrollment failures
 		// leave activation pending and the existing worker can retry safely.
@@ -338,11 +345,14 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 			err = h.validateProResourceIdentities(ctx, team, sub, params)
 		}
 		if err == nil {
-			err = h.persistProPayments(ctx, choice, sub, receipts, false)
+			err = h.persistProPayments(ctx, choice, sub, receipts, false, true)
 		}
 	}
 	if err != nil {
-		return "", errors.Join(append(verificationErrors, err)...)
+		return "", errors.Join(append(verificationErrors, err, resourceErr)...)
+	}
+	if resourceErr != nil && !errors.Is(resourceErr, errProResourcesUnpaid) {
+		return "", resourceErr
 	}
 	// Cache only after the verified payments and activation transaction commits.
 	_, err = h.Pool.Exec(ctx, `INSERT INTO billing_pro_invoice_seen(team_id,invoice_id) SELECT $1,unnest($2::text[]) ON CONFLICT DO NOTHING`, team, verifiedIDs)
@@ -449,7 +459,7 @@ func (h *Handlers) proPaymentReconciliationTick(ctx context.Context) (int, error
 
 func (h *Handlers) validateProResourceIdentities(ctx context.Context, team uuid.UUID, sub invoiceSubscription, params StripeCreateCheckoutSessionParams) error {
 	expected := map[string]bool{}
-	for _, id := range params.PriceIDs {
+	for _, id := range append(append([]string{}, params.PriceIDs...), params.DeferredResourcePriceIDs...) {
 		expected[id] = false
 	}
 	var rounding string
