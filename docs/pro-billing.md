@@ -101,7 +101,7 @@ with hourly background retries as a fallback.
 
 ## Monthly usage entitlements
 
-Apply `20261015172000_monthly_usage_entitlement_issuance.sql` before deploying
+Apply `20261015181522_monthly_usage_entitlement_issuance.sql` before deploying
 control-plane replicas. The background entitlement worker issues one $1,000
 usage grant per original monthly anniversary for both Pro plans. Annual payment
 coverage is verified independently of the monthly credit cadence. Every new
