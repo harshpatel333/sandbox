@@ -519,7 +519,9 @@ func (b *x11Backend) markRepaint() error {
 	if b.damage == 0 {
 		return errNoChangeWatch
 	}
-	_, _, _, err := b.snapshot()
+	// The sample, not the whole frame: the display being left may already
+	// be too large to read in one piece.
+	_, _, _, err := b.snapshotWith(b.rawSample)
 	return err
 }
 
