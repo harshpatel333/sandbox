@@ -168,3 +168,8 @@ FROM contract c
 LEFT JOIN period ON period.contract_id = c.id
 LEFT JOIN billing_usage_entitlement e ON e.team_id = c.team_id AND e.contract_id = c.id
     AND e.kind = c.entitlement_kind AND e.period_start = period.period_start;
+
+-- name: EndLapsedCommercialContracts :execrows
+-- A fixed term ends at ends_at; nothing else transitions it, so this sweep does.
+UPDATE billing_commercial_contract SET status = 'ended', revision = revision + 1
+WHERE status <> 'ended' AND ends_at IS NOT NULL AND ends_at <= clock_timestamp();

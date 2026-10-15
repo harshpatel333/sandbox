@@ -69,3 +69,12 @@ func TestIntegration_PlanLimitsKeepManualOverrides(t *testing.T) {
 	endContract(t, c)
 	assertTeamLimits(t, c.TeamID, 150, &vcpu, nil, nil)
 }
+
+func TestIntegration_PlanLimitsEndWithLapsedTerm(t *testing.T) {
+	c := commercialActivate(t, commercialFixture(t, false))
+	correctionExec(t, `UPDATE billing_commercial_contract SET ends_at = clock_timestamp() - interval '1 second', revision = revision + 1 WHERE id = $1`, c.ID)
+	if n, err := testQueries.EndLapsedCommercialContracts(t.Context()); err != nil || n < 1 {
+		t.Fatalf("ended %d lapsed contracts: %v", n, err)
+	}
+	assertTeamLimits(t, c.TeamID, 20, nil, nil, nil)
+}
