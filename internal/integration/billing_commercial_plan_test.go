@@ -53,6 +53,28 @@ func TestIntegration_GetBillingSummaryCommercialPlan(t *testing.T) {
 			key: "free", status: "active",
 		},
 		{
+			name: "lapsed fixed term reports free",
+			team: func(t *testing.T) uuid.UUID {
+				team, err := testQueries.CreateTeam(t.Context(), "commercial-"+uuid.NewString())
+				if err != nil {
+					t.Fatal(err)
+				}
+				customer, subscription := "cus_"+uuid.NewString(), "sub_"+uuid.NewString()
+				start := time.Date(commercialNow(t).Year(), commercialNow(t).Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, -2, 0)
+				end := start.AddDate(0, 1, 0)
+				correctionExec(t, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,commercial_billing_anchor) VALUES($1,$2,$3,$4)`, team.ID, customer, subscription, start)
+				if _, err := testQueries.CreateCommercialContract(t.Context(), db.CreateCommercialContractParams{
+					TeamID: team.ID, OfferKey: "pro_monthly", StartsAt: start, EndsAt: commercialTime(end), CustomerID: customer, SubscriptionID: subscription,
+					BasePriceID: "price_base", ChargeAmountCents: 120000, ChargeIntervalMonths: 1,
+					EntitlementKind: "metered_usage", EntitlementAmountCents: 100000, EntitlementCadence: "monthly", EntitlementAnchor: start,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				return team.ID
+			},
+			key: "free", status: "active",
+		},
+		{
 			name: "pro monthly awaiting payment",
 			team: func(t *testing.T) uuid.UUID { return commercialFixture(t, false).TeamID },
 			key:  "pro_monthly", status: "pending", price: float64(1200), interval: float64(1), included: "not_issued",

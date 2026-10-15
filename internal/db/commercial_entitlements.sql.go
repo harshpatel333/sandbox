@@ -632,7 +632,9 @@ func (q *Queries) GetCurrentCommercialContract(ctx context.Context, teamID uuid.
 
 const getCurrentCommercialPlan = `-- name: GetCurrentCommercialPlan :one
 WITH contract AS MATERIALIZED (
+    -- Nothing ends a fixed-term contract at its boundary, so a lapsed term counts as ended here.
     SELECT b.id, b.team_id, b.offer_key, b.status, b.starts_at, b.ends_at, b.customer_id, b.subscription_id, b.base_price_id, b.charge_kind, b.charge_amount_cents, b.charge_interval_months, b.currency, b.entitlement_kind, b.entitlement_amount_cents, b.entitlement_cadence, b.entitlement_anchor, b.collection_has_overdue_balance, b.collection_checked_at, b.collection_valid_until, b.collection_evidence, b.revision, b.created_at FROM billing_commercial_contract b WHERE b.team_id = $1 AND b.status <> 'ended'
+        AND (b.ends_at IS NULL OR b.ends_at > clock_timestamp())
 ), period AS MATERIALIZED (
     SELECT c.id AS contract_id, p.period_start::timestamptz AS period_start,
         p.period_end::timestamptz AS period_end, p.amount_cents::bigint AS amount_cents

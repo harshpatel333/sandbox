@@ -154,7 +154,9 @@ RETURNING *;
 
 -- name: GetCurrentCommercialPlan :one
 WITH contract AS MATERIALIZED (
+    -- Nothing ends a fixed-term contract at its boundary, so a lapsed term counts as ended here.
     SELECT b.* FROM billing_commercial_contract b WHERE b.team_id = sqlc.arg(team_id) AND b.status <> 'ended'
+        AND (b.ends_at IS NULL OR b.ends_at > clock_timestamp())
 ), period AS MATERIALIZED (
     SELECT c.id AS contract_id, p.period_start::timestamptz AS period_start,
         p.period_end::timestamptz AS period_end, p.amount_cents::bigint AS amount_cents
