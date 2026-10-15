@@ -186,3 +186,8 @@ FROM contract c CROSS JOIN attempt
 WHERE e.team_id = c.team_id AND e.contract_id = c.id AND e.id = sqlc.arg(entitlement_id) AND e.state = 'pending'
     AND billing_contract_eligible(c::billing_commercial_contract, e.period_start, e.period_end) AND e.period_start <= clock_timestamp() AND e.period_end > clock_timestamp()
 RETURNING e.*;
+
+-- name: EndLapsedCommercialContracts :execrows
+-- A fixed term ends at ends_at; nothing else transitions it, so this sweep does.
+UPDATE billing_commercial_contract SET status = 'ended', revision = revision + 1
+WHERE status <> 'ended' AND ends_at IS NOT NULL AND ends_at <= clock_timestamp();
