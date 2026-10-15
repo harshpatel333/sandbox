@@ -152,6 +152,7 @@ BEGIN
         END IF;
         IF NEW.state = 'issued' AND (
             NEW.issuance_evidence->>'id' IS DISTINCT FROM NEW.stripe_credit_grant_id
+            OR COALESCE((NEW.issuance_evidence->>'voided_at')::bigint,0) <> 0
             OR NEW.issuance_evidence->'customer' IS DISTINCT FROM NEW.request_payload->'customer'
             OR NEW.issuance_evidence->'amount' IS DISTINCT FROM NEW.request_payload->'amount'
             OR NEW.issuance_evidence->'category' IS DISTINCT FROM NEW.request_payload->'category'

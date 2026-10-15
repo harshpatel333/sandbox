@@ -277,6 +277,29 @@ func TestEntitlementInventoryResumesBeyondFirstPage(t *testing.T) {
 	}
 }
 
+func TestEntitlementRecoveryRejectsVoidedGrant(t *testing.T) {
+	f := newEntitlementFixture(t)
+	f.lost.Store(true)
+	if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err == nil {
+		t.Fatal("expected lost provider response")
+	}
+	f.mu.Lock()
+	f.grant.VoidedAt = time.Now().Unix()
+	voided := *f.grant
+	f.mu.Unlock()
+	if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err == nil {
+		t.Fatal("accepted voided grant during recovery")
+	}
+	e, err := f.h.DB.GetCurrentUsageEntitlement(t.Context(), db.GetCurrentUsageEntitlementParams{TeamID: f.c.TeamID, Kind: f.c.EntitlementKind})
+	if err != nil || e.State != "uncertain" || f.grants.Load() != 1 {
+		t.Fatalf("voided recovery concealed or replaced the failed allowance: state=%s posts=%d err=%v", e.State, f.grants.Load(), err)
+	}
+	raw, _ := json.Marshal(voided)
+	if _, err = f.h.DB.ConfirmUsageEntitlementIssued(t.Context(), db.ConfirmUsageEntitlementIssuedParams{TeamID: f.c.TeamID, EntitlementID: e.ID, GrantID: &voided.ID, Evidence: raw}); err == nil {
+		t.Fatal("database accepted voided confirmation evidence")
+	}
+}
+
 func TestEntitlementCrashBeforeDispatchAndConcurrentRecovery(t *testing.T) {
 	f := newEntitlementFixture(t)
 	f.noDispatch.Store(true)

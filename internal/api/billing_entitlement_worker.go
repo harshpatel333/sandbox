@@ -381,6 +381,9 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey); err != nil {
 		return next, err
 	}
+	if grant.VoidedAt != 0 {
+		return next, errors.New("created grant was voided; operator recovery required")
+	}
 	raw, _ := json.Marshal(grant)
 	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: team, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})
 	return end.Add(time.Second), err
@@ -443,6 +446,9 @@ func (h *Handlers) discoverUsageEntitlement(ctx context.Context, c db.BillingCom
 	grant, err := client.retrieveEntitlementGrant(ctx, ids[0])
 	if err != nil {
 		return err
+	}
+	if grant.VoidedAt != 0 {
+		return errors.New("recovered grant was voided; operator recovery required")
 	}
 	raw, _ := json.Marshal(grant)
 	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})
