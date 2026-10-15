@@ -97,10 +97,12 @@ type templateBuildResponse struct {
 const (
 	maxName = 128
 
-	// Platform ceiling — applies to every team including system.
-	absoluteMaxVcpu      = 10
-	absoluteMaxMemoryMib = 20480
-	absoluteMaxDiskMib   = 65536
+	// Platform ceiling — applies to every team including system. Sits above
+	// every plan so a team can be raised past Pro without a platform change;
+	// 32 vCPU is Firecracker's maximum.
+	absoluteMaxVcpu      = 32
+	absoluteMaxMemoryMib = 131072
+	absoluteMaxDiskMib   = 131072
 
 	// Customer-team defaults (overridable via team.max_template_*).
 	defaultMaxVcpu      = 2
