@@ -630,6 +630,55 @@ func (q *Queries) GetCurrentCommercialContract(ctx context.Context, teamID uuid.
 	return i, err
 }
 
+const getCurrentCommercialPlan = `-- name: GetCurrentCommercialPlan :one
+WITH contract AS MATERIALIZED (
+    -- Nothing ends a fixed-term contract at its boundary, so a lapsed term counts as ended here.
+    SELECT b.id, b.team_id, b.offer_key, b.status, b.starts_at, b.ends_at, b.customer_id, b.subscription_id, b.base_price_id, b.charge_kind, b.charge_amount_cents, b.charge_interval_months, b.currency, b.entitlement_kind, b.entitlement_amount_cents, b.entitlement_cadence, b.entitlement_anchor, b.collection_has_overdue_balance, b.collection_checked_at, b.collection_valid_until, b.collection_evidence, b.revision, b.created_at FROM billing_commercial_contract b WHERE b.team_id = $1 AND b.status <> 'ended'
+        AND (b.ends_at IS NULL OR b.ends_at > clock_timestamp())
+), period AS MATERIALIZED (
+    SELECT c.id AS contract_id, p.period_start::timestamptz AS period_start,
+        p.period_end::timestamptz AS period_end, p.amount_cents::bigint AS amount_cents
+    FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) AS p(period_start, period_end, amount_cents)
+)
+SELECT c.offer_key, c.status, c.starts_at, c.ends_at, c.charge_amount_cents, c.charge_interval_months,
+    period.period_start, period.period_end, period.amount_cents AS period_amount_cents, e.state AS entitlement_state
+FROM contract c
+LEFT JOIN period ON period.contract_id = c.id
+LEFT JOIN billing_usage_entitlement e ON e.team_id = c.team_id AND e.contract_id = c.id
+    AND e.kind = c.entitlement_kind AND e.period_start = period.period_start
+`
+
+type GetCurrentCommercialPlanRow struct {
+	OfferKey             string             `json:"offer_key"`
+	Status               string             `json:"status"`
+	StartsAt             time.Time          `json:"starts_at"`
+	EndsAt               pgtype.Timestamptz `json:"ends_at"`
+	ChargeAmountCents    int64              `json:"charge_amount_cents"`
+	ChargeIntervalMonths int32              `json:"charge_interval_months"`
+	PeriodStart          pgtype.Timestamptz `json:"period_start"`
+	PeriodEnd            pgtype.Timestamptz `json:"period_end"`
+	PeriodAmountCents    *int64             `json:"period_amount_cents"`
+	EntitlementState     *string            `json:"entitlement_state"`
+}
+
+func (q *Queries) GetCurrentCommercialPlan(ctx context.Context, teamID uuid.UUID) (GetCurrentCommercialPlanRow, error) {
+	row := q.db.QueryRow(ctx, getCurrentCommercialPlan, teamID)
+	var i GetCurrentCommercialPlanRow
+	err := row.Scan(
+		&i.OfferKey,
+		&i.Status,
+		&i.StartsAt,
+		&i.EndsAt,
+		&i.ChargeAmountCents,
+		&i.ChargeIntervalMonths,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.PeriodAmountCents,
+		&i.EntitlementState,
+	)
+	return i, err
+}
+
 const getCurrentUsageEntitlement = `-- name: GetCurrentUsageEntitlement :one
 SELECT id, team_id, contract_id, payment_id, kind, period_start, period_end, amount_cents, currency, issuance_source, provider_created_at, adopted_at, adopted_available_balance_cents, state, idempotency_key, first_attempt_at, request_payload, provider_invoice_start, provider_invoice_end, stripe_credit_grant_id, issuance_evidence, issued_at, created_at FROM billing_usage_entitlement WHERE team_id = $1 AND kind = $2
     AND period_start <= clock_timestamp() AND period_end > clock_timestamp()
