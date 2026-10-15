@@ -144,14 +144,18 @@ type StripeBillingCreditGrant struct {
 }
 
 type StripeCreateCheckoutSessionParams struct {
-	CustomerID        string
-	SuccessURL        string
-	CancelURL         string
-	ClientReferenceID string
-	Metadata          map[string]string
-	PriceIDs          []string
-	IdempotencyKey    string
-	ExpiresAt         *time.Time
+	BasePriceID              string
+	DeferredResourcePriceIDs []string                      `json:",omitempty"`
+	ResourceTerms            []StripeCheckoutResourceTerms `json:",omitempty"`
+	Flexible                 bool
+	CustomerID               string
+	SuccessURL               string
+	CancelURL                string
+	ClientReferenceID        string
+	Metadata                 map[string]string
+	PriceIDs                 []string
+	IdempotencyKey           string
+	ExpiresAt                *time.Time
 }
 
 type StripeCheckoutSession struct {
@@ -257,6 +261,7 @@ type billingExportAttemptRecord struct {
 }
 
 type billingCheckoutSessionRequest struct {
+	Offer       string    `json:"offer,omitempty"`
 	OperationID uuid.UUID `json:"operation_id,omitempty"`
 	Decision    string    `json:"decision,omitempty"`
 	HomeRegion  string    `json:"home_region,omitempty"`
@@ -401,7 +406,7 @@ func (c *stripeHTTPClient) CreateBillingCreditGrant(ctx context.Context, params 
 // GetCustomerCreditBalance reads Stripe's authoritative aggregate credit balance.
 func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, customerID string) (StripeCreditBalance, error) {
 	var resp struct {
-		Balances []struct {
+		Balances *[]struct {
 			AvailableBalance struct {
 				Monetary *struct {
 					Currency string `json:"currency"`
@@ -419,9 +424,14 @@ func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, custome
 	if err := c.doForm(ctx, http.MethodGet, path, nil, &resp, ""); err != nil {
 		return StripeCreditBalance{}, err
 	}
+	if resp.Balances == nil {
+		return StripeCreditBalance{}, fmt.Errorf("stripe credit balance summary omitted balances")
+	}
 	var cents int64
-	seenUSD := false
-	for _, b := range resp.Balances {
+	// Stripe returns one entry per grant currency, so a customer with no
+	// applicable grants has an empty list: a known zero, not a failed read.
+	seenUSD := len(*resp.Balances) == 0
+	for _, b := range *resp.Balances {
 		// Stripe may omit the monetary object when a balance is not
 		// representable. Treat that as an unavailable read, not as a known
 		// zero: decoding a missing object into a value struct would silently
@@ -458,6 +468,14 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 	}
 	for i, priceID := range params.PriceIDs {
 		form.Set(fmt.Sprintf("line_items[%d][price]", i), priceID)
+	}
+	if params.Flexible {
+		form.Set("subscription_data[billing_mode][type]", "flexible")
+	}
+	if params.BasePriceID != "" {
+		i := len(params.PriceIDs)
+		form.Set(fmt.Sprintf("line_items[%d][price]", i), params.BasePriceID)
+		form.Set(fmt.Sprintf("line_items[%d][quantity]", i), "1")
 	}
 	var resp struct {
 		ID  string `json:"id"`
@@ -502,6 +520,25 @@ func (c *stripeHTTPClient) RetrieveEvent(ctx context.Context, eventID string) (j
 	return raw, nil
 }
 
+type stripeRequestError struct {
+	Status  int
+	Message string
+}
+
+func (e *stripeRequestError) Error() string { return e.Message }
+func definitiveStripeRejection(err error) bool {
+	var e *stripeRequestError
+	if !errors.As(err, &e) {
+		return false
+	}
+	switch e.Status {
+	case 400, 401, 403, 404, 422:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *stripeHTTPClient) doForm(ctx context.Context, method, path string, form url.Values, out any, idempotencyKey string) error {
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -533,7 +570,7 @@ func (c *stripeHTTPClient) doForm(ctx context.Context, method, path string, form
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("stripe %s %s returned %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(body)))
+		return &stripeRequestError{Status: resp.StatusCode, Message: fmt.Sprintf("stripe %s %s returned %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(body)))}
 	}
 	if out == nil {
 		return nil
@@ -1611,6 +1648,25 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "invalid checkout session request", http.StatusBadRequest)
 		return
 	}
+	if req.Offer != "" && req.Offer != "free" {
+		if trusted {
+			respondErrorMsg(c, "bad_request", "Pro uses the plan-aware checkout route", http.StatusBadRequest)
+			return
+		}
+		h.createProCheckout(c, teamID, actorID, req)
+		return
+	}
+	if h.Pool != nil {
+		var proPending bool
+		if err := h.Pool.QueryRow(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN ('pro_monthly','pro_annual'))`, teamID).Scan(&proPending); err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if proPending {
+			proConflict(c)
+			return
+		}
+	}
 	var claims *promotionAccountClaims
 	if trusted {
 		var ok bool
@@ -2020,6 +2076,9 @@ func logStripeWebhookProcessingFailure(err error, eventID, eventType string) boo
 }
 
 func (h *Handlers) processRecordedStripeWebhook(ctx context.Context, event stripeEventEnvelope) error {
+	if handled, err := h.processProWebhook(ctx, event); handled || err != nil {
+		return err
+	}
 	if event.Type == "checkout.session.completed" {
 		pending, err := h.associateStripeCheckoutBeforeReconciliation(ctx, event)
 		if err != nil {
@@ -2611,7 +2670,7 @@ func stripePromotionSubscriptionReservationParams(teamID, userID uuid.UUID, even
 // the team billing row, which precedes any webhook row.
 func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q *db.Queries, event stripeEventEnvelope, preReservation *stripePromotionPreReservation) error {
 	switch event.Type {
-	case "checkout.session.completed", "checkout.session.expired":
+	case "checkout.session.completed", "checkout.session.expired", "checkout.session.async_payment_succeeded", "checkout.session.async_payment_failed":
 		var obj stripeCheckoutCompletedObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return err
@@ -2678,7 +2737,7 @@ func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q 
 			}
 		}
 		return err
-	case "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
+	case "invoice.paid", "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
 		var obj stripeInvoiceObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return err
@@ -2692,7 +2751,7 @@ func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q 
 
 func (h *Handlers) resolveStripeWebhookRouting(ctx context.Context, event *stripeEventEnvelope) (stripeWebhookRoutingDecision, error) {
 	switch event.Type {
-	case "checkout.session.completed", "checkout.session.expired":
+	case "checkout.session.completed", "checkout.session.expired", "checkout.session.async_payment_succeeded", "checkout.session.async_payment_failed":
 		var obj stripeCheckoutCompletedObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return stripeWebhookRoutingDecisionInvalid, err
@@ -2724,7 +2783,7 @@ func (h *Handlers) resolveStripeWebhookRouting(ctx context.Context, event *strip
 			return stripeWebhookRoutingDecisionInvalid, err
 		}
 		return stripeWebhookRoutingDecisionOwned, nil
-	case "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
+	case "invoice.paid", "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
 		var obj stripeInvoiceObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return stripeWebhookRoutingDecisionInvalid, err
@@ -3493,7 +3552,7 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 			}
 		}
 		return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)})
-	case "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
+	case "invoice.paid", "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
 		var obj stripeInvoiceObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return err

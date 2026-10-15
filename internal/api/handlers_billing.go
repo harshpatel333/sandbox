@@ -121,7 +121,28 @@ type billingSummaryResponse struct {
 	BillingPeriod            billingSummaryPeriod              `json:"billing_period"`
 	PricingTier              billingSummaryPricingTier         `json:"pricing_tier"`
 	Trial                    *billingTrialBalance              `json:"trial,omitempty"`
+	Plan                     billingSummaryPlan                `json:"plan"`
 	CalculatedAt             time.Time                         `json:"calculated_at"`
+}
+
+// billingSummaryPlan is the team's commercial plan, separate from PricingTier,
+// which is the usage rate card every plan shares.
+type billingSummaryPlan struct {
+	Key                   string                       `json:"key"`
+	Name                  string                       `json:"name"`
+	Status                string                       `json:"status"`
+	PriceUSD              *float64                     `json:"price_usd"`
+	BillingIntervalMonths *int32                       `json:"billing_interval_months"`
+	StartsAt              *time.Time                   `json:"starts_at"`
+	EndsAt                *time.Time                   `json:"ends_at"`
+	IncludedUsage         *billingSummaryIncludedUsage `json:"included_usage"`
+}
+
+type billingSummaryIncludedUsage struct {
+	AmountUSD   float64   `json:"amount_usd"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	Status      string    `json:"status"`
 }
 
 type billingTrialBalance struct {
@@ -258,6 +279,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		creditBalance pgtype.Numeric
 		trialBalance  db.GetTeamTrialBalanceRow
 		trialRunway   db.GetTeamTrialRunwayRow
+		plan          billingSummaryPlan
 	)
 	g, ctx := errgroup.WithContext(c.Request.Context())
 	hasEstablishedSubscription := billingAccountHasEstablishedSubscription(account)
@@ -290,6 +312,20 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		if err != nil {
 			return fmt.Errorf("get team trial balance: %w", err)
 		}
+		return nil
+	})
+
+	g.Go(func() error {
+		row, err := h.DB.GetCurrentCommercialPlan(ctx, teamID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			plan = billingSummaryPlan{Key: "free", Name: "Free", Status: "active"}
+			return nil
+		}
+		if err != nil {
+			// A failed lookup must not present a paying team as Free.
+			return fmt.Errorf("get current commercial plan: %w", err)
+		}
+		plan = billingPlanFromContract(row)
 		return nil
 	})
 
@@ -550,8 +586,46 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			RunwayState:      runwayState,
 			RunwayObservedAt: runwayObservedAt,
 		},
+		Plan:         plan,
 		CalculatedAt: now,
 	})
+}
+
+var commercialPlanNames = map[string]string{"pro_monthly": "Pro Monthly", "pro_annual": "Pro Annual"}
+
+func billingPlanFromContract(row db.GetCurrentCommercialPlanRow) billingSummaryPlan {
+	name, ok := commercialPlanNames[row.OfferKey]
+	if !ok {
+		name = row.OfferKey
+	}
+	price := float64(row.ChargeAmountCents) / 100
+	interval := row.ChargeIntervalMonths
+	starts := row.StartsAt
+	plan := billingSummaryPlan{
+		Key: row.OfferKey, Name: name, Status: row.Status,
+		PriceUSD: &price, BillingIntervalMonths: &interval, StartsAt: &starts,
+	}
+	if row.EndsAt.Valid {
+		plan.EndsAt = &row.EndsAt.Time
+	}
+	// No current period means the contract has not started or its allowances
+	// have run out; there is nothing to show as included this month.
+	if row.PeriodStart.Valid && row.PeriodEnd.Valid && row.PeriodAmountCents != nil {
+		status := "not_issued"
+		if row.EntitlementState != nil {
+			status = "pending"
+			if *row.EntitlementState == "issued" {
+				status = "issued"
+			}
+		}
+		plan.IncludedUsage = &billingSummaryIncludedUsage{
+			AmountUSD:   float64(*row.PeriodAmountCents) / 100,
+			PeriodStart: row.PeriodStart.Time,
+			PeriodEnd:   row.PeriodEnd.Time,
+			Status:      status,
+		}
+	}
+	return plan
 }
 
 func stripeExpectedInvoiceAmount(currentChargesUSD, appliedCreditUSD float64) float64 {
@@ -755,7 +829,8 @@ func (h *Handlers) requireBillingRead(c *gin.Context) (uuid.UUID, bool) {
 
 type billingResourceState struct {
 	config.BillingResourceConfig
-	Billable bool
+	Billable       bool
+	PurchasedTerms *StripeCheckoutResourceTerms
 }
 
 func (h *Handlers) billingConfiguredResources() []config.BillingResourceConfig {

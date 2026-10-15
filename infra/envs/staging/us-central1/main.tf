@@ -220,6 +220,8 @@ module "api" {
     VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host_b.internal_ip)
     STRIPE_API_BASE_URL         = "https://api.stripe.com"
     STRIPE_CHECKOUT_PRICE_IDS   = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
+    STRIPE_PRO_MONTHLY_PRICE_ID = "price_1UQiJZQ9Sm5V6nX8dRNQ5ob5"
+    STRIPE_PRO_ANNUAL_PRICE_ID  = "price_1UQiJjQ9Sm5V6nX8toQIgOzz"
     BILLING_RESOURCE_CONFIG = jsonencode([
       {
         resource_key         = "vcpu"
@@ -614,13 +616,13 @@ module "sandbox_host_b" {
   }
 }
 
-# The second host's own background-data disk, same shape as the first's.
+# The second host's data disk was expanded to 1000 GB; preserve its capacity.
 resource "google_compute_disk" "sandbox_data_b" {
   project = local.project_id
   name    = "superserve-vmd-staging-2-sandbox-data"
   zone    = local.zone
   type    = "pd-balanced"
-  size    = 500
+  size    = 1000
 
   labels = merge(local.common_labels, {
     component = "vmd"
