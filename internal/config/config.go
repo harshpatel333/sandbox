@@ -19,6 +19,9 @@ import (
 
 // Config holds all configuration for the Superserve Sandbox control plane.
 type Config struct {
+	BillingUsageEntitlementsEnabled bool
+	BillingEntitlementWorkers       int
+
 	TemplateBuildRegion       string                       // TEMPLATE_BUILD_REGION matches the host registry region exactly
 	TemplateBackupBucket      string                       // BACKUP_BUCKET, cell-local durable template storage
 	ComputeRestrictionsFile   string                       // COMPUTE_RESTRICTIONS_FILE; empty disables config loading
@@ -29,11 +32,13 @@ type Config struct {
 	TeamCreationRegion        string                       // TEAM_CREATION_REGION; receiving cell identifier
 	TeamCreationKeys          map[string]ed25519.PublicKey // TEAM_CREATION_PUBLIC_KEYS; kid to base64 public key
 
-	StripeSecretKey               string   // STRIPE_SECRET_KEY
-	StripeWebhookSecret           string   // STRIPE_WEBHOOK_SECRET (snapshot lifecycle destination)
-	StripeMeterErrorWebhookSecret string   // STRIPE_METER_ERROR_WEBHOOK_SECRET (thin meter-error destination)
-	StripeAPIBaseURL              string   // STRIPE_API_BASE_URL, default "https://api.stripe.com"
-	StripeAPIVersion              string   // STRIPE_API_VERSION, required for Stripe requests
+	StripeSecretKey               string // STRIPE_SECRET_KEY
+	StripeWebhookSecret           string // STRIPE_WEBHOOK_SECRET (snapshot lifecycle destination)
+	StripeMeterErrorWebhookSecret string // STRIPE_METER_ERROR_WEBHOOK_SECRET (thin meter-error destination)
+	StripeAPIBaseURL              string // STRIPE_API_BASE_URL, default "https://api.stripe.com"
+	StripeAPIVersion              string // STRIPE_API_VERSION, required for Stripe requests
+	StripeProMonthlyPriceID       string
+	StripeProAnnualPriceID        string
 	StripeCheckoutPriceIDs        []string // STRIPE_CHECKOUT_PRICE_IDS, required for checkout sessions
 	BillingResources              []BillingResourceConfig
 	AppAllowedOrigins             []string // APP_ALLOWED_ORIGINS, comma-separated browser origins allowed in billing redirects
@@ -128,9 +133,16 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	workers, err := strconv.Atoi(envOrDefault("BILLING_ENTITLEMENT_WORKERS", "8"))
+	if err != nil || workers < 2 || workers > 32 {
+		return nil, fmt.Errorf("BILLING_ENTITLEMENT_WORKERS must be between 2 and 32")
+	}
 	checkoutPriceIDs := checkoutPriceIDs()
 
 	cfg := &Config{
+		BillingUsageEntitlementsEnabled: boolEnv("BILLING_USAGE_ENTITLEMENTS_ENABLED", false),
+		BillingEntitlementWorkers:       workers,
+
 		TeamCreationRegion:            os.Getenv("TEAM_CREATION_REGION"),
 		TeamCreationKeys:              teamCreationKeys(os.Getenv("TEAM_CREATION_PUBLIC_KEYS")),
 		ComputeRestrictionsFile:       os.Getenv("COMPUTE_RESTRICTIONS_FILE"),
@@ -144,6 +156,8 @@ func Load() (*Config, error) {
 		StripeAPIBaseURL:              envOrDefault("STRIPE_API_BASE_URL", "https://api.stripe.com"),
 		StripeAPIVersion:              strings.TrimSpace(os.Getenv("STRIPE_API_VERSION")),
 		StripeCheckoutPriceIDs:        checkoutPriceIDs,
+		StripeProMonthlyPriceID:       strings.TrimSpace(os.Getenv("STRIPE_PRO_MONTHLY_PRICE_ID")),
+		StripeProAnnualPriceID:        strings.TrimSpace(os.Getenv("STRIPE_PRO_ANNUAL_PRICE_ID")),
 		BillingResources:              billingResources(checkoutPriceIDs),
 		AppAllowedOrigins:             splitCSV(os.Getenv("APP_ALLOWED_ORIGINS")),
 		SandboxAccessTokenSeed:        seed,

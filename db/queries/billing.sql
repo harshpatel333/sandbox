@@ -109,6 +109,35 @@ SELECT
     (billable_storage_mib_seconds(sqlc.arg(team_id),sqlc.arg(period_start),sqlc.arg(period_end))/1024.0)::numeric AS billable_storage_gib_seconds
 FROM compute, storage;
 
+-- name: GetTeamBillingChargeableUsage :one
+-- Compute and billable storage clipped to [period_start, period_end), for
+-- readers that charge or preview charges and need no tracked storage.
+WITH compute AS (
+    SELECT
+        COALESCE(SUM(
+            EXTRACT(EPOCH FROM (
+                LEAST(COALESCE(i.ended_at, now()), sqlc.arg(period_end))
+                - GREATEST(i.started_at, sqlc.arg(period_start))
+            )) * i.vcpu_count
+        ), 0)::numeric AS vcpu_seconds,
+        COALESCE(SUM(
+            EXTRACT(EPOCH FROM (
+                LEAST(COALESCE(i.ended_at, now()), sqlc.arg(period_end))
+                - GREATEST(i.started_at, sqlc.arg(period_start))
+            )) * i.memory_mib
+        ), 0)::numeric AS memory_mib_seconds
+    FROM sandbox_compute_billing_interval i
+    WHERE i.team_id = sqlc.arg(team_id)
+      AND sqlc.arg(period_start) < LEAST(now(), sqlc.arg(period_end))
+      AND i.started_at < LEAST(now(), sqlc.arg(period_end))
+      AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
+)
+SELECT
+    compute.vcpu_seconds,
+    (compute.memory_mib_seconds / 1024.0)::numeric AS memory_gib_seconds,
+    (billable_storage_mib_seconds(sqlc.arg(team_id),sqlc.arg(period_start),sqlc.arg(period_end))/1024.0)::numeric AS billable_storage_gib_seconds
+FROM compute;
+
 -- name: GetActiveTeamBillingPeriod :one
 SELECT *
 FROM team_billing_period
@@ -274,6 +303,49 @@ SET hour_end = EXCLUDED.hour_end,
     vcpu_seconds = EXCLUDED.vcpu_seconds,
     memory_mib_seconds = EXCLUDED.memory_mib_seconds,
     storage_mib_seconds = EXCLUDED.storage_mib_seconds,
+    updated_at = now()
+RETURNING *;
+
+-- name: UpsertTeamBillingUsageHourCompute :one
+-- Compute only. A new hour's storage is NULL until measured; a refreshed hour
+-- keeps its previously measured storage.
+WITH compute AS (
+    SELECT
+        COALESCE(SUM(
+            EXTRACT(EPOCH FROM (
+                LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
+                - GREATEST(i.started_at, sqlc.arg(hour_start))
+            )) * i.vcpu_count
+        ), 0)::numeric AS vcpu_seconds,
+        COALESCE(SUM(
+            EXTRACT(EPOCH FROM (
+                LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
+                - GREATEST(i.started_at, sqlc.arg(hour_start))
+            )) * i.memory_mib
+        ), 0)::numeric AS memory_mib_seconds
+    FROM sandbox_compute_billing_interval i
+    WHERE i.team_id = sqlc.arg(team_id)
+      AND i.started_at < sqlc.arg(hour_end)
+      AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
+      AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
+)
+INSERT INTO team_billing_usage_hourly (
+    team_id, hour_start, hour_end,
+    vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+)
+SELECT
+    sqlc.arg(team_id)::uuid,
+    sqlc.arg(hour_start)::timestamptz,
+    sqlc.arg(hour_end)::timestamptz,
+    compute.vcpu_seconds,
+    compute.memory_mib_seconds,
+    NULL::numeric
+FROM compute
+WHERE feature_enabled('billing_hourly_rollups', sqlc.arg(team_id)::uuid)
+ON CONFLICT (team_id, hour_start) DO UPDATE
+SET hour_end = EXCLUDED.hour_end,
+    vcpu_seconds = EXCLUDED.vcpu_seconds,
+    memory_mib_seconds = EXCLUDED.memory_mib_seconds,
     updated_at = now()
 RETURNING *;
 
@@ -1459,6 +1531,26 @@ SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end 
 FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start;
 
 
+-- name: GetTeamBillingUsageFromRollups :many
+-- Usage per bucket for billing pages: saved hourly rollups for settled hours,
+-- intervals for the rest. Billable storage stays exact and live.
+SELECT u.bucket_start::timestamptz AS period_start, u.bucket_end::timestamptz AS period_end,
+ u.vcpu_seconds::numeric AS vcpu_seconds,
+ (u.memory_mib_seconds/1024.0)::numeric AS memory_gib_seconds,
+ (u.storage_mib_seconds/1024.0)::numeric AS storage_gib_seconds,
+ u.storage_direct::boolean AS storage_direct,
+ (billable_storage_mib_seconds(sqlc.arg(team_id),u.bucket_start::timestamptz,u.bucket_end::timestamptz)/1024.0)::numeric AS billable_storage_gib_seconds
+FROM billing_usage_from_rollups(sqlc.arg(team_id)::uuid,sqlc.arg(period_starts)::timestamptz[],sqlc.arg(period_ends)::timestamptz[]) u
+ORDER BY 1;
+
+-- name: GetTeamTrackedStorageSeries :many
+-- Direct tracked storage for buckets saved rollups cannot answer exactly.
+SELECT starts.bucket_start::timestamptz AS period_start,
+ (storage_mib_seconds(sqlc.arg(team_id)::uuid,starts.bucket_start,ends.bucket_end,sqlc.arg(floor_legacy_artifacts)::boolean)/1024.0)::numeric AS storage_gib_seconds
+FROM unnest(sqlc.arg(period_starts)::timestamptz[]) WITH ORDINALITY starts(bucket_start,n)
+JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
+ORDER BY starts.n;
+
 -- name: GetTeamTrialRunway :one
 WITH lifecycle AS (
     SELECT trial_credit_warning_lifecycle(sqlc.arg(team_id))::text AS key
@@ -1518,3 +1610,24 @@ SELECT begin_stripe_checkout_with_publication_decision(
 -- name: StripeCheckoutPublicationFailed :one
 SELECT stripe_checkout_publication_failed(sqlc.arg(team_id)::uuid,
     sqlc.arg(generation)::timestamptz, sqlc.arg(user_id)::uuid)::boolean AS publication_failed;
+
+-- name: ClaimSweepLease :one
+-- One statement decides election and hands back the shared page position.
+-- The WHERE admits only an expired lease or the current holder, and the
+-- verdict is whether a row came back, so two contenders cannot both win.
+INSERT INTO sweep_lease (name, locked_by, locked_until)
+VALUES (sqlc.arg(name), sqlc.arg(locked_by), now() + make_interval(secs => sqlc.arg(lease_seconds)::int))
+ON CONFLICT (name) DO UPDATE
+SET locked_by = EXCLUDED.locked_by,
+    locked_until = EXCLUDED.locked_until,
+    updated_at = now()
+WHERE sweep_lease.locked_until <= now()
+   OR sweep_lease.locked_by = EXCLUDED.locked_by
+RETURNING cursor_id;
+
+-- name: AdvanceSweepCursor :exec
+-- Guarded by holder: a replica whose lease lapsed mid-page must not move
+-- the cursor its successor is already working from.
+UPDATE sweep_lease
+SET cursor_id = sqlc.narg(cursor_id), updated_at = now()
+WHERE name = sqlc.arg(name) AND locked_by = sqlc.arg(locked_by);

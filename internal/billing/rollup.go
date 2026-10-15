@@ -28,7 +28,15 @@ const (
 	defaultHourlyRollupBatchSize             = 100
 	defaultHourlyRollupMaxAttempts           = 5
 	defaultHourlyRollupWorkers               = 1
+
+	storageReportsIncompleteRetry = 30 * time.Second
+	storageUsageUnknownRetry      = 15 * time.Minute
+	unbilledStorageBudget         = 5 * time.Second
 )
+
+// errStorageUsageUnknown means an owned artifact has no recorded size. Unlike
+// a report in flight, it resolves only through reconciliation, so it backs off.
+var errStorageUsageUnknown = errors.New("storage usage unknown")
 
 type HourlyRollupConfig struct {
 	SchedulerInterval     time.Duration
@@ -205,9 +213,17 @@ func processJob(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg Hour
 		return completeJob(ctx, pool, job.ID, workerID)
 	}
 
-	err = upsertCompleteRollupUsage(ctx, pool, q, job)
+	billable, err := storageBillableForHour(ctx, pool, job.TeamID, job.HourEnd)
+	if err == nil && billable {
+		err = upsertCompleteRollupUsage(ctx, pool, q, job)
+	} else if err == nil {
+		err = upsertUnbilledStorageRollupUsage(ctx, pool, q, job)
+	}
 	if errors.Is(err, ErrStorageReportsIncomplete) {
-		return deferIncompleteRollupJob(ctx, pool, job.ID, workerID)
+		return deferRollupJob(ctx, pool, job.ID, workerID, err, "storage reports incomplete", storageReportsIncompleteRetry)
+	}
+	if errors.Is(err, errStorageUsageUnknown) {
+		return deferRollupJob(ctx, pool, job.ID, workerID, err, "storage usage unknown", storageUsageUnknownRetry)
 	}
 	if err != nil {
 		nextAttemptAt := time.Now().UTC().Add(backoff(job.AttemptCount))
@@ -218,6 +234,64 @@ func processJob(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg Hour
 	}
 
 	return completeJob(ctx, pool, job.ID, workerID)
+}
+
+// storageBillableForHour mirrors the export: storage is charged for an hour
+// only once the team's activation is effective before the hour ends.
+func storageBillableForHour(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, hourEnd time.Time) (bool, error) {
+	var billable bool
+	err := pool.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM team_storage_billing_activation WHERE team_id=$1 AND effective_at<$2)`, teamID, hourEnd).Scan(&billable)
+	return billable, err
+}
+
+// upsertUnbilledStorageRollupUsage records compute without waiting on storage
+// reports or the storage calculation, which can exceed the rollup budget for
+// large teams. Storage is display-only here and is measured best-effort.
+func upsertUnbilledStorageRollupUsage(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, job rollupJob) error {
+	_, err := q.UpsertTeamBillingUsageHourCompute(ctx, db.UpsertTeamBillingUsageHourComputeParams{
+		TeamID:    job.TeamID,
+		HourStart: job.HourStart,
+		HourEnd:   job.HourEnd,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	err = measureUnbilledRollupStorage(ctx, pool, job)
+	if errors.Is(err, ErrStorageReportsIncomplete) {
+		// Compute is recorded; keep the job deferred so storage is measured once
+		// its reports land. Hours outside the rolling window are never revisited.
+		return err
+	}
+	if err != nil {
+		log.Debug().Err(err).Str("team_id", job.TeamID.String()).Time("hour_start", job.HourStart).
+			Msg("unbilled hourly storage left unmeasured")
+	}
+	return nil
+}
+
+// measureUnbilledRollupStorage skips the receipt fence: the value is not
+// billed, and holding host locks here would stall report ingestion. It leaves
+// updated_at alone: readers take updated_at as the compute capture time.
+func measureUnbilledRollupStorage(ctx context.Context, pool *pgxpool.Pool, job rollupJob) error {
+	ctx, cancel := context.WithTimeout(ctx, unbilledStorageBudget)
+	defer cancel()
+	var complete bool
+	if err := pool.QueryRow(ctx, `SELECT storage_reports_complete_through($1, $2)`, job.TeamID, job.HourEnd).Scan(&complete); err != nil {
+		return err
+	}
+	if !complete {
+		return ErrStorageReportsIncomplete
+	}
+	_, err := pool.Exec(ctx, `
+UPDATE team_billing_usage_hourly h
+SET storage_mib_seconds = m.storage_mib_seconds
+FROM (SELECT storage_mib_seconds($1::uuid, $2::timestamptz, $3::timestamptz) AS storage_mib_seconds) m
+WHERE h.team_id = $1 AND h.hour_start = $2 AND m.storage_mib_seconds IS NOT NULL`, job.TeamID, job.HourStart, job.HourEnd)
+	return err
 }
 
 func upsertCompleteRollupUsage(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, job rollupJob) error {
@@ -251,9 +325,16 @@ func upsertCompleteRollupUsage(ctx context.Context, pool *pgxpool.Pool, q *db.Qu
 			return flagErr
 		}
 		if enabled {
-			// The upsert's snapshot was incomplete even if a worker has now
-			// committed. Retry the aggregation instead of completing an empty job.
-			return ErrStorageReportsIncomplete
+			// Owner creation isn't fenced, so a new obligation can commit
+			// between the gate and the upsert; only a complete hour is unknown.
+			complete, err := storageReportsCompleteThrough(ctx, tx, job.TeamID, job.HourEnd)
+			if err != nil {
+				return fmt.Errorf("check storage report completeness: %w", err)
+			}
+			if !complete {
+				return ErrStorageReportsIncomplete
+			}
+			return errStorageUsageUnknown
 		}
 		err = nil
 	}
@@ -263,25 +344,25 @@ func upsertCompleteRollupUsage(ctx context.Context, pool *pgxpool.Pool, q *db.Qu
 	return tx.Commit(ctx)
 }
 
-func deferIncompleteRollupJob(ctx context.Context, pool *pgxpool.Pool, jobID uuid.UUID, workerID string) error {
-	// Claiming reserves one attempt; waiting for accepted storage reports is
-	// not a failed rollup and must not consume its retry budget.
+func deferRollupJob(ctx context.Context, pool *pgxpool.Pool, jobID uuid.UUID, workerID string, cause error, reason string, delay time.Duration) error {
+	// Claiming reserves one attempt; waiting on storage measurements is not a
+	// failed rollup and must not consume its retry budget.
 	const query = `
 UPDATE billing_rollup_job
 SET status = 'pending',
     attempt_count = GREATEST(attempt_count - 1, 0),
     locked_by = NULL,
     locked_until = NULL,
-    next_attempt_at = now() + interval '30 seconds',
-    last_error = 'storage reports incomplete',
+    next_attempt_at = now() + $3 * interval '1 second',
+    last_error = $4,
     updated_at = now()
 WHERE id = $1
   AND locked_by = $2`
-	_, err := pool.Exec(ctx, query, jobID, workerID)
+	_, err := pool.Exec(ctx, query, jobID, workerID, delay.Seconds(), reason)
 	if err != nil {
 		return err
 	}
-	return ErrStorageReportsIncomplete
+	return cause
 }
 
 func claimSchedulerLease(ctx context.Context, pool *pgxpool.Pool, workerID string, lockedUntil time.Time) (bool, error) {
@@ -654,7 +735,9 @@ WITH candidate AS (
               AND locked_until <= now()
           )
       )
-    ORDER BY hour_start ASC, updated_at ASC
+    -- Deferred jobs requeue behind work that has waited longer; ordering by
+    -- hour_start let unresolvable old hours starve every newer job.
+    ORDER BY next_attempt_at ASC, hour_start ASC
     LIMIT $2
     FOR UPDATE SKIP LOCKED
 )

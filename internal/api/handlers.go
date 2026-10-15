@@ -178,13 +178,6 @@ type Handlers struct {
 	trialWarningAfter     uuid.UUID
 	trialWarningPending   map[uuid.UUID]struct{}
 
-	// trialEligibilityAfter advances one bounded eligibility page per sweep.
-	// Keeping the cursor on the handler prevents a large historical trial
-	// population from restarting at the UUID prefix every tick.
-	trialEligibilityMu         sync.Mutex
-	trialEligibilityAfter      uuid.UUID
-	trialEligibilityAfterValid bool
-
 	// asyncMu/asyncCond/asyncCount track fire-and-forget bookkeeping goroutines
 	// (ActivateSandbox, FinalizePause) so tests can wait for quiescence;
 	// production never waits. Not a sync.WaitGroup: concurrent requests Add
@@ -198,6 +191,9 @@ type Handlers struct {
 	// answers; zero means the default. The sweeper finishes whatever did
 	// not fit.
 	TeardownInlineBudget time.Duration
+	// TrackedStorageBudget bounds the direct storage figure on billing pages;
+	// zero means the default.
+	TrackedStorageBudget time.Duration
 	// inlineTeardowns caps how many inline reclaims may hold a vmd RPC at
 	// once on this replica; a delete that finds it full leaves its reclaim
 	// to the sweeper. Lazily set up so struct-literal construction in tests
@@ -772,6 +768,12 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		return nil, ""
 	}
 	deadline := time.Now().Add(activateSettleWindow)
+	// A pause the owner was just told succeeded may still be finalizing. It
+	// is waited out as an explicit resume waits, so the caller gets a running
+	// sandbox. Only 'pausing' waits: a failed sandbox keeps its 409, which is
+	// how callers tell failed from busy.
+	var pausingDeadline, pauseWaitStart time.Time
+	pausePoll, pauseReads := pausingSettlePollStart, 0
 	for {
 		row, err := h.DB.GetSandboxWithPreviewPolicyForRouting(c.Request.Context(), db.GetSandboxWithPreviewPolicyForRoutingParams{
 			ID:     sandboxID,
@@ -788,6 +790,15 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		}
 		sandbox := row.Sandbox
 		c.Set("routing_observed_at", row.RoutingObservedAt)
+		if pauseReads > 0 && sandbox.Status != db.SandboxStatusPausing {
+			result := telemetry.SettleResultDiverged
+			if sandbox.Status == db.SandboxStatusPaused {
+				result = telemetry.SettleResultSettled
+			}
+			recordActivateSettleWait(c, &sandbox, result, pauseWaitStart, pauseReads+1)
+			// Reported once: a settle into 'resuming' keeps this loop re-reading.
+			pauseReads = 0
+		}
 		switch sandbox.Status {
 		case db.SandboxStatusActive:
 			return &sandbox, row.Access
@@ -820,11 +831,51 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			}
 			respondError(c, ErrInvalidState)
 			return nil, ""
+		case db.SandboxStatusPausing:
+			if pauseReads == 0 {
+				pausingDeadline, pauseWaitStart = time.Now().Add(pausingSettleWindow), time.Now()
+			}
+			pauseReads++
+			if time.Now().Before(pausingDeadline) {
+				// Context-aware, as the resume's wait: a client that has gone
+				// is released at cancellation rather than at the next poll.
+				timer := time.NewTimer(pausePoll)
+				select {
+				case <-timer.C:
+					pausePoll = nextSettlePollInterval(pausePoll)
+					continue
+				case <-c.Request.Context().Done():
+					timer.Stop()
+					recordActivateSettleWait(c, &sandbox, telemetry.SettleResultCanceled, pauseWaitStart, pauseReads)
+					respondStillPausing(c)
+					return nil, ""
+				}
+			}
+			recordActivateSettleWait(c, &sandbox, telemetry.SettleResultTimeout, pauseWaitStart, pauseReads)
+			respondStillPausing(c)
+			return nil, ""
 		default:
 			respondError(c, ErrInvalidState)
 			return nil, ""
 		}
 	}
+}
+
+// respondStillPausing answers a pause that outlived the settle window: a
+// conflict the caller can tell from a failed sandbox, and retry.
+func respondStillPausing(c *gin.Context) {
+	c.Header("Retry-After", "1")
+	respondError(c, ErrSandboxPausing)
+}
+
+// recordActivateSettleWait reports a wait for a pause in flight on the
+// resume settle series: an activate is a resume with a lookup in front.
+func recordActivateSettleWait(c *gin.Context, sandbox *db.Sandbox, result string, start time.Time, reads int) {
+	waited := time.Since(start)
+	l := sandboxLogger(sandbox.ID.String(), sandbox.HostID)
+	l.Warn().Dur("waited", waited).Int("reads", reads).Str("result", result).
+		Msg("activate waited for a pause in flight to settle")
+	RecordResumeSettleWait(c.Request.Context(), result, sandbox.HostID, waited, reads)
 }
 
 // resumePausedSandbox restores the VM, reapplies network config, and flips
@@ -1641,6 +1692,10 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 			// A settle-window 409 is the slowest lookup there is; it must
 			// land there, not vanish into a claim that never happened.
 			tLookupDone = time.Time{}
+			if sandbox.Status == db.SandboxStatusPausing {
+				respondStillPausing(c)
+				return false
+			}
 			respondError(c, ErrInvalidState)
 			return false
 		}
@@ -2064,6 +2119,21 @@ func (h *Handlers) teardownVM(ctx context.Context, sandboxID uuid.UUID, hostID s
 // at sandboxBasePath was the last reference and the template has moved on.
 // Nothing to do is not an error; a step that did not run is, so the reclaim
 // is retried rather than recorded complete with the dir still there.
+// refusedInsertResponse turns the reachability probe's outcome into the answer
+// a create gets when its insert was refused. A probe that failed leaves the
+// template unknown rather than absent, and the three outcomes differ in what
+// the caller should do: retry the request, read the template again, or stop.
+func refusedInsertResponse(probeErr error, servable bool) (code, message string, status int) {
+	switch {
+	case probeErr != nil:
+		return "service_unavailable", sandboxCreateTransientResponseMessage, http.StatusServiceUnavailable
+	case servable:
+		return "template_rebuilt", "Template was rebuilt during create; retry", http.StatusConflict
+	default:
+		return "not_found", "Template not found", http.StatusNotFound
+	}
+}
+
 func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sandboxBasePath *string, sandboxTemplateID pgtype.UUID) error {
 	if sandboxBasePath == nil || !sandboxTemplateID.Valid {
 		return nil
@@ -3319,14 +3389,33 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	dbErr := insertRes.err
 
 	// 0 rows from the source's insert = the template or snapshot was deleted
-	// mid-create.
+	// mid-create, or the template moved to a newer generation while this
+	// create held the paths it read.
 	sourceRace := (templateID.Valid || sourceSnapshotID != uuid.Nil) && errors.Is(dbErr, pgx.ErrNoRows)
 	respondSourceGone := func() {
 		if sourceSnapshotID != uuid.Nil {
 			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
 			return
 		}
-		respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+		// Only on this path, so the probe costs nothing on a normal create. A
+		// template that is still servable was rebuilt under us: saying "not
+		// found" about a template that exists is both wrong and unretryable,
+		// and the cached entry would hand the next attempt the same stale
+		// generation.
+		probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 5*time.Second)
+		servable, probeErr := h.DB.TemplateStillServable(probeCtx, db.TemplateStillServableParams{
+			TemplateID: templateID.Bytes, TeamID: teamID, SystemTeamID: h.systemTeamID(),
+		})
+		probeCancel()
+		// The cached entry named the generation this insert just refused, so it
+		// is stale whichever way the probe went.
+		InvalidateTemplateCache(templateID.Bytes)
+		if probeErr != nil {
+			log.Warn().Err(probeErr).Str("template_id", uuid.UUID(templateID.Bytes).String()).
+				Msg("create: template reachability unknown after a refused insert")
+		}
+		code, msg, status := refusedInsertResponse(probeErr, servable)
+		respondErrorMsg(c, code, msg, status)
 	}
 
 	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.

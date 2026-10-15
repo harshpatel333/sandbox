@@ -20,7 +20,7 @@ func TestBillingMetricsBoundLabelsAndKeepUnknownProviderDistinct(t *testing.T) {
 	}
 	r.RecordBillingWork(ctx, "raw-secret", true, time.Second, 2)
 	r.RecordBillingLag(ctx, 3600)
-	for _, state := range []string{"pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted"} {
+	for _, state := range []string{"pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted", "entitlement_paid_missing", "entitlement_debt_unknown"} {
 		r.RecordBillingBacklog(ctx, state, 3, 90)
 	}
 	r.RecordBillingReconciliation(ctx, "raw-secret", 10, nil, nil)
@@ -46,7 +46,7 @@ func TestBillingMetricsBoundLabelsAndKeepUnknownProviderDistinct(t *testing.T) {
 					}
 				}
 			case "billing_event_backlog_capped":
-				if points := m.Data.(metricdata.Gauge[int64]).DataPoints; len(points) != 6 {
+				if points := m.Data.(metricdata.Gauge[int64]).DataPoints; len(points) != 8 {
 					t.Fatalf("collapsed event states: %+v", points)
 				}
 			case "billing_reconciliation_total":
@@ -78,5 +78,50 @@ func TestBillingMetricsBoundLabelsAndKeepUnknownProviderDistinct(t *testing.T) {
 		if !seen[name] {
 			t.Errorf("missing instrument %s", name)
 		}
+	}
+}
+
+func TestProBillingBacklogClearsAndBoundsLabels(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer provider.Shutdown(ctx)
+	r := &OTelRecorder{}
+	if err := r.initBilling(provider.Meter("test")); err != nil {
+		t.Fatal(err)
+	}
+	r.RecordProBillingBacklog(ctx, "pro_monthly", 3, 700, 4, 1000)
+	r.RecordProBillingBacklog(ctx, "pro_monthly", 0, 0, 0, 0)
+	r.RecordProBillingBacklog(ctx, "unbounded-customer", 2000, 900, 2000, 1800)
+	var data metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &data); err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, scope := range data.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "billing_pro_paid_activation_pending" && m.Name != "billing_pro_recovery_overdue" {
+				continue
+			}
+			seen++
+			for _, point := range m.Data.(metricdata.Gauge[int64]).DataPoints {
+				v, _ := point.Attributes.Value("offer")
+				switch v.AsString() {
+				case "pro_monthly":
+					if point.Value != 0 {
+						t.Fatal("recovered backlog did not clear")
+					}
+				case "unknown":
+					if point.Value != 1000 {
+						t.Fatal("backlog is unbounded")
+					}
+				default:
+					t.Fatal("unbounded offer label")
+				}
+			}
+		}
+	}
+	if seen != 2 {
+		t.Fatal("missing Pro backlog instruments")
 	}
 }

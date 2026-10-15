@@ -57,3 +57,7 @@ func ProcessJobsForTest(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, 
 	cfg = normalizeConfig(cfg)
 	processJobs(ctx, pool, q, cfg, workerID)
 }
+
+func MeasureUnbilledStorageForTest(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, hourStart time.Time) error {
+	return measureUnbilledRollupStorage(ctx, pool, rollupJob{TeamID: teamID, HourStart: hourStart, HourEnd: hourStart.Add(time.Hour)})
+}

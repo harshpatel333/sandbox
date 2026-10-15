@@ -309,6 +309,26 @@ func TestStripeCreditBalancePreservesKnownZero(t *testing.T) {
 	}
 }
 
+func TestStripeCreditBalanceTreatsNoGrantsAsKnownZero(t *testing.T) {
+	transport := &stripeCreditBalanceRoundTripper{body: `{"object":"billing.credit_balance_summary","balances":[]}`}
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	got, err := client.GetCustomerCreditBalance(t.Context(), "cus_example")
+	if err != nil {
+		t.Fatalf("customer without grants should have a known zero balance: %v", err)
+	}
+	if got.AvailableUSD != 0 {
+		t.Fatalf("available credit = %v, want 0", got.AvailableUSD)
+	}
+}
+
+func TestStripeCreditBalanceRejectsMissingBalances(t *testing.T) {
+	transport := &stripeCreditBalanceRoundTripper{body: `{"object":"billing.credit_balance_summary"}`}
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	if _, err := client.GetCustomerCreditBalance(t.Context(), "cus_example"); err == nil {
+		t.Fatal("expected a response without balances to be unavailable")
+	}
+}
+
 func TestStripeCreditBalanceDoesNotTruncateAggregateBalances(t *testing.T) {
 	var balances strings.Builder
 	balances.WriteString(`{"balances":[`)

@@ -89,7 +89,7 @@ func TestComputeRestrictionExplicitResumeStateResponses(t *testing.T) {
 	}{
 		{name: "active", statuses: []db.SandboxStatus{db.SandboxStatusActive}, want: http.StatusConflict, code: "conflict"},
 		{name: "missing", want: http.StatusNotFound, code: "not_found"},
-		{name: "pausing", statuses: []db.SandboxStatus{db.SandboxStatusPausing}, want: http.StatusConflict, code: "conflict"},
+		{name: "pausing", statuses: []db.SandboxStatus{db.SandboxStatusPausing}, want: http.StatusConflict, code: "sandbox_pausing"},
 		{name: "pause reverted", statuses: []db.SandboxStatus{db.SandboxStatusPausing, db.SandboxStatusActive}, want: http.StatusConflict, code: "conflict"},
 		{name: "pause completed", statuses: []db.SandboxStatus{db.SandboxStatusPausing, db.SandboxStatusPaused}, want: http.StatusForbidden, code: "abuse_denied"},
 	} {

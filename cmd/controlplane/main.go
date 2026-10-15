@@ -406,7 +406,7 @@ func run() error {
 		}
 		return c, err
 	}
-	buildCfg := supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID)
+	buildCfg := supervisor.DefaultBuildSupervisorConfig()
 	buildCfg.Cell = cfg.TemplateBuildRegion
 	buildCfg.PublicationBucket = cfg.TemplateBackupBucket
 	buildSupervisor := supervisor.NewBuildSupervisor(buildCfg, queries, buildResolver).
@@ -444,6 +444,8 @@ func run() error {
 	handlers.StartInvoiceEnrollmentService(ctx)
 	handlers.StartInvoiceReconciliationService(ctx)
 	handlers.StartStripeCheckoutAssociationMonitor(ctx)
+	handlers.StartProPaymentReconciliation(ctx)
+	handlers.StartUsageEntitlementService(ctx)
 
 	// Quota watcher: alerts when a team crosses 80% of a resource limit. Fans out
 	// to a Slack webhook and an email notifier; each channel is independently
