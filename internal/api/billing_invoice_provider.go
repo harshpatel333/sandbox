@@ -208,45 +208,6 @@ func (c *stripeHTTPClient) ensureInvoiceSubscriptionValidated(ctx context.Contex
 	return a, nil
 }
 
-func (c *stripeHTTPClient) billingCycleInvoice(ctx context.Context, a invoiceAccount, start, end int64) (StripeInvoiceAmounts, error) {
-	var list struct {
-		Data    []StripeInvoiceAmounts `json:"data"`
-		HasMore bool                   `json:"has_more"`
-	}
-	query := url.Values{"subscription": {a.Subscription}, "limit": {"100"}}
-	if err := c.doForm(ctx, http.MethodGet, "/v1/invoices?"+query.Encode(), nil, &list, ""); err != nil {
-		return StripeInvoiceAmounts{}, err
-	}
-	var match *StripeInvoiceAmounts
-	for _, candidate := range list.Data {
-		if candidate.BillingReason != "subscription_cycle" || candidate.Status == "void" || candidate.PeriodStart != start || candidate.PeriodEnd != end {
-			continue
-		}
-		invoice, err := c.RetrieveBillingInvoice(ctx, candidate.ID)
-		if err != nil {
-			return invoice, err
-		}
-		found := invoice.PeriodStart == start && invoice.PeriodEnd == end
-		if found {
-			if match != nil {
-				return invoice, fmt.Errorf("multiple cycle invoices for period")
-			}
-			v := invoice
-			match = &v
-		}
-	}
-	if match == nil {
-		return StripeInvoiceAmounts{}, fmt.Errorf("waiting for the scheduled renewal invoice")
-	}
-	if list.HasMore {
-		return *match, fmt.Errorf("invoice inventory exceeds reconciliation scan limit")
-	}
-	if match.Customer != a.Customer || match.Currency != "usd" || match.Parent.SubscriptionDetails == nil || match.Parent.SubscriptionDetails.Subscription != a.Subscription {
-		return *match, fmt.Errorf("invoice association changed")
-	}
-	return *match, nil
-}
-
 // A tentative attempt timestamp is not proof that collection was held. Rescue
 // eligible drafts and exclude renewals that were already outside our protection.
 func (c *stripeHTTPClient) invoiceEnrollmentBoundary(ctx context.Context, a invoiceAccount, attempt time.Time) (time.Time, error) {
