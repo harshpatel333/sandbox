@@ -67,7 +67,8 @@ CREATE TRIGGER billing_contract_plan_limits
     FOR EACH ROW WHEN (OLD.status IS DISTINCT FROM NEW.status AND NEW.status IN ('active', 'ended'))
     EXECUTE FUNCTION billing_contract_apply_plan_limits();
 
-SELECT apply_plan_limits(team_id, offer_key) FROM billing_commercial_contract WHERE status = 'active';
+SELECT apply_plan_limits(team_id, offer_key) FROM billing_commercial_contract
+WHERE status = 'active' AND (ends_at IS NULL OR ends_at > clock_timestamp());
 
 DO $$
 DECLARE r text;
