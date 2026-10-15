@@ -54,6 +54,14 @@ func (f *machineAdminFixture) ReadPrincipal(ctx context.Context, principal uuid.
 	f.principalID = principal
 	return auth.MachinePrincipal{PrincipalID: principal, Generation: 7, Status: auth.PrincipalActive}, f.called(ctx, "read")
 }
+func (f *machineAdminFixture) ReadCredential(ctx context.Context, principal, credential uuid.UUID) (auth.MachineCredential, error) {
+	f.principalID, f.replacementID = principal, credential
+	return auth.MachineCredential{PrincipalID: principal, CredentialID: credential, LineageID: uuid.New(), State: auth.CredentialRevoked, ExpiresAt: time.Unix(100, 0), RevocationGeneration: 7}, f.called(ctx, "read_credential")
+}
+func (f *machineAdminFixture) RevokeCredentialScoped(ctx context.Context, principal, credential uuid.UUID, generation int64) error {
+	f.principalID, f.replacementID, f.generation = principal, credential, generation
+	return f.called(ctx, "revoke_scoped")
+}
 func (f *machineAdminFixture) mutate(ctx context.Context, action string, principal uuid.UUID, material string, generation int64, operation uuid.UUID) (auth.MachineCredential, error) {
 	f.principalID, f.material, f.generation, f.operationID = principal, material, generation, operation
 	return auth.MachineCredential{CredentialID: uuid.New(), PrincipalID: principal, LineageID: uuid.New(), State: auth.CredentialActive, ExpiresAt: time.Now().Add(time.Hour), RevocationGeneration: uint64(generation)}, f.called(ctx, action)
@@ -109,6 +117,8 @@ func TestMachineAdministrationOperatorBoundary(t *testing.T) {
 		{"POST", "/principals/" + id + "/credentials/issue"}, {"POST", "/principals/" + id + "/credentials/rotate"},
 		{"POST", "/principals/" + id + "/credentials/restore"}, {"POST", "/principals/" + id + "/disable"},
 		{"POST", "/credentials/" + id + "/revoke"},
+		{"GET", "/principals/" + id + "/credentials/" + id},
+		{"POST", "/principals/" + id + "/credentials/revoke"},
 	}
 	for _, route := range routes {
 		for _, token := range []string{"", "test-infrastructure-only", "test-runtime-key"} {
@@ -124,6 +134,53 @@ func TestMachineAdministrationOperatorBoundary(t *testing.T) {
 	}
 	if len(fixture.calls) != 0 {
 		t.Fatalf("unauthorized calls reached authority: %v", fixture.calls)
+	}
+}
+
+func TestMachineCredentialReconciliationTransport(t *testing.T) {
+	f := &machineAdminFixture{}
+	router := machineAdminRouter(t, f)
+	principal, credential := uuid.New(), uuid.New()
+	path := "/internal/machine-identity/principals/" + principal.String() + "/credentials/"
+	response := machineAdminRequest(router, "GET", path+credential.String(), "", "test-operator-only", false)
+	if response.Code != http.StatusOK || f.principalID != principal || f.replacementID != credential || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("metadata response: %d %s", response.Code, response.Body)
+	}
+	requireExactKeys(t, response.Body.Bytes(), []string{"credential_id", "principal_id", "lineage_id", "state", "expires_at", "revocation_generation"})
+	if !strings.Contains(response.Body.String(), `"state":"revoked"`) {
+		t.Fatal("reconciliation hid revoked state")
+	}
+	body := `{"credential_id":"` + credential.String() + `","expected_generation":7}`
+	response = machineAdminRequest(router, "POST", path+"revoke", body, "test-operator-only", false)
+	if response.Code != http.StatusNoContent || f.principalID != principal || f.replacementID != credential || f.generation != 7 {
+		t.Fatalf("scoped revoke dispatch: %d %s", response.Code, response.Body)
+	}
+	for _, invalid := range []string{`{}`, `null`, `{"credential_id":"` + credential.String() + `","expected_generation":0}`, body + `{}`, strings.TrimSuffix(body, "}") + `,"operation_id":"` + uuid.NewString() + `"}`} {
+		before := len(f.calls)
+		response = machineAdminRequest(router, "POST", path+"revoke", invalid, "test-operator-only", false)
+		if response.Code != http.StatusBadRequest || len(f.calls) != before {
+			t.Fatalf("invalid revoke reached authority: %d", response.Code)
+		}
+	}
+	f.err = pgx.ErrNoRows
+	response = machineAdminRequest(router, "GET", path+credential.String(), "", "test-operator-only", false)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("missing metadata status %d", response.Code)
+	}
+	response = machineAdminRequest(router, "POST", path+"revoke", body, "test-operator-only", false)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("missing revoke target status %d", response.Code)
+	}
+	f.err = errors.New("sensitive database details")
+	for _, method := range []string{"GET", "POST"} {
+		suffix := credential.String()
+		if method == "POST" {
+			suffix = "revoke"
+		}
+		response = machineAdminRequest(router, method, path+suffix, body, "test-operator-only", false)
+		if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "sensitive") {
+			t.Fatalf("unsafe reconciliation error: %d %s", response.Code, response.Body)
+		}
 	}
 }
 
