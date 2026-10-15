@@ -24,31 +24,40 @@ import (
 )
 
 type proProviderFixture struct {
-	rounded, held                                  bool
-	failEnrollment, failChargeLookup               bool
-	holdResumesAt                                  int64
-	creditNote, refund                             int64
-	mu                                             sync.Mutex
-	team                                           uuid.UUID
-	customer, sub, session, offer, price, interval string
-	amount                                         int64
-	anchor, baseStart, baseEnd                     int64
-	metadata                                       map[string]string
-	status                                         string
-	paid, failCreate                               bool
-	rejection                                      int
-	subStatus                                      string
-	wrongRate, wrongMeter                          bool
-	payOnTerminalInventory                         bool
-	handlers                                       *api.Handlers
-	creates                                        int
-	keys                                           []string
+	rounded, held                                     bool
+	resourcesAttached, failAttach, loseAttachResponse bool
+	attachCalls                                       int
+	attachKeys                                        []string
+	failEnrollment, failChargeLookup                  bool
+	holdResumesAt                                     int64
+	creditNote, refund                                int64
+	mu                                                sync.Mutex
+	team                                              uuid.UUID
+	customer, sub, session, offer, price, interval    string
+	amount                                            int64
+	anchor, baseStart, baseEnd                        int64
+	metadata                                          map[string]string
+	status                                            string
+	paid, failCreate                                  bool
+	cancelAtPeriodEnd                                 bool
+	cancelAt                                          int64
+	loseCancelResponse                                bool
+	resumeOnResourceRead                              bool
+	cancelOnResourceRead                              bool
+	rejection                                         int
+	subStatus                                         string
+	wrongRate, wrongMeter                             bool
+	payOnTerminalInventory                            bool
+	handlers                                          *api.Handlers
+	creates                                           int
+	keys                                              []string
 }
 
 func newProFixture(t *testing.T, offer string) (*proProviderFixture, *gin.Engine, string) {
 	t.Helper()
 	team, key, _ := seedTeamAndKeyWithRole(t, "team_owner")
 	f := &proProviderFixture{team: team, customer: "cus_" + team.String(), sub: "sub_" + team.String(), session: "cs_" + strings.ReplaceAll(team.String(), "-", ""), offer: offer, price: "price_" + offer, interval: "month", amount: 120000, status: "open"}
+	f.resourcesAttached = offer != "pro_annual"
 	anchor := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
 	f.anchor, f.baseStart, f.baseEnd = anchor.Unix(), anchor.Unix(), anchor.AddDate(0, 1, 0).Unix()
 	if offer == "pro_annual" {
@@ -90,11 +99,50 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 		write(map[string]any{"data": []any{map[string]any{"id": f.sub, "status": f.subscriptionStatus()}}})
 	case r.URL.Path == "/v1/subscriptions/"+f.sub && r.Method == "POST":
 		_ = r.ParseForm()
-		f.held = r.Form.Get("pause_collection[behavior]") == "keep_as_draft"
+		if r.Form.Has("cancel_at_period_end") {
+			f.cancelAtPeriodEnd = r.Form.Get("cancel_at_period_end") == "true"
+		}
+		if r.Form.Has("cancel_at") {
+			f.cancelAt, _ = strconv.ParseInt(r.Form.Get("cancel_at"), 10, 64)
+			f.cancelAtPeriodEnd = false
+			if f.loseCancelResponse {
+				http.Error(w, "lost cancellation response", 500)
+				return
+			}
+		}
+		if r.Form.Get("items[0][price]") != "" {
+			f.attachCalls++
+			f.attachKeys = append(f.attachKeys, r.Header.Get("Idempotency-Key"))
+			if f.failAttach {
+				http.Error(w, "injected attachment failure", 500)
+				return
+			}
+			if r.Form.Get("items[0][price]") != "price_cpu" || r.Form.Get("items[1][price]") != "price_memory" || r.Form.Get("items[2][price]") != "price_storage" || r.Form.Get("items[3][price]") != "" || r.Form.Get("proration_behavior") != "none" || r.Form.Get("billing_cycle_anchor") != "" || r.Form.Get("metadata[pro_usage_attached]") != f.metadata["checkout_generation"] {
+				http.Error(w, "invalid attachment terms", 400)
+				return
+			}
+			f.resourcesAttached = true
+			if f.cancelAtPeriodEnd {
+				f.cancelAt = time.Unix(f.anchor, 0).UTC().AddDate(0, 1, 0).Unix()
+			}
+			f.metadata["pro_usage_attached"] = r.Form.Get("metadata[pro_usage_attached]")
+			if f.loseAttachResponse {
+				http.Error(w, "lost attachment response", 500)
+				return
+			}
+		} else if r.Form.Has("pause_collection[behavior]") {
+			f.held = r.Form.Get("pause_collection[behavior]") == "keep_as_draft"
+		}
 		write(map[string]any{})
 	case r.URL.Path == "/v1/prices/"+f.price:
 		write(basePrice)
 	case strings.HasPrefix(r.URL.Path, "/v1/prices/price_"):
+		if f.resumeOnResourceRead {
+			f.cancelAtPeriodEnd, f.cancelAt, f.resumeOnResourceRead = false, 0, false
+		}
+		if f.cancelOnResourceRead {
+			f.cancelAtPeriodEnd, f.cancelAt, f.cancelOnResourceRead = true, f.baseEnd, false
+		}
 		p := strings.TrimPrefix(r.URL.Path, "/v1/prices/")
 		write(map[string]any{"id": p, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": f.resourceRate(p), "recurring": map[string]any{"usage_type": "metered", "interval": "month", "interval_count": 1, "meter": f.resourceMeter(p)}})
 	case r.URL.Path == "/v1/customers":
@@ -105,6 +153,10 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 		f.keys = append(f.keys, r.Header.Get("Idempotency-Key"))
 		if r.Form.Get("subscription_data[billing_mode][type]") != "flexible" {
 			http.Error(w, "missing flexible billing", 400)
+			return
+		}
+		if f.offer == "pro_annual" && (r.Form.Get("line_items[0][price]") != f.price || r.Form.Get("line_items[0][quantity]") != "1" || r.Form.Get("line_items[1][price]") != "") {
+			http.Error(w, "Checkout does not support prices with different billing intervals", 400)
 			return
 		}
 		f.metadata = map[string]string{}
@@ -135,7 +187,10 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 		write(map[string]any{"id": f.session, "customer": f.customer, "client_reference_id": f.team.String(), "mode": "subscription", "status": f.status, "payment_status": paid, "subscription": sub, "metadata": f.metadata})
 	case r.URL.Path == "/v1/subscriptions/"+f.sub:
 		items := []any{map[string]any{"id": "si_base", "quantity": 1, "price": basePrice, "current_period_start": f.baseStart, "current_period_end": f.baseEnd}}
-		resourcePrices := []string{"price_cpu", "price_memory", "price_storage"}
+		var resourcePrices []string
+		if f.resourcesAttached {
+			resourcePrices = []string{"price_cpu", "price_memory", "price_storage"}
+		}
 		if f.rounded {
 			resourcePrices = append(resourcePrices, "price_round")
 		}
@@ -147,7 +202,7 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 				return map[string]any{"behavior": "keep_as_draft", "resumes_at": f.holdResumesAt}
 			}
 			return nil
-		}(), "start_date": f.anchor, "billing_cycle_anchor": f.anchor, "billing_mode": map[string]any{"type": "flexible"}, "metadata": f.metadata, "items": map[string]any{"data": items}})
+		}(), "cancel_at": f.cancelAt, "cancel_at_period_end": f.cancelAtPeriodEnd, "start_date": f.anchor, "billing_cycle_anchor": f.anchor, "billing_mode": map[string]any{"type": "flexible"}, "metadata": f.metadata, "items": map[string]any{"data": items}})
 	case r.URL.Path == "/v1/billing/meters":
 		meters := []any{}
 		for p, event := range map[string]string{"price_cpu": "cpu_vcpu_hours", "price_memory": "memory_gib_hours", "price_storage": "storage_gib_hours", "price_round": "invoice_rounding_cents_v1"} {
@@ -762,6 +817,120 @@ func TestIntegration_ProActivationRetryRechecksInvoiceProtection(t *testing.T) {
 			f.held, f.rounded, f.holdResumesAt = true, true, 0
 			f.mu.Unlock()
 			assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
+		})
+	}
+}
+
+func TestIntegration_AnnualUsageAttachmentRecovery(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lost_response_%v", lost), func(t *testing.T) {
+			f, r, key := newProFixture(t, "pro_annual")
+			assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
+			f.mu.Lock()
+			f.status = "complete"
+			f.mu.Unlock()
+			assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "payment_confirmation_pending")
+			f.mu.Lock()
+			if f.attachCalls != 0 {
+				t.Fatal("attached usage before verified cash payment")
+			}
+			f.paid = true
+			f.failAttach = !lost
+			f.loseAttachResponse = lost
+			f.mu.Unlock()
+			assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 202, "payment_confirmation_pending")
+			assertProResponse(t, r, key, "/stripe/plan-choice", `{"offer":"free"}`, 409, "plan_conflict")
+			var pending bool
+			if err := testPool.QueryRow(t.Context(), `SELECT s.state='pending' AND s.paid_observed_at IS NOT NULL AND a.trial_ended_at IS NULL AND c.status='pending' AND (SELECT count(*) FROM billing_contract_payment WHERE team_id=$1)=1 AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement WHERE team_id=$1) FROM billing_signup_choice s JOIN team_billing_account a USING(team_id) JOIN billing_commercial_contract c USING(team_id) WHERE s.team_id=$1`, f.team).Scan(&pending); err != nil || !pending {
+				t.Fatalf("attachment failure lost paid fence: %v %v", pending, err)
+			}
+			// Reconfiguration must not alter the purchased usage catalog on retry.
+			f.handlers.Config.StripeCheckoutPriceIDs = []string{"price_new_cpu"}
+			f.mu.Lock()
+			f.failAttach = false
+			f.loseAttachResponse = false
+			f.mu.Unlock()
+			for range 2 {
+				assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			want := 2
+			if lost {
+				want = 1
+			}
+			if f.attachCalls != want {
+				t.Fatalf("attachment calls=%d want=%d", f.attachCalls, want)
+			}
+			if len(f.attachKeys) == 2 && f.attachKeys[0] != f.attachKeys[1] {
+				t.Fatal("attachment retry changed idempotency key")
+			}
+			var amount int64
+			var anchor time.Time
+			if err := testPool.QueryRow(t.Context(), `SELECT charge_amount_cents,entitlement_anchor FROM billing_commercial_contract WHERE team_id=$1 AND status='active'`, f.team).Scan(&amount, &anchor); err != nil || amount != 1200000 || anchor.Unix() != f.anchor {
+				t.Fatalf("annual contract changed: %d %v %v", amount, anchor, err)
+			}
+		})
+	}
+}
+
+func TestIntegration_AnnualAttachmentPreservesScheduledCancellation(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lost_normalization_response_%v", lost), func(t *testing.T) {
+			f, r, key := newProFixture(t, "pro_annual")
+			assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
+			f.mu.Lock()
+			f.status, f.paid, f.failAttach = "complete", true, true
+			f.mu.Unlock()
+			assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 202, "payment_confirmation_pending")
+			f.mu.Lock()
+			f.failAttach, f.cancelAtPeriodEnd = false, true
+			f.cancelAt, f.loseCancelResponse = f.baseEnd, lost
+			f.mu.Unlock()
+			if lost {
+				assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 202, "payment_confirmation_pending")
+			}
+			assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.cancelAt != f.baseEnd || f.cancelAtPeriodEnd || len(f.attachKeys) != 2 || f.attachKeys[0] != f.attachKeys[1] {
+				t.Fatalf("annual deadline or attachment replay changed: cancel=%d end=%d relative=%v keys=%v", f.cancelAt, f.baseEnd, f.cancelAtPeriodEnd, f.attachKeys)
+			}
+			var preserved bool
+			if err := testPool.QueryRow(t.Context(), `SELECT a.cancel_at_period_end AND c.status='active' AND c.charge_amount_cents=1200000 AND (SELECT count(*) FROM billing_contract_payment WHERE team_id=$1)=1 FROM team_billing_account a JOIN billing_commercial_contract c USING(team_id) WHERE a.team_id=$1`, f.team).Scan(&preserved); err != nil || !preserved {
+				t.Fatalf("scheduled cancellation forfeited paid term or enabled renewal: %v %v", preserved, err)
+			}
+		})
+	}
+}
+
+func TestIntegration_AnnualAttachmentRespectsChangedCancellation(t *testing.T) {
+	for _, scheduled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("scheduled_during_reads_%v", scheduled), func(t *testing.T) {
+			f, r, key := newProFixture(t, "pro_annual")
+			assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
+			f.mu.Lock()
+			f.status, f.paid, f.cancelAtPeriodEnd = "complete", true, !scheduled
+			if !scheduled {
+				f.cancelAt = f.baseEnd
+			}
+			f.resumeOnResourceRead, f.cancelOnResourceRead = !scheduled, scheduled
+			f.mu.Unlock()
+			assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 202, "payment_confirmation_pending")
+			assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			var deadline int64
+			if scheduled {
+				deadline = f.baseEnd
+			}
+			if f.cancelAtPeriodEnd || f.cancelAt != deadline {
+				t.Fatalf("changed cancellation intent: relative=%v deadline=%d want=%d", f.cancelAtPeriodEnd, f.cancelAt, deadline)
+			}
+			var canceled bool
+			if err := testPool.QueryRow(t.Context(), `SELECT cancel_at_period_end FROM team_billing_account WHERE team_id=$1`, f.team).Scan(&canceled); err != nil || canceled != scheduled {
+				t.Fatalf("stale local cancellation: %v %v", canceled, err)
+			}
 		})
 	}
 }
