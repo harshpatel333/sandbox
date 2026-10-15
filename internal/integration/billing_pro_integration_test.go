@@ -891,13 +891,28 @@ func TestIntegration_AnnualAttachmentPreservesScheduledCancellation(t *testing.T
 				assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 202, "payment_confirmation_pending")
 			}
 			assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
+			// A later subscription webhook must use Pro reconciliation, preserving
+			// explicit cancellation and the monthly usage period with annual first.
+			snapshot := httptest.NewRecorder()
+			f.serve(snapshot, httptest.NewRequest(http.MethodGet, "/v1/subscriptions/"+f.sub, nil))
+			payload, err := json.Marshal(map[string]any{"id": "evt_" + uuid.NewString(), "type": "customer.subscription.updated", "created": time.Now().Unix(), "data": map[string]any{"object": json.RawMessage(snapshot.Body.Bytes())}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/stripe/webhook", bytes.NewReader(payload))
+			req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now()))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("subscription webhook failed: %d %s", w.Code, w.Body.String())
+			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			if f.cancelAt != f.baseEnd || f.cancelAtPeriodEnd || len(f.attachKeys) != 2 || f.attachKeys[0] != f.attachKeys[1] {
 				t.Fatalf("annual deadline or attachment replay changed: cancel=%d end=%d relative=%v keys=%v", f.cancelAt, f.baseEnd, f.cancelAtPeriodEnd, f.attachKeys)
 			}
 			var preserved bool
-			if err := testPool.QueryRow(t.Context(), `SELECT a.cancel_at_period_end AND c.status='active' AND c.charge_amount_cents=1200000 AND (SELECT count(*) FROM billing_contract_payment WHERE team_id=$1)=1 FROM team_billing_account a JOIN billing_commercial_contract c USING(team_id) WHERE a.team_id=$1`, f.team).Scan(&preserved); err != nil || !preserved {
+			if err := testPool.QueryRow(t.Context(), `SELECT a.cancel_at_period_end AND a.current_period_start=$2 AND a.current_period_end=$3 AND c.status='active' AND c.charge_amount_cents=1200000 AND (SELECT count(*) FROM billing_contract_payment WHERE team_id=$1)=1 FROM team_billing_account a JOIN billing_commercial_contract c USING(team_id) WHERE a.team_id=$1`, f.team, time.Unix(f.anchor, 0), time.Unix(f.anchor, 0).UTC().AddDate(0, 1, 0)).Scan(&preserved); err != nil || !preserved {
 				t.Fatalf("scheduled cancellation forfeited paid term or enabled renewal: %v %v", preserved, err)
 			}
 		})
