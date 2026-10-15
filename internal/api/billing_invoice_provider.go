@@ -17,6 +17,7 @@ type invoiceSubscription struct {
 	EndedAt           int64             `json:"ended_at"`
 	StartDate         int64             `json:"start_date"`
 	CancelAtPeriodEnd bool              `json:"cancel_at_period_end"`
+	CancelAt          int64             `json:"cancel_at"`
 	Metadata          map[string]string `json:"metadata"`
 	BillingMode       struct {
 		Type string `json:"type"`
@@ -35,15 +36,17 @@ type invoiceSubscription struct {
 	} `json:"automatic_tax"`
 	BillingThresholds any `json:"billing_thresholds"`
 	Items             struct {
-		Data []struct {
-			ID       string       `json:"id"`
-			Quantity int64        `json:"quantity"`
-			Price    storagePrice `json:"price"`
-			Start    int64        `json:"current_period_start"`
-			End      int64        `json:"current_period_end"`
-		} `json:"data"`
-		HasMore bool `json:"has_more"`
+		Data    []invoiceSubscriptionItem `json:"data"`
+		HasMore bool                      `json:"has_more"`
 	} `json:"items"`
+}
+
+type invoiceSubscriptionItem struct {
+	ID       string       `json:"id"`
+	Quantity int64        `json:"quantity"`
+	Price    storagePrice `json:"price"`
+	Start    int64        `json:"current_period_start"`
+	End      int64        `json:"current_period_end"`
 }
 
 type invoiceAccount struct {
