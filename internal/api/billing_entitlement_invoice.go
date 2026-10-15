@@ -94,14 +94,21 @@ func (h *Handlers) prepareEntitlementCredits(ctx context.Context, p billing.Expo
 }
 
 func (h *Handlers) eligibleInvoiceCredits(ctx context.Context, customer string, end int64, prices []string, client *stripeHTTPClient) ([]billing.InvoiceCreditGrant, error) {
-	_, err := h.Pool.Exec(ctx, `INSERT INTO billing_invoice_credit_scan(customer_id,invoice_end) VALUES($1,$2) ON CONFLICT DO NOTHING`, customer, end)
+	ledger, inventory, err := h.creditScanVersion(ctx, customer, client)
 	if err != nil {
 		return nil, err
 	}
-	var after string
-	var saved []byte
-	if err = h.Pool.QueryRow(ctx, `SELECT cursor,credits FROM billing_invoice_credit_scan WHERE customer_id=$1 AND invoice_end=$2`, customer, end).Scan(&after, &saved); err != nil {
+	_, err = h.Pool.Exec(ctx, `INSERT INTO billing_invoice_credit_scan(customer_id,invoice_end,ledger_head,inventory_head) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, customer, end, ledger, inventory)
+	if err != nil {
 		return nil, err
+	}
+	var after, savedLedger, savedInventory string
+	var saved []byte
+	if err = h.Pool.QueryRow(ctx, `SELECT cursor,credits,ledger_head,inventory_head FROM billing_invoice_credit_scan WHERE customer_id=$1 AND invoice_end=$2`, customer, end).Scan(&after, &saved, &savedLedger, &savedInventory); err != nil {
+		return nil, err
+	}
+	if ledger != savedLedger || inventory != savedInventory {
+		return nil, h.restartInvoiceCreditScan(ctx, customer, end, after, ledger, inventory)
 	}
 	var result []billing.InvoiceCreditGrant
 	if err = json.Unmarshal(saved, &result); err != nil {
@@ -129,50 +136,11 @@ func (h *Handlers) eligibleInvoiceCredits(ctx context.Context, customer string, 
 	if more {
 		ids = ids[:50]
 	}
-	slots := make([]*billing.InvoiceCreditGrant, len(ids))
-	group, work := errgroup.WithContext(ctx)
-	group.SetLimit(8)
-	for i, id := range ids {
-		group.Go(func() error {
-			g, e := client.retrieveEntitlementGrant(work, id)
-			if e != nil {
-				return e
-			}
-			if g.Customer != customer {
-				return errors.New("credit grant customer changed")
-			}
-			if g.VoidedAt != 0 || g.EffectiveAt > end || (g.ExpiresAt != 0 && g.ExpiresAt <= end) {
-				return nil
-			}
-			if e = h.verifyOwnedEntitlementGrant(work, g); e != nil {
-				return e
-			}
-			balance, e := client.grantLedgerBalance(work, customer, id)
-			if e != nil {
-				return e
-			}
-			if balance == 0 {
-				return nil
-			}
-			if e = creditScope(g, customer, end, prices); e != nil {
-				return e
-			}
-			raw, e := json.Marshal(g)
-			if e != nil {
-				return e
-			}
-			slots[i] = &billing.InvoiceCreditGrant{ID: id, Before: balance, ExpiresAt: g.ExpiresAt, Evidence: raw}
-			return nil
-		})
-	}
-	if err = group.Wait(); err != nil {
+	page, err := h.refreshInvoiceCredits(ctx, customer, end, prices, ids, client)
+	if err != nil {
 		return nil, err
 	}
-	for _, g := range slots {
-		if g != nil {
-			result = append(result, *g)
-		}
-	}
+	result = append(result, page...)
 	if len(result) > 200 {
 		return nil, errors.New("positive eligible credit set exceeds per-invoice work budget; operator reconciliation required")
 	}
@@ -189,6 +157,25 @@ func (h *Handlers) eligibleInvoiceCredits(ctx context.Context, customer string, 
 			return nil, errors.New("credit scan changed concurrently")
 		}
 		return nil, errCreditInventoryPending
+	}
+	// Earlier pages may be minutes old. Refresh all positive candidates together
+	// before returning evidence that can authorize invoice finalization.
+	if after != "" {
+		positiveIDs := make([]string, len(result))
+		for i, g := range result {
+			positiveIDs[i] = g.ID
+		}
+		result, err = h.refreshInvoiceCredits(ctx, customer, end, prices, positiveIDs, client)
+		if err != nil {
+			return nil, err
+		}
+	}
+	finalLedger, finalInventory, err := h.creditScanVersion(ctx, customer, client)
+	if err != nil {
+		return nil, err
+	}
+	if finalLedger != ledger || finalInventory != inventory {
+		return nil, h.restartInvoiceCreditScan(ctx, customer, end, after, finalLedger, finalInventory)
 	}
 	tag, err := h.Pool.Exec(ctx, `DELETE FROM billing_invoice_credit_scan WHERE customer_id=$1 AND invoice_end=$2 AND cursor=$3`, customer, end, after)
 	if err != nil {
@@ -531,7 +518,7 @@ func (h *Handlers) verifyEntitlementForfeiture(ctx context.Context, contract uui
 			return nil
 		}
 	}
-	return errors.New("missing allowance lacks full-period nonpayment evidence; operator recovery required")
+	return h.discoverEntitlementForfeiture(ctx, contract, p, a, client)
 }
 
 // A scheduled cycle invoice cannot precede its service interval. There is no
@@ -603,4 +590,170 @@ func (h *Handlers) billingCycleInvoice(ctx context.Context, a invoiceAccount, st
 		return inv, errors.New("invoice association changed")
 	}
 	return inv, nil
+}
+
+func (h *Handlers) refreshInvoiceCredits(ctx context.Context, customer string, end int64, prices, ids []string, client *stripeHTTPClient) ([]billing.InvoiceCreditGrant, error) {
+	slots := make([]*billing.InvoiceCreditGrant, len(ids))
+	group, work := errgroup.WithContext(ctx)
+	group.SetLimit(8)
+	for i, id := range ids {
+		group.Go(func() error {
+			g, e := client.retrieveEntitlementGrant(work, id)
+			if e != nil {
+				return e
+			}
+			if g.Customer != customer {
+				return errors.New("credit grant customer changed")
+			}
+			if g.VoidedAt != 0 || g.EffectiveAt > end || (g.ExpiresAt != 0 && g.ExpiresAt <= end) {
+				return nil
+			}
+			if e = h.verifyOwnedEntitlementGrant(work, g); e != nil {
+				return e
+			}
+			balance, e := client.grantLedgerBalance(work, customer, id)
+			if e != nil {
+				return e
+			}
+			if balance == 0 {
+				return nil
+			}
+			if e = creditScope(g, customer, end, prices); e != nil {
+				return e
+			}
+			raw, e := json.Marshal(g)
+			if e != nil {
+				return e
+			}
+			slots[i] = &billing.InvoiceCreditGrant{ID: id, Before: balance, ExpiresAt: g.ExpiresAt, Evidence: raw}
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	result := []billing.InvoiceCreditGrant{}
+	for _, g := range slots {
+		if g != nil {
+			result = append(result, *g)
+		}
+	}
+	return result, nil
+}
+
+// A bounded existence check is enough to block issuance, but not to attribute a
+// whole missed period. Search older invoices when saved observations lack proof.
+func (h *Handlers) discoverEntitlementForfeiture(ctx context.Context, contract uuid.UUID, p billing.ExportPeriod, a invoiceAccount, client *stripeHTTPClient) error {
+	var after string
+	if err := h.Pool.QueryRow(ctx, `SELECT COALESCE(evidence->>'forfeiture_cursor','') FROM billing_entitlement_withheld WHERE contract_id=$1 AND period_start=$2`, contract, p.Start).Scan(&after); err != nil {
+		return err
+	}
+	q := url.Values{"customer": {a.Customer}, "limit": {"50"}, "created[lte]": {strconv.FormatInt(p.Start.Unix()+300, 10)}}
+	if after != "" {
+		q.Set("starting_after", after)
+	}
+	var page struct {
+		Data    []StripeInvoiceAmounts `json:"data"`
+		HasMore bool                   `json:"has_more"`
+	}
+	if err := client.doForm(ctx, http.MethodGet, "/v1/invoices?"+q.Encode(), nil, &page, ""); err != nil {
+		return err
+	}
+	invoices := make([]StripeInvoiceAmounts, len(page.Data))
+	fetch, work := errgroup.WithContext(ctx)
+	fetch.SetLimit(8)
+	for i, candidate := range page.Data {
+		fetch.Go(func() error {
+			if candidate.ID == "" || candidate.Customer != a.Customer {
+				return errors.New("historical debt inventory ownership mismatch")
+			}
+			inv, err := client.RetrieveBillingInvoice(work, candidate.ID)
+			if err != nil {
+				return err
+			}
+			if inv.ID != candidate.ID || inv.Customer != a.Customer {
+				return errors.New("historical debt ownership mismatch")
+			}
+			invoices[i] = inv
+			return nil
+		})
+	}
+	if err := fetch.Wait(); err != nil {
+		return err
+	}
+	for _, inv := range invoices {
+		if inv.BillingReason == "subscription_cycle" && inv.PeriodEnd == p.Start.Unix() && (inv.Parent.SubscriptionDetails == nil || inv.Parent.SubscriptionDetails.Subscription != a.Subscription) {
+			continue
+		}
+		if entitlementDebtSpansPeriod(inv, p.Start.Unix(), p.End.Unix()) {
+			_, err := h.Pool.Exec(ctx, `INSERT INTO billing_entitlement_debt(contract_id,period_start,invoice_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, contract, p.Start, inv.ID)
+			return err
+		}
+	}
+	next := ""
+	if page.HasMore {
+		if len(page.Data) == 0 {
+			return errors.New("incomplete historical debt page")
+		}
+		next = page.Data[len(page.Data)-1].ID
+		if next == after {
+			return errors.New("historical debt cursor did not advance")
+		}
+	}
+	tag, err := h.Pool.Exec(ctx, `UPDATE billing_entitlement_withheld SET evidence=jsonb_set(evidence,'{forfeiture_cursor}',to_jsonb($3::text)) WHERE contract_id=$1 AND period_start=$2 AND COALESCE(evidence->>'forfeiture_cursor','')=$4`, contract, p.Start, next, after)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("historical debt discovery changed concurrently")
+	}
+	if page.HasMore {
+		return errCreditInventoryPending
+	}
+	return errors.New("missing allowance lacks full-period nonpayment evidence; operator recovery required")
+}
+
+// Stripe's reverse-chronological list heads fence ledger and inventory changes,
+// including reinstated zero balances and new grants behind the local page cursor.
+func (h *Handlers) creditScanVersion(ctx context.Context, customer string, client *stripeHTTPClient) (string, string, error) {
+	heads := make([]string, 2)
+	for i, path := range []string{"credit_balance_transactions", "credit_grants"} {
+		var page struct {
+			Data *[]struct {
+				ID string `json:"id"`
+			} `json:"data"`
+			HasMore bool `json:"has_more"`
+		}
+		q := url.Values{"customer": {customer}, "limit": {"1"}}
+		if err := client.doForm(ctx, http.MethodGet, "/v1/billing/"+path+"?"+q.Encode(), nil, &page, ""); err != nil {
+			return "", "", err
+		}
+		if page.Data == nil || len(*page.Data) > 1 || (page.HasMore && len(*page.Data) == 0) {
+			return "", "", errors.New("incomplete credit scan version")
+		}
+		if len(*page.Data) == 1 {
+			heads[i] = (*page.Data)[0].ID
+			if heads[i] == "" {
+				return "", "", errors.New("empty credit scan version identity")
+			}
+		}
+	}
+	var indexed bool
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_entitlement_work w JOIN billing_commercial_contract c ON c.id=w.contract_id WHERE c.customer_id=$1 AND w.inventory_cursor IS NULL AND w.inventory_checked_at IS NOT NULL AND COALESCE(w.inventory_head,'')=$2)`, customer, heads[1]).Scan(&indexed); err != nil {
+		return "", "", err
+	}
+	if !indexed {
+		return "", "", errCreditInventoryPending
+	}
+	return heads[0], heads[1], nil
+}
+func (h *Handlers) restartInvoiceCreditScan(ctx context.Context, customer string, end int64, after, ledger, inventory string) error {
+	tag, err := h.Pool.Exec(ctx, `UPDATE billing_invoice_credit_scan SET cursor='',credits='[]',ledger_head=$4,inventory_head=$5 WHERE customer_id=$1 AND invoice_end=$2 AND cursor=$3`, customer, end, after, ledger, inventory)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("credit scan changed concurrently")
+	}
+	return errCreditInventoryPending
 }

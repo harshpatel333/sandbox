@@ -618,10 +618,12 @@ type BillingInvoiceClose struct {
 }
 
 type BillingInvoiceCreditScan struct {
-	CustomerID string `json:"customer_id"`
-	InvoiceEnd int64  `json:"invoice_end"`
-	Cursor     string `json:"cursor"`
-	Credits    []byte `json:"credits"`
+	CustomerID    string `json:"customer_id"`
+	InvoiceEnd    int64  `json:"invoice_end"`
+	Cursor        string `json:"cursor"`
+	Credits       []byte `json:"credits"`
+	LedgerHead    string `json:"ledger_head"`
+	InventoryHead string `json:"inventory_head"`
 }
 
 type BillingInvoiceDiscovery struct {

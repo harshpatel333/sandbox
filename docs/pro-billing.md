@@ -145,7 +145,12 @@ issuance does not enumerate old grants. Invoice checks select grants by the
 closing period and retrieve current evidence before using it. At most 200
 positive-balance grants may fund one close; larger simultaneously eligible sets
 require operator reconciliation. Candidate evaluation resumes in 50-grant pages,
-so depleted non-expiring history does not consume that limit. Expired grants from
+so depleted non-expiring history does not consume that limit. Before a completed
+scan can authorize finalization, all retained positive candidates are retrieved
+again to detect voids or consumption while earlier pages were saved. A change in
+the provider ledger or grant-inventory list head restarts the scan, including
+when a previously exhausted grant is reinstated. The provider inventory head
+must also match a completed local discovery pass. Expired grants from
 other monthly periods are excluded by the query. Delayed cycle-invoice discovery also saves its cursor
 between 100-invoice pages, with no upper creation-time cutoff.
 
@@ -161,7 +166,11 @@ creation time alone does not prove nonpayment: checks use finalized/payable
 time. A scheduled renewal has a five-minute close-processing budget after its
 boundary; later finalization or a retained platform incident requires manual
 review before forfeiture. Other invoices must already have been payable at the
-period start to prove that they prevented issuance throughout that period.
+period start to prove that they prevented issuance throughout that period. When
+saved debt observations are insufficient, historical invoice discovery resumes
+in 50-invoice pages across all statuses, including debt settled after expiry.
+A proving invoice is retained for subsequent checks; missing proof keeps the
+invoice held for recovery.
 
 `usage_entitlement` billing-work telemetry records attempts and failures.
 The independent `usage_entitlement_backlog` sampler updates

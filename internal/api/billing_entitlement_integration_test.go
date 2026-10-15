@@ -530,10 +530,19 @@ func TestEntitlementSchedulerCustomerIsolation(t *testing.T) {
 
 func TestInvoiceCreditScanSkipsDepletedHistory(t *testing.T) {
 	f := newEntitlementFixture(t)
+	seedCreditScanHead(t, f, "credgr_205")
 	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO billing_provider_credit(customer_id,grant_id,evidence,effective_at,expires_at) SELECT $1,'credgr_'||lpad(i::text,3,'0'),'{}'::jsonb,0,0 FROM generate_series(1,205) i`, f.c.CustomerID); err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/billing/credit_grants" {
+			fmt.Fprint(w, `{"data":[{"id":"credgr_205"}]}`)
+			return
+		}
+		if r.URL.Path == "/v1/billing/credit_balance_transactions" {
+			fmt.Fprint(w, `{"data":[{"id":"cbtxn_original"}]}`)
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/v1/billing/credit_grants/") {
 			g := testEntitlementGrant()
 			g.ID = strings.TrimPrefix(r.URL.Path, "/v1/billing/credit_grants/")
@@ -604,5 +613,176 @@ func TestInvoiceDiscoveryResumesAndIncludesDelayedCreation(t *testing.T) {
 	}
 	if inv, err := f.h.billingCycleInvoice(t.Context(), a, f.start.Unix(), f.end.Unix(), client); err != nil || inv.ID != "in_replacement" {
 		t.Fatal("completed scan retained obsolete match", inv.ID, err)
+	}
+}
+
+func TestInvoiceCreditScanRefreshesEarlierPages(t *testing.T) {
+	for _, change := range []string{"consumed", "voided"} {
+		t.Run(change, func(t *testing.T) {
+			f := newEntitlementFixture(t)
+			seedCreditScanHead(t, f, "credgr_051")
+			if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO billing_provider_credit(customer_id,grant_id,evidence,effective_at,expires_at) SELECT $1,'credgr_'||lpad(i::text,3,'0'),'{}'::jsonb,0,0 FROM generate_series(1,51) i`, f.c.CustomerID); err != nil {
+				t.Fatal(err)
+			}
+			var changed atomic.Bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/billing/credit_grants" {
+					fmt.Fprint(w, `{"data":[{"id":"credgr_051"}]}`)
+					return
+				}
+				if r.URL.Path == "/v1/billing/credit_balance_transactions" {
+					fmt.Fprint(w, `{"data":[{"id":"cbtxn_original"}]}`)
+					return
+				}
+				if strings.HasPrefix(r.URL.Path, "/v1/billing/credit_grants/") {
+					g := testEntitlementGrant()
+					g.ID = strings.TrimPrefix(r.URL.Path, "/v1/billing/credit_grants/")
+					g.Customer = f.c.CustomerID
+					g.Metadata = nil
+					g.EffectiveAt = 1
+					g.ExpiresAt = 0
+					if g.ID == "credgr_001" && changed.Load() && change == "voided" {
+						g.VoidedAt = 2
+					}
+					json.NewEncoder(w).Encode(g)
+					return
+				}
+				balance := 0
+				if r.URL.Query().Get("filter[credit_grant]") == "credgr_001" {
+					balance = 100000
+					if changed.Load() {
+						balance = 20000
+					}
+				}
+				fmt.Fprintf(w, `{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":%d}}}]}`, balance)
+			}))
+			defer srv.Close()
+			client := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+			prices := []string{"cpu", "memory", "round", "storage"}
+			if _, err := f.h.eligibleInvoiceCredits(t.Context(), f.c.CustomerID, f.end.Unix(), prices, client); !errors.Is(err, errCreditInventoryPending) {
+				t.Fatal(err)
+			}
+			changed.Store(true)
+			grants, err := f.h.eligibleInvoiceCredits(t.Context(), f.c.CustomerID, f.end.Unix(), prices, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if change == "voided" {
+				if len(grants) != 0 {
+					t.Fatal("voided earlier-page grant accepted", grants)
+				}
+			} else if len(grants) != 1 || grants[0].Before != 20000 {
+				t.Fatal("stale earlier-page balance accepted", grants)
+			}
+		})
+	}
+}
+func TestEntitlementForfeitureDiscoversOmittedOlderDebt(t *testing.T) {
+	f := newEntitlementFixture(t)
+	p := billing.ExportPeriod{TeamID: f.c.TeamID, Start: f.start, End: f.end}
+	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence) VALUES($1,$2,$3,'{}')`, f.c.ID, f.start, f.end); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO billing_entitlement_debt(contract_id,period_start,invoice_id) VALUES($1,$2,'in_newer')`, f.c.ID, f.start); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/invoices" {
+			if r.URL.Query().Get("status") != "" {
+				t.Error("discovery excludes settled/uncollectible history")
+			}
+			if r.URL.Query().Get("starting_after") == "" {
+				fmt.Fprintf(w, `{"data":[{"id":"in_newer","customer":%q}],"has_more":true}`, f.c.CustomerID)
+			} else {
+				if r.URL.Query().Get("starting_after") != "in_newer" {
+					t.Error("cursor not resumed")
+				}
+				fmt.Fprintf(w, `{"data":[{"id":"in_older","customer":%q}]}`, f.c.CustomerID)
+			}
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/v1/invoices/")
+		finalized := f.start.Unix() + 3600
+		if id == "in_older" {
+			finalized = f.start.Unix() - 3600
+		}
+		fmt.Fprintf(w, `{"id":%q,"customer":%q,"status":"paid","status_transitions":{"finalized_at":%d,"paid_at":%d},"lines":{"data":[]}}`, id, f.c.CustomerID, finalized, f.end.Unix()+1)
+	}))
+	defer srv.Close()
+	client := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+	a := invoiceAccount{Customer: f.c.CustomerID, Subscription: f.c.SubscriptionID}
+	if err := f.h.verifyEntitlementForfeiture(t.Context(), f.c.ID, p, a, client); !errors.Is(err, errCreditInventoryPending) {
+		t.Fatal("historical scan did not persist cursor", err)
+	}
+	if err := f.h.verifyEntitlementForfeiture(t.Context(), f.c.ID, p, a, client); err != nil {
+		t.Fatal("omitted older debt not recovered", err)
+	}
+	var saved bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM billing_entitlement_debt WHERE contract_id=$1 AND invoice_id='in_older')`, f.c.ID).Scan(&saved); err != nil || !saved {
+		t.Fatal("forfeiture proof not retained", saved, err)
+	}
+}
+
+func seedCreditScanHead(t *testing.T, f *entitlementFixture, head string) {
+	t.Helper()
+	if _, err := f.h.Pool.Exec(t.Context(), `UPDATE billing_entitlement_work SET inventory_head=$2,inventory_checked_at=clock_timestamp(),inventory_cursor=NULL WHERE contract_id=$1`, f.c.ID, head); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestInvoiceCreditScanRestartsForReinstatedZeroBalance(t *testing.T) {
+	f := newEntitlementFixture(t)
+	seedCreditScanHead(t, f, "credgr_051")
+	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO billing_provider_credit(customer_id,grant_id,evidence,effective_at,expires_at) SELECT $1,'credgr_'||lpad(i::text,3,'0'),'{}'::jsonb,0,0 FROM generate_series(1,51) i`, f.c.CustomerID); err != nil {
+		t.Fatal(err)
+	}
+	var reinstated atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/billing/credit_grants" {
+			fmt.Fprint(w, `{"data":[{"id":"credgr_051"}]}`)
+			return
+		}
+		if r.URL.Path == "/v1/billing/credit_balance_transactions" {
+			id := "cbtxn_original"
+			if reinstated.Load() {
+				id = "cbtxn_reinstated"
+			}
+			fmt.Fprintf(w, `{"data":[{"id":%q}]}`, id)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/billing/credit_grants/") {
+			g := testEntitlementGrant()
+			g.ID = strings.TrimPrefix(r.URL.Path, "/v1/billing/credit_grants/")
+			g.Customer = f.c.CustomerID
+			g.Metadata = nil
+			g.EffectiveAt = 1
+			g.ExpiresAt = 0
+			json.NewEncoder(w).Encode(g)
+			return
+		}
+		balance := 0
+		if r.URL.Query().Get("filter[credit_grant]") == "credgr_001" && reinstated.Load() {
+			balance = 100000
+		}
+		fmt.Fprintf(w, `{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":%d}}}]}`, balance)
+	}))
+	defer srv.Close()
+	client := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+	prices := []string{"cpu", "memory", "round", "storage"}
+	scan := func() ([]billing.InvoiceCreditGrant, error) {
+		return f.h.eligibleInvoiceCredits(t.Context(), f.c.CustomerID, f.end.Unix(), prices, client)
+	}
+	if _, err := scan(); !errors.Is(err, errCreditInventoryPending) {
+		t.Fatal(err)
+	}
+	reinstated.Store(true)
+	if _, err := scan(); !errors.Is(err, errCreditInventoryPending) {
+		t.Fatal("ledger change did not restart scan", err)
+	}
+	if _, err := scan(); !errors.Is(err, errCreditInventoryPending) {
+		t.Fatal("restarted scan did not read first page", err)
+	}
+	grants, err := scan()
+	if err != nil || len(grants) != 1 || grants[0].ID != "credgr_001" || grants[0].Before != 100000 {
+		t.Fatal("reinstated credit omitted", grants, err)
 	}
 }

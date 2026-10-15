@@ -27,6 +27,7 @@ CREATE TABLE billing_entitlement_debt (
 CREATE TABLE billing_invoice_credit_scan (
  customer_id text NOT NULL, invoice_end bigint NOT NULL,
  cursor text NOT NULL DEFAULT '', credits jsonb NOT NULL DEFAULT '[]',
+ ledger_head text NOT NULL, inventory_head text NOT NULL,
  PRIMARY KEY(customer_id,invoice_end)
 );
 CREATE TABLE billing_invoice_discovery (
