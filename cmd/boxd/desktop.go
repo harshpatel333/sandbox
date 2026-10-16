@@ -806,7 +806,7 @@ func (s *desktopService) lowerActions(actions []*pb.Action) ([]loweredAction, er
 			}
 			ev := a.Scroll
 			lowered[i] = func(ctx context.Context) error { return s.execScroll(ctx, ev, cmds) }
-			afterPointer = false
+			// A scroll leaves focus where it is, like a move.
 		default:
 			return nil, fmt.Errorf("action %d: one of pointer, key, or scroll is required", i)
 		}

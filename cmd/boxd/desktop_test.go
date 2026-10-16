@@ -1389,6 +1389,7 @@ func TestSendActions_KeysAfterAClickSettle(t *testing.T) {
 	move := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 11, Y: 21, Action: pb.PointerAction_POINTER_ACTION_MOVE}}}
 	defaultMove := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 12, Y: 22}}}
 	key := &pb.Action{Action: &pb.Action_Key{Key: &pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "hi"}}}}
+	scroll := &pb.Action{Action: &pb.Action_Scroll{Scroll: &pb.ScrollEvent{Dy: 3}}}
 	for _, tc := range []struct {
 		name    string
 		actions []*pb.Action
@@ -1396,6 +1397,7 @@ func TestSendActions_KeysAfterAClickSettle(t *testing.T) {
 	}{
 		{"click then key", []*pb.Action{click, key}, 1},
 		{"settle kept across a move", []*pb.Action{click, move, key}, 1},
+		{"settle kept across a scroll", []*pb.Action{click, scroll, key}, 1},
 		{"one settle per click, not per key", []*pb.Action{click, key, key, click, key}, 2},
 		{"keys before clicks", []*pb.Action{key, click, click}, 0},
 		{"moves leave focus where it is", []*pb.Action{defaultMove, key, move, key}, 0},
