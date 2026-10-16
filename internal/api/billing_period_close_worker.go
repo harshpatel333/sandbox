@@ -35,7 +35,9 @@ func (h *Handlers) approveBillingPeriod(ctx context.Context, p billing.ExportPer
 	defer tx.Rollback(ctx)
 	q := h.DB.WithTx(tx)
 	var anchor pgtype.Timestamptz
-	if err = tx.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1 FOR SHARE`, p.TeamID).Scan(&anchor); err != nil {
+	err = tx.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1 FOR SHARE`, p.TeamID).Scan(&anchor)
+	// Human approval also supports non-commercial periods without an account.
+	if err != nil && !(errors.Is(err, pgx.ErrNoRows) && actor != uuid.Nil) {
 		return db.TeamBillingPeriod{}, err
 	}
 	if anchor.Valid {

@@ -375,3 +375,18 @@ func TestIntegration_BillingCloseSharesExportLease(t *testing.T) {
 		t.Fatalf("shared ownership lost: %v %v", shared, err)
 	}
 }
+
+func TestIntegration_BillingCloseManualApprovalWithoutAccount(t *testing.T) {
+	team, periodID, start, end := seedBillingPeriodForStripe(t, false, false)
+	admin := seedPlatformAdminProfile(t)
+	r := newBillingRouter(t, &fakeStripeClient{})
+	response := doInternal(r, "POST", "/internal/teams/"+team.String()+"/billing/periods/"+periodID+"/approve", admin.String(), "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("manual approval without account: %d %s", response.Code, response.Body.String())
+	}
+	var human bool
+	if err := testPool.QueryRow(t.Context(), `SELECT status='approved' AND approval_source='human' AND approved_by=$4
+ FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team, start, end, admin).Scan(&human); err != nil || !human {
+		t.Fatalf("human provenance missing: %v %v", human, err)
+	}
+}
