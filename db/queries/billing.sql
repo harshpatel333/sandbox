@@ -439,7 +439,8 @@ RETURNING *;
 -- name: ApproveTeamBillingPeriod :one
 UPDATE team_billing_period
 SET status = 'approved',
-    approved_by = sqlc.arg(approved_by),
+    approval_source = CASE WHEN sqlc.narg(approved_by)::uuid IS NULL THEN 'system' ELSE 'human' END,
+    approved_by = sqlc.narg(approved_by),
     approved_at = now(),
     blocked_reason = NULL,
     blocked_at = NULL,
