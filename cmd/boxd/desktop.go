@@ -740,10 +740,11 @@ const maxBatchActions = 64
 // misrouted in a browser; keys a request round trip later never were.
 const pointerKeySettle = 80 * time.Millisecond
 
-// sleepCtx waits for d unless ctx ends first.
-func sleepCtx(ctx context.Context, d time.Duration) error {
+// settleAfterPointer is the wait itself; tests replace it to see where it
+// is applied without timing requests.
+var settleAfterPointer = func(ctx context.Context) error {
 	select {
-	case <-time.After(d):
+	case <-time.After(pointerKeySettle):
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -789,7 +790,7 @@ func (s *desktopService) lowerActions(actions []*pb.Action) ([]loweredAction, er
 			ev := a.Key
 			if afterPointer {
 				lowered[i] = func(ctx context.Context) error {
-					if err := sleepCtx(ctx, pointerKeySettle); err != nil {
+					if err := settleAfterPointer(ctx); err != nil {
 						return err
 					}
 					return s.execKey(ctx, ev, args)

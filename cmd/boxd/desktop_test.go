@@ -1373,29 +1373,36 @@ func TestStep_WaitForChangeWithoutX11KeepsTheSettle(t *testing.T) {
 func TestSendActions_KeysAfterAClickSettle(t *testing.T) {
 	stepFakeBins(t, "")
 	client := newDesktopTestServer(t)
-	run := func(actions []*pb.Action) time.Duration {
+	settles := 0
+	orig := settleAfterPointer
+	settleAfterPointer = func(context.Context) error { settles++; return nil }
+	t.Cleanup(func() { settleAfterPointer = orig })
+	run := func(actions []*pb.Action) int {
 		t.Helper()
-		start := time.Now()
+		settles = 0
 		if _, err := client.SendActions(context.Background(), connect.NewRequest(&pb.ActionBatch{Actions: actions})); err != nil {
 			t.Fatalf("SendActions: %v", err)
 		}
-		return time.Since(start)
+		return settles
 	}
 	click := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 10, Y: 20, Action: pb.PointerAction_POINTER_ACTION_CLICK}}}
 	move := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 11, Y: 21, Action: pb.PointerAction_POINTER_ACTION_MOVE}}}
-	key := &pb.Action{Action: &pb.Action_Key{Key: &pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "hi"}}}}
-	if d := run([]*pb.Action{click, key}); d < pointerKeySettle {
-		t.Errorf("click then key took %v, want at least the %v settle", d, pointerKeySettle)
-	}
-	if d := run([]*pb.Action{click, move, key}); d < pointerKeySettle {
-		t.Errorf("click, move, key took %v, want the settle kept across the move", d)
-	}
-	if d := run([]*pb.Action{key, click, click}); d >= pointerKeySettle {
-		t.Errorf("key then clicks took %v, want no settle", d)
-	}
 	defaultMove := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 12, Y: 22}}}
-	if d := run([]*pb.Action{defaultMove, key, move, key}); d >= pointerKeySettle {
-		t.Errorf("moves then keys took %v, want no settle: a move leaves focus where it is", d)
+	key := &pb.Action{Action: &pb.Action_Key{Key: &pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "hi"}}}}
+	for _, tc := range []struct {
+		name    string
+		actions []*pb.Action
+		want    int
+	}{
+		{"click then key", []*pb.Action{click, key}, 1},
+		{"settle kept across a move", []*pb.Action{click, move, key}, 1},
+		{"one settle per click, not per key", []*pb.Action{click, key, key, click, key}, 2},
+		{"keys before clicks", []*pb.Action{key, click, click}, 0},
+		{"moves leave focus where it is", []*pb.Action{defaultMove, key, move, key}, 0},
+	} {
+		if got := run(tc.actions); got != tc.want {
+			t.Errorf("%s: %d settles, want %d", tc.name, got, tc.want)
+		}
 	}
 }
 
