@@ -1368,14 +1368,43 @@ func TestStep_WaitForChangeWithoutX11KeepsTheSettle(t *testing.T) {
 	}
 }
 
+// Keys that follow a click in one batch wait for the client to move its
+// focus; keys that do not follow a click, and clicks themselves, do not.
+func TestSendActions_KeysAfterAClickSettle(t *testing.T) {
+	stepFakeBins(t, "")
+	client := newDesktopTestServer(t)
+	run := func(actions []*pb.Action) time.Duration {
+		t.Helper()
+		start := time.Now()
+		if _, err := client.SendActions(context.Background(), connect.NewRequest(&pb.ActionBatch{Actions: actions})); err != nil {
+			t.Fatalf("SendActions: %v", err)
+		}
+		return time.Since(start)
+	}
+	click := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 10, Y: 20, Action: pb.PointerAction_POINTER_ACTION_CLICK}}}
+	move := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 11, Y: 21, Action: pb.PointerAction_POINTER_ACTION_MOVE}}}
+	key := &pb.Action{Action: &pb.Action_Key{Key: &pb.KeyEvent{Input: &pb.KeyEvent_Text{Text: "hi"}}}}
+	if d := run([]*pb.Action{click, key}); d < pointerKeySettle {
+		t.Errorf("click then key took %v, want at least the %v settle", d, pointerKeySettle)
+	}
+	if d := run([]*pb.Action{click, move, key}); d < pointerKeySettle {
+		t.Errorf("click, move, key took %v, want the settle kept across the move", d)
+	}
+	if d := run([]*pb.Action{key, click, click}); d >= pointerKeySettle {
+		t.Errorf("key then clicks took %v, want no settle", d)
+	}
+}
+
 func TestStep_ValidationErrorNeverShellsOut(t *testing.T) {
 	// No fake tools on PATH: rejected requests must fail before any action.
 	client := newDesktopTestServer(t)
 	for name, req := range map[string]*pb.StepRequest{
-		"bad action":   {Actions: []*pb.Action{{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: -5, Y: 1}}}}},
-		"empty batch":  {},
-		"settle limit": {Actions: stepBatch(), SettleMs: uint32(maxStepSettle/time.Millisecond) + 1},
-		"bad format":   {Actions: stepBatch(), Format: pb.FrameFormat(99)},
+		"bad action":           {Actions: []*pb.Action{{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: -5, Y: 1}}}}},
+		"empty batch":          {},
+		"settle limit":         {Actions: stepBatch(), SettleMs: uint32(maxStepSettle/time.Millisecond) + 1},
+		"bad format":           {Actions: stepBatch(), Format: pb.FrameFormat(99)},
+		"quiet without change": {Actions: stepBatch(), QuietMs: 50},
+		"quiet over settle":    {Actions: stepBatch(), WaitForChange: true, SettleMs: 100, QuietMs: 200},
 	} {
 		_, err := client.Step(context.Background(), connect.NewRequest(req))
 		var ce *connect.Error
