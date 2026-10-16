@@ -142,7 +142,11 @@ func runYCOperatorAdoption(t *testing.T, existing bool, methodType string, creat
 		case r.URL.Path == "/v1/invoices/in_first":
 			fmt.Fprintf(w, `{"id":"in_first","customer":%q,"status":"paid","currency":"usd","subtotal":1200000,"total":0,"amount_due":0,"amount_paid":0,"amount_remaining":0,"starting_balance":0,"ending_balance":0,"total_discount_amounts":[{"amount":1200000}],"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"amount":1200000,"currency":"usd","quantity":1,"period":{"start":%d,"end":%d},"pricing":{"price_details":{"price":%q}},"parent":{"subscription_item_details":{"subscription":%q}}}]}}`, customer, sub.ID, sub.StartDate, sub.Items.Data[0].End, p.BasePriceID, sub.ID)
 		case strings.HasPrefix(r.URL.Path, "/v1/coupons/"):
-			output(map[string]any{"id": strings.TrimPrefix(r.URL.Path, "/v1/coupons/"), "duration": "once", "percent_off": 100, "applies_to": map[string]any{"products": []string{sub.Items.Data[0].Price.Product}}})
+			coupon := map[string]any{"id": strings.TrimPrefix(r.URL.Path, "/v1/coupons/"), "duration": "once", "percent_off": 100}
+			if r.URL.Query().Get("expand[]") == "applies_to" {
+				coupon["applies_to"] = map[string]any{"products": []string{sub.Items.Data[0].Price.Product}}
+			}
+			output(coupon)
 		case r.URL.Path == "/v1/subscriptions":
 			if r.Method == http.MethodPost {
 				subscriptionWrites++
