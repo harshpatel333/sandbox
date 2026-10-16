@@ -255,7 +255,7 @@ func RequestLogger() gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 
-		if raw != "" && c.FullPath() != "/internal/teams" && c.Request.URL.Path != "/internal/qm/authorize" && !strings.HasPrefix(c.Request.URL.Path, "/internal/machine-identity") && !strings.HasPrefix(path, "/internal/qm/organizations/") {
+		if raw != "" && c.FullPath() != "/internal/teams" && c.Request.URL.Path != "/internal/qm/authorize" && !strings.HasPrefix(c.Request.URL.Path, "/internal/yc/") && !strings.HasPrefix(c.Request.URL.Path, "/internal/machine-identity") && !strings.HasPrefix(path, "/internal/qm/organizations/") {
 			path = path + "?" + raw
 		}
 
