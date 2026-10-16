@@ -1393,6 +1393,10 @@ func TestSendActions_KeysAfterAClickSettle(t *testing.T) {
 	if d := run([]*pb.Action{key, click, click}); d >= pointerKeySettle {
 		t.Errorf("key then clicks took %v, want no settle", d)
 	}
+	defaultMove := &pb.Action{Action: &pb.Action_Pointer{Pointer: &pb.PointerEvent{X: 12, Y: 22}}}
+	if d := run([]*pb.Action{defaultMove, key, move, key}); d >= pointerKeySettle {
+		t.Errorf("moves then keys took %v, want no settle: a move leaves focus where it is", d)
+	}
 }
 
 func TestStep_ValidationErrorNeverShellsOut(t *testing.T) {

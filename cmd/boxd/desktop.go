@@ -775,7 +775,10 @@ func (s *desktopService) lowerActions(actions []*pb.Action) ([]loweredAction, er
 			}
 			ev := a.Pointer
 			lowered[i] = func(ctx context.Context) error { return s.execPointer(ctx, ev, args) }
-			if ev.GetAction() != pb.PointerAction_POINTER_ACTION_MOVE {
+			switch ev.GetAction() {
+			case pb.PointerAction_POINTER_ACTION_UNSPECIFIED, pb.PointerAction_POINTER_ACTION_MOVE:
+				// A move (the default action) leaves focus where it is.
+			default:
 				afterPointer = true
 			}
 		case *pb.Action_Key:

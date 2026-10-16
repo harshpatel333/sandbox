@@ -466,7 +466,7 @@ func (b *x11Backend) captureChangedWith(ctx context.Context, read func() (*image
 		}
 		if hash != baseline {
 			if quiet > 0 {
-				return b.awaitQuiet(ctx, read, frame, hash, raced, deadline, quiet)
+				return b.awaitQuiet(ctx, read, frame, hash, raced, baseline, deadline, quiet)
 			}
 			return frame, hash, true, nil
 		}
@@ -485,8 +485,9 @@ func (b *x11Backend) captureChangedWith(ctx context.Context, read func() (*image
 // returns the frame once none has been reported for quiet, or the latest
 // one at deadline. A batch often lands in several paints (a focus ring,
 // then the typed text); the first of them is not the state the batch
-// produced.
-func (b *x11Backend) awaitQuiet(ctx context.Context, read func() (*image.RGBA, uint16, error), frame *image.RGBA, hash uint64, raced bool, deadline time.Time, quiet time.Duration) (*image.RGBA, uint64, bool, error) {
+// produced. changed is judged on the frame returned: a change the later
+// paints undid is not one.
+func (b *x11Backend) awaitQuiet(ctx context.Context, read func() (*image.RGBA, uint16, error), frame *image.RGBA, hash uint64, raced bool, baseline uint64, deadline time.Time, quiet time.Duration) (*image.RGBA, uint64, bool, error) {
 	for {
 		b.damaged = b.damaged || raced
 		until := time.Now().Add(quiet)
@@ -497,11 +498,16 @@ func (b *x11Backend) awaitQuiet(ctx context.Context, read func() (*image.RGBA, u
 		if err != nil {
 			return nil, 0, false, err
 		}
-		if !damaged || !time.Now().Before(deadline) {
-			return frame, hash, true, nil
+		if !damaged {
+			return frame, hash, hash != baseline, nil
 		}
+		// A report pending at the deadline is still read, so the frame is
+		// the latest one and not the one before the last repaint.
 		if frame, hash, raced, err = b.snapshotWith(read); err != nil {
 			return nil, 0, false, err
+		}
+		if !time.Now().Before(deadline) {
+			return frame, hash, hash != baseline, nil
 		}
 	}
 }
