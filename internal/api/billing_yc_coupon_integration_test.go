@@ -44,7 +44,7 @@ func runYCCouponCreation(t *testing.T, create bool, evidence, loss string) {
 	sub.LatestInvoice = "in_" + team.ID.String()
 	sub.Discounts = []string{"di_coupon_fixture"}
 	approval.Customer = sub.Customer
-	approval.CompanyIdentity = "https://www.ycombinator.com/companies/fixture-" + team.ID.String()
+	approval.CompanyIdentity = "https://example.com/companies/fixture-" + team.ID.String()
 	request, _ := json.Marshal(approval)
 	terms, _ := json.Marshal(params)
 	if _, err = h.Pool.Exec(t.Context(), `INSERT INTO billing_yc_operation(team_id,approved_by,evidence_reference,request,resource_terms,customer_id) VALUES($1,'operator','fixture',$2,$3,$4)`, team.ID, request, terms, sub.Customer); err != nil {
