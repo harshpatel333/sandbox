@@ -30,12 +30,26 @@ class RevisionTests(unittest.TestCase):
                 ci.return_value = False
                 with self.assertRaises(gate.GateError):
                     gate.require_ci(env)
-        with patch.object(gate, "api", return_value={"object": {"sha": OLD}}), \
-                self.assertRaises(gate.GateError):
-            gate.require_ci(self.env)
-        with patch.object(gate, "api", side_effect=[{"object": {"sha": SHA}}, {"object": {"sha": OLD}}]), \
-                patch.object(gate.push_ci, "wait_for_ci", return_value=True), self.assertRaises(gate.GateError):
-            gate.require_ci(self.env)
+
+    def test_main_advancing_does_not_invalidate_pinned_deployment(self):
+        for event in ("push", "workflow_dispatch"):
+            for advance_before_ci in (False, True):
+                with self.subTest(event=event, advance_before_ci=advance_before_ci):
+                    env = dict(self.env, GITHUB_EVENT_NAME=event)
+                    main = {"object": {"sha": OLD if advance_before_ci else SHA}}
+                    def complete_ci(*args):
+                        main["object"]["sha"] = OLD
+                        return True
+                    with patch.object(gate, "api", return_value=main), \
+                            patch.object(gate.push_ci, "wait_for_ci", side_effect=complete_ci) as ci:
+                        self.assertEqual(gate.require_ci(env), SHA)
+                        ci.assert_called_once_with("example/repo", SHA, "push")
+                        self.assertEqual(gate.verify_revision(env), SHA)
+
+    def test_non_resume_revision_must_match_workflow_commit(self):
+        for event in ("push", "workflow_dispatch"):
+            with self.subTest(event=event), self.assertRaises(gate.GateError):
+                gate.verify_revision(dict(self.env, GITHUB_EVENT_NAME=event, DEPLOYMENT_REVISION=OLD))
 
     def test_only_authenticated_proxy_resume_can_use_ancestor(self):
         env = dict(self.env, GITHUB_EVENT_NAME="workflow_dispatch", DEPLOYMENT_REVISION=OLD, RESUME_RUN_ID="123")

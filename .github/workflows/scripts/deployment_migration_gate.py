@@ -50,9 +50,8 @@ def verify_revision(env):
         comparison = api(repository, f"compare/{revision}...main")
         if comparison.get("status") not in ("ahead", "identical"):
             raise GateError("Resume revision is not an ancestor of current main")
-    elif (revision != env["GITHUB_SHA"]
-          or api(repository, "git/ref/heads/main")["object"]["sha"] != revision):
-        raise GateError("Main advanced; deployment must be re-evaluated")
+    elif revision != env["GITHUB_SHA"]:
+        raise GateError("Deployment revision must match the workflow revision")
     return revision
 
 
