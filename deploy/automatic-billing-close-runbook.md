@@ -14,6 +14,12 @@ new automatic attempts and invoice reconciliation/release, including calls from
 the incremental exporter. Restart the affected controlplane revisions to apply
 configuration changes. Already dispatched provider requests cannot be recalled.
 
+The billing-export feature flag prevents new approval/export work. Already
+frozen, enrolled periods continue reconciling their accepted usage and immutable
+invoice settlement even if that flag is disabled. Recovery does not allocate or
+submit new usage while exports are disabled; incomplete delivery remains held.
+Use the emergency automatic-close switch above to stop invoice release as well.
+
 Discovery traverses 100 periods per page using the period primary key; it waits
 one minute after a complete sweep. A replica processes at most four sequential
 attempts per batch with a 60-second batch deadline, then waits 5-6 seconds.

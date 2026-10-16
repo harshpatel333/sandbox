@@ -144,8 +144,10 @@ func (h *Handlers) discoverBillingPeriodCloseWork(ctx context.Context) error {
             SELECT p.team_id,p.period_start,p.period_end FROM team_billing_period p JOIN team_billing_account a USING(team_id)
             LEFT JOIN billing_invoice_account i USING(team_id) LEFT JOIN billing_invoice_close c USING(team_id,period_start,period_end)
             WHERE (p.team_id,p.period_start,p.period_end)>=($1,$2,$3) AND (p.team_id,p.period_start,p.period_end)<=($4,$5,$6)
-             AND p.period_end<=now() AND a.stripe_customer_id IS NOT NULL AND a.stripe_subscription_id IS NOT NULL
-             AND a.commercial_billing_anchor IS NOT NULL AND feature_enabled('billing_export_enabled',p.team_id)
+             AND p.period_end<=now() AND (
+               (a.stripe_customer_id IS NOT NULL AND a.stripe_subscription_id IS NOT NULL
+                AND a.commercial_billing_anchor IS NOT NULL AND feature_enabled('billing_export_enabled',p.team_id))
+               OR (p.status IN ('exporting','exported','finalized') AND i.enrolled_at<p.period_end))
              AND (i.team_id IS NULL OR i.enrolled_at<p.period_end)
              AND (p.finalized_at IS NULL OR (c.state IS NOT NULL AND c.state<>'released')) AND COALESCE(c.state,'')<>'released'
             ON CONFLICT DO NOTHING`, first.TeamID, first.Start, first.End, last.TeamID, last.Start, last.End)
@@ -268,9 +270,6 @@ func (h *Handlers) advanceBillingPeriodClose(ctx context.Context, p billing.Expo
 	if err != nil {
 		return hold("eligibility", err)
 	}
-	if !enabled {
-		return hold("disabled", fmt.Errorf("billing export is disabled"))
-	}
 	period, err := h.DB.GetTeamBillingPeriod(ctx, db.GetTeamBillingPeriodParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End})
 	if err != nil {
 		return hold("eligibility", err)
@@ -283,6 +282,9 @@ func (h *Handlers) advanceBillingPeriodClose(ctx context.Context, p billing.Expo
 		return hold("eligibility", err)
 	}
 	frozen := period.Status == "exporting" || period.Status == "exported" || period.FinalizedAt.Valid
+	if !enabled && !frozen {
+		return hold("disabled", fmt.Errorf("billing export is disabled"))
+	}
 	if !frozen {
 		if !active || !anchor.Valid {
 			return hold("eligibility", fmt.Errorf("verified active commercial subscription is required"))
@@ -319,7 +321,20 @@ func (h *Handlers) advanceBillingPeriodClose(ctx context.Context, p billing.Expo
 	// Export remains responsible for canonical completeness and immutable event
 	// reconciliation. Never infer successful export from approval alone.
 	if !period.FinalizedAt.Valid {
-		if _, err = h.exportIncrementalPeriod(ctx, p); err != nil {
+		if !enabled {
+			// Disabling new exports must not strand an already frozen invoice.
+			// Observe its existing usage without allocating or submitting new usage.
+			_, err = h.reconcileFrozenIncrementalPeriod(ctx, p)
+			if err == nil {
+				err = h.reconcileInvoicePeriod(ctx, p)
+			}
+			if err == nil && period.Status == "exporting" {
+				err = h.markBillingPeriodExported(ctx, p)
+			}
+		} else {
+			_, err = h.exportIncrementalPeriod(ctx, p)
+		}
+		if err != nil {
 			var invoiceEnd time.Time
 			e := h.Pool.QueryRow(ctx, `SELECT invoice_end FROM billing_invoice_calendar WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End).Scan(&invoiceEnd)
 			if e == nil && invoiceEnd.After(h.nowUTC()) {

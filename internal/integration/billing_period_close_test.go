@@ -19,9 +19,10 @@ import (
 )
 
 func TestIntegration_AutomaticBillingClose(t *testing.T) {
-	for _, mode := range []string{"clean", "anomaly", "future", "response_loss", "pre_enrollment", "provider_future", "nonzero", "missing_enrollment", "earlier_held", "unicode_error"} {
+	for _, mode := range []string{"clean", "anomaly", "future", "response_loss", "pre_enrollment", "provider_future", "nonzero", "missing_enrollment", "earlier_held", "unicode_error", "disabled_exporting", "disabled_exported", "disabled_finalized", "disabled_open"} {
 		t.Run(mode, func(t *testing.T) {
-			nonzero := mode == "nonzero" || mode == "earlier_held"
+			disabledFrozen := strings.HasPrefix(mode, "disabled_") && mode != "disabled_open"
+			nonzero := mode == "nonzero" || mode == "earlier_held" || disabledFrozen
 			team, _, start, end := seedBillingPeriodForStripe(t, false, true)
 			correctionExec(t, `UPDATE team_billing_period SET status='open' WHERE team_id=$1`, team)
 			if !nonzero {
@@ -157,10 +158,12 @@ func TestIntegration_AutomaticBillingClose(t *testing.T) {
 			insertPricingPlanForTest(t, t.Context(), key, true)
 			correctionExec(t, `INSERT INTO pricing_rate(plan_key,resource,unit,price_usd,effective_from) VALUES($1,'vcpu','second',0.00001,$2)`, key, start)
 			correctionExec(t, `INSERT INTO team_pricing_plan(team_id,plan_key,effective_from) VALUES($1,$2,$3)`, team, key, start)
-			if mode == "earlier_held" {
-				// Recover an already verified export after an earlier held period
-				// becomes visible. Frozen export retries do not run invoice closing.
+			if mode == "earlier_held" || disabledFrozen {
+				// Start recovery after provider verification but before local close.
 				correctionExec(t, `UPDATE team_billing_period SET status='approved' WHERE team_id=$1`, team)
+				if disabledFrozen {
+					correctionExec(t, `UPDATE team_billing_period SET approved_at=now(),approved_by=$2,approval_source='human' WHERE team_id=$1`, team, seedPlatformAdminProfile(t))
+				}
 				for i := 0; i < 3; i++ {
 					_ = newHandler().ExportInvoicePeriodForTest(t.Context(), billing.ExportPeriod{TeamID: team, Start: start, End: end})
 				}
@@ -168,8 +171,22 @@ func TestIntegration_AutomaticBillingClose(t *testing.T) {
 				if err := testPool.QueryRow(t.Context(), `SELECT state='verified' FROM billing_invoice_close WHERE team_id=$1`, team).Scan(&verified); err != nil || !verified {
 					t.Fatalf("setup did not verify later invoice: %v %v", verified, err)
 				}
-				correctionExec(t, `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, team, enrolled, start)
-				correctionExec(t, `INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason) VALUES($1,99,99,'audit-only local fixture')`, team)
+				if mode == "earlier_held" {
+					correctionExec(t, `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, team, enrolled, start)
+					correctionExec(t, `INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason) VALUES($1,99,99,'audit-only local fixture')`, team)
+				}
+				if mode == "disabled_exporting" {
+					// Model a crash after provider verification, before marking exported.
+					correctionExec(t, `UPDATE team_billing_period SET status='exporting' WHERE team_id=$1`, team)
+				}
+				if mode == "disabled_finalized" {
+					if _, err := billing.FinalizeTeamBillingPeriodWithCredits(t.Context(), testPool, team, start, end, newHandler().ResolveActiveBillingMeter); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if disabledFrozen || mode == "disabled_open" {
+				correctionExec(t, `UPDATE team_feature_flag SET enabled=false WHERE team_id=$1 AND key='billing_export_enabled'`, team)
 			}
 			// Drive discovery rather than inserting a close record or approving manually.
 			correctionExec(t, `UPDATE billing_period_close_discovery SET after_team='00000000-0000-0000-0000-000000000000',after_start='-infinity',after_end='-infinity',next_run_at=now()`)
@@ -206,11 +223,11 @@ func TestIntegration_AutomaticBillingClose(t *testing.T) {
 				}
 				return
 			}
-			if mode == "pre_enrollment" {
+			if mode == "pre_enrollment" || mode == "disabled_open" {
 				var n int
 				err := testPool.QueryRow(t.Context(), `SELECT count(*) FROM billing_period_close_work WHERE team_id=$1`, team).Scan(&n)
 				if err != nil || n != 0 {
-					t.Fatalf("pre-enrollment history scheduled: %d %v", n, err)
+					t.Fatalf("ineligible history scheduled: %d %v", n, err)
 				}
 				return
 			}
@@ -257,10 +274,10 @@ func TestIntegration_AutomaticBillingClose(t *testing.T) {
 				correctionExec(t, `UPDATE billing_period_close_work SET next_attempt_at=now() WHERE team_id=$1`, team)
 			}
 			var approved, final bool
-			if err := testPool.QueryRow(t.Context(), `SELECT approval_source='system' AND approved_by IS NULL,finalized_at IS NOT NULL FROM team_billing_period WHERE team_id=$1`, team).Scan(&approved, &final); err != nil || !approved || !final {
+			if err := testPool.QueryRow(t.Context(), `SELECT (approval_source='system' AND approved_by IS NULL) OR ($2 AND approval_source='human'),finalized_at IS NOT NULL FROM team_billing_period WHERE team_id=$1`, team, disabledFrozen).Scan(&approved, &final); err != nil || !approved || !final {
 				t.Fatalf("approval=%v final=%v err=%v", approved, final, err)
 			}
-			if mode == "nonzero" && usageEvents != 1 {
+			if nonzero && usageEvents != 1 {
 				t.Fatalf("usage delivered %d times", usageEvents)
 			}
 			if finalizations != 1 || releases != 1 {

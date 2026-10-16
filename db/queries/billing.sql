@@ -481,7 +481,9 @@ WITH exported_period AS (
             AND u.finalized_at IS NULL
       )
       AND storage_reports_complete_through(team_billing_period.team_id, team_billing_period.period_end)
-      AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
+      AND (feature_enabled('billing_export_enabled', team_billing_period.team_id)
+           OR (team_billing_period.status='exporting' AND billing_invoice_close_matches(
+               team_billing_period.team_id, team_billing_period.period_start, team_billing_period.period_end)))
     RETURNING *
 ),
 exported_usage AS (
