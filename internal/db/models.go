@@ -684,6 +684,29 @@ type BillingPeriodAnomaly struct {
 	ResolvedBy  pgtype.UUID        `json:"resolved_by"`
 }
 
+type BillingPeriodCloseDiscovery struct {
+	Singleton  bool      `json:"singleton"`
+	AfterTeam  uuid.UUID `json:"after_team"`
+	AfterStart time.Time `json:"after_start"`
+	AfterEnd   time.Time `json:"after_end"`
+	NextRunAt  time.Time `json:"next_run_at"`
+}
+
+type BillingPeriodCloseWork struct {
+	TeamID         uuid.UUID          `json:"team_id"`
+	PeriodStart    time.Time          `json:"period_start"`
+	PeriodEnd      time.Time          `json:"period_end"`
+	NextAttemptAt  time.Time          `json:"next_attempt_at"`
+	LeaseToken     pgtype.UUID        `json:"lease_token"`
+	LeaseUntil     pgtype.Timestamptz `json:"lease_until"`
+	Attempts       int64              `json:"attempts"`
+	LastAttemptAt  pgtype.Timestamptz `json:"last_attempt_at"`
+	LastProgressAt pgtype.Timestamptz `json:"last_progress_at"`
+	LastError      *string            `json:"last_error"`
+	Stage          string             `json:"stage"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
 type BillingProClosedPurchase struct {
 	TeamID         uuid.UUID `json:"team_id"`
 	Generation     time.Time `json:"generation"`
@@ -925,6 +948,48 @@ type LegacyHostStorageReport struct {
 	Attempts               int32       `json:"attempts"`
 	NextAttemptAt          time.Time   `json:"next_attempt_at"`
 	LastError              *string     `json:"last_error"`
+}
+
+type MachineCredential struct {
+	ID                   uuid.UUID          `json:"id"`
+	PrincipalID          uuid.UUID          `json:"principal_id"`
+	LineageID            uuid.UUID          `json:"lineage_id"`
+	State                string             `json:"state"`
+	ExpiresAt            time.Time          `json:"expires_at"`
+	RevocationGeneration int64              `json:"revocation_generation"`
+	Permissions          []string           `json:"permissions"`
+	Audience             string             `json:"audience"`
+	SecretHash           []byte             `json:"secret_hash"`
+	IssuedAt             time.Time          `json:"issued_at"`
+	RevokedAt            pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type MachineLifecycleOperation struct {
+	PrincipalID             uuid.UUID   `json:"principal_id"`
+	OperationID             uuid.UUID   `json:"operation_id"`
+	OperationKind           string      `json:"operation_kind"`
+	ExpectedGeneration      int64       `json:"expected_generation"`
+	InputDigest             []byte      `json:"input_digest"`
+	LineageID               uuid.UUID   `json:"lineage_id"`
+	CredentialDigest        []byte      `json:"credential_digest"`
+	ReplacementCredentialID pgtype.UUID `json:"replacement_credential_id"`
+	ExpiresAt               time.Time   `json:"expires_at"`
+	Permissions             []string    `json:"permissions"`
+	Audience                string      `json:"audience"`
+	ResultCredentialID      pgtype.UUID `json:"result_credential_id"`
+	CreatedAt               time.Time   `json:"created_at"`
+}
+
+type MachinePrincipal struct {
+	ID                 uuid.UUID          `json:"id"`
+	TeamID             uuid.UUID          `json:"team_id"`
+	HostedTenantID     uuid.UUID          `json:"hosted_tenant_id"`
+	Status             string             `json:"status"`
+	Generation         int64              `json:"generation"`
+	ApprovedTemplateID pgtype.UUID        `json:"approved_template_id"`
+	RestoreUntil       pgtype.Timestamptz `json:"restore_until"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
 }
 
 type NetFlow struct {
@@ -1238,6 +1303,13 @@ type SandboxComputeBillingInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+}
+
+type SandboxMachineOwner struct {
+	SandboxID        uuid.UUID `json:"sandbox_id"`
+	OwnerPrincipalID uuid.UUID `json:"owner_principal_id"`
+	TeamID           uuid.UUID `json:"team_id"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // Preview routing policy. default_access is the API default for new ports; access is a restrictive Phase 1-compatible wire fallback.
@@ -1584,6 +1656,7 @@ type TeamBillingPeriod struct {
 	GrossChargesUsd     pgtype.Numeric     `json:"gross_charges_usd"`
 	CreditsAppliedUsd   pgtype.Numeric     `json:"credits_applied_usd"`
 	NetInvoiceAmountUsd pgtype.Numeric     `json:"net_invoice_amount_usd"`
+	ApprovalSource      *string            `json:"approval_source"`
 }
 
 type TeamBillingUsage struct {
