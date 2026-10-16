@@ -173,8 +173,21 @@ func TestIntegration_AutomaticBillingClose(t *testing.T) {
 			}
 			// Drive discovery rather than inserting a close record or approving manually.
 			correctionExec(t, `UPDATE billing_period_close_discovery SET after_team='00000000-0000-0000-0000-000000000000',after_start='-infinity',after_end='-infinity',next_run_at=now()`)
-			if err := newHandler().DiscoverBillingPeriodCloseForTest(t.Context()); err != nil {
-				t.Fatal(err)
+			for page := 0; ; page++ {
+				if page == 100 {
+					t.Fatal("discovery did not complete its bounded sweep")
+				}
+				if err := newHandler().DiscoverBillingPeriodCloseForTest(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				var after uuid.UUID
+				if err := testPool.QueryRow(t.Context(), `SELECT after_team FROM billing_period_close_discovery`).Scan(&after); err != nil {
+					t.Fatal(err)
+				}
+				if after == uuid.Nil {
+					break
+				}
+				correctionExec(t, `UPDATE billing_period_close_discovery SET next_run_at=now()`)
 			}
 			correctionExec(t, `UPDATE billing_period_close_work SET next_attempt_at=now()+interval '10 years' WHERE team_id<>$1`, team)
 			if mode == "earlier_held" {
