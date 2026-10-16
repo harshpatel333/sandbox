@@ -23,7 +23,7 @@ class RevisionTests(unittest.TestCase):
     def test_current_revision_ci_and_manual_failure(self):
         for event in ("push", "workflow_dispatch"):
             env = dict(self.env, GITHUB_EVENT_NAME=event)
-            with patch.object(gate, "api", return_value={"object": {"sha": SHA}}), \
+            with patch.object(gate, "api", return_value={"status": "identical"}), \
                     patch.object(gate.push_ci, "wait_for_ci", return_value=True) as ci:
                 self.assertEqual(gate.require_ci(env), SHA)
                 ci.assert_called_once_with("example/repo", SHA, "push")
@@ -36,9 +36,9 @@ class RevisionTests(unittest.TestCase):
             for advance_before_ci in (False, True):
                 with self.subTest(event=event, advance_before_ci=advance_before_ci):
                     env = dict(self.env, GITHUB_EVENT_NAME=event)
-                    main = {"object": {"sha": OLD if advance_before_ci else SHA}}
+                    main = {"status": "ahead" if advance_before_ci else "identical"}
                     def complete_ci(*args):
-                        main["object"]["sha"] = OLD
+                        main["status"] = "ahead"
                         return True
                     with patch.object(gate, "api", return_value=main), \
                             patch.object(gate.push_ci, "wait_for_ci", side_effect=complete_ci) as ci:
@@ -51,7 +51,21 @@ class RevisionTests(unittest.TestCase):
             with self.subTest(event=event), self.assertRaises(gate.GateError):
                 gate.verify_revision(dict(self.env, GITHUB_EVENT_NAME=event, DEPLOYMENT_REVISION=OLD))
 
-    def test_only_authenticated_proxy_resume_can_use_ancestor(self):
+    def test_removed_revision_is_rejected_before_or_after_ci(self):
+        for event in ("push", "workflow_dispatch"):
+            for state in ("behind", "diverged", None):
+                for remove_before_ci in (False, True):
+                    with self.subTest(event=event, state=state, remove_before_ci=remove_before_ci):
+                        env = dict(self.env, GITHUB_EVENT_NAME=event)
+                        responses = [{"status": state}] if remove_before_ci else [
+                            {"status": "identical"}, {"status": state}]
+                        with patch.object(gate, "api", side_effect=responses) as api, \
+                                patch.object(gate.push_ci, "wait_for_ci", return_value=True), \
+                                self.assertRaisesRegex(gate.GateError, "not an ancestor"):
+                            gate.require_ci(env)
+                        api.assert_called_with("example/repo", f"compare/{SHA}...main")
+
+    def test_only_authenticated_proxy_resume_can_override_workflow_revision(self):
         env = dict(self.env, GITHUB_EVENT_NAME="workflow_dispatch", DEPLOYMENT_REVISION=OLD, RESUME_RUN_ID="123")
         run = dict(head_sha=OLD, head_branch="main", path=".github/workflows/deploy-proxy.yml", event="push")
         with patch.object(gate, "api", side_effect=[run, {"status": "ahead"}]):
