@@ -78,6 +78,10 @@ type stripeCreditBalanceReader interface {
 	GetCustomerCreditBalance(context.Context, string) (StripeCreditBalance, error)
 }
 
+type stripeGrantBalanceReader interface {
+	GetCreditGrantLedgerBalance(ctx context.Context, customerID, grantID string) (float64, error)
+}
+
 type stripeEventRetriever interface {
 	RetrieveEvent(ctx context.Context, eventID string) (json.RawMessage, error)
 }
@@ -450,6 +454,13 @@ func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, custome
 	// The aggregate grant balance does not attest which active-period meter
 	// events have been applied, even when usage is submitted incrementally.
 	return StripeCreditBalance{AvailableUSD: float64(cents) / 100, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: false}, nil
+}
+
+// The ledger balance, not available_balance: draft-invoice reservations already
+// reduce the latter, and the summary subtracts current-period usage itself.
+func (c *stripeHTTPClient) GetCreditGrantLedgerBalance(ctx context.Context, customerID, grantID string) (float64, error) {
+	cents, err := c.grantLedgerBalance(ctx, customerID, grantID)
+	return float64(cents) / 100, err
 }
 
 func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error) {
