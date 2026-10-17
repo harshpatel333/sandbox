@@ -78,6 +78,10 @@ type stripeCreditBalanceReader interface {
 	GetCustomerCreditBalance(context.Context, string) (StripeCreditBalance, error)
 }
 
+type stripeGrantBalanceReader interface {
+	GetCreditGrantAvailableBalance(ctx context.Context, customerID, grantID string) (float64, error)
+}
+
 type stripeEventRetriever interface {
 	RetrieveEvent(ctx context.Context, eventID string) (json.RawMessage, error)
 }
@@ -450,6 +454,27 @@ func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, custome
 	// The aggregate grant balance does not attest which active-period meter
 	// events have been applied, even when usage is submitted incrementally.
 	return StripeCreditBalance{AvailableUSD: float64(cents) / 100, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: false}, nil
+}
+
+func (c *stripeHTTPClient) GetCreditGrantAvailableBalance(ctx context.Context, customerID, grantID string) (float64, error) {
+	var resp struct {
+		Balances []struct {
+			AvailableBalance struct {
+				Monetary *struct {
+					Currency string `json:"currency"`
+					Value    int64  `json:"value"`
+				} `json:"monetary"`
+			} `json:"available_balance"`
+		} `json:"balances"`
+	}
+	q := url.Values{"customer": {customerID}, "filter[type]": {"credit_grant"}, "filter[credit_grant]": {grantID}}
+	if err := c.doForm(ctx, http.MethodGet, "/v1/billing/credit_balance_summary?"+q.Encode(), nil, &resp, ""); err != nil {
+		return 0, err
+	}
+	if len(resp.Balances) != 1 || resp.Balances[0].AvailableBalance.Monetary == nil || resp.Balances[0].AvailableBalance.Monetary.Currency != "usd" {
+		return 0, fmt.Errorf("stripe credit grant %s balance is incomplete", grantID)
+	}
+	return float64(resp.Balances[0].AvailableBalance.Monetary.Value) / 100, nil
 }
 
 func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error) {
