@@ -45,6 +45,7 @@ func (h *Handlers) enqueueInvoiceCollection(ctx context.Context, p billing.Expor
 	if inv.Parent.SubscriptionDetails == nil {
 		return fmt.Errorf("collection invoice has no subscription")
 	}
+	authorized = authorized && inv.CollectionMethod == "charge_automatically"
 	state := "pending"
 	if !authorized {
 		state = "review_required"
@@ -181,7 +182,7 @@ func (h *Handlers) collectInvoice(ctx context.Context, c *stripeHTTPClient, job 
 	if inv.Status == "void" || inv.Status == "uncollectible" {
 		return inv.Status, "invoice closed without payment"
 	}
-	if inv.Status != "open" || inv.AutoAdvance || inv.AmountRemaining == nil || *inv.AmountRemaining != inv.AmountDue || inv.AmountDue <= 0 {
+	if inv.CollectionMethod != "charge_automatically" || inv.Status != "open" || inv.AutoAdvance || inv.AmountRemaining == nil || *inv.AmountRemaining != inv.AmountDue || inv.AmountDue <= 0 {
 		return "review_required", "invoice is not held open with the verified amount due"
 	}
 	state, err := c.invoicePaymentState(ctx, inv)
@@ -203,8 +204,8 @@ func (h *Handlers) collectInvoice(ctx context.Context, c *stripeHTTPClient, job 
 	if err != nil {
 		return job.State, "subscription retrieval unavailable"
 	}
-	if sub.Customer != job.Customer || sub.LiveMode != job.LiveMode || (sub.Status != "canceled" && (sub.PauseCollection == nil || sub.PauseCollection.Behavior != "keep_as_draft" || sub.PauseCollection.ResumesAt != 0)) {
-		return "review_required", "subscription collection hold changed"
+	if sub.CollectionMethod != "charge_automatically" || sub.Customer != job.Customer || sub.LiveMode != job.LiveMode || (sub.Status != "canceled" && (sub.PauseCollection == nil || sub.PauseCollection.Behavior != "keep_as_draft" || sub.PauseCollection.ResumesAt != 0)) {
+		return "review_required", "subscription collection method or hold changed"
 	}
 	// Persist intent before any network side effect. An expired worker cannot
 	// initiate a new call; an uncertain call is replayed only with the same key.
