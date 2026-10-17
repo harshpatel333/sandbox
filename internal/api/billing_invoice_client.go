@@ -17,6 +17,7 @@ import (
 // preview has status=draft too; its upcoming_ ID does not identify an invoice
 // that can be held or finalized.
 type StripeInvoiceAmounts struct {
+	LiveMode          bool  `json:"livemode"`
 	Created           int64 `json:"created"`
 	StatusTransitions struct {
 		PaidAt      int64 `json:"paid_at"`
