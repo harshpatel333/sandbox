@@ -79,7 +79,7 @@ type stripeCreditBalanceReader interface {
 }
 
 type stripeGrantBalanceReader interface {
-	GetCreditGrantAvailableBalance(ctx context.Context, customerID, grantID string) (float64, error)
+	GetCreditGrantLedgerBalance(ctx context.Context, customerID, grantID string) (float64, error)
 }
 
 type stripeEventRetriever interface {
@@ -456,25 +456,11 @@ func (c *stripeHTTPClient) GetCustomerCreditBalance(ctx context.Context, custome
 	return StripeCreditBalance{AvailableUSD: float64(cents) / 100, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: false}, nil
 }
 
-func (c *stripeHTTPClient) GetCreditGrantAvailableBalance(ctx context.Context, customerID, grantID string) (float64, error) {
-	var resp struct {
-		Balances []struct {
-			AvailableBalance struct {
-				Monetary *struct {
-					Currency string `json:"currency"`
-					Value    int64  `json:"value"`
-				} `json:"monetary"`
-			} `json:"available_balance"`
-		} `json:"balances"`
-	}
-	q := url.Values{"customer": {customerID}, "filter[type]": {"credit_grant"}, "filter[credit_grant]": {grantID}}
-	if err := c.doForm(ctx, http.MethodGet, "/v1/billing/credit_balance_summary?"+q.Encode(), nil, &resp, ""); err != nil {
-		return 0, err
-	}
-	if len(resp.Balances) != 1 || resp.Balances[0].AvailableBalance.Monetary == nil || resp.Balances[0].AvailableBalance.Monetary.Currency != "usd" {
-		return 0, fmt.Errorf("stripe credit grant %s balance is incomplete", grantID)
-	}
-	return float64(resp.Balances[0].AvailableBalance.Monetary.Value) / 100, nil
+// The ledger balance, not available_balance: draft-invoice reservations already
+// reduce the latter, and the summary subtracts current-period usage itself.
+func (c *stripeHTTPClient) GetCreditGrantLedgerBalance(ctx context.Context, customerID, grantID string) (float64, error) {
+	cents, err := c.grantLedgerBalance(ctx, customerID, grantID)
+	return float64(cents) / 100, err
 }
 
 func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error) {

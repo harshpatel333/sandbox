@@ -77,7 +77,7 @@ func (f *fakeStripeClient) GetCustomerCreditBalance(_ context.Context, _ string)
 	return f.creditBalance, nil
 }
 
-func (f *fakeStripeClient) GetCreditGrantAvailableBalance(_ context.Context, _, _ string) (float64, error) {
+func (f *fakeStripeClient) GetCreditGrantLedgerBalance(_ context.Context, _, _ string) (float64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.grantBalanceUSD, f.grantBalanceErr

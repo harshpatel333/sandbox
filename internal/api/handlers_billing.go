@@ -508,7 +508,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			// metered-scope summary leaves them out; add the period's grant.
 			if grants, ok := h.Stripe.(stripeGrantBalanceReader); e == nil && ok && planGrantID != "" {
 				var grantUSD float64
-				if grantUSD, e = grants.GetCreditGrantAvailableBalance(c.Request.Context(), *account.StripeCustomerID, planGrantID); e == nil {
+				if grantUSD, e = grants.GetCreditGrantLedgerBalance(c.Request.Context(), *account.StripeCustomerID, planGrantID); e == nil {
 					cb.AvailableUSD += grantUSD
 				}
 			}
