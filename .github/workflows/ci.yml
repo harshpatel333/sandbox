@@ -24,6 +24,7 @@ jobs:
           python3 scripts/test_migration_cli.py
           python3 scripts/test_migration_overlay.py
           python3 scripts/test_migration_execution.py
+          python3 scripts/test_shared_auth_migrations.py
 
   unit-tests:
     name: Unit Tests
@@ -194,7 +195,7 @@ jobs:
       - name: Run usage entitlement and invoice credit race contracts
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
-        run: go test -v -race -tags integration -count=1 -timeout 2m -run '^(TestEntitlement|TestInvoiceCredit|TestInvoiceDiscovery|TestEmptyCredit)' ./internal/api
+        run: go test -v -race -tags integration -count=1 -timeout 2m -run '^(TestYC|TestEntitlement|TestInvoiceCredit|TestInvoiceDiscovery|TestEmptyCredit)' ./internal/api
 
       - name: Run retained storage API race contracts
         env:

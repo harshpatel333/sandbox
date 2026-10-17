@@ -398,6 +398,19 @@ type BillingContractPayment struct {
 	Evidence                    []byte    `json:"evidence"`
 }
 
+type BillingContractWaiver struct {
+	ID                   uuid.UUID `json:"id"`
+	TeamID               uuid.UUID `json:"team_id"`
+	ContractID           uuid.UUID `json:"contract_id"`
+	OfferKey             string    `json:"offer_key"`
+	OfferVersion         int32     `json:"offer_version"`
+	CustomerID           string    `json:"customer_id"`
+	SubscriptionID       string    `json:"subscription_id"`
+	StartsAt             time.Time `json:"starts_at"`
+	EndsAt               time.Time `json:"ends_at"`
+	CollectibleBaseCents int64     `json:"collectible_base_cents"`
+}
+
 type BillingEntitlementDebt struct {
 	ContractID  uuid.UUID `json:"contract_id"`
 	PeriodStart time.Time `json:"period_start"`
@@ -795,7 +808,7 @@ type BillingUsageEntitlement struct {
 	ID                           uuid.UUID          `json:"id"`
 	TeamID                       uuid.UUID          `json:"team_id"`
 	ContractID                   uuid.UUID          `json:"contract_id"`
-	PaymentID                    uuid.UUID          `json:"payment_id"`
+	PaymentID                    pgtype.UUID        `json:"payment_id"`
 	Kind                         string             `json:"kind"`
 	PeriodStart                  time.Time          `json:"period_start"`
 	PeriodEnd                    time.Time          `json:"period_end"`
@@ -815,6 +828,7 @@ type BillingUsageEntitlement struct {
 	IssuanceEvidence             []byte             `json:"issuance_evidence"`
 	IssuedAt                     pgtype.Timestamptz `json:"issued_at"`
 	CreatedAt                    time.Time          `json:"created_at"`
+	WaiverID                     pgtype.UUID        `json:"waiver_id"`
 }
 
 type BillingUsageExport struct {
@@ -833,6 +847,38 @@ type BillingUsageExport struct {
 	SentAt                     pgtype.Timestamptz `json:"sent_at"`
 	UpdatedAt                  time.Time          `json:"updated_at"`
 	StripeIdempotencyKey       *string            `json:"stripe_idempotency_key"`
+}
+
+type BillingYcOperation struct {
+	TeamID                 uuid.UUID          `json:"team_id"`
+	ID                     uuid.UUID          `json:"id"`
+	ContractID             uuid.UUID          `json:"contract_id"`
+	RenewalContractID      uuid.UUID          `json:"renewal_contract_id"`
+	ApprovedBy             string             `json:"approved_by"`
+	ApprovedAt             time.Time          `json:"approved_at"`
+	EvidenceReference      string             `json:"evidence_reference"`
+	Request                []byte             `json:"request"`
+	ResourceTerms          []byte             `json:"resource_terms"`
+	CustomerID             *string            `json:"customer_id"`
+	SubscriptionID         *string            `json:"subscription_id"`
+	FirstInvoiceID         *string            `json:"first_invoice_id"`
+	ApprovedGrantEvidence  []byte             `json:"approved_grant_evidence"`
+	State                  string             `json:"state"`
+	ProviderAttemptAt      pgtype.Timestamptz `json:"provider_attempt_at"`
+	CustomerAttemptAt      pgtype.Timestamptz `json:"customer_attempt_at"`
+	StartsAt               pgtype.Timestamptz `json:"starts_at"`
+	EndsAt                 pgtype.Timestamptz `json:"ends_at"`
+	PaymentMethodReady     bool               `json:"payment_method_ready"`
+	PaymentMethodCheckedAt pgtype.Timestamptz `json:"payment_method_checked_at"`
+	RevokedAt              pgtype.Timestamptz `json:"revoked_at"`
+	RevokedBy              *string            `json:"revoked_by"`
+	NextCheckAt            time.Time          `json:"next_check_at"`
+	LastError              *string            `json:"last_error"`
+	InvoiceCursor          *string            `json:"invoice_cursor"`
+	CancelGeneration       int64              `json:"cancel_generation"`
+	CancelPending          bool               `json:"cancel_pending"`
+	CancelRequestedAt      *int64             `json:"cancel_requested_at"`
+	CancelBoundary         pgtype.Timestamptz `json:"cancel_boundary"`
 }
 
 type DeviceCode struct {
@@ -1154,6 +1200,23 @@ type ProxyAudit struct {
 	UpstreamStatus *int32      `json:"upstream_status"`
 	LatencyMs      *int32      `json:"latency_ms"`
 	ErrorCode      *string     `json:"error_code"`
+}
+
+type QmOrganizationTeam struct {
+	Namespace      string             `json:"namespace"`
+	QmOrgID        uuid.UUID          `json:"qm_org_id"`
+	IdempotencyKey string             `json:"idempotency_key"`
+	AuthorityID    uuid.UUID          `json:"authority_id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	HomeRegion     string             `json:"home_region"`
+	CreatedAt      time.Time          `json:"created_at"`
+	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
+}
+
+type QmTeamServiceAuthority struct {
+	Namespace   string    `json:"namespace"`
+	AuthorityID uuid.UUID `json:"authority_id"`
+	HomeRegion  string    `json:"home_region"`
 }
 
 type QuotaAlertState struct {
@@ -1962,4 +2025,12 @@ type UserSignupTrialClaim struct {
 	ClaimedAt time.Time   `json:"claimed_at"`
 	TeamID    pgtype.UUID `json:"team_id"`
 	CreatedAt time.Time   `json:"created_at"`
+}
+
+type YcClaimTeamIntent struct {
+	TeamID     uuid.UUID          `json:"team_id"`
+	ClaimID    uuid.UUID          `json:"claim_id"`
+	UserID     uuid.UUID          `json:"user_id"`
+	CreatedAt  time.Time          `json:"created_at"`
+	ReleasedAt pgtype.Timestamptz `json:"released_at"`
 }
