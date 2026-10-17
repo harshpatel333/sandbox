@@ -13,6 +13,7 @@ func TestInvoiceCollectionPaymentEvidence(t *testing.T) {
 		{"processing", "processing", "processing"},
 		{"intent succeeded but invoice open", "succeeded", "processing"},
 		{"authentication", "requires_action", "requires_action"},
+		{"unattempted without method", "requires_payment_method", "ready"},
 		{"declined", "requires_payment_method", "requires_payment_method"},
 		{"canceled intent", "canceled", "review_required"},
 		{"capture", "requires_capture", "review_required"},
@@ -36,7 +37,7 @@ func TestInvoiceCollectionPaymentEvidence(t *testing.T) {
 				pi["livemode"] = true
 			case "multiple payments":
 				data = append(data, payment)
-			case "previous error":
+			case "previous error", "declined":
 				pi["last_payment_error"] = map[string]any{"code": "card_declined"}
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

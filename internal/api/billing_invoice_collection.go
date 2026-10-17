@@ -286,7 +286,12 @@ func (c *stripeHTTPClient) invoicePaymentState(ctx context.Context, inv StripeIn
 		case "requires_action":
 			state = "requires_action"
 		case "requires_payment_method":
-			state = "requires_payment_method"
+			// Finalization can leave the intent without a method. Invoice /pay
+			// resolves Billing defaults; only an actual failure parks the job.
+			// An uncertain earlier call still reuses its saved key and window.
+			if pi.LastError != nil {
+				state = "requires_payment_method"
+			}
 		case "requires_confirmation":
 			if pi.LastError != nil {
 				return "review_required", nil

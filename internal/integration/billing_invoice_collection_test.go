@@ -48,6 +48,11 @@ func TestIntegration_InvoiceCollectionRecovery(t *testing.T) {
 		{"processing", "unknown", "processing", "processing", 1, 0},
 		{"authentication", "unknown", "requires_action", "requires_action", 1, 0},
 		{"decline", "unknown", "requires_payment_method", "requires_payment_method", 1, 0},
+		{"initial method resolution", "pending", "requires_payment_method", "unknown", 0, 200},
+		{"uncertain before method resolution", "unknown", "requires_payment_method", "unknown", 1, 200},
+		{"declined outside worker", "pending", "requires_payment_method", "requires_payment_method", 0, 0},
+		{"decline error cleared", "requires_payment_method", "requires_payment_method", "review_required", 1, 0},
+		{"expired before method resolution", "unknown", "requires_payment_method", "review_required", 24, 0},
 		{"do not retry decline", "requires_payment_method", "requires_confirmation", "review_required", 1, 0},
 		{"reconcile paid", "unknown", "", "paid", 24, 0},
 		{"uncollectible then paid", "uncollectible", "", "paid", 24, 0},
@@ -74,9 +79,13 @@ func TestIntegration_InvoiceCollectionRecovery(t *testing.T) {
 				case r.URL.Path == "/v1/invoices/"+inv.ID:
 					_ = json.NewEncoder(w).Encode(inv)
 				case r.URL.Path == "/v1/invoice_payments":
-					_ = json.NewEncoder(w).Encode(map[string]any{"has_more": false, "data": []any{map[string]any{"invoice": inv.ID, "currency": "usd", "status": "open", "payment": map[string]any{"type": "payment_intent", "payment_intent": map[string]any{"id": "pi_example", "customer": inv.Customer, "currency": "usd", "status": tc.pi}}}}})
+					pi := map[string]any{"id": "pi_example", "customer": inv.Customer, "currency": "usd", "status": tc.pi}
+					if tc.name == "decline" || tc.name == "declined outside worker" {
+						pi["last_payment_error"] = map[string]any{"code": "card_declined"}
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"has_more": false, "data": []any{map[string]any{"invoice": inv.ID, "currency": "usd", "status": "open", "payment": map[string]any{"type": "payment_intent", "payment_intent": pi}}}})
 				case r.URL.Path == "/v1/subscriptions/sub_example":
-					_ = json.NewEncoder(w).Encode(map[string]any{"id": "sub_example", "customer": inv.Customer, "status": "active", "pause_collection": map[string]any{"behavior": "keep_as_draft"}, "items": map[string]any{"data": []any{map[string]any{"id": "si_example"}}}})
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": "sub_example", "customer": inv.Customer, "default_payment_method": "pm_example", "status": "active", "pause_collection": map[string]any{"behavior": "keep_as_draft"}, "items": map[string]any{"data": []any{map[string]any{"id": "si_example"}}}})
 				case strings.HasSuffix(r.URL.Path, "/pay"):
 					calls++
 					if r.Header.Get("Idempotency-Key") != "billing-invoice-pay:v1:"+inv.ID {
@@ -101,7 +110,7 @@ func TestIntegration_InvoiceCollectionRecovery(t *testing.T) {
 			if err := testPool.QueryRow(t.Context(), `SELECT state FROM billing_invoice_collection WHERE invoice_id=$1`, inv.ID).Scan(&state); err != nil {
 				t.Fatal(err)
 			}
-			if state != tc.want || (calls > 0) != (tc.payStatus > 0) {
+			if state != tc.want || (calls == 1) != (tc.payStatus > 0) || calls > 1 {
 				t.Fatalf("state=%s calls=%d", state, calls)
 			}
 			if first != nil {
