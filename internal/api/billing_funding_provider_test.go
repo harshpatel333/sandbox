@@ -231,7 +231,7 @@ func TestFundingCollectionRequiresLiveMeteredRoute(t *testing.T) {
 		{"active", true}, {"trialing", true}, {"past_due", true}, {"canceled", false}, {"incomplete", false}, {"incomplete_expired", false}, {"unpaid", false}, {"paused", false},
 	} {
 		t.Run(tc.status, func(t *testing.T) {
-			sub := invoiceSubscription{ID: "sub_example", Status: tc.status, CollectionMethod: "send_invoice"}
+			sub := invoiceSubscription{ID: "sub_example", Status: tc.status, CollectionMethod: "charge_automatically"}
 			for _, id := range []string{"cpu", "memory"} {
 				p := storagePrice{ID: "price_" + id, Product: "prod_example", Currency: "usd", BillingScheme: "per_unit", UnitAmountDecimal: "1"}
 				p.Recurring.UsageType, p.Recurring.Interval, p.Recurring.IntervalCount, p.Recurring.Meter = "metered", "month", 1, "mtr_"+id
@@ -240,6 +240,13 @@ func TestFundingCollectionRequiresLiveMeteredRoute(t *testing.T) {
 			if got := fundingCollectionReady(sub); got != tc.ready {
 				t.Fatalf("ready=%v", got)
 			}
+			for _, method := range []string{"send_invoice", ""} {
+				sub.CollectionMethod = method
+				if fundingCollectionReady(sub) {
+					t.Fatalf("unsupported collection method %q accepted", method)
+				}
+			}
+			sub.CollectionMethod = "charge_automatically"
 			sub.Items.Data[1].Price.Recurring.Meter = ""
 			if fundingCollectionReady(sub) {
 				t.Fatal("incomplete metered route accepted")

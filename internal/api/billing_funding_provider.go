@@ -202,7 +202,7 @@ func (c *stripeHTTPClient) observeFundingPage(ctx context.Context, customer, sub
 }
 
 func fundingCollectionReady(sub invoiceSubscription) bool {
-	if sub.ID == "" || !slices.Contains([]string{"active", "trialing", "past_due"}, sub.Status) || sub.EndedAt != 0 || sub.Items.HasMore || sub.CollectionMethod != "charge_automatically" && sub.CollectionMethod != "send_invoice" {
+	if sub.ID == "" || !slices.Contains([]string{"active", "trialing", "past_due"}, sub.Status) || sub.EndedAt != 0 || sub.Items.HasMore || sub.CollectionMethod != "charge_automatically" {
 		return false
 	}
 	if sub.PauseCollection != nil && (sub.PauseCollection.Behavior != "keep_as_draft" || sub.PauseCollection.ResumesAt != 0) {

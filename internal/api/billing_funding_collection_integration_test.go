@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,12 +72,14 @@ func TestFundingReplacementEnrollmentAndScopedCreditSettlement(t *testing.T) {
 		}
 		return map[string]any{"id": "price_" + id, "product": "prod_example", "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": amount, "recurring": map[string]any{"usage_type": "metered", "interval": "month", "interval_count": 1, "meter": "mtr_" + id}}
 	}
+	var collectionMethod atomic.Value
+	collectionMethod.Store("charge_automatically")
 	subscription := func(id, status string) map[string]any {
 		items := []any{}
 		for _, resource := range []string{"cpu", "memory", "round"} {
 			items = append(items, map[string]any{"id": "si_" + resource, "price": price(resource), "current_period_start": end.Unix(), "current_period_end": end.AddDate(0, 1, 0).Unix()})
 		}
-		return map[string]any{"id": id, "customer": customer, "status": status, "collection_method": "charge_automatically", "billing_cycle_anchor": anchor.Unix(), "pause_collection": map[string]any{"behavior": "keep_as_draft"}, "items": map[string]any{"data": items}}
+		return map[string]any{"id": id, "customer": customer, "status": status, "collection_method": collectionMethod.Load().(string), "billing_cycle_anchor": anchor.Unix(), "pause_collection": map[string]any{"behavior": "keep_as_draft"}, "items": map[string]any{"data": items}}
 	}
 	invoiceID := "in_" + team.String()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +89,14 @@ func TestFundingReplacementEnrollmentAndScopedCreditSettlement(t *testing.T) {
 		}
 		var out any
 		switch r.URL.Path {
+		case "/v1/customers/" + customer:
+			out = map[string]any{"id": customer, "invoice_settings": map[string]any{"default_payment_method": "pm_example"}}
+		case "/v1/payment_methods/pm_example":
+			out = map[string]any{"id": "pm_example", "customer": customer, "type": "card", "card": map[string]any{"exp_month": 12, "exp_year": now.Year() + 1, "fingerprint": "fp_example"}}
+		case "/v1/setup_intents":
+			out = map[string]any{"data": []any{map[string]any{"id": "seti_example", "customer": customer, "payment_method": "pm_example", "status": "succeeded", "usage": "off_session"}}}
+		case "/v1/charges":
+			out = map[string]any{"data": []any{fundingCharge{ID: "ch_example", Customer: customer, Currency: "usd", Status: "succeeded", Paid: true, Captured: true, AmountCaptured: 100}}}
 		case "/v1/subscriptions/" + oldSub:
 			out = subscription(oldSub, "canceled")
 		case "/v1/subscriptions/" + replacement:
@@ -120,7 +131,7 @@ func TestFundingReplacementEnrollmentAndScopedCreditSettlement(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(out)
 	}))
 	t.Cleanup(srv.Close)
-	client := &stripeHTTPClient{baseURL: srv.URL, httpClient: srv.Client(), apiVersion: "2026-07-29.dahlia"}
+	client := &stripeHTTPClient{baseURL: srv.URL, httpClient: srv.Client(), apiVersion: "2026-07-29.dahlia", secretKey: "sk_test_example"}
 	h.Stripe = client
 	if err := h.commitFreeFundingPlan(ctx, team, uuid.New()); err != nil {
 		t.Fatal(err)
@@ -170,6 +181,45 @@ func TestFundingReplacementEnrollmentAndScopedCreditSettlement(t *testing.T) {
 	var ended bool
 	if err := h.Pool.QueryRow(ctx, `SELECT status='ended' AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement WHERE contract_id=$1) FROM billing_commercial_contract WHERE id=$1`, contract.ID).Scan(&ended); err != nil || !ended {
 		t.Fatalf("inventory fallback revived old benefits: %v %v", ended, err)
+	}
+	// Exercise the enrolled provider route and the admission predicate together:
+	// manual invoices cannot authorize card-only usage, but credits still can.
+	exec(`UPDATE billing_invoice_account SET adjustment_event_name=$2 WHERE team_id=$1`, team, invoiceRoundingEvent)
+	actor := uuid.New()
+	exec(`INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
+	exec(`UPDATE team_signup_trial_provenance SET creator_user_id=$2,creator_bound_at=now() WHERE team_id=$1`, team, actor)
+	exec(`SELECT register_promotion_signup_device($1,$2,$3,$4)`, actor, uuid.New(), uuid.NewString(), uuid.NewString())
+	exec(`UPDATE billing_funding_account SET observe=true,enforce=true WHERE team_id=$1`, team)
+	t.Cleanup(func() {
+		_, _ = h.Pool.Exec(context.Background(), `UPDATE billing_funding_account SET observe=false,enforce=false WHERE team_id=$1`, team)
+	})
+	for _, method := range []string{"charge_automatically", "send_invoice"} {
+		t.Run("funding-"+method, func(t *testing.T) {
+			collectionMethod.Store(method)
+			job, snapshot := claimFundingTestJob(t, h, team)
+			observation, err := h.observeFundingProvider(ctx, team, snapshot.Account, "", "")
+			wantCollection := method == "charge_automatically"
+			if err != nil || !observation.PaymentMethodReusable || !observation.CashCollected || observation.CollectionReady != wantCollection {
+				t.Fatalf("provider observation=%+v err=%v", observation, err)
+			}
+			credit := &fundingCreditObservation{SpendableUSD: "0", ValidUntil: snapshot.At.Add(time.Minute)}
+			if err := h.publishFundingObservation(ctx, job, snapshot, credit, &observation, nil); err != nil {
+				t.Fatal(err)
+			}
+			allowed, err := h.DB.IsTeamSandboxBillingEligible(ctx, team)
+			if err != nil || allowed != wantCollection {
+				t.Fatalf("card-only access with %s: allowed=%v err=%v", method, allowed, err)
+			}
+			job, snapshot = claimFundingTestJob(t, h, team)
+			credit.SpendableUSD = "1"
+			if err := h.publishFundingObservation(ctx, job, snapshot, credit, &observation, nil); err != nil {
+				t.Fatal(err)
+			}
+			allowed, err = h.DB.IsTeamSandboxBillingEligible(ctx, team)
+			if err != nil || !allowed {
+				t.Fatalf("credit access with %s: allowed=%v err=%v", method, allowed, err)
+			}
+		})
 	}
 	// Any change after the prepared plan stays held rather than charging cash.
 	grant.VoidedAt = now.Unix()
