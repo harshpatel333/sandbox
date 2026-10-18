@@ -19,6 +19,7 @@ func TestBillingMetricsBoundLabelsAndKeepUnknownProviderDistinct(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.RecordBillingWork(ctx, "raw-secret", true, time.Second, 2)
+	r.RecordBillingWork(ctx, "funding_observation", true, time.Second, 1)
 	r.RecordBillingLag(ctx, 3600)
 	for _, state := range []string{"pending", "uncertain", "recovery_required", "rejected", "submitted", "adopted", "entitlement_paid_missing", "entitlement_debt_unknown"} {
 		r.RecordBillingBacklog(ctx, state, 3, 90)
@@ -37,13 +38,20 @@ func TestBillingMetricsBoundLabelsAndKeepUnknownProviderDistinct(t *testing.T) {
 			switch m.Name {
 			case "billing_operations_total":
 				points := m.Data.(metricdata.Sum[int64]).DataPoints
-				if len(points) != 1 || points[0].Value != 1 {
+				if len(points) != 2 {
 					t.Fatalf("operations: %+v", points)
 				}
-				for _, a := range points[0].Attributes.ToSlice() {
-					if a.Key == "operation" && a.Value.AsString() != "unknown" {
-						t.Fatal(a)
+				operations := map[string]bool{}
+				for _, point := range points {
+					operation, _ := point.Attributes.Value("operation")
+					result, _ := point.Attributes.Value("result")
+					if point.Value != 1 || result.AsString() != "error" {
+						t.Fatalf("operations: %+v", points)
 					}
+					operations[operation.AsString()] = true
+				}
+				if !operations["unknown"] || !operations["funding_observation"] {
+					t.Fatalf("funding errors collapsed into unknown: %+v", operations)
 				}
 			case "billing_event_backlog_capped":
 				if points := m.Data.(metricdata.Gauge[int64]).DataPoints; len(points) != 8 {

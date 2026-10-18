@@ -124,6 +124,7 @@ jobs:
           # ordered integration/migration command in the same isolated job.
           go test -v -tags integration -count=1 -race -timeout 10m ./cmd/seed-templates/
           go test -v -tags integration -count=1 -race -timeout 1m -run '^TestQMKeyUsage$' ./internal/api
+          go test -v -tags integration -count=1 -race -timeout 3m -run '^TestFunding|^TestIntegrationFundingCredit' ./internal/api
 
   proxy-database-contracts:
     name: Proxy Database Contracts

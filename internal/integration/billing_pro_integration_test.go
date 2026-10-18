@@ -403,7 +403,60 @@ func TestIntegration_ProReviewRecoveryCases(t *testing.T) {
 		f.subStatus = "canceled"
 		f.mu.Unlock()
 		assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{"restart":true}`, 200, "active")
-		assertProResponse(t, r, key, "/stripe/plan-choice", `{"offer":"free"}`, 409, "plan_conflict")
+		// Cancellation alone preserves the paid term. An explicit Free choice
+		// releases future benefits while retaining receipts and issued allowance.
+		contract, err := testQueries.GetCurrentCommercialContract(t.Context(), f.team)
+		if err != nil || contract.Status != "active" {
+			t.Fatalf("cancellation discarded paid coverage: %+v %v", contract, err)
+		}
+		contract = commercialObserve(t, contract, false)
+		entitlement := commercialClaim(t, contract)
+		correctionExec(t, `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open') ON CONFLICT DO NOTHING`, f.team, entitlement.PeriodStart, entitlement.PeriodEnd)
+		correctionExec(t, `INSERT INTO billing_invoice_calendar(team_id,period_start,period_end,customer_id,subscription_id,invoice_start,invoice_end,billing_cycle_anchor) VALUES($1,$2,$3,$4,$5,$2,$3,$6) ON CONFLICT DO NOTHING`, f.team, entitlement.PeriodStart, entitlement.PeriodEnd, f.customer, f.sub, f.anchor)
+		entitlement, err = testQueries.BeginUsageEntitlementIssuance(t.Context(), db.BeginUsageEntitlementIssuanceParams{
+			TeamID: f.team, ContractID: contract.ID, EntitlementID: entitlement.ID,
+			InvoiceStart: commercialTime(entitlement.PeriodStart), InvoiceEnd: commercialTime(entitlement.PeriodEnd),
+			Prices: []byte(`[{"id":"price_cpu"},{"id":"price_memory"},{"id":"price_storage"}]`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var grantEvidence map[string]any
+		if err = json.Unmarshal(entitlement.RequestPayload, &grantEvidence); err != nil {
+			t.Fatal(err)
+		}
+		grantID := "credgr_" + uuid.NewString()
+		grantEvidence["id"] = grantID
+		evidence, err := json.Marshal(grantEvidence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = testQueries.ConfirmUsageEntitlementIssued(t.Context(), db.ConfirmUsageEntitlementIssuedParams{TeamID: f.team, EntitlementID: entitlement.ID, GrantID: &grantID, Evidence: evidence}); err != nil {
+			t.Fatal(err)
+		}
+		var receiptBefore, allowanceBefore, choiceBefore []byte
+		if err = testPool.QueryRow(t.Context(), `SELECT to_jsonb(p),to_jsonb(e),to_jsonb(s) FROM billing_contract_payment p JOIN billing_usage_entitlement e ON e.payment_id=p.id JOIN billing_signup_choice s ON s.team_id=p.team_id WHERE p.team_id=$1`, f.team).Scan(&receiptBefore, &allowanceBefore, &choiceBefore); err != nil {
+			t.Fatal(err)
+		}
+		for range 2 {
+			assertProResponse(t, r, key, "/stripe/plan-choice", `{"offer":"free"}`, 200, "committed")
+		}
+		var preserved bool
+		err = testPool.QueryRow(t.Context(), `SELECT c.status='ended' AND s.offer_key='free' AND s.state='committed'
+			AND a.stripe_customer_id=$2 AND a.stripe_subscription_id=$3 AND a.stripe_subscription_status='canceled'
+			AND (SELECT count(*) FROM billing_contract_payment WHERE team_id=$1)=1
+			AND (SELECT to_jsonb(p) FROM billing_contract_payment p WHERE team_id=$1)=$4::jsonb
+			AND (SELECT count(*) FROM billing_usage_entitlement WHERE team_id=$1)=1
+			AND (SELECT to_jsonb(e) FROM billing_usage_entitlement e WHERE team_id=$1)=$5::jsonb
+			AND (SELECT count(*) FROM billing_plan_release WHERE team_id=$1)=1
+			AND EXISTS(SELECT 1 FROM billing_plan_release WHERE team_id=$1 AND previous_choice=$6::jsonb
+				AND previous_offer='pro_annual' AND provider_status='canceled' AND subscription_id=$3
+				AND actor_id=($6::jsonb->>'actor_id')::uuid)
+			FROM billing_commercial_contract c JOIN billing_signup_choice s USING(team_id)
+			JOIN team_billing_account a USING(team_id) WHERE c.id=$7`, f.team, f.customer, f.sub, receiptBefore, allowanceBefore, choiceBefore, contract.ID).Scan(&preserved)
+		if err != nil || !preserved {
+			t.Fatalf("explicit release lost paid history, issued credit, or audit identity: %v %v", preserved, err)
+		}
 	})
 	t.Run("missed webhook worker recovery", func(t *testing.T) {
 		f, r, key := newProFixture(t, "pro_monthly")
