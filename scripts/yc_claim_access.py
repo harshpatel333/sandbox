@@ -14,7 +14,7 @@ WORKFLOW = '.github/workflows/terraform-rollout-staging.yml'
 BUCKET = 'rayai-dev-control-plane-evidence'
 DEPLOYER = 'superserve-github-actions@rayai-dev.iam.gserviceaccount.com'
 MEMBER = 'serviceAccount:superserve-cp-staging@rayai-dev.iam.gserviceaccount.com'
-TERRAFORM_VERSION = '1.14.9'
+TERRAFORM_VERSION = '1.16.6'
 TARGETS = {
     f'google_secret_manager_secret_iam_member.controlplane_runtime["yc-claim-{kind}-token-staging-usc1"]':
     f'yc-claim-{kind}-token-staging-usc1'

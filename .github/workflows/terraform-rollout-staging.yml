@@ -89,7 +89,7 @@ jobs:
         run: python3 scripts/yc_claim_access.py check
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: '1.14.9'
+          terraform_version: '1.16.6'
           terraform_wrapper: false
       - uses: google-github-actions/auth@v2
         with:
