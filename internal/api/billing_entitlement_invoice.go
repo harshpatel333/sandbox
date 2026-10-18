@@ -262,8 +262,8 @@ func (h *Handlers) invoicePlanCredits(ctx context.Context, p billing.ExportPerio
 		if err := client.rejectCompetingCreditInvoice(ctx, a.Customer, invoiceID, plan.InvoiceEnd); err != nil {
 			return 0, err
 		}
-		var contract uuid.UUID
-		if err := h.Pool.QueryRow(ctx, `SELECT id FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 ORDER BY created_at DESC LIMIT 1`, p.TeamID, a.Customer, a.Subscription).Scan(&contract); err != nil {
+		contract, err := h.invoiceCreditInventoryContract(ctx, p.TeamID, a)
+		if err != nil {
 			return 0, err
 		}
 		if err := h.syncCreditInventory(ctx, contract, a.Customer, client); err != nil {

@@ -2125,7 +2125,7 @@ func (h *Handlers) processRecordedStripeWebhook(ctx context.Context, event strip
 	if existingEvent.ProcessedAt.Valid {
 		return nil
 	}
-	preReservation, err := h.reserveStripePromotionBeforeWebhook(ctx, queries, event)
+	preReservation, err := h.reserveStripePromotionBeforeWebhook(ctx, conn, event)
 	if err != nil {
 		return err
 	}
@@ -2368,7 +2368,8 @@ func isStripePromotionAuthorityFailure(err error) bool {
 	}
 }
 
-func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, queries *db.Queries, event stripeEventEnvelope) (*stripePromotionPreReservation, error) {
+func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, reader db.DBTX, event stripeEventEnvelope) (*stripePromotionPreReservation, error) {
+	queries := db.New(reader)
 	if event.Type != "customer.subscription.created" && event.Type != "customer.subscription.updated" && event.Type != "customer.subscription.resumed" {
 		return nil, nil
 	}
@@ -2402,6 +2403,13 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, quer
 			return nil, nil
 		}
 		return nil, err
+	}
+	var releasedPlan bool
+	if err := reader.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE team_id=$1)`, account.TeamID).Scan(&releasedPlan); err != nil {
+		return nil, err
+	}
+	if releasedPlan {
+		return nil, nil
 	}
 	orderingAccount := db.TeamBillingAccount{
 		TeamID:                          account.TeamID,
@@ -3213,6 +3221,38 @@ func (h *Handlers) settleStaleStripePromotion(ctx context.Context, q *db.Queries
 
 func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Context, tx pgx.Tx, event stripeEventEnvelope, preReservation *stripePromotionPreReservation) error {
 	q := h.DB.WithTx(tx)
+	if strings.HasPrefix(event.Type, "customer.subscription.") || strings.HasPrefix(event.Type, "checkout.session.") || strings.HasPrefix(event.Type, "invoice.") {
+		var binding struct {
+			ID           string `json:"id"`
+			Customer     string `json:"customer"`
+			Subscription string `json:"subscription"`
+			Parent       struct {
+				SubscriptionDetails *struct {
+					Subscription string `json:"subscription"`
+				} `json:"subscription_details"`
+			} `json:"parent"`
+		}
+		if err := json.Unmarshal(event.Data.Object, &binding); err != nil {
+			return err
+		}
+		if strings.HasPrefix(event.Type, "customer.subscription.") {
+			binding.Subscription = binding.ID
+		}
+		if binding.Parent.SubscriptionDetails != nil {
+			binding.Subscription = binding.Parent.SubscriptionDetails.Subscription
+		}
+		var released bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE customer_id=$1 AND (subscription_id=$2 OR previous_choice->>'session_id'=$3))`, binding.Customer, binding.Subscription, binding.ID).Scan(&released); err != nil {
+			return err
+		}
+		if released {
+			if strings.HasPrefix(event.Type, "invoice.") {
+				_, err := tx.Exec(ctx, `UPDATE billing_invoice_collection SET next_attempt_at=LEAST(next_attempt_at,clock_timestamp()) WHERE invoice_id=$1 AND customer_id=$2 AND state NOT IN ('paid','void')`, binding.ID, binding.Customer)
+				return err
+			}
+			return nil
+		}
+	}
 	eventAt := stripeEventTime(int64(event.Created))
 	if isStripeMeterErrorEvent(event.Type) && len(bytes.TrimSpace(event.Data.Object)) == 0 {
 		if err := h.expandStripeThinMeterEvent(ctx, &event); err != nil {
@@ -3447,10 +3487,14 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 			periodStart = timestamptzFromUnix(start)
 			periodEnd = timestamptzFromUnix(end)
 		}
+		var releasedPlan bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE team_id=$1)`, account.TeamID).Scan(&releasedPlan); err != nil {
+			return err
+		}
 		promotionReserved := false
 		promotionReservationAttempted := false
 		var activationUser pgtype.UUID
-		if !cancellation && !revocationCompleted && (strings.EqualFold(obj.Status, "active") || strings.EqualFold(obj.Status, "trialing")) {
+		if !releasedPlan && !cancellation && !revocationCompleted && (strings.EqualFold(obj.Status, "active") || strings.EqualFold(obj.Status, "trialing")) {
 			if actor := stripePromotionActorForSubscription(account, obj); actor != uuid.Nil {
 				activationUser = pgtype.UUID{Bytes: actor, Valid: true}
 			}

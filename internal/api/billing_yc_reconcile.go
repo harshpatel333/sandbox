@@ -20,6 +20,13 @@ import (
 )
 
 func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
+	var released bool
+	if err := h.Pool.QueryRow(ctx, `SELECT billing_yc_released($1)`, team).Scan(&released); err != nil {
+		return err
+	}
+	if released {
+		return nil
+	}
 	o, err := h.ycOperation(ctx, team)
 	if err != nil {
 		return err

@@ -32,7 +32,7 @@ const (
 	// 402s within a few seconds on every replica, webhook or not.
 	billingIneligibleTTL = 3 * time.Second
 	// billingEligQueryTimeout bounds the shared flight's read; the query is
-	// three indexed lookups, so anything slower is the DB misbehaving.
+	// bounded local indexed lookups, with no provider calls.
 	billingEligQueryTimeout = 5 * time.Second
 	// evictSamplePerPut caps how many entries a put inspects for expiry, so
 	// eviction cost never scales with team cardinality on the request path.

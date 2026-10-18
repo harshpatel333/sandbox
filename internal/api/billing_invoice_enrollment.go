@@ -182,7 +182,11 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 		if ycErr == nil {
 			err = client.ycGrantPreflight(ctx, a.Customer, ycContract, ycGrant)
 		} else if errors.Is(ycErr, pgx.ErrNoRows) {
-			_, err = client.invoiceCreditLedger(ctx, a.Customer, time.Now().Unix())
+			var released bool
+			released, err = h.preflightReleasedFundingCredits(ctx, team, a, client, tx)
+			if err == nil && !released {
+				_, err = client.invoiceCreditLedger(ctx, a.Customer, time.Now().Unix())
+			}
 		} else {
 			err = ycErr
 		}

@@ -708,7 +708,11 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	if a.Base.Price != "" {
 		err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
 	} else {
-		plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
+		var released bool
+		released, err = h.prepareReleasedFundingCredits(ctx, p, a, inv.ID, &plan, client)
+		if err == nil && !released {
+			plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
+		}
 	}
 	return plan, err
 }

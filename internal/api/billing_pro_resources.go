@@ -120,10 +120,12 @@ func (h *Handlers) billingSubscriptionResourceStates(ctx context.Context, team u
 	if len(readers) > 0 {
 		reader = readers[0]
 	}
-	err := reader.QueryRow(ctx, `SELECT s.request_payload FROM billing_signup_choice s
+	err := reader.QueryRow(ctx, `WITH evidence AS (SELECT s.request_payload,1 priority FROM billing_signup_choice s
         WHERE s.team_id=$1 AND s.offer_key IN ('pro_monthly','pro_annual')
         AND s.subscription_id=COALESCE(NULLIF($2,''),(SELECT stripe_subscription_id FROM team_billing_account WHERE team_id=$1))
-        UNION ALL SELECT resource_terms FROM billing_yc_operation WHERE team_id=$1 AND subscription_id=COALESCE(NULLIF($2,''),(SELECT stripe_subscription_id FROM team_billing_account WHERE team_id=$1))`, team, subscription).Scan(&payload)
+        UNION ALL SELECT resource_terms,2 FROM billing_yc_operation WHERE team_id=$1 AND subscription_id=COALESCE(NULLIF($2,''),(SELECT stripe_subscription_id FROM team_billing_account WHERE team_id=$1))
+        UNION ALL SELECT previous_choice->'request_payload',3 FROM billing_plan_release WHERE team_id=$1 AND subscription_id=COALESCE(NULLIF($2,''),(SELECT stripe_subscription_id FROM team_billing_account WHERE team_id=$1)))
+        SELECT request_payload FROM evidence WHERE request_payload IS NOT NULL AND request_payload<>'null'::jsonb ORDER BY priority LIMIT 1`, team, subscription).Scan(&payload)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return states, nil
 	}

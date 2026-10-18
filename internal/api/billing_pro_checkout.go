@@ -275,38 +275,16 @@ func (h *Handlers) CommitFreeSignupPlan(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	ctx := c.Request.Context()
-	tx, err := h.Pool.Begin(ctx)
+	actor, err := customerActorID(c)
 	if err != nil {
-		respondError(c, ErrInternal)
 		return
 	}
-	defer tx.Rollback(ctx)
-	_, err = tx.Exec(ctx, `INSERT INTO team_billing_account(team_id) VALUES($1) ON CONFLICT DO NOTHING`, team)
-	if err == nil {
-		_, err = h.DB.WithTx(tx).LockTeamBillingAccount(ctx, team)
-	}
-	if err != nil {
-		respondError(c, ErrInternal)
-		return
-	}
-	var selected *string
-	var state string
-	err = tx.QueryRow(ctx, `SELECT offer_key,state FROM billing_signup_choice WHERE team_id=$1 FOR UPDATE`, team).Scan(&selected, &state)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		respondError(c, ErrInternal)
-		return
-	}
-	if selected != nil && *selected != "free" {
-		proConflict(c)
-		return
-	}
-	_, err = tx.Exec(ctx, `UPDATE billing_signup_choice SET offer_key='free',state='committed',revision=revision+1 WHERE team_id=$1`, team)
-	if err == nil {
-		err = tx.Commit(ctx)
-	}
-	if err != nil {
-		respondError(c, ErrInternal)
+	if err = h.commitFreeFundingPlan(c.Request.Context(), team, actor); err != nil {
+		if errors.Is(err, errFundingPlanTransition) {
+			respondErrorMsg(c, "plan_conflict", err.Error(), http.StatusConflict)
+		} else {
+			respondError(c, ErrInternal)
+		}
 		return
 	}
 	c.JSON(200, gin.H{"offer": "free", "state": "committed"})
@@ -347,8 +325,15 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 	if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 		return false, err
 	}
+	subscription := obj.Subscription
+	if strings.HasPrefix(event.Type, "customer.subscription.") {
+		subscription = obj.ID
+	}
+	if obj.Parent.SubscriptionDetails != nil {
+		subscription = obj.Parent.SubscriptionDetails.Subscription
+	}
 	var yc bool
-	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_operation WHERE customer_id=$1)`, obj.Customer).Scan(&yc); err != nil {
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_yc_operation o WHERE customer_id=$1 AND NOT billing_yc_released(o.team_id))`, obj.Customer).Scan(&yc); err != nil {
 		return false, err
 	}
 	if yc {
@@ -358,14 +343,20 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 		_, err := h.DB.MarkStripeWebhookEventProcessed(ctx, event.ID)
 		return true, err
 	}
+	var released bool
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE customer_id=$1 AND (subscription_id=$2 OR previous_choice->>'session_id'=$3))`, obj.Customer, subscription, obj.ID).Scan(&released); err != nil {
+		return false, err
+	}
+	if released {
+		if strings.HasPrefix(event.Type, "invoice.") {
+			if _, err := h.Pool.Exec(ctx, `UPDATE billing_invoice_collection SET next_attempt_at=LEAST(next_attempt_at,clock_timestamp()) WHERE invoice_id=$1 AND customer_id=$2 AND state NOT IN ('paid','void')`, obj.ID, obj.Customer); err != nil {
+				return true, err
+			}
+		}
+		_, err := h.DB.MarkStripeWebhookEventProcessed(ctx, event.ID)
+		return true, err
+	}
 	var closed bool
-	subscription := obj.Subscription
-	if strings.HasPrefix(event.Type, "customer.subscription.") {
-		subscription = obj.ID
-	}
-	if obj.Parent.SubscriptionDetails != nil {
-		subscription = obj.Parent.SubscriptionDetails.Subscription
-	}
 	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_closed_purchase p JOIN team_billing_account a USING(team_id) WHERE a.stripe_customer_id=$1 AND (p.subscription_id=$2 OR p.session_id=$3))`, obj.Customer, subscription, obj.ID).Scan(&closed); err != nil {
 		return false, err
 	}
