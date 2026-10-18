@@ -584,6 +584,40 @@ type BillingFinalizationAttempt struct {
 	LastAttemptAt time.Time `json:"last_attempt_at"`
 }
 
+type BillingFundingAccount struct {
+	TeamID             uuid.UUID          `json:"team_id"`
+	Observe            bool               `json:"observe"`
+	Enforce            bool               `json:"enforce"`
+	Generation         int64              `json:"generation"`
+	NextCheckAt        time.Time          `json:"next_check_at"`
+	LeaseToken         pgtype.UUID        `json:"lease_token"`
+	LeaseUntil         pgtype.Timestamptz `json:"lease_until"`
+	CustomerID         *string            `json:"customer_id"`
+	SubscriptionID     *string            `json:"subscription_id"`
+	ObservedGeneration *int64             `json:"observed_generation"`
+	CreditUsd          pgtype.Numeric     `json:"credit_usd"`
+	CreditValidUntil   pgtype.Timestamptz `json:"credit_valid_until"`
+	CreditEvidence     []byte             `json:"credit_evidence"`
+	PaymentMethodID    *string            `json:"payment_method_id"`
+	PaymentMethodReady bool               `json:"payment_method_ready"`
+	CollectionReady    bool               `json:"collection_ready"`
+	CashChargeID       *string            `json:"cash_charge_id"`
+	CashCollected      bool               `json:"cash_collected"`
+	ChargeCursor       *string            `json:"charge_cursor"`
+	ProviderValidUntil pgtype.Timestamptz `json:"provider_valid_until"`
+	ProviderEvidence   []byte             `json:"provider_evidence"`
+	CheckedAt          pgtype.Timestamptz `json:"checked_at"`
+	ProviderCheckedAt  pgtype.Timestamptz `json:"provider_checked_at"`
+	CreditCheckedAt    pgtype.Timestamptz `json:"credit_checked_at"`
+	LastError          *string            `json:"last_error"`
+	Failures           int32              `json:"failures"`
+}
+
+type BillingFundingPolicy struct {
+	Singleton        bool  `json:"singleton"`
+	MaxObservedTeams int32 `json:"max_observed_teams"`
+}
+
 type BillingIncrementalPeriod struct {
 	TeamID                 uuid.UUID          `json:"team_id"`
 	PeriodStart            time.Time          `json:"period_start"`
@@ -741,6 +775,22 @@ type BillingPeriodCloseWork struct {
 	LastError      *string            `json:"last_error"`
 	Stage          string             `json:"stage"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+type BillingPlanRelease struct {
+	ID               uuid.UUID   `json:"id"`
+	TeamID           uuid.UUID   `json:"team_id"`
+	ActorID          uuid.UUID   `json:"actor_id"`
+	PreviousOffer    *string     `json:"previous_offer"`
+	CustomerID       *string     `json:"customer_id"`
+	SubscriptionID   *string     `json:"subscription_id"`
+	YcOperationID    pgtype.UUID `json:"yc_operation_id"`
+	PreviousChoice   []byte      `json:"previous_choice"`
+	PreviousAccount  []byte      `json:"previous_account"`
+	PreviousYc       []byte      `json:"previous_yc"`
+	ProviderStatus   string      `json:"provider_status"`
+	ProviderEvidence []byte      `json:"provider_evidence"`
+	ReleasedAt       time.Time   `json:"released_at"`
 }
 
 type BillingProClosedPurchase struct {

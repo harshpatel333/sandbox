@@ -257,7 +257,7 @@ CREATE FUNCTION billing_funding_fingerprint(p_team uuid) RETURNS text LANGUAGE s
 $$;
 
 ALTER FUNCTION team_sandbox_billing_eligible(uuid) RENAME TO team_sandbox_billing_eligible_legacy;
-CREATE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS boolean LANGUAGE sql STABLE AS $$
+CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT CASE
  WHEN EXISTS(SELECT 1 FROM abuse_restrictions r WHERE r.subject_team_id=p_team_id AND r.released_at IS NULL
  AND (r.expires_at IS NULL OR r.expires_at>now()) AND r.action IN ('create','resume')) THEN false
