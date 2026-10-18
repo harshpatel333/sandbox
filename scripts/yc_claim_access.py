@@ -29,7 +29,17 @@ def require(condition, message):
 
 def run(*args, cwd=None):
     result = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
-    require(result.returncode == 0, f'{args[0]} command failed; private output withheld')
+    if result.returncode:
+        categories = ('Invalid for_each argument', 'Invalid count argument', 'Error acquiring the state lock',
+                      'Invalid provider configuration',
+                      'Resource precondition failed', 'Output refers to sensitive values',
+                      'Required plugins are not installed', 'Inconsistent dependency lock file',
+                      'Failed to query available provider packages', 'Failed to install provider',
+                      'Failed to load plugin schemas', 'Backend initialization required',
+                      'Invalid target', 'Unrecognized remote plugin message',
+                      'Resource instance managed by newer provider version', 'Insufficient features blocks')
+        diagnostic = '; '.join(c for c in categories if c in result.stderr or c in result.stdout)
+        raise ValueError(f'{args[0]} {args[1]} failed: {diagnostic or "unclassified private diagnostic"}')
     return result.stdout
 
 

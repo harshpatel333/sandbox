@@ -44,6 +44,13 @@ def receipt():
 
 
 class ClaimAccessTest(unittest.TestCase):
+    def test_command_errors_expose_only_fixed_categories(self):
+        result = access.subprocess.CompletedProcess([], 1, stdout='private value',
+            stderr='Error: Invalid for_each argument\nsecret payload must remain private')
+        with patch.object(access.subprocess, 'run', return_value=result):
+            with self.assertRaisesRegex(ValueError, '^terraform plan failed: Invalid for_each argument$'):
+                access.run('terraform', 'plan')
+
     def test_exact_two_grants_and_targeted_incomplete_flag(self):
         p = plan()
         p['resource_changes'].append({'address': 'unchanged', 'mode': 'managed', 'change': {'actions': ['no-op']}})
