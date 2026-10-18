@@ -27,19 +27,52 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def diagnostic_metadata(output, directory):
+    sources = {p.resolve(): (p.relative_to(ROOT).as_posix(), len(p.read_text().splitlines()))
+               for p in (ROOT / 'infra').rglob('*.tf') if '.terraform' not in p.parts}
+    diagnostics = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get('type') != 'diagnostic':
+            continue
+        diagnostic = event.get('diagnostic')
+        if not isinstance(diagnostic, dict):
+            continue
+        severity = diagnostic.get('severity')
+        safe = {'severity': severity if severity in ('error', 'warning') else 'unknown'}
+        address = diagnostic.get('address')
+        if isinstance(address, str) and address in TARGETS:
+            safe['address'] = address
+        location = diagnostic.get('range')
+        if isinstance(location, dict):
+            filename = location.get('filename')
+            start = location.get('start')
+            number = start.get('line') if isinstance(start, dict) else None
+            if isinstance(filename, str) and len(filename) <= 4096:
+                try:
+                    source = sources.get((directory / filename).resolve())
+                except (ValueError, OSError):
+                    source = None
+                if source:
+                    safe['file'] = source[0]
+                    if type(number) is int and 1 <= number <= source[1]:
+                        safe['line'] = number
+        diagnostics.append(safe)
+        if len(diagnostics) == 100:
+            break
+    return diagnostics
+
+
 def run(*args, cwd=None):
     result = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
     if result.returncode:
-        categories = ('Invalid for_each argument', 'Invalid count argument', 'Error acquiring the state lock',
-                      'Invalid provider configuration',
-                      'Resource precondition failed', 'Output refers to sensitive values',
-                      'Required plugins are not installed', 'Inconsistent dependency lock file',
-                      'Failed to query available provider packages', 'Failed to install provider',
-                      'Failed to load plugin schemas', 'Backend initialization required',
-                      'Invalid target', 'Unrecognized remote plugin message',
-                      'Resource instance managed by newer provider version', 'Insufficient features blocks')
-        diagnostic = '; '.join(c for c in categories if c in result.stderr or c in result.stdout)
-        raise ValueError(f'{args[0]} {args[1]} failed: {diagnostic or "unclassified private diagnostic"}')
+        failure = {'command': ' '.join(args[:2]), 'exit_status': result.returncode}
+        if args[:2] == ('terraform', 'plan') and '-json' in args:
+            failure['diagnostics'] = diagnostic_metadata(result.stdout, Path(cwd))
+        raise ValueError(json.dumps(failure))
     return result.stdout
 
 
@@ -157,7 +190,7 @@ def main(phase):
         if phase == 'plan':
             run_id = env['GITHUB_RUN_ID']
             require(re.fullmatch('[1-9][0-9]*', run_id), 'Invalid run ID')
-            run('terraform', 'plan', '-input=false', '-lock-timeout=5m',
+            run('terraform', 'plan', '-json', '-input=false', '-lock-timeout=5m',
                 *(f'-target={address}' for address in TARGETS), '-out=' + str(planfile), cwd=DIRECTORY)
             changes = validate_plan(json.loads(run('terraform', 'show', '-json', str(planfile), cwd=DIRECTORY)))
             uri = prefix(sha, run_id) + '/approved.tfplan'

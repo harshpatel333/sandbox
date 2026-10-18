@@ -44,12 +44,34 @@ def receipt():
 
 
 class ClaimAccessTest(unittest.TestCase):
-    def test_command_errors_expose_only_fixed_categories(self):
-        result = access.subprocess.CompletedProcess([], 1, stdout='private value',
-            stderr='Error: Invalid for_each argument\nsecret payload must remain private')
+    def test_command_errors_expose_only_structured_source_metadata(self):
+        secret = 'private-credential-value'
+        diagnostic = {'type': 'diagnostic', '@message': secret, 'diagnostic': {
+            'severity': 'error', 'summary': secret, 'detail': secret, 'code': secret,
+            'snippet': {'values': [{'value': secret}]}, 'address': secret,
+            'range': {'filename': 'control-plane-identity.tf', 'start': {'line': 96}}}}
+        result = access.subprocess.CompletedProcess([], 1, stdout=json.dumps(diagnostic), stderr=secret)
         with patch.object(access.subprocess, 'run', return_value=result):
-            with self.assertRaisesRegex(ValueError, '^terraform plan failed: Invalid for_each argument$'):
-                access.run('terraform', 'plan')
+            with self.assertRaises(ValueError) as error:
+                access.run('terraform', 'plan', '-json', cwd=access.DIRECTORY)
+        safe = json.loads(str(error.exception))
+        self.assertEqual(safe, {'command': 'terraform plan', 'exit_status': 1, 'diagnostics': [
+            {'severity': 'error', 'file': 'infra/envs/staging/us-central1/control-plane-identity.tf', 'line': 96}]})
+        self.assertNotIn(secret, str(error.exception))
+
+    def test_diagnostic_metadata_rejects_unknown_paths_fields_and_types(self):
+        secret = 'private-credential-value'
+        cases = [None, secret, {'type': 'diagnostic', 'diagnostic': secret}]
+        for filename in ('/outside/' + secret, '../../../../../' + secret, secret + '\x00', [], None):
+            cases.append({'type': 'diagnostic', 'diagnostic': {'severity': secret,
+                'range': {'filename': filename, 'start': {'line': secret}}, 'address': secret}})
+        cases.append({'type': 'diagnostic', 'diagnostic': {'severity': 'warning',
+            'range': {'filename': 'main.tf', 'start': {'line': -1}}}})
+        output = '\n'.join(json.dumps(c) for c in cases)
+        safe = access.diagnostic_metadata(output, access.DIRECTORY)
+        self.assertNotIn(secret, json.dumps(safe))
+        self.assertEqual(safe[-1], {'severity': 'warning', 'file': 'infra/envs/staging/us-central1/main.tf'})
+        self.assertEqual(len(access.diagnostic_metadata(output * 100, access.DIRECTORY)), 100)
 
     def test_exact_two_grants_and_targeted_incomplete_flag(self):
         p = plan()
