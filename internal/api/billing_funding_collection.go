@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/url"
 	"sort"
 	"time"
 
@@ -41,7 +43,7 @@ func (h *Handlers) fundingCreditInventoryReady(ctx context.Context, contract uui
 }
 
 func (h *Handlers) preflightReleasedFundingCredits(ctx context.Context, team uuid.UUID, a invoiceAccount, client *stripeHTTPClient, reader db.DBTX) (bool, error) {
-	contract, released, err := h.releasedFundingCreditContract(ctx, team, a, reader)
+	_, released, err := h.releasedFundingCreditContract(ctx, team, a, reader)
 	if err != nil || !released {
 		return released, err
 	}
@@ -59,16 +61,42 @@ func (h *Handlers) preflightReleasedFundingCredits(ctx context.Context, team uui
 		}
 	}
 	sort.Strings(prices)
-	if err = h.fundingCreditInventoryReady(ctx, contract, a.Customer, client); err != nil {
+	// Enrollment holds its account transaction. This compatibility check uses
+	// only the provider, so it never waits for another pool connection. The
+	// held invoice is authorized later by the durable inventory and promise
+	// checks in prepareReleasedFundingCredits, outside that transaction.
+	var page struct {
+		Data    []entitlementGrant `json:"data"`
+		HasMore bool               `json:"has_more"`
+	}
+	q := url.Values{"customer": {a.Customer}, "limit": {"100"}}
+	if err = client.doForm(ctx, http.MethodGet, "/v1/billing/credit_grants?"+q.Encode(), nil, &page, ""); err != nil {
 		return true, err
 	}
-	at := time.Now().UTC()
-	grants, err := h.eligibleInvoiceCredits(ctx, a.Customer, at.Unix(), prices, client)
-	if err != nil {
-		return true, err
+	if page.HasMore || len(page.Data) > 100 {
+		return true, errors.New("replacement credit preflight exceeds inventory bound; operator reconciliation required")
 	}
-	p := billing.ExportPeriod{TeamID: team, Start: at, End: at}
-	return true, h.verifyPreservedFundingCredits(ctx, p, contract, a.Customer, at.Unix(), prices, grants, client)
+	at := time.Now().UTC().Unix()
+	seen := make(map[string]bool, len(page.Data))
+	for _, grant := range page.Data {
+		if grant.ID == "" || grant.Customer != a.Customer || seen[grant.ID] {
+			return true, errors.New("replacement credit inventory identity mismatch")
+		}
+		seen[grant.ID] = true
+		if grant.VoidedAt != 0 || grant.EffectiveAt > at || (grant.ExpiresAt != 0 && grant.ExpiresAt <= at) {
+			continue
+		}
+		balance, err := client.grantLedgerBalance(ctx, a.Customer, grant.ID)
+		if err != nil {
+			return true, err
+		}
+		if balance > 0 {
+			if err = creditScope(grant, a.Customer, at, prices); err != nil {
+				return true, err
+			}
+		}
+	}
+	return true, nil
 }
 
 func (h *Handlers) prepareReleasedFundingCredits(ctx context.Context, p billing.ExportPeriod, a invoiceAccount, invoiceID string, plan *billing.InvoiceClosePlan, client *stripeHTTPClient) (bool, error) {

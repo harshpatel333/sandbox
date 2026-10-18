@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -20,6 +22,14 @@ import (
 func TestFundingReplacementEnrollmentAndScopedCreditSettlement(t *testing.T) {
 	h, team := fundingTransitionFixture(t)
 	ctx := t.Context()
+	poolConfig := h.Pool.Config()
+	poolConfig.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	h.Pool, h.DB = pool, db.New(pool)
 	exec := func(sql string, args ...any) {
 		t.Helper()
 		if _, err := h.Pool.Exec(ctx, sql, args...); err != nil {
@@ -119,7 +129,9 @@ func TestFundingReplacementEnrollmentAndScopedCreditSettlement(t *testing.T) {
 	// Resume an existing held enrollment attempt from the replacement's first
 	// billing period, then close that completed period with its preserved grant.
 	exec(`UPDATE billing_invoice_enrollment SET started_at=$2,requested_at=$2 WHERE team_id=$1`, team, start)
-	if err := h.enrollInvoiceAccount(ctx, team, nil); err != nil {
+	enrollmentCtx, cancelEnrollment := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelEnrollment()
+	if err := h.enrollInvoiceAccount(enrollmentCtx, team, nil); err != nil {
 		t.Fatalf("replacement enrollment rejected scoped expiring credit: %v", err)
 	}
 	a, enrolled, err := h.invoiceAccount(ctx, team)
