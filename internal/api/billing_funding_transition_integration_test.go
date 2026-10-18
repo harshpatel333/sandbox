@@ -127,8 +127,9 @@ func TestFundingReleaseRequiresTerminalProviderProof(t *testing.T) {
 }
 
 func TestFundingReleaseCompletedProCheckout(t *testing.T) {
-	for _, competing := range []bool{false, true} {
-		t.Run(map[bool]string{false: "completed", true: "competing-attempt"}[competing], func(t *testing.T) {
+	for _, scenario := range []string{"completed", "non-UTC", "different-generation", "missing-generation", "malformed-generation", "checkout-generation-mismatch", "subscription-generation-mismatch", "competing-attempt"} {
+		t.Run(scenario, func(t *testing.T) {
+			competing := scenario == "competing-attempt"
 			h, team := fundingTransitionFixture(t)
 			ctx := t.Context()
 			actor := uuid.New()
@@ -136,7 +137,18 @@ func TestFundingReleaseCompletedProCheckout(t *testing.T) {
 			session := "cs_" + strings.ReplaceAll(team.String(), "-", "")
 			generation := time.Now().UTC().Truncate(time.Microsecond)
 			key := "pro:fixture:" + team.String()
-			metadata := map[string]string{"checkout_generation": generation.Format(time.RFC3339Nano), "commercial_offer": "pro_monthly", "activation_user_id": actor.String()}
+			frozenGeneration := generation.Format(time.RFC3339Nano)
+			switch scenario {
+			case "non-UTC":
+				frozenGeneration = generation.In(time.FixedZone("fixture", -5*60*60)).Format(time.RFC3339Nano)
+			case "different-generation":
+				frozenGeneration = generation.Add(time.Second).Format(time.RFC3339Nano)
+			case "missing-generation":
+				frozenGeneration = ""
+			case "malformed-generation":
+				frozenGeneration = "not-a-timestamp"
+			}
+			metadata := map[string]string{"checkout_generation": frozenGeneration, "commercial_offer": "pro_monthly", "activation_user_id": actor.String()}
 			params, _ := json.Marshal(StripeCreateCheckoutSessionParams{CustomerID: customer, IdempotencyKey: key, Metadata: metadata})
 			if _, err := h.Pool.Exec(ctx, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status) VALUES($1,$2,$3,'active')`, team, customer, subscription); err != nil {
 				t.Fatal(err)
@@ -159,11 +171,15 @@ func TestFundingReleaseCompletedProCheckout(t *testing.T) {
 					w.WriteHeader(500)
 					return
 				}
+				providerMetadata := map[string]string{"checkout_generation": frozenGeneration, "commercial_offer": "pro_monthly", "activation_user_id": actor.String()}
+				if (scenario == "checkout-generation-mismatch" && r.URL.Path == "/v1/checkout/sessions/"+session) || (scenario == "subscription-generation-mismatch" && r.URL.Path == "/v1/subscriptions/"+subscription) {
+					providerMetadata["checkout_generation"] = generation.Add(time.Second).Format(time.RFC3339Nano)
+				}
 				switch r.URL.Path {
 				case "/v1/subscriptions/" + subscription:
-					_ = json.NewEncoder(w).Encode(map[string]any{"id": subscription, "customer": customer, "status": "canceled", "metadata": metadata, "items": map[string]any{"data": []map[string]string{{"id": "si_example"}}}})
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": subscription, "customer": customer, "status": "canceled", "metadata": providerMetadata, "items": map[string]any{"data": []map[string]string{{"id": "si_example"}}}})
 				case "/v1/checkout/sessions/" + session:
-					_ = json.NewEncoder(w).Encode(StripeRetrievedCheckoutSession{ID: session, CustomerID: customer, SubscriptionID: subscription, ClientReferenceID: team.String(), Status: "complete", Mode: "subscription", Metadata: metadata})
+					_ = json.NewEncoder(w).Encode(StripeRetrievedCheckoutSession{ID: session, CustomerID: customer, SubscriptionID: subscription, ClientReferenceID: team.String(), Status: "complete", Mode: "subscription", Metadata: providerMetadata})
 				default:
 					t.Errorf("unexpected provider path: %s", r.URL.Path)
 					w.WriteHeader(500)
@@ -179,6 +195,16 @@ func TestFundingReleaseCompletedProCheckout(t *testing.T) {
 				var preserved bool
 				if err = h.Pool.QueryRow(ctx, `SELECT checkout_initializing_at=$2 AND checkout_may_exist AND cardinality(checkout_pending_attempt_ids)=1 AND NOT EXISTS(SELECT 1 FROM billing_plan_release WHERE team_id=$1) FROM team_billing_account WHERE team_id=$1`, team, generation).Scan(&preserved); err != nil || !preserved {
 					t.Fatalf("competing state changed: %v %v", preserved, err)
+				}
+				return
+			}
+			if scenario != "completed" && scenario != "non-UTC" {
+				if !errors.Is(err, errFundingPlanTransition) {
+					t.Fatalf("unverified generation released: %v", err)
+				}
+				var preserved bool
+				if err = h.Pool.QueryRow(ctx, `SELECT checkout_initializing_at=$2 AND checkout_may_exist AND NOT EXISTS(SELECT 1 FROM billing_plan_release WHERE team_id=$1) FROM team_billing_account WHERE team_id=$1`, team, generation).Scan(&preserved); err != nil || !preserved {
+					t.Fatalf("generation rejection changed checkout state: %v %v", preserved, err)
 				}
 				return
 			}

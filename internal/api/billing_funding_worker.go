@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -240,6 +241,9 @@ func fundingStripeMode(key string) (bool, error) {
 }
 
 func (h *Handlers) fundingCollectionEnrolled(ctx context.Context, team uuid.UUID, account db.TeamBillingAccount, sub invoiceSubscription, client *stripeHTTPClient) (bool, error) {
+	if os.Getenv("BILLING_AUTOMATIC_CLOSE_DISABLED") == "true" {
+		return false, nil
+	}
 	a, enrolled, err := h.invoiceAccount(ctx, team)
 	if err != nil || !enrolled {
 		return false, err

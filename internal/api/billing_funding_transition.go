@@ -148,7 +148,11 @@ func (h *Handlers) commitFreeFundingPlan(ctx context.Context, team, actor uuid.U
 			if e != nil {
 				return e
 			}
-			generation := choice.Generation.UTC().Format(time.RFC3339Nano)
+			generation := params.Metadata["checkout_generation"]
+			generationTime, e := time.Parse(time.RFC3339Nano, generation)
+			if e != nil || !generationTime.Equal(choice.Generation) {
+				return errFundingPlanTransition
+			}
 			if session.ID != *choice.Session || session.CustomerID != customer || session.ClientReferenceID != team.String() || session.Status != "complete" || session.Mode != "subscription" || session.SubscriptionID != subscription || session.Metadata["checkout_generation"] != generation || session.Metadata["commercial_offer"] != choice.Offer || session.Metadata["activation_user_id"] != choice.Actor.String() || sub.Metadata["checkout_generation"] != generation || sub.Metadata["commercial_offer"] != choice.Offer {
 				return errFundingPlanTransition
 			}

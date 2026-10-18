@@ -183,7 +183,8 @@ func TestFundingReplacementEnrollmentAndScopedCreditSettlement(t *testing.T) {
 		t.Fatalf("inventory fallback revived old benefits: %v %v", ended, err)
 	}
 	// Exercise the enrolled provider route and the admission predicate together:
-	// manual invoices cannot authorize card-only usage, but credits still can.
+	// manual invoices or a disabled collector cannot authorize card-only usage,
+	// but credits still can.
 	exec(`UPDATE billing_invoice_account SET adjustment_event_name=$2 WHERE team_id=$1`, team, invoiceRoundingEvent)
 	actor := uuid.New()
 	exec(`INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
@@ -193,13 +194,20 @@ func TestFundingReplacementEnrollmentAndScopedCreditSettlement(t *testing.T) {
 	t.Cleanup(func() {
 		_, _ = h.Pool.Exec(context.Background(), `UPDATE billing_funding_account SET observe=false,enforce=false WHERE team_id=$1`, team)
 	})
-	for _, method := range []string{"charge_automatically", "send_invoice"} {
-		t.Run("funding-"+method, func(t *testing.T) {
-			collectionMethod.Store(method)
+	for _, tc := range []struct {
+		name, method, closeDisabled string
+		wantCollection              bool
+	}{
+		{"automatic", "charge_automatically", "false", true},
+		{"manual-invoice", "send_invoice", "false", false},
+		{"collector-disabled", "charge_automatically", "true", false},
+	} {
+		t.Run("funding-"+tc.name, func(t *testing.T) {
+			t.Setenv("BILLING_AUTOMATIC_CLOSE_DISABLED", tc.closeDisabled)
+			collectionMethod.Store(tc.method)
 			job, snapshot := claimFundingTestJob(t, h, team)
 			observation, err := h.observeFundingProvider(ctx, team, snapshot.Account, "", "")
-			wantCollection := method == "charge_automatically"
-			if err != nil || !observation.PaymentMethodReusable || !observation.CashCollected || observation.CollectionReady != wantCollection {
+			if err != nil || !observation.PaymentMethodReusable || !observation.CashCollected || observation.CollectionReady != tc.wantCollection {
 				t.Fatalf("provider observation=%+v err=%v", observation, err)
 			}
 			credit := &fundingCreditObservation{SpendableUSD: "0", ValidUntil: snapshot.At.Add(time.Minute)}
@@ -207,8 +215,8 @@ func TestFundingReplacementEnrollmentAndScopedCreditSettlement(t *testing.T) {
 				t.Fatal(err)
 			}
 			allowed, err := h.DB.IsTeamSandboxBillingEligible(ctx, team)
-			if err != nil || allowed != wantCollection {
-				t.Fatalf("card-only access with %s: allowed=%v err=%v", method, allowed, err)
+			if err != nil || allowed != tc.wantCollection {
+				t.Fatalf("card-only access with %s: allowed=%v err=%v", tc.name, allowed, err)
 			}
 			job, snapshot = claimFundingTestJob(t, h, team)
 			credit.SpendableUSD = "1"
@@ -217,7 +225,7 @@ func TestFundingReplacementEnrollmentAndScopedCreditSettlement(t *testing.T) {
 			}
 			allowed, err = h.DB.IsTeamSandboxBillingEligible(ctx, team)
 			if err != nil || !allowed {
-				t.Fatalf("credit access with %s: allowed=%v err=%v", method, allowed, err)
+				t.Fatalf("credit access with %s: allowed=%v err=%v", tc.name, allowed, err)
 			}
 		})
 	}
