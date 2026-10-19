@@ -88,6 +88,14 @@ func run() error {
 
 	resolver := proxy.NewVMDResolver(vmdAddr)
 	proxyHandler := proxy.NewHandler(domains, resolver, log)
+	// The scheme browsers reach the proxy on; TLS normally terminates in front
+	// of it. Plain http is for a proxy served on loopback hosts.
+	switch scheme := envOrDefault("PROXY_PUBLIC_SCHEME", "https"); scheme {
+	case "https", "http":
+		proxyHandler.WithPublicScheme(scheme)
+	default:
+		log.Fatal().Str("scheme", scheme).Msg("PROXY_PUBLIC_SCHEME must be https or http")
+	}
 	routingEnabled := os.Getenv("PEER_ROUTING_ENABLED")
 	if routingEnabled != "" && routingEnabled != "0" && routingEnabled != "1" {
 		log.Fatal().Msg("PEER_ROUTING_ENABLED must be empty, 0, or 1")

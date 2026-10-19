@@ -98,6 +98,7 @@ on:
       # asset changes — leaving that host on stale binaries.
       - '.github/workflows/deploy-vmd.yml'
       - '.github/workflows/scripts/deploy-vmd.py'
+      - '.github/workflows/scripts/host_transport.py'
       - '.github/workflows/scripts/select-deploy-target.sh'
 
 # Serialize runs rather than canceling: deploy-vmd.py stops vmd, rewrites

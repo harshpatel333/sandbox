@@ -126,6 +126,10 @@ type Handler struct {
 
 	// analytics emits data-plane usage events; set via WithAnalytics, nil no-ops.
 	analytics *analytics.Client
+
+	// publicScheme is the scheme browsers use to reach this proxy, for the
+	// absolute redirects it issues. "https" unless set via WithPublicScheme.
+	publicScheme string
 }
 
 // originAllowed checks whether the given Origin header matches one of the
@@ -173,7 +177,17 @@ func NewHandler(domains []string, resolver Resolver, log zerolog.Logger) *Handle
 		authenticatedConns: newConnLimiter(1024),
 		sessions:           auth.NewSessionRegistry(1024),
 		log:                log,
+		publicScheme:       "https",
 	}
+	return h
+}
+
+// WithPublicScheme sets the scheme browsers reach the proxy on. Plain "http"
+// suits only a proxy served on loopback hosts such as *.localhost, and only
+// in browsers that treat those as secure contexts and so keep the Secure
+// preview cookie (Chromium-based browsers and recent Firefox).
+func (h *Handler) WithPublicScheme(scheme string) *Handler {
+	h.publicScheme = scheme
 	return h
 }
 
@@ -303,7 +317,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !enforcePreviewPublication(w, r, instanceID, port, info, h.seedKey, h.originAllowed(r.Header.Get("Origin"))) {
+	if !enforcePreviewPublication(w, r, instanceID, port, info, h.seedKey, h.originAllowed(r.Header.Get("Origin")), h.publicScheme) {
 		return
 	}
 
