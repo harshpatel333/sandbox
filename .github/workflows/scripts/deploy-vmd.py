@@ -454,7 +454,11 @@ def main() -> int:
     check_bundle_parity()
     egress_preflight = egress_capacity_preflight(os.environ)
     egress_update = egress_capacity_update(os.environ)
-    local = local_instance(os.environ)
+    try:
+        local = local_instance(os.environ)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
     project = os.environ.get("GCP_PROJECT", "") if local else os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
     label = os.environ.get("VMD_LABEL", "component=vmd")

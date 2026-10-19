@@ -47,7 +47,11 @@ from host_transport import local_instance, scp_command, ssh_command
 
 
 def main() -> int:
-    local = local_instance(os.environ)
+    try:
+        local = local_instance(os.environ)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
     project = os.environ.get("GCP_PROJECT", "") if local else os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
     if not region.strip():

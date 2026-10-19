@@ -28,8 +28,9 @@ The install scripts depend on the local services:
 
 So the order is:
 
-* **Create:** `host-bootstrap` → local services → API → `install-vmd` →
-  `install-proxy` → console.
+* **Create:** `host-bootstrap` → `services-up` → `install-api` → `install-vmd`
+  → `install-proxy` → `seed-base` → `install-ui`. `seed-base` activates the
+  host, which needs VMD's first heartbeat, and builds the base template.
 * **Upgrade:** `install-vmd` → `install-proxy` → local services and API →
   console, which is the order production deploys use. Secretsproxy restarts
   against the API that is already running.
@@ -43,8 +44,8 @@ So the order is:
 | `DEVBOX_NAME`, `DEVBOX_ID` | required | Box name and id |
 | `DEVBOX_SANDBOX_SHA` | unset | Selected revision. When it is set, the scripts refuse a checkout at any other revision |
 | `DEVBOX_BUCKET` | `superserve-devbox-$DEVBOX_ID` | The box's bucket. VMD uploads template builds and pause backups to it |
-| `DEVBOX_ARTIFACT_BUCKET` | `$DEVBOX_BUCKET` | Bucket whose `hostprep/` prefix holds the kernel and rootfs objects. The box reads it with its own identity |
-| `DEVBOX_DATA_DISK_DEVICE` | `$DEVBOX_NAME-data` | GCE device name of the data disk, as in `/dev/disk/by-id/google-<name>` |
+| `DEVBOX_ARTIFACT_BUCKET` | `rayai-dev-devbox-hostprep` | Shared read-only bucket whose `hostprep/` prefix holds the kernel and rootfs objects. The box reads it with its own identity |
+| `DEVBOX_DATA_DISK_DEVICE` | `devbox-data` | GCE device name of the data disk, as in `/dev/disk/by-id/google-<name>` |
 | `DEVBOX_FIRECRACKER_VERSION`, `DEVBOX_FIRECRACKER_SHA256` | `runtime-pins.env` | Firecracker release and binary digest |
 | `DEVBOX_KERNEL_OBJECT`, `DEVBOX_KERNEL_DIGEST` | `runtime-pins.env` | Guest kernel object under `hostprep/` and its MD5 or SHA-256 |
 | `DEVBOX_ROOTFS_OBJECT`, `DEVBOX_ROOTFS_DIGEST` | `runtime-pins.env` | Base rootfs object under `hostprep/` and its MD5 or SHA-256 |
@@ -57,14 +58,13 @@ So the order is:
 it, and `runtime.json` records what was installed.
 
 The kernel and rootfs are read from `gs://$DEVBOX_ARTIFACT_BUCKET/hostprep/`
-with the box's own identity. That is either the box bucket, if CI copies the
-objects there first, or a shared bucket the box has read-only access to. Firecracker comes from
+with the box's own identity. Boxes can read that bucket but not write to it,
+and it is seeded once from the staging host's verified files. Firecracker comes from
 the public `superserve-ai/firecracker` release and Go from `go.dev`. Each is
 verified against its pin.
 
-Shared local secrets are read from
-`/mnt/sandbox-data/superserve-devbox/local-secrets.env`, which the services
-step creates:
+Shared local secrets are read from `/etc/superserve-devbox/local-secrets.env`,
+which `services-up.sh` generates once and keeps on the data disk:
 
 * `INTERNAL_API_TOKEN`: VMD, and secretsproxy as `DAEMON_AUTH_TOKEN`. It must
   equal the API's token.
