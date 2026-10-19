@@ -189,7 +189,7 @@ docker_args=()
 for arg in "${BUILD_ARGS[@]}"; do
   docker_args+=(--build-arg "$arg")
 done
-DOCKER_BUILDKIT=1 docker build --progress=plain \
+DOCKER_BUILDKIT=1 docker build --progress=plain --network host \
   -f "$SCRIPT_DIR/console.Dockerfile" \
   --build-arg "UI_REVISION=$revision" "${docker_args[@]}" \
   -t "$IMAGE" "$UI_SRC" || die "console build failed; the previous console is still running"
