@@ -13,7 +13,19 @@ from pathlib import Path
 
 KEY = 'sandbox-host-identity'
 STATE = '/etc/sandbox/host-identity.json'
+ENV = '/etc/sandbox/host-identity.env'
+DROPIN = '/etc/systemd/system/superserve-vmd.service.d/identity.conf'
 LOCK = '/run/lock/sandbox-host-identity.install'
+
+
+def identity_files(identity):
+    """The installed record, the environment VMD and the proxy read it through,
+    and the VMD drop-in that loads that environment."""
+    return {
+        STATE: json.dumps(identity),
+        ENV: f"HOST_ID={identity['host_id']}\nHOST_IDENTITY_FILE={STATE}\n",
+        DROPIN: f'[Service]\nEnvironmentFile={ENV}\n',
+    }
 
 
 @contextmanager
@@ -109,9 +121,8 @@ def main():
         current_items = {i['key']: i['value'] for i in current.get('metadata', {}).get('items', [])}
         if json.loads(current_items[KEY]) != identity:
             raise ValueError('concurrent identity installation; retry after investigating')
-        payload = shlex.quote(json.dumps(identity))
-        env = shlex.quote(f"HOST_ID={identity['host_id']}\nHOST_IDENTITY_FILE={STATE}\n")
-        unit = shlex.quote('[Service]\nEnvironmentFile=/etc/sandbox/host-identity.env\n')
+        files = identity_files(identity)
+        payload, env, unit = (shlex.quote(files[path]) for path in (STATE, ENV, DROPIN))
         ssh(f'''set -eu
 sudo install -d -m 0755 /etc/sandbox /etc/systemd/system/superserve-vmd.service.d
 printf '%s' {payload} | sudo tee {STATE}.new >/dev/null

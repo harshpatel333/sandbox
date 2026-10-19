@@ -18,7 +18,7 @@ import (
 
 func enforcePreviewForTest(w http.ResponseWriter, port int, info InstanceInfo) bool {
 	req := httptest.NewRequest(http.MethodGet, "http://unused/", nil)
-	return enforcePreviewPublication(w, req, "66ca164d-964b-43da-b81a-004d51598d6a", port, info, nil, false)
+	return enforcePreviewPublication(w, req, "66ca164d-964b-43da-b81a-004d51598d6a", port, info, nil, false, "https")
 }
 
 func TestPreviewPublicationLegacyAllowsAnyPort(t *testing.T) {
@@ -186,7 +186,7 @@ func TestPreviewHeaderTokenAuthenticationMatrix(t *testing.T) {
 				req.Header.Add(auth.PreviewTokenHeader, value)
 			}
 			w := httptest.NewRecorder()
-			got := enforcePreviewPublication(w, req, sandboxID, port, tt.info, tt.seed, false)
+			got := enforcePreviewPublication(w, req, sandboxID, port, tt.info, tt.seed, false, "https")
 			if got != tt.want {
 				t.Fatalf("allowed = %v, want %v; status=%d body=%q", got, tt.want, w.Code, w.Body.String())
 			}
@@ -226,7 +226,7 @@ func TestPreviewTokenOnlyHandlesGenuineCORSPreflightLocally(t *testing.T) {
 			req.Header.Set("Access-Control-Request-Method", tt.acrm)
 			req.Header.Set("Access-Control-Request-Headers", auth.PreviewTokenHeader+", Content-Type")
 			w := httptest.NewRecorder()
-			if got := enforcePreviewPublication(w, req, sandboxID, 3000, info, seed, tt.originAllowed); got {
+			if got := enforcePreviewPublication(w, req, sandboxID, 3000, info, seed, tt.originAllowed, "https"); got {
 				t.Fatal("preflight or unauthenticated OPTIONS request was forwarded")
 			}
 			if w.Code != tt.wantStatus {
@@ -388,7 +388,7 @@ func TestPreviewBrowserSentinelAcceptsIndependentCarrierValues(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "http://unused/path", nil)
 			tt.build(req)
 			w := httptest.NewRecorder()
-			if !enforcePreviewPublication(w, req, sandboxID, port, info, seed, false) {
+			if !enforcePreviewPublication(w, req, sandboxID, port, info, seed, false, "https") {
 				t.Fatalf("browser carrier denied: status=%d body=%q", w.Code, w.Body.String())
 			}
 		})
@@ -419,7 +419,7 @@ func TestPreviewBrowserSentinelDoesNotWeakenPhaseThreeCarrierBoundary(t *testing
 				req.URL.RawQuery = auth.PreviewTokenQueryParam + "=" + url.QueryEscape(valid)
 			}
 			w := httptest.NewRecorder()
-			if enforcePreviewPublication(w, req, sandboxID, port, phaseThree, seed, false) {
+			if enforcePreviewPublication(w, req, sandboxID, port, phaseThree, seed, false, "https") {
 				t.Fatalf("Phase 3 sentinel accepted %s carrier", carrier)
 			}
 			if w.Code != http.StatusUnauthorized {
@@ -433,7 +433,7 @@ func TestPreviewBrowserSentinelDoesNotWeakenPhaseThreeCarrierBoundary(t *testing
 	req := httptest.NewRequest(http.MethodGet, "http://unused/path", nil)
 	req.Header.Set(auth.PreviewTokenHeader, valid)
 	w := httptest.NewRecorder()
-	if enforcePreviewPublication(w, req, sandboxID, port, info, seed, false) || w.Code != http.StatusUnauthorized {
+	if enforcePreviewPublication(w, req, sandboxID, port, info, seed, false, "https") || w.Code != http.StatusUnauthorized {
 		t.Fatalf("zero-generation browser policy = allowed/status %d", w.Code)
 	}
 }
@@ -462,7 +462,7 @@ func TestPreviewBrowserQueryBootstrapIsSecureAndSameOrigin(t *testing.T) {
 	req.URL.RawQuery = "keep=%2f&" + auth.PreviewTokenQueryParam + "=stale&space=a+b&" +
 		"superserve%5fpreview_token=" + url.QueryEscape(valid) + "&bad=%zz"
 	w := httptest.NewRecorder()
-	if enforcePreviewPublication(w, req, sandboxID, port, info, seed, false) {
+	if enforcePreviewPublication(w, req, sandboxID, port, info, seed, false, "https") {
 		t.Fatal("bootstrap request was forwarded instead of redirected")
 	}
 	if w.Code != http.StatusFound {
@@ -505,7 +505,7 @@ func TestPreviewBrowserQueryBootstrapRejectsInvalidTokenWithoutCookie(t *testing
 	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
 	req := httptest.NewRequest(http.MethodGet, "http://unused/?"+auth.PreviewTokenQueryParam+"=invalid", nil)
 	w := httptest.NewRecorder()
-	if enforcePreviewPublication(w, req, sandboxID, 3000, browserPreviewTestPolicy(3000, 1), seed, false) {
+	if enforcePreviewPublication(w, req, sandboxID, 3000, browserPreviewTestPolicy(3000, 1), seed, false, "https") {
 		t.Fatal("invalid signed link was allowed")
 	}
 	if w.Code != http.StatusUnauthorized || w.Header().Get("Set-Cookie") != "" {
@@ -525,7 +525,7 @@ func TestPreviewBrowserQueryBootstrapPreservesEmptyQueryComponent(t *testing.T) 
 	req.URL.RawQuery = auth.PreviewTokenQueryParam + "=" + url.QueryEscape(valid) + "&"
 
 	w := httptest.NewRecorder()
-	if enforcePreviewPublication(w, req, sandboxID, port, browserPreviewTestPolicy(port, 1), seed, false) {
+	if enforcePreviewPublication(w, req, sandboxID, port, browserPreviewTestPolicy(port, 1), seed, false, "https") {
 		t.Fatal("bootstrap request was forwarded instead of redirected")
 	}
 	want := "https://" + req.Host + "/path?"
@@ -562,7 +562,7 @@ func TestPreviewBrowserQueryRedirectExceptions(t *testing.T) {
 			req.Header.Set("Upgrade", tt.upgrade)
 			req.Header.Set("Connection", tt.connection)
 			w := httptest.NewRecorder()
-			got := enforcePreviewPublication(w, req, sandboxID, port, info, seed, false)
+			got := enforcePreviewPublication(w, req, sandboxID, port, info, seed, false, "https")
 			if got != tt.wantDirect {
 				t.Fatalf("direct = %v, want %v; status=%d", got, tt.wantDirect, w.Code)
 			}
@@ -596,7 +596,7 @@ func TestPreviewBrowserHandlesGenuineCORSPreflightLocally(t *testing.T) {
 			req.Header.Set("Access-Control-Request-Method", tt.acrm)
 			req.Header.Set("Access-Control-Request-Headers", auth.PreviewTokenHeader)
 			w := httptest.NewRecorder()
-			if got := enforcePreviewPublication(w, req, sandboxID, 3000, info, seed, tt.originAllowed); got {
+			if got := enforcePreviewPublication(w, req, sandboxID, 3000, info, seed, tt.originAllowed, "https"); got {
 				t.Fatal("preflight or unauthenticated OPTIONS request was forwarded")
 			}
 			if w.Code != tt.wantStatus {
@@ -799,4 +799,25 @@ func TestPreviewCredentialsAreScrubbedBeforePublicAndBrowserUpstreams(t *testing
 	private := browserPreviewTestPolicy(port, 3)
 	private.VMIP, private.Status, private.StartedAt = "127.0.0.1", "running", 1
 	request(private, true)
+}
+
+func TestPreviewBrowserQueryBootstrapRedirectsOnPublicScheme(t *testing.T) {
+	const (
+		sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
+		port      = 3000
+		version   = int64(7)
+	)
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	valid := mintPreviewTestToken(t, seed, sandboxID, port, version)
+
+	req := httptest.NewRequest(http.MethodGet, "http://unused/", nil)
+	req.Host = "3000-" + sandboxID + ".sandbox.localhost:8090"
+	req.URL.RawQuery = auth.PreviewTokenQueryParam + "=" + url.QueryEscape(valid)
+	w := httptest.NewRecorder()
+	if enforcePreviewPublication(w, req, sandboxID, port, browserPreviewTestPolicy(port, version), seed, false, "http") {
+		t.Fatal("bootstrap request was forwarded instead of redirected")
+	}
+	if got, want := w.Header().Get("Location"), "http://"+req.Host+"/"; got != want {
+		t.Fatalf("redirect Location = %q, want %q", got, want)
+	}
 }
