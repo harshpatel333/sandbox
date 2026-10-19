@@ -14,11 +14,7 @@ main() {
   devbox_load_env
   devbox_require_bootstrapped
   devbox_instance
-  devbox_load_local_secrets INTERNAL_API_TOKEN
-  if [ -z "${DATABASE_URL:-}" ]; then
-    [ -n "${POSTGRES_PASSWORD:-}" ] || devbox_die "local-secrets.env has neither DATABASE_URL nor POSTGRES_PASSWORD"
-    DATABASE_URL=$(python3 -c 'import sys, urllib.parse; print("postgresql://postgres:" + urllib.parse.quote(sys.argv[1], safe="") + "@127.0.0.1:54322/postgres?sslmode=disable")' "$POSTGRES_PASSWORD")
-  fi
+  devbox_load_local_secrets INTERNAL_API_TOKEN DATABASE_URL
   local revision bin
   revision=$(devbox_revision)
   bin=$DEVBOX_REPO/bin

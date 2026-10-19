@@ -69,9 +69,7 @@ symlink to the data-disk copy:
 
 * `INTERNAL_API_TOKEN`: VMD, and secretsproxy as `DAEMON_AUTH_TOKEN`. It must
   equal the API's token.
-* `DATABASE_URL`: VMD and the secretsproxy audit sink. Without it,
-  `install-vmd.sh` builds it from `POSTGRES_PASSWORD` for the local Postgres
-  on `127.0.0.1:54322`.
+* `DATABASE_URL`: VMD and the secretsproxy audit sink.
 * `SANDBOX_ACCESS_TOKEN_SEED`: the proxy data plane, shared with the API.
 
 ## What it configures
