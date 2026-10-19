@@ -16,6 +16,11 @@ MANAGED_BY = "superserve-devbox"
 PROJECT = "rayai-dev"
 ZONE = "us-central1-a"
 MANIFEST_METADATA_KEY = "devbox-manifest"
+# The devbox project also hosts staging, so the workflow identity's IAM is
+# conditioned on these name prefixes; labels carry the bare devbox name.
+RESOURCE_PREFIX = "devbox-"
+DATA_DISK_SUFFIX = "-data"
+DATA_DISK_DEVICE_NAME = "devbox-data"
 BUCKET_PREFIX = "superserve-devbox-"
 
 DEFAULT_LIFETIME_HOURS = 24
@@ -35,10 +40,15 @@ FORBIDDEN_LABELS = ("sandbox_role", "sandbox_status", "environment", "region")
 STATES = ("creating", "ready", "failed", "deploying", "destroying")
 RESOURCE_TYPES = ("instance", "disk", "bucket", "artifact_repo")
 MIGRATION_RESULTS = ("applied", "none", "failed")
+DEPLOY_RESULTS = ("succeeded", "failed")
 
+REPOSITORIES = ("sandbox", "ui")
 COMPONENTS = ("vmd", "proxy", "api", "ui")
-CREATE_SCRIPTS = ("host-bootstrap.sh", "install-vmd.sh", "install-proxy.sh",
-                  "services-up.sh", "install-api.sh", "install-ui.sh")
+COMPONENT_REPOSITORIES = {"vmd": "sandbox", "proxy": "sandbox", "api": "sandbox", "ui": "ui"}
+# A fresh host needs the database and API before VMD and secretsproxy start.
+CREATE_SCRIPTS = ("host-bootstrap.sh", "services-up.sh", "install-api.sh", "install-vmd.sh",
+                  "install-proxy.sh", "seed-base.sh", "install-ui.sh")
+# Upgrades follow the production order and never reseed.
 COMPONENT_SCRIPTS = {
     "vmd": ("install-vmd.sh",),
     "proxy": ("install-proxy.sh",),
@@ -137,6 +147,14 @@ def concurrency_group(name):
     return "devbox-" + validate_name(name)
 
 
+def instance_name(name):
+    return RESOURCE_PREFIX + validate_name(name)
+
+
+def data_disk_name(name):
+    return instance_name(name) + DATA_DISK_SUFFIX
+
+
 def bucket_name(devbox_id):
     return BUCKET_PREFIX + validate_devbox_id(devbox_id)
 
@@ -185,7 +203,7 @@ def select_instance(instances, name):
     if len(matches) > 1:
         raise ContractError(f"{len(matches)} instances claim devbox name {name}; refusing to guess")
     instance = matches[0]
-    if instance.get("name") != name:
+    if instance.get("name") != instance_name(name):
         raise ContractError(f"Instance {instance.get('name')!r} is labelled as devbox {name}")
     check_labels(instance["labels"], name)
     return instance
@@ -193,9 +211,9 @@ def select_instance(instances, name):
 
 def resources(name, devbox_id, zone=ZONE):
     return [
-        {"type": "instance", "name": name, "zone": zone},
-        {"type": "disk", "name": name, "zone": zone},
-        {"type": "disk", "name": name + "-data", "zone": zone},
+        {"type": "instance", "name": instance_name(name), "zone": zone},
+        {"type": "disk", "name": instance_name(name), "zone": zone},
+        {"type": "disk", "name": data_disk_name(name), "zone": zone},
         {"type": "bucket", "name": bucket_name(devbox_id)},
     ]
 
@@ -210,6 +228,7 @@ def revision(branch, sha):
 
 def new_manifest(*, name, devbox_id, owner, actor, created_at, expires_at, revisions,
                  project=PROJECT, zone=ZONE):
+    revisions = {key: revision(revisions[key]["branch"], revisions[key]["sha"]) for key in REPOSITORIES}
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "name": validate_name(name),
@@ -222,7 +241,8 @@ def new_manifest(*, name, devbox_id, owner, actor, created_at, expires_at, revis
         "expires_at": iso(expires_at),
         "state": "creating",
         "resources": resources(name, devbox_id, zone),
-        "revisions": {key: revision(value["branch"], value["sha"]) for key, value in revisions.items()},
+        "revisions": revisions,
+        "components": {component: dict(revisions[COMPONENT_REPOSITORIES[component]]) for component in COMPONENTS},
         "runtime": {},
         "services": {},
         "deploys": [],
@@ -245,15 +265,20 @@ def validate_manifest(manifest):
     parse_iso(manifest["expires_at"])
     if manifest["state"] not in STATES:
         raise ContractError(f"Manifest state {manifest['state']!r} is not one of {STATES}")
-    for key, kind in (("resources", list), ("revisions", dict), ("runtime", dict),
+    for key, kind in (("resources", list), ("revisions", dict), ("components", dict), ("runtime", dict),
                       ("services", dict), ("deploys", list)):
         if not isinstance(manifest.get(key), kind):
             raise ContractError(f"Manifest field {key!r} must be a {kind.__name__}")
     for resource in manifest["resources"]:
         if not isinstance(resource, dict) or resource.get("type") not in RESOURCE_TYPES or not resource.get("name"):
             raise ContractError(f"Manifest resource {resource!r} is malformed")
-    for value in manifest["revisions"].values():
-        revision(value.get("branch"), value.get("sha"))
+    for field, keys in (("revisions", REPOSITORIES), ("components", COMPONENTS)):
+        if set(manifest[field]) != set(keys):
+            raise ContractError(f"Manifest {field} must have exactly {', '.join(keys)}")
+        for value in manifest[field].values():
+            if not isinstance(value, dict):
+                raise ContractError(f"Manifest {field} entry {value!r} is malformed")
+            revision(value.get("branch"), value.get("sha"))
     return manifest
 
 
@@ -281,24 +306,33 @@ def component_scripts(components):
     return [script for component in components for script in COMPONENT_SCRIPTS[component]]
 
 
-def record_deploy(manifest, *, at, actor, components, revisions, migrations):
+def record_deploy(manifest, *, at, actor, components, revisions, migrations, result):
     if migrations not in MIGRATION_RESULTS:
         raise ContractError(f"Unknown migration result {migrations!r}")
+    if result not in DEPLOY_RESULTS:
+        raise ContractError(f"Unknown deploy result {result!r}")
+    repositories = {COMPONENT_REPOSITORIES[component] for component in components}
+    if set(revisions) != repositories:
+        raise ContractError(f"Deploy of {', '.join(components)} must resolve exactly {', '.join(sorted(repositories))}")
     updated = copy.deepcopy(manifest)
-    previous = updated["revisions"]
+    moved = {**updated["revisions"],
+             **{key: revision(value["branch"], value["sha"]) for key, value in revisions.items()}}
     updated["deploys"].append({
         "at": iso(at),
         "actor": actor,
         "components": list(components),
-        "from": {key: value["sha"] for key, value in previous.items()},
-        "to": {key: value["sha"] for key, value in revisions.items()},
+        "from": {key: value["sha"] for key, value in updated["revisions"].items()},
+        "to": {key: value["sha"] for key, value in moved.items()},
         "migrations": migrations,
+        "result": result,
     })
-    updated["revisions"] = {key: revision(value["branch"], value["sha"]) for key, value in revisions.items()}
+    updated["revisions"] = moved
+    for component in components:
+        updated["components"][component] = dict(moved[COMPONENT_REPOSITORIES[component]])
     return validate_manifest(updated)
 
 
 def forwarding_command(name, zone=ZONE, project=PROJECT):
     forwards = " ".join(f"-L {port}:127.0.0.1:{port}" for _, port in FORWARDED_PORTS)
-    return (f"gcloud compute ssh {name} --zone={zone} --project={project} "
+    return (f"gcloud compute ssh {instance_name(name)} --zone={zone} --project={project} "
             f"--tunnel-through-iap -- -N {forwards}")

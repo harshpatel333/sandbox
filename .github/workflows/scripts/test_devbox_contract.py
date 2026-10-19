@@ -12,6 +12,7 @@ import devbox_contract as contract
 CREATED = datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc)
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+SHA_C = "c" * 40
 
 
 def manifest():
@@ -90,20 +91,24 @@ class LabelTests(unittest.TestCase):
 
     def test_target_resolution_uses_labels_not_name_prefix(self):
         values = contract.labels("my-box", "3f9c0a1b2c4d", "owner", CREATED)
-        target = {"name": "my-box", "labels": values}
-        instances = [{"name": "my-box-2", "labels": {**values, "devbox-name": "my-box-2"}},
-                     {"name": "my-box", "labels": {}}, target]
+        target = {"name": "devbox-my-box", "labels": values}
+        instances = [{"name": "devbox-my-box-2", "labels": {**values, "devbox-name": "my-box-2"}},
+                     {"name": "devbox-my-box", "labels": {}}, target]
         self.assertIs(contract.select_instance(instances, "my-box"), target)
         with self.assertRaises(contract.ContractError):
-            contract.select_instance([{"name": "my-box", "labels": {}}], "my-box")
+            contract.select_instance([{"name": "devbox-my-box", "labels": {}}], "my-box")
         with self.assertRaises(contract.ContractError):
             contract.select_instance([target, dict(target)], "my-box")
         with self.assertRaises(contract.ContractError):
-            contract.select_instance([{"name": "renamed", "labels": values}], "my-box")
+            contract.select_instance([{"name": "my-box", "labels": values}], "my-box")
         self.assertEqual(contract.discovery_filter("my-box"),
                          "labels.managed-by=superserve-devbox AND labels.devbox-name=my-box")
 
-    def test_concurrency_group(self):
+    def test_resource_names_fit_gcp_limits(self):
+        name = "a" * contract.MAX_NAME_LENGTH
+        self.assertEqual(contract.instance_name("my-box"), "devbox-my-box")
+        self.assertEqual(contract.data_disk_name("my-box"), "devbox-my-box-data")
+        self.assertLessEqual(len(contract.data_disk_name(name)), 63)
         self.assertEqual(contract.concurrency_group("my-box"), "devbox-my-box")
 
 
@@ -114,8 +119,8 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(value["state"], "creating")
         self.assertEqual(value["expires_at"], "2026-10-21T15:00:00Z")
         self.assertEqual([r["name"] for r in value["resources"]],
-                         ["awille-ai-dev-a7f3c9", "awille-ai-dev-a7f3c9", "awille-ai-dev-a7f3c9-data",
-                          "superserve-devbox-3f9c0a1b2c4d"])
+                         ["devbox-awille-ai-dev-a7f3c9", "devbox-awille-ai-dev-a7f3c9",
+                          "devbox-awille-ai-dev-a7f3c9-data", "superserve-devbox-3f9c0a1b2c4d"])
         self.assertEqual(value["deploys"], [])
 
     def test_revisions_require_full_shas(self):
@@ -133,22 +138,40 @@ class ManifestTests(unittest.TestCase):
             contract.with_state(manifest(), "running")
         self.assertEqual(contract.with_state(manifest(), "ready")["state"], "ready")
 
-    def test_record_deploy_appends_and_keeps_expiry(self):
+    def test_initial_components_follow_their_repository(self):
+        self.assertEqual(manifest()["components"], {
+            "vmd": {"branch": "main", "sha": SHA_A}, "proxy": {"branch": "main", "sha": SHA_A},
+            "api": {"branch": "main", "sha": SHA_A}, "ui": {"branch": "main", "sha": SHA_B}})
+        with self.assertRaises(contract.ContractError):
+            contract.validate_manifest({**manifest(), "components": {"vmd": {"branch": "main", "sha": SHA_A}}})
+
+    def test_record_deploy_moves_only_deployed_components(self):
         before = manifest()
         at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
         after = contract.record_deploy(
-            before, at=at, actor="someone", components=["api"], migrations="applied",
-            revisions={"sandbox": {"branch": "feature", "sha": SHA_B}, "ui": {"branch": "main", "sha": SHA_B}})
+            before, at=at, actor="someone", components=["api"], migrations="applied", result="succeeded",
+            revisions={"sandbox": {"branch": "feature", "sha": SHA_C}})
         self.assertEqual(before["deploys"], [])
         self.assertEqual(after["expires_at"], before["expires_at"])
-        self.assertEqual(after["revisions"]["sandbox"], {"branch": "feature", "sha": SHA_B})
+        self.assertEqual(after["revisions"], {"sandbox": {"branch": "feature", "sha": SHA_C},
+                                              "ui": {"branch": "main", "sha": SHA_B}})
+        self.assertEqual(after["components"]["api"], {"branch": "feature", "sha": SHA_C})
+        self.assertEqual(after["components"]["vmd"], {"branch": "main", "sha": SHA_A})
         self.assertEqual(after["deploys"], [{
             "at": "2026-10-20T18:00:00Z", "actor": "someone", "components": ["api"],
-            "from": {"sandbox": SHA_A, "ui": SHA_B}, "to": {"sandbox": SHA_B, "ui": SHA_B},
-            "migrations": "applied"}])
-        with self.assertRaises(contract.ContractError):
-            contract.record_deploy(before, at=at, actor="x", components=[], migrations="skipped",
-                                   revisions=before["revisions"])
+            "from": {"sandbox": SHA_A, "ui": SHA_B}, "to": {"sandbox": SHA_C, "ui": SHA_B},
+            "migrations": "applied", "result": "succeeded"}])
+
+    def test_record_deploy_rejects_unknown_outcomes_and_mismatched_revisions(self):
+        at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
+        sandbox = {"sandbox": {"branch": "main", "sha": SHA_C}}
+        for overrides in ({"migrations": "skipped"}, {"result": "partial"},
+                          {"revisions": {"ui": {"branch": "main", "sha": SHA_C}}},
+                          {"revisions": {**sandbox, "ui": {"branch": "main", "sha": SHA_C}}}):
+            arguments = {"at": at, "actor": "x", "components": ["vmd"], "migrations": "none",
+                         "result": "failed", "revisions": sandbox, **overrides}
+            with self.subTest(overrides=overrides), self.assertRaises(contract.ContractError):
+                contract.record_deploy(manifest(), **arguments)
 
 
 class ComponentTests(unittest.TestCase):
@@ -157,14 +180,17 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(contract.parse_components(" ui , vmd "), ["vmd", "ui"])
         self.assertEqual(contract.component_scripts(contract.parse_components("ui,api")),
                          ["services-up.sh", "install-api.sh", "install-ui.sh"])
-        self.assertEqual(contract.component_scripts(contract.COMPONENTS), list(contract.CREATE_SCRIPTS[1:]))
+        self.assertEqual(contract.component_scripts(contract.COMPONENTS),
+                         ["install-vmd.sh", "install-proxy.sh", "services-up.sh", "install-api.sh", "install-ui.sh"])
+        self.assertEqual(contract.CREATE_SCRIPTS[:3], ("host-bootstrap.sh", "services-up.sh", "install-api.sh"))
+        self.assertNotIn("seed-base.sh", contract.component_scripts(contract.COMPONENTS))
         for bad in ("", ",", "all,api", "db", "vmd,db"):
             with self.subTest(value=bad), self.assertRaises(contract.ContractError):
                 contract.parse_components(bad)
 
     def test_forwarding_command_covers_contract_ports(self):
         command = contract.forwarding_command("my-box")
-        self.assertTrue(command.startswith("gcloud compute ssh my-box --zone=us-central1-a "
+        self.assertTrue(command.startswith("gcloud compute ssh devbox-my-box --zone=us-central1-a "
                                            "--project=rayai-dev --tunnel-through-iap -- -N "))
         for port in (3000, 8080, 54321, 8025, 8090):
             self.assertIn(f"-L {port}:127.0.0.1:{port}", command)
