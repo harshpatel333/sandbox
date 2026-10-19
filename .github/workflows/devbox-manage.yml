@@ -1,0 +1,94 @@
+name: Manage Devboxes
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: list, destroy one box by name, destroy your boxes, or destroy every workflow-managed box
+        type: choice
+        required: true
+        default: list
+        options: [list, destroy-named, destroy-mine, destroy-all]
+      name:
+        description: Devbox name (destroy-named only)
+        type: string
+        required: false
+      confirm:
+        description: destroy-all only. Leave blank to preview the target set, then rerun with the confirmation it prints
+        type: string
+        required: false
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ACTION: ${{ github.event_name == 'schedule' && 'auto-delete' || inputs.action }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    environment: devbox
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - name: Require main
+        env:
+          SOURCE_REF: ${{ github.ref }}
+        run: test "$SOURCE_REF" = refs/heads/main
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Inventory and resolve targets
+        id: plan
+        env:
+          NAME: ${{ inputs.name }}
+          CONFIRM: ${{ inputs.confirm }}
+          ACTOR: ${{ github.actor }}
+        run: >-
+          python3 .github/workflows/scripts/devbox_inventory.py plan
+          --action "$ACTION" --name "$NAME" --actor "$ACTOR" --confirm "$CONFIRM"
+
+  destroy:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    environment: devbox
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
+    concurrency:
+      group: devbox-${{ matrix.target.name }}
+      cancel-in-progress: false
+    name: destroy ${{ matrix.target.name }} (${{ matrix.target.devbox_id }})
+    steps:
+      - name: Require main
+        env:
+          SOURCE_REF: ${{ github.ref }}
+        run: test "$SOURCE_REF" = refs/heads/main
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Re-validate identity and destroy
+        env:
+          NAME: ${{ matrix.target.name }}
+          DEVBOX_ID: ${{ matrix.target.devbox_id }}
+          EXPIRED_ONLY: ${{ env.ACTION == 'auto-delete' && '--require-expired' || '' }}
+        run: >-
+          python3 .github/workflows/scripts/devbox_inventory.py destroy
+          --name "$NAME" --devbox-id "$DEVBOX_ID" $EXPIRED_ONLY
