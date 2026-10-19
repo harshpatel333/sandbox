@@ -64,8 +64,15 @@ class DeadlineExceeded(StepError):
 class Deadline:
     end = None
 
+    reporting = False
+
     def start(self, seconds):
         self.end = time.monotonic() + seconds
+
+    def report(self):
+        if not self.reporting:
+            self.reporting = True
+            self.start(REPORT_SECONDS)
 
     def cap(self, timeout):
         if self.end is None:
@@ -371,10 +378,14 @@ def box_config(manifest, env):
     return {**values, **extra}
 
 
-def deliver_configuration(box, manifest, env):
-    box.write_file(f"{contract.BOX_CONFIG_DIR}/devbox.env", env_file(box_config(manifest, env)), "0644")
-    box.write_file(f"{contract.BOX_CONFIG_DIR}/secrets.env",
-                   env_file(prefixed(env, SECRET_PREFIX, "secrets")), "0600")
+def configuration(manifest, env):
+    return env_file(box_config(manifest, env)), env_file(prefixed(env, SECRET_PREFIX, "secrets"))
+
+
+def deliver_configuration(box, files):
+    devbox_env, secrets_env = files
+    box.write_file(f"{contract.BOX_CONFIG_DIR}/devbox.env", devbox_env, "0644")
+    box.write_file(f"{contract.BOX_CONFIG_DIR}/secrets.env", secrets_env, "0600")
 
 
 def collect_state(box, manifest):
@@ -466,15 +477,15 @@ def create(env, profile_path=PROFILE_PATH):
     revisions = {key: contract.revision(env[f"{key.upper()}_BRANCH"], env[f"{key.upper()}_SHA"])
                  for key in ("sandbox", "ui")}
     profile = load_profile(profile_path)
-    prefixed(env, SECRET_PREFIX, "secrets")
-    prefixed(env, CONFIG_PREFIX, "variables")
-
     devbox_id = contract.new_devbox_id()
     created_at = contract.utc_now()
     expires_at = contract.expiry(created_at, lifetime)
     labels = contract.labels(name, devbox_id, owner, expires_at)
     manifest = contract.new_manifest(name=name, devbox_id=devbox_id, owner=owner, actor=env["GITHUB_ACTOR"],
                                      created_at=created_at, expires_at=expires_at, revisions=revisions)
+    # Built before anything exists, so a bad value (empty, multi-line, or
+    # overriding a reserved key) is refused with nothing to clean up.
+    files = configuration(manifest, env)
     box = Box(name)
     # A taken name belongs to another box; it must never reach the failure
     # path, whose summary prints a destroy command for the name.
@@ -508,7 +519,7 @@ def create(env, profile_path=PROFILE_PATH):
         for key in ("sandbox", "ui"):
             box.checkout(key, revisions[key]["sha"])
         box.require_scripts(contract.CREATE_SCRIPTS)
-        deliver_configuration(box, manifest, env)
+        deliver_configuration(box, files)
         for script in contract.CREATE_SCRIPTS:
             box.run_script(script)
         manifest = contract.with_state(collect_state(box, manifest), "ready")
@@ -589,7 +600,7 @@ def mark_failed(name, devbox_id):
 
 
 def report_create_failure(env, name, devbox_id, error, instance_started):
-    DEADLINE.start(REPORT_SECONDS)
+    DEADLINE.report()
     try:
         found = discover(name, devbox_id)
         discovery = ""
@@ -646,6 +657,7 @@ def main(argv=None):
         if args.command == "prepare-create":
             prepare_create(env)
         elif args.command == "finish-create":
+            DEADLINE.report()
             finish_create(env)
         else:
             DEADLINE.start(DEADLINE_SECONDS)

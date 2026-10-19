@@ -182,6 +182,7 @@ class WorkflowCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(setattr, workflow.DEADLINE, "end", None)
+        self.addCleanup(setattr, workflow.DEADLINE, "reporting", False)
 
     def env(self, **values):
         return {"GITHUB_REF": "refs/heads/main", "GITHUB_ACTOR": "AWille-AI", "GITHUB_OUTPUT": str(self.output),
@@ -299,11 +300,13 @@ class CreateTests(WorkflowCase):
         for args in cloud.commands:
             self.assertFalse(any("sk_test_example" in a or "recaptcha-secret" in a for a in args), args)
 
-    def test_unset_secret_fails_before_provisioning(self):
-        cloud = FakeCloud()
-        with self.assertRaises(workflow.StepError):
-            self.create(cloud, DEVBOX_SECRET_STRIPE_SECRET_KEY="")
-        self.assertEqual(cloud.commands, [])
+    def test_bad_configuration_fails_before_provisioning(self):
+        for values in ({"DEVBOX_SECRET_STRIPE_SECRET_KEY": ""}, {"DEVBOX_SECRET_STRIPE_SECRET_KEY": "sk_test\n"},
+                       {"DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG": '{\n  "cpu": 1\n}'}, {"DEVBOX_CONFIG_DEVBOX_ID": "x"}):
+            cloud = FakeCloud()
+            with self.subTest(values=values), self.assertRaises(workflow.StepError):
+                self.create(cloud, **values)
+            self.assertEqual(cloud.commands, [])
 
     def test_name_collision_is_refused_without_offering_cleanup(self):
         cloud = FakeCloud(existing=["my-box"])
