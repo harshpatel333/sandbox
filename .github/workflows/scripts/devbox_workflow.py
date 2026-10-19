@@ -717,6 +717,10 @@ def deploy(env, now=contract.utc_now):
 
     box.wait_for_ssh(attempts=5)
     scripts = contract.component_scripts(components)
+    if "sandbox" not in revisions:
+        # The scripts then come from the box's current sandbox checkout, which
+        # prepare could not see; check them before anything on the box changes.
+        box.require_scripts(scripts)
     progress = {"checked_out": [], "deployed": [], "api_started": False}
     save = lambda: save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "progress": progress})
     save()

@@ -53,6 +53,7 @@ class FakeCloud:
         self.relabel_after_checkouts = None
         self.pending_instance = False
         self.fail_disk_create = False
+        self.box_missing = set()
         self.repo_scripts = list(contract.CREATE_SCRIPTS)
         self.existing = list(existing)
         self.branches = branches if branches is not None else {"main": SANDBOX_SHA, "feature": NEW_SHA}
@@ -141,6 +142,9 @@ class FakeCloud:
         if target and input is not None and "cat >" in unquote(command):
             self.box_files[target.group(1)] = input
             return ok()
+        if command.startswith("for script in"):
+            missing = [script for script in self.box_missing if script in command]
+            return fail(1, f"missing {missing[0]}") if missing else ok()
         if "git -C" in unquote(command):
             self.checkouts.append(re.search(r"checkout -q --force --detach ([0-9a-f]{40})", unquote(command)).group(1))
             return ok()
@@ -587,6 +591,14 @@ class DeployTests(WorkflowCase):
         self.assertEqual(cloud.checkouts, [NEW_SHA])
         self.assertEqual(cloud.scripts, [])
         self.assertFalse([path for path in cloud.box_files if path.endswith(".env")])
+
+    def test_ui_only_deploy_checks_the_box_scripts_before_changing_anything(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.box_missing = {"install-ui.sh"}
+        with self.assertRaisesRegex(workflow.StepError, "install-ui.sh"):
+            self.deploy(cloud, "ui", SANDBOX_BRANCH="", SANDBOX_SHA="", UI_BRANCH="feature", UI_SHA=NEW_SHA)
+        self.assertEqual(cloud.metadata_writes, [])
+        self.assertEqual(cloud.checkouts, [])
 
     def test_failed_box_can_be_redeployed(self):
         cloud = FakeCloud(instances=self.box(state="failed"))
