@@ -291,14 +291,14 @@ class DestroyTest(unittest.TestCase):
         cloud = FakeCloud()
         cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d')
         manifest = json.loads(cloud.instances_[0]['metadata']['items'][0]['value'])
-        manifest['resources'].append({'type': 'artifact_repo', 'name': 'devbox-3f9c0a1b2c4d'})
+        manifest['resources'].append({'type': 'disk', 'name': 'devbox-alice-dev-a7f3c9-scratch', 'zone': ZONE})
         if invalid:
             del manifest['created_at']
         cloud.instances_[0]['metadata']['items'][0]['value'] = json.dumps(manifest)
         for _ in range(2):
             with self.assertRaises(SystemExit) as stop:
                 inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
-            self.assertIn('artifact_repo devbox-3f9c0a1b2c4d', stop.exception.code)
+            self.assertIn('disk devbox-alice-dev-a7f3c9-scratch', stop.exception.code)
         self.assertEqual(cloud.calls, [])
 
     def test_disk_attached_to_another_instance_is_not_deleted(self):
