@@ -392,8 +392,10 @@ class UnlabelledResourceTest(unittest.TestCase):
                              'creationTimestamp': CREATED, 'selfLink': link('disks', data), 'users': []})
         [box], _ = boxes(cloud)
         self.assertNotIn(('disk', data), [(r.kind, r.name) for r in box.resources])
-        inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
-        self.assertNotIn(('disk', data), cloud.calls)
+        with self.assertRaises(SystemExit) as stop:
+            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertIn(f'{data}: is not labelled as this devbox', stop.exception.code)
+        self.assertEqual(cloud.calls, [])
 
     def test_blocked_remnant_is_not_reported_gone_when_nothing_else_remains(self):
         cloud = FakeCloud()
@@ -414,10 +416,13 @@ class UnlabelledResourceTest(unittest.TestCase):
 
     def test_remnants_not_attributable_to_another_identity_still_block(self):
         _, boot, _ = gce('alice-dev-a7f3c9')
-        for kind, change in (('disk', {'devbox-id': 'BADID'}), ('bucket', {'devbox-id': 'ffffffffffff'})):
-            with self.subTest(kind=kind):
+        for kind, change in (('disk', {'devbox-id': 'BADID'}), ('bucket', {'devbox-id': 'ffffffffffff'}),
+                             ('disk', {'devbox-id': 'ffffffffffff', 'devbox-name': 'bob-dev-0d1e2f'}),
+                             ('disk', {'devbox-id': 'ffffffffffff', 'devbox-name': ''}),
+                             ('disk', {'devbox-id': 'ffffffffffff', 'managed-by': 'someone-else'})):
+            with self.subTest(kind=kind, change=change):
                 cloud = FakeCloud()
-                cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False)
+                cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False, environment='staging')
                 cloud.disks_ = cloud.disks_[:1] if kind == 'disk' else []
                 cloud.buckets_ = cloud.buckets_ if kind == 'bucket' else []
                 (cloud.disks_ or cloud.buckets_)[0]['labels'].update(change)
@@ -437,14 +442,11 @@ class UnlabelledResourceTest(unittest.TestCase):
                 cloud.disks_[0].update(change)
                 [box], ignored = boxes(cloud)
                 self.assertNotIn(('disk', boot), [(r.kind, r.name) for r in box.resources])
-                if reason == 'devbox-name':
-                    inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
-                    self.assertNotIn(('disk', boot), cloud.calls)
-                    continue
-                self.assertIn(reason, ignored[0][1])
+                if reason != 'devbox-name':
+                    self.assertIn(reason, ignored[0][1])
                 with self.assertRaises(SystemExit) as stop:
                     inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
-                self.assertIn(reason, stop.exception.code)
+                self.assertIn(boot, stop.exception.code)
                 self.assertEqual(cloud.calls, [])
 
 

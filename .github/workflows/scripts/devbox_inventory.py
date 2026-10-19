@@ -406,17 +406,24 @@ def find(cloud, project, name, devbox_id):
 
 
 def find_with_blocked(cloud, project, name, devbox_id):
-    """Return the box and any resource it expects that was refused, which destroy must not leave behind silently."""
-    boxes, ignored = inventory(collect(cloud), project)
+    """Return the box and every resource at one of its contract names that neither it nor another devbox
+    provably owns; destroy refuses rather than leave such a resource behind and report the box gone."""
+    resources = collect(cloud)
+    boxes, ignored = inventory(resources, project)
     box = next((b for b in boxes if b.name == name and b.devbox_id == devbox_id), None)
+    claimed = {id(r) for b in boxes for r in b.resources}
+    reasons = {id(r): reason for r, reason in ignored}
     wanted = expected(name, devbox_id)
-    return box, [(r, reason) for r, reason in ignored
-                 if (r.kind, r.name) in wanted and not _owned_elsewhere(r, name, devbox_id)]
+    return box, [(r, reasons.get(id(r), 'is not labelled as this devbox'))
+                 for r in resources if (r.kind, r.name) in wanted and id(r) not in claimed
+                 and not _owned_elsewhere(r, name, devbox_id)]
 
 
 def _owned_elsewhere(resource, name, devbox_id):
-    other = resource.labels.get('devbox-id')
-    return (other != devbox_id and isinstance(other, str) and contract.DEVBOX_ID_PATTERN.fullmatch(other) is not None
+    labels = resource.labels
+    other = labels.get('devbox-id')
+    return (labels.get('managed-by') == contract.MANAGED_BY and labels.get('devbox-name') == name
+            and other != devbox_id and isinstance(other, str) and contract.DEVBOX_ID_PATTERN.fullmatch(other) is not None
             and (resource.kind, resource.name) in expected(name, other))
 
 
