@@ -85,6 +85,7 @@ class LabelTests(unittest.TestCase):
             ({**values, "managed-by": "terraform"}, None),
             ({**values, "devbox-name": "other"}, None),
             ({**values, "sandbox_role": "vmd"}, None),
+            ({**values, "component": "vmd"}, None),
             ({}, None),
         ):
             with self.subTest(found=found), self.assertRaises(contract.ContractError):

@@ -34,9 +34,10 @@ SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 
 LABEL_KEYS = ("managed-by", "devbox-name", "devbox-id", "owner", "expires-at")
-# Staging and production discover their hosts through these labels; a devbox
+# Staging and production discover their hosts through these labels (the
+# environments.yaml selectors and the component=vmd* deploy targets); a devbox
 # carrying any of them could be swept into a real deployment.
-FORBIDDEN_LABELS = ("sandbox_role", "sandbox_status", "environment", "region")
+FORBIDDEN_LABELS = ("sandbox_role", "sandbox_status", "environment", "region", "component")
 
 STATES = ("creating", "ready", "failed", "deploying", "destroying")
 RESOURCE_TYPES = ("instance", "disk", "bucket")
