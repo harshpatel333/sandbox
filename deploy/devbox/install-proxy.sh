@@ -19,7 +19,9 @@ REDIRECT_ADDR=127.0.0.1:5008
 
 # The fleet units listen on every interface; on the box only loopback. Kept
 # as drop-ins so the fleet units install unchanged. The address is fixed at
-# create: VMD probes the proxy's health at the URL bootstrap gave it.
+# create: VMD probes the proxy's health at the URL bootstrap gave it. An
+# active socket keeps the addresses it bound, so changed drop-ins stop it for
+# the deploy to rebind.
 install_listeners() {
   local socket service changed=0 health
   health=$(sed -n 's/^PROXY_HEALTH_URL=//p' /etc/sandbox/vmd.env | tail -n 1)

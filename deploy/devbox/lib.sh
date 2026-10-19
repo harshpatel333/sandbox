@@ -85,6 +85,7 @@ devbox_revision() {
   local head selected
   head=$(git -c safe.directory="$DEVBOX_REPO" -C "$DEVBOX_REPO" rev-parse HEAD) || devbox_die "cannot read the sandbox revision at $DEVBOX_REPO"
   if [ -n "${DEVBOX_SANDBOX_SHA:-}" ]; then
+    [[ "$DEVBOX_SANDBOX_SHA" =~ ^[0-9a-fA-F]{7,40}$ ]] || devbox_die "DEVBOX_SANDBOX_SHA must be a commit SHA"
     selected=$(git -c safe.directory="$DEVBOX_REPO" -C "$DEVBOX_REPO" rev-parse --verify --quiet "$DEVBOX_SANDBOX_SHA^{commit}") || selected=$DEVBOX_SANDBOX_SHA
     [ "$head" = "$selected" ] || devbox_die "$DEVBOX_REPO is at $head, not the selected $DEVBOX_SANDBOX_SHA"
   fi
