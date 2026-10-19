@@ -41,7 +41,8 @@ host_status() {
 }
 
 if [[ $dry_run == true ]]; then
-  log "dry run: host $host_id is '$(host_status)'; would activate it and seed $(basename "$base_spec")"
+  status=$(host_status)
+  log "dry run: host $host_id is '$status'; would activate it and seed $(basename "$base_spec")"
   exit 0
 fi
 

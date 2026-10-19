@@ -12,10 +12,12 @@ x-service: &service
     driver: journald
 
 services:
+  # Statement logging stays off: the image's first initialization sets role
+  # passwords with DDL that it would otherwise write to the journal.
   db:
     <<: *service
     image: supabase/postgres:17.11.0.002
-    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql-devbox/pg_hba.conf -c listen_addresses=127.0.0.1
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql-devbox/pg_hba.conf -c listen_addresses=127.0.0.1 -c log_statement=none
     environment:
       PGPORT: "54322"
       POSTGRES_PORT: "54322"

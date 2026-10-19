@@ -140,7 +140,8 @@ if [[ $dry_run == true ]]; then
   trap 'rm -f "$tmp_env"' EXIT
   render_api_env "$tmp_env"
   log "dry run: API configuration is valid for $sha"
-  log "pending migrations: $(pending_migrations | tr '\n' ' ')"
+  pending_list=$(pending_migrations)
+  log "pending migrations: ${pending_list//$'\n'/ }"
   exit 0
 fi
 
