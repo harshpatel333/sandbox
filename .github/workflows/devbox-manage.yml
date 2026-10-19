@@ -73,6 +73,7 @@ jobs:
     concurrency:
       group: devbox-${{ matrix.target.name }}
       cancel-in-progress: false
+      queue: max
     name: destroy ${{ matrix.target.name }} (${{ matrix.target.devbox_ids }})
     steps:
       - name: Require main
