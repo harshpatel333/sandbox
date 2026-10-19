@@ -61,30 +61,11 @@ record() {
   mv "$deploy_record.tmp" "$deploy_record"
 }
 
-go_version() { sed -n 's/^go \([0-9.]*\)$/\1/p' "$src/go.mod"; }
-
+# host-bootstrap.sh installs Go; the go command fetches a newer toolchain
+# itself when go.mod asks for one.
 ensure_go() {
-  local version root
-  version=$(go_version)
-  [[ -n $version ]] || die "cannot read the Go version from go.mod"
-  root="$DEVBOX_INSTALL_DIR/tools/go$version"
-  if [[ ! -x $root/bin/go ]]; then
-    local tarball="go$version.linux-amd64.tar.gz" want tmp
-    want=$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' |
-      python3 -I -c 'import json, sys
-name = sys.argv[1]
-print(next(f["sha256"] for r in json.load(sys.stdin) for f in r["files"] if f["filename"] == name))' "$tarball") ||
-      die "no published checksum for $tarball"
-    tmp=$(mktemp -d "$DEVBOX_INSTALL_DIR/tools/.go.XXXXXX")
-    curl -fsSL -o "$tmp/$tarball" "https://go.dev/dl/$tarball"
-    echo "$want  $tmp/$tarball" | sha256sum --check --quiet - || die "checksum mismatch for $tarball"
-    mkdir "$tmp/go"
-    tar -xzf "$tmp/$tarball" -C "$tmp/go" --strip-components=1
-    rm -rf "$root"
-    mv "$tmp/go" "$root"
-    rm -rf "$tmp"
-  fi
-  export PATH="$root/bin:$PATH" GOTOOLCHAIN=local GOFLAGS=-mod=readonly
+  [[ -x /usr/local/go/bin/go ]] || die "missing /usr/local/go/bin/go; run host-bootstrap.sh first"
+  export PATH="/usr/local/go/bin:$PATH" GOFLAGS=-mod=readonly
 }
 
 ensure_supabase_cli() {
@@ -135,7 +116,6 @@ render_api_env() {
 }
 
 if [[ $dry_run == true ]]; then
-  [[ -n $(go_version) ]] || die "cannot read the Go version from go.mod"
   tmp_env=$(mktemp)
   trap 'rm -f "$tmp_env"' EXIT
   render_api_env "$tmp_env"
