@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
@@ -207,6 +208,11 @@ func ApplyTrustedProxies(r *gin.Engine, raw string) error {
 		if c = strings.TrimSpace(c); c != "" {
 			cidrs = append(cidrs, c)
 		}
+	}
+	// An empty slice would make gin trust no hop and key every caller on the
+	// load balancer's address, so a list of only separators is a config error.
+	if len(cidrs) == 0 {
+		return fmt.Errorf("no CIDRs in %q", raw)
 	}
 	return r.SetTrustedProxies(cidrs)
 }
