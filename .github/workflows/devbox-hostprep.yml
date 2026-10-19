@@ -12,9 +12,11 @@ on:
         default: superserve-vmd-staging
         type: string
 
+# Shares the VMD deploy queue so the staging rootfs is not rewritten mid-copy.
 concurrency:
-  group: devbox-hostprep
+  group: deploy-vmd
   cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read

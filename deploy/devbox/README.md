@@ -61,10 +61,13 @@ for role in roles/iam.workloadIdentityPoolAdmin roles/recaptchaenterprise.admin 
 done
 ```
 
-Everything else it needs (service accounts, custom roles, project IAM,
-networks, firewall rules, buckets, enabling APIs, the state bucket) it already
-uses for the staging root. If the first apply still fails on a permission,
-grant that one and rerun the workflow.
+Everything else it needs it already holds: service accounts, custom roles,
+project IAM, firewall rules, buckets, enabling APIs and the state bucket for
+the staging root, and subnet IAM, routers and NAT through
+`roles/compute.networkAdmin`. If the first apply still fails on a permission,
+grant that one and rerun the workflow. These grants give every workflow that
+runs as the staging Terraform identity, including pull request plans, the
+same reach; that identity can already change project IAM.
 
 Break glass: with project owner and access to the state bucket, the same root
 can be applied by hand from the repository root with
@@ -82,11 +85,12 @@ name-conditioned login grant; check it once on the first box with
 Terraform also creates `gs://rayai-dev-devbox-hostprep`, which boxes read the
 guest kernel and base rootfs from at bootstrap. Its name is deliberately
 outside `superserve-devbox-*`, so box destroy and the box's object grant never
-match it. Boxes can only read it; the only writer is the staging Terraform
-identity, through the Devbox Hostprep Seed workflow.
+match it. Boxes can only read it; besides project-level storage admins, only
+the staging Terraform identity can write it, through the Devbox Hostprep Seed
+workflow.
 
 Dispatch Devbox Hostprep Seed (`.github/workflows/devbox-hostprep.yml`) from
-`main` once, while no VMD deploy is running. It copies the guest kernel and
+`main` once; it waits for any running VMD deploy. It copies the guest kernel and
 base rootfs from staging Host 1 over IAP SSH, only reading the host. The
 kernel is never modified and must match the SHA-256 recorded in the
 [Host 2 identity runbook](../host2-identity-runbook.md), or the job stops.

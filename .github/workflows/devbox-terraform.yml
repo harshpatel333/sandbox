@@ -10,6 +10,7 @@ on:
     paths:
       - 'deploy/devbox/terraform/**'
       - 'infra/modules/network/**'
+      - 'scripts/sanitize-terraform-plan.sh'
       - '.github/workflows/devbox-terraform.yml'
   push:
     branches: [main]
@@ -25,9 +26,12 @@ on:
         default: false
         type: boolean
 
+# Applies queue behind each other and are never displaced by a pull request
+# plan; plans of one pull request queue behind each other.
 concurrency:
-  group: devbox-terraform
+  group: devbox-terraform-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'apply' }}
   cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read
@@ -37,9 +41,11 @@ jobs:
   terraform:
     name: Devbox Terraform
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: staging
     env:
       TF_IN_AUTOMATION: 'true'
+      HAS_GCP_AUTH: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
       ROOT: deploy/devbox/terraform
       APPLY: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
       ALLOW_DESTROY: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_destroy }}
@@ -50,13 +56,19 @@ jobs:
         with:
           terraform_wrapper: false
 
+      - name: Skip without cloud credentials
+        if: env.HAS_GCP_AUTH != 'true'
+        run: echo "::notice title=Devbox plan skipped::No cloud credentials are available to this run, for example a pull request from a fork."
+
       - name: Authenticate to Google Cloud
+        if: env.HAS_GCP_AUTH == 'true'
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Plan
+        if: env.HAS_GCP_AUTH == 'true'
         run: |
           set -euo pipefail
           terraform -chdir="$ROOT" init -input=false -lock-timeout=10m
@@ -71,19 +83,19 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Refuse deletes and replacements
-        if: env.ALLOW_DESTROY != 'true'
+        if: env.HAS_GCP_AUTH == 'true' && env.ALLOW_DESTROY != 'true'
         run: |
           set -euo pipefail
           destructive=$(terraform -chdir="$ROOT" show -json tfplan \
             | jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address')
           if [ -n "$destructive" ]; then
-            echo "::error title=Destructive devbox plan::The plan deletes or replaces: $(echo $destructive)"
+            echo "::error title=Destructive devbox plan::The plan deletes or replaces: $(tr '\n' ' ' <<<"$destructive")"
             echo "Dispatch this workflow from main with allow_destroy if the change is intentional." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
       - name: Apply
-        if: env.APPLY == 'true'
+        if: env.HAS_GCP_AUTH == 'true' && env.APPLY == 'true'
         run: |
           set -euo pipefail
           terraform -chdir="$ROOT" apply -input=false -lock-timeout=10m tfplan
