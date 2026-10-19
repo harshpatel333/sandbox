@@ -75,6 +75,6 @@ variable "hostprep_bucket" {
 }
 
 variable "hostprep_seeder" {
-  description = "Principal that seeds the hostprep bucket from a staging host; the only writer."
+  description = "Principal that seeds the hostprep bucket from a staging host."
   type        = string
 }

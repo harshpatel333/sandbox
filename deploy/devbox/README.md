@@ -61,10 +61,10 @@ for role in roles/iam.workloadIdentityPoolAdmin roles/recaptchaenterprise.admin 
 done
 ```
 
-Everything else it needs it already holds: service accounts, custom roles,
-project IAM, firewall rules, buckets, enabling APIs and the state bucket for
-the staging root, and subnet IAM, routers and NAT through
-`roles/compute.networkAdmin`. If the first apply still fails on a permission,
+Everything else it needs it already holds. The staging root uses its rights
+over service accounts, custom roles, project IAM, firewall rules, buckets,
+API enablement and the state bucket, and `roles/compute.networkAdmin` covers
+subnet IAM, routers and NAT. If the first apply still fails on a permission,
 grant that one and rerun the workflow. These grants give every workflow that
 runs as the staging Terraform identity, including pull request plans, the
 same reach; that identity can already change project IAM.
@@ -85,12 +85,12 @@ name-conditioned login grant; check it once on the first box with
 Terraform also creates `gs://rayai-dev-devbox-hostprep`, which boxes read the
 guest kernel and base rootfs from at bootstrap. Its name is deliberately
 outside `superserve-devbox-*`, so box destroy and the box's object grant never
-match it. Boxes can only read it; besides project-level storage admins, only
-the staging Terraform identity can write it, through the Devbox Hostprep Seed
-workflow.
+match it. Boxes can only read it. Apart from principals with project-wide
+storage rights, only the staging Terraform identity can write it, through the
+Devbox Hostprep Seed workflow.
 
 Dispatch Devbox Hostprep Seed (`.github/workflows/devbox-hostprep.yml`) from
-`main` once; it waits for any running VMD deploy. It copies the guest kernel and
+`main` once, preferably while no VMD deploy is running. It copies the guest kernel and
 base rootfs from staging Host 1 over IAP SSH, only reading the host. The
 kernel is never modified and must match the SHA-256 recorded in the
 [Host 2 identity runbook](../host2-identity-runbook.md), or the job stops.

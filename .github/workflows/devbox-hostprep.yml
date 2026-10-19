@@ -12,11 +12,9 @@ on:
         default: superserve-vmd-staging
         type: string
 
-# Shares the VMD deploy queue so the staging rootfs is not rewritten mid-copy.
 concurrency:
-  group: deploy-vmd
+  group: devbox-hostprep
   cancel-in-progress: false
-  queue: max
 
 permissions:
   contents: read
@@ -27,6 +25,7 @@ jobs:
     name: Seed hostprep artifacts
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     environment: staging
     env:
       HOST: ${{ inputs.host }}

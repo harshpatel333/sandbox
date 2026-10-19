@@ -58,7 +58,12 @@ jobs:
 
       - name: Skip without cloud credentials
         if: env.HAS_GCP_AUTH != 'true'
-        run: echo "::notice title=Devbox plan skipped::No cloud credentials are available to this run, for example a pull request from a fork."
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "::error title=Missing cloud credentials::The staging Terraform identity is not configured; nothing was applied."
+            exit 1
+          fi
+          echo "::notice title=Devbox plan skipped::No cloud credentials are available to this pull request, for example one from a fork."
 
       - name: Authenticate to Google Cloud
         if: env.HAS_GCP_AUTH == 'true'
