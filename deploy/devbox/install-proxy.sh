@@ -18,11 +18,13 @@ PROXY_DOMAIN=sandbox.localhost
 REDIRECT_ADDR=127.0.0.1:5008
 
 # The fleet units listen on every interface; on the box only loopback. Kept
-# as drop-ins so the fleet units install unchanged. An active socket keeps
-# the addresses it bound, so a changed listener stops it for the deploy to
-# rebind.
+# as drop-ins so the fleet units install unchanged. The address is fixed at
+# create: VMD probes the proxy's health at the URL bootstrap gave it.
 install_listeners() {
-  local socket service changed=0
+  local socket service changed=0 health
+  health=$(sed -n 's/^PROXY_HEALTH_URL=//p' /etc/sandbox/vmd.env | tail -n 1)
+  [ "$health" = "http://$DEVBOX_PROXY_ADDR/health" ] \
+    || devbox_die "VMD probes the proxy at $health, not $DEVBOX_PROXY_ADDR; the proxy address is fixed when the box is created"
   socket=$(printf '[Socket]\nListenStream=\nListenStream=%s\nListenStream=%s\n' "$DEVBOX_PROXY_ADDR" "$REDIRECT_ADDR")
   service=$(printf '[Service]\nEnvironment=PROXY_ADDR=%s\nEnvironment=PROXY_REDIRECT_ADDR=%s\n' "$DEVBOX_PROXY_ADDR" "$REDIRECT_ADDR")
   install -d -m 0755 /etc/systemd/system/proxy.socket.d /etc/systemd/system/proxy.service.d

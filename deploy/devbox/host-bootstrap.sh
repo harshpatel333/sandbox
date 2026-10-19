@@ -228,9 +228,15 @@ main() {
   devbox_load_env
   devbox_instance
   check_prerequisites
+  # A rerun keeps the capacity sized at create (memory reported by the kernel
+  # drifts across updates); explicit overrides still apply and are verified.
+  local memory=${DEVBOX_VMD_SCHEDULABLE_MEMORY_MIB:-} vcpus=${DEVBOX_VMD_SCHEDULABLE_VCPUS:-}
+  if [ -f /etc/sandbox/vmd.env ]; then
+    memory=${memory:-$(sed -n 's/^VMD_SCHEDULABLE_MEMORY_MIB=//p' /etc/sandbox/vmd.env | tail -n 1)}
+    vcpus=${vcpus:-$(sed -n 's/^VMD_SCHEDULABLE_VCPUS=//p' /etc/sandbox/vmd.env | tail -n 1)}
+  fi
   read -r MEMORY_MIB VCPUS < <(python3 "$DEVBOX_REPO/deploy/devbox/devbox_host.py" capacity \
-    --nproc "$(nproc)" --reserve-mib "$RESERVE_MIB" \
-    --memory-mib "${DEVBOX_VMD_SCHEDULABLE_MEMORY_MIB:-}" --vcpus "${DEVBOX_VMD_SCHEDULABLE_VCPUS:-}") \
+    --nproc "$(nproc)" --reserve-mib "$RESERVE_MIB" --memory-mib "$memory" --vcpus "$vcpus") \
     || devbox_die "cannot size schedulable capacity"
   devbox_log "host $DEVBOX_INSTANCE ($DEVBOX_ZONE): $MEMORY_MIB MiB, $VCPUS vCPUs schedulable"
   run_host_bootstrap

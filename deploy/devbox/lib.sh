@@ -44,7 +44,9 @@ devbox_load_env() {
   export DEVBOX_ARTIFACT_BUCKET=${DEVBOX_ARTIFACT_BUCKET:-rayai-dev-devbox-hostprep}
   export DEVBOX_DATA_DISK_DEVICE=${DEVBOX_DATA_DISK_DEVICE:-devbox-data}
   export DEVBOX_PROXY_ADDR=${DEVBOX_PROXY_ADDR:-127.0.0.1:8090}
-  [[ "$DEVBOX_PROXY_ADDR" =~ ^127\.0\.0\.1:[0-9]{1,5}$ ]] || devbox_die "DEVBOX_PROXY_ADDR must be a 127.0.0.1 address"
+  if ! [[ "$DEVBOX_PROXY_ADDR" =~ ^127\.0\.0\.1:([1-9][0-9]{0,4})$ ]] || [ "${BASH_REMATCH[1]}" -gt 65535 ]; then
+    devbox_die "DEVBOX_PROXY_ADDR must be a 127.0.0.1 address"
+  fi
   export DEVBOX_API_URL=${DEVBOX_API_URL:-http://127.0.0.1:8080}
   export DEVBOX_CONSOLE_ORIGIN=${DEVBOX_CONSOLE_ORIGIN:-http://localhost:3000}
 }
@@ -80,10 +82,11 @@ devbox_load_local_secrets() {
 
 # The checkout's revision, which must be the one CI selected when it says.
 devbox_revision() {
-  local head
+  local head selected
   head=$(git -c safe.directory="$DEVBOX_REPO" -C "$DEVBOX_REPO" rev-parse HEAD) || devbox_die "cannot read the sandbox revision at $DEVBOX_REPO"
-  if [ -n "${DEVBOX_SANDBOX_SHA:-}" ] && [ "$head" != "$DEVBOX_SANDBOX_SHA" ]; then
-    devbox_die "$DEVBOX_REPO is at $head, not the selected $DEVBOX_SANDBOX_SHA"
+  if [ -n "${DEVBOX_SANDBOX_SHA:-}" ]; then
+    selected=$(git -c safe.directory="$DEVBOX_REPO" -C "$DEVBOX_REPO" rev-parse --verify --quiet "$DEVBOX_SANDBOX_SHA^{commit}") || selected=$DEVBOX_SANDBOX_SHA
+    [ "$head" = "$selected" ] || devbox_die "$DEVBOX_REPO is at $head, not the selected $DEVBOX_SANDBOX_SHA"
   fi
   printf '%s\n' "$head"
 }
@@ -96,11 +99,13 @@ devbox_require_bootstrapped() {
   # moves the pins is tested against the old ones until the box is recreated.
   python3 - "$DEVBOX_RUNTIME_JSON" <<'PY' || true
 import json, os, sys
-artifacts = json.load(open(sys.argv[1]))["artifacts"]
-for name, installed, pinned in (
-    ("Firecracker", artifacts["firecracker"]["sha256"], os.environ["DEVBOX_FIRECRACKER_SHA256"]),
-    ("kernel", artifacts["kernel"]["digest"], os.environ["DEVBOX_KERNEL_DIGEST"]),
+artifacts = json.load(open(sys.argv[1])).get("artifacts", {})
+for name, key, field, pin in (
+    ("Firecracker", "firecracker", "sha256", "DEVBOX_FIRECRACKER_SHA256"),
+    ("kernel", "kernel", "digest", "DEVBOX_KERNEL_DIGEST"),
+    ("base rootfs", "rootfs", "digest", "DEVBOX_ROOTFS_DIGEST"),
 ):
+    installed, pinned = artifacts.get(key, {}).get(field, ""), os.environ.get(pin, "")
     if installed != pinned:
         print(f"WARNING: this box runs the {name} it was created with ({installed[:12]}), "
               f"not this revision's pin ({pinned[:12]}); recreate the box to test the new one", file=sys.stderr)

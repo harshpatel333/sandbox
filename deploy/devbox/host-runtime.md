@@ -50,7 +50,7 @@ So the order is:
 | `DEVBOX_KERNEL_OBJECT`, `DEVBOX_KERNEL_DIGEST` | `runtime-pins.env` | Guest kernel object under `hostprep/` and its MD5 or SHA-256 |
 | `DEVBOX_ROOTFS_OBJECT`, `DEVBOX_ROOTFS_DIGEST` | `runtime-pins.env` | Base rootfs object under `hostprep/` and its MD5 or SHA-256 |
 | `DEVBOX_VMD_SCHEDULABLE_MEMORY_MIB`, `DEVBOX_VMD_SCHEDULABLE_VCPUS` | machine memory minus `DEVBOX_HOST_RESERVE_MIB` (8192), and all vCPUs | Capacity VMD advertises |
-| `DEVBOX_PROXY_ADDR` | `127.0.0.1:8090` | Proxy listener |
+| `DEVBOX_PROXY_ADDR` | `127.0.0.1:8090` | Proxy listener. Fixed when the box is created, because VMD probes its health there |
 | `DEVBOX_API_URL` | `http://127.0.0.1:8080` | Control plane VMD and secretsproxy call |
 | `DEVBOX_CONSOLE_ORIGIN` | `http://localhost:3000` | Browser origin allowed to use the proxy data plane |
 
@@ -63,8 +63,9 @@ and it is seeded once from the staging host's verified files. Firecracker comes 
 the public `superserve-ai/firecracker` release and Go from `go.dev`. Each is
 verified against its pin.
 
-Shared local secrets are read from `/etc/superserve-devbox/local-secrets.env`,
-which `services-up.sh` generates once and keeps on the data disk:
+Shared local secrets are read from `/etc/superserve-devbox/local-secrets.env`.
+`services-up.sh` generates them once on the data disk, and that path is a
+symlink to the data-disk copy:
 
 * `INTERNAL_API_TOKEN`: VMD, and secretsproxy as `DAEMON_AUTH_TOKEN`. It must
   equal the API's token.
