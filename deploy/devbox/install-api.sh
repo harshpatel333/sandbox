@@ -155,6 +155,7 @@ trap 'if [[ $migrating == true ]]; then migrating=false; record_partial_failure 
 trap 'exit 143' TERM
 trap 'exit 130' INT
 trap 'exit 129' HUP
+trap 'exit 141' PIPE
 log "applying ${#pending[@]} pending migration(s)"
 if ! (cd "$workdir" && PGPASSWORD=$POSTGRES_PASSWORD SUPABASE_TELEMETRY_DISABLED=1 "$supabase" db push --yes \
   --db-url "postgresql://postgres@127.0.0.1:54322/postgres?sslmode=disable"); then
