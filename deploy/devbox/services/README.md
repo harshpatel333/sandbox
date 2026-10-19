@@ -44,7 +44,7 @@ for every TCP connection.
 `local-secrets.env` holds `POSTGRES_PASSWORD`, `DATABASE_URL` (as `postgres`), `PROMOTION_EVIDENCE_PROXY_PASSWORD`,
 `JWT_SECRET`, `ANON_KEY`, `SERVICE_ROLE_KEY`, `SANDBOX_ACCESS_TOKEN_SEED`,
 `INTERNAL_API_TOKEN`, `OPERATOR_API_TOKEN`, `PROMOTION_CAPTURE_TOKEN`,
-`PROMOTION_ACCOUNT_TOKEN`, `PROMOTION_ACCOUNT_PUBLIC_KEY` and `SYSTEM_TEAM_ID`.
+`PROMOTION_ACCOUNT_TOKEN`, `PROMOTION_ACCOUNT_PUBLIC_KEY`, `SECRETS_SIGNING_KEY` (the API's sandbox JWT signing seed, published at `/internal/jwks`) and `SYSTEM_TEAM_ID`.
 The console, VMD and proxy read the values they share with the API from it.
 
 ## Configuration read from CI

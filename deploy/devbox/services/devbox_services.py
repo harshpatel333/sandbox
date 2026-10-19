@@ -35,6 +35,7 @@ GENERATED = {
     "PROMOTION_CAPTURE_TOKEN": lambda: random.token_hex(32),
     "PROMOTION_ACCOUNT_TOKEN": lambda: random.token_hex(32),
     "SYSTEM_TEAM_ID": lambda: str(uuid.uuid4()),
+    "SECRETS_SIGNING_KEY": lambda: base64.b64encode(random.token_bytes(32)).decode(),
 }
 
 # The only local secrets the containers receive.
@@ -215,6 +216,7 @@ def api_env(env, runtime):
         "PROMOTION_ACCOUNT_TOKEN": need(env, "PROMOTION_ACCOUNT_TOKEN"),
         "PROMOTION_ACCOUNT_PUBLIC_KEY": need(env, "PROMOTION_ACCOUNT_PUBLIC_KEY"),
         "SYSTEM_TEAM_ID": need(env, "SYSTEM_TEAM_ID"),
+        "SECRETS_SIGNING_KEY": need(env, "SECRETS_SIGNING_KEY"),
         "EMAIL_TRANSPORT": "smtp",
         "SMTP_HOST": "127.0.0.1",
         "SMTP_PORT": "1025",

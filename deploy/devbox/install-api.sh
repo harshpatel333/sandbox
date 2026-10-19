@@ -183,6 +183,7 @@ psql_admin <<SQL
 SET log_statement = 'none';
 SET log_min_error_statement = 'panic';
 SET pgaudit.log = 'none';
+SET log_min_duration_statement = -1;
 ALTER ROLE promotion_evidence_proxy PASSWORD '$PROMOTION_EVIDENCE_PROXY_PASSWORD';
 INSERT INTO team (id, name) VALUES ('$SYSTEM_TEAM_ID', 'superserve-system') ON CONFLICT (id) DO NOTHING;
 SQL

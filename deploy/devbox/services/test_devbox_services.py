@@ -38,6 +38,7 @@ class SecretsTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.key.stat().st_mode), 0o600)
         self.assertEqual(ds.read_env(self.env), values)
         self.assertEqual(len(bytes.fromhex(values["SANDBOX_ACCESS_TOKEN_SEED"])), 32)
+        self.assertEqual(len(base64.b64decode(values["SECRETS_SIGNING_KEY"], validate=True)), 32)
         self.assertNotEqual(values["PROMOTION_CAPTURE_TOKEN"], values["PROMOTION_ACCOUNT_TOKEN"])
         self.assertNotEqual(values["PROMOTION_ACCOUNT_TOKEN"], values["INTERNAL_API_TOKEN"])
 
