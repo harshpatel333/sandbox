@@ -139,6 +139,25 @@ def require(actual, expected, label):
             raise ProvisionError(f"Existing {label} conflicts at {key}; no replacement will be created")
 
 
+def require_price(price, label, product_id, tax_behavior, unit_amount_decimal, recurring):
+    require(price, {"active": True, "currency": "usd", "billing_scheme": "per_unit",
+                    "type": "recurring", "product": product_id, "transform_quantity": None,
+                    "custom_unit_amount": None, "tax_behavior": tax_behavior}, label)
+    currencies = price.get("currency_options")
+    if not isinstance(currencies, dict) or not currencies:
+        raise ProvisionError(f"{label} currency options were not expanded; no writes attempted")
+    if set(currencies) != {"usd"}:
+        raise ProvisionError(f"{label} has additional currency options; reconcile them manually")
+    require(price.get("recurring") or {}, {"interval_count": 1, "trial_period_days": None, **recurring},
+            f"{label} recurring settings")
+    try:
+        equal = Decimal(str(price.get("unit_amount_decimal"))) == Decimal(unit_amount_decimal)
+    except InvalidOperation:
+        equal = False
+    if not equal:
+        raise ProvisionError(f"Existing {label} has a different rate; no replacement will be created")
+
+
 def inspect(stripe, spec):
     # Finish all reads and conflict checks before creating any object.
     meters, products, prices = [stripe.inventory(kind) for kind in PATHS]
@@ -164,22 +183,8 @@ def inspect(stripe, spec):
     if price:
         if not meter or not product:
             raise ProvisionError("Storage price exists without a matching meter and product")
-        require(price, {"active": True, "currency": "usd", "billing_scheme": "per_unit",
-                        "type": "recurring", "product": product["id"], "transform_quantity": None,
-                        "custom_unit_amount": None, "tax_behavior": spec["tax_behavior"]}, "price")
-        currencies = price.get("currency_options")
-        if not isinstance(currencies, dict) or not currencies:
-            raise ProvisionError("Storage price currency options were not expanded; no writes attempted")
-        if set(currencies) != {"usd"}:
-            raise ProvisionError("Storage price has additional currency options; reconcile them manually")
-        require(price.get("recurring") or {}, {"meter": meter["id"], "interval": "month",
-                "interval_count": 1, "usage_type": "metered", "trial_period_days": None}, "price recurring settings")
-        try:
-            equal = Decimal(str(price.get("unit_amount_decimal"))) == Decimal(spec["unit_amount_decimal"])
-        except InvalidOperation:
-            equal = False
-        if not equal:
-            raise ProvisionError("Existing storage price has a different rate; no replacement will be created")
+        require_price(price, "Storage price", product["id"], spec["tax_behavior"], spec["unit_amount_decimal"],
+                      {"meter": meter["id"], "interval": "month", "usage_type": "metered"})
     return {"meter": meter, "product": product, "price": price}
 
 

@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import argparse
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 import json
 import os
 import sys
 
-from provision_storage_stripe import PATHS, ProvisionError, Stripe
+from provision_storage_stripe import PATHS, ProvisionError, Stripe, require, require_price
 
 API_VERSION = "2026-05-27.dahlia"
 TAX_BEHAVIOR = "exclusive"
@@ -41,29 +41,10 @@ def cents_per_hour(usd_per_second):
     return Decimal(usd_per_second) * 360000
 
 
-def same_amount(price, cents):
-    try:
-        return Decimal(str(price.get("unit_amount_decimal"))) == cents
-    except InvalidOperation:
-        return False
-
-
-def require_usd_only(price, label):
-    # Checkout lets Stripe present any currency option; the API rejects non-USD payments.
-    if set(price.get("currency_options") or {}) != {"usd"}:
-        raise ProvisionError(f"Existing {label} has missing or non-USD currency options; reconcile it manually")
-
-
 def one(items, label):
     if len(items) > 1:
         raise ProvisionError(f"Multiple {label} objects exist; reconcile them manually")
     return items[0] if items else None
-
-
-def require(actual, expected, label):
-    for key, value in expected.items():
-        if actual.get(key) != value:
-            raise ProvisionError(f"Existing {label} conflicts at {key}; no replacement will be created")
 
 
 def inspect(stripe):
@@ -84,14 +65,9 @@ def inspect(stripe):
         if price:
             if not meter or not product:
                 raise ProvisionError(f"{label} price exists without its meter and product")
-            require(price, {"active": True, "currency": "usd", "billing_scheme": "per_unit", "type": "recurring",
-                            "product": product["id"], "transform_quantity": None,
-                            "tax_behavior": TAX_BEHAVIOR}, f"{label} price")
-            require_usd_only(price, f"{label} price")
-            require(price.get("recurring") or {}, {"meter": meter["id"], "interval": "month", "interval_count": 1,
-                                                   "usage_type": "metered"}, f"{label} price recurring settings")
-            if not same_amount(price, cents_per_hour(usage["usd_per_second"])):
-                raise ProvisionError(f"Existing {label} price has a different rate; no replacement will be created")
+            require_price(price, f"{label} price", product["id"], TAX_BEHAVIOR,
+                          cents_per_hour(usage["usd_per_second"]),
+                          {"meter": meter["id"], "interval": "month", "usage_type": "metered"})
         found[label] = {"meter": meter, "product": product, "price": price}
     product = one([p for p in products if p["id"] == PRO_PRODUCT["id"]], "Pro product")
     if product:
@@ -102,12 +78,11 @@ def inspect(stripe):
         if price:
             if not product:
                 raise ProvisionError(f"{pro['offer']} price exists without the Pro product")
-            require(price, {"active": True, "currency": "usd", "billing_scheme": "per_unit", "type": "recurring",
-                            "product": product["id"], "transform_quantity": None, "tax_behavior": TAX_BEHAVIOR,
-                            "unit_amount_decimal": str(pro["cents"])}, f"{pro['offer']} price")
-            require_usd_only(price, f"{pro['offer']} price")
-            require(price.get("recurring") or {}, {"interval": pro["interval"], "interval_count": 1,
-                                                   "usage_type": "licensed"}, f"{pro['offer']} price recurring settings")
+            label = f"{pro['offer']} price"
+            require_price(price, label, product["id"], TAX_BEHAVIOR, pro["cents"],
+                          {"meter": None, "interval": pro["interval"], "usage_type": "licensed"})
+            # The API compares the Pro amount as an exact string, not as a number.
+            require(price, {"unit_amount_decimal": str(pro["cents"])}, label)
         found[pro["offer"]] = {"price": price}
     return found
 

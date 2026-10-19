@@ -91,18 +91,33 @@ class ProvisionTests(unittest.TestCase):
         self.assertEqual(run_quiet(stripe)["github_environment_variables"], env)
         self.assertEqual(stripe.writes, [])
 
-    def test_existing_price_with_another_rate_tax_behavior_or_currency_stops_before_writing(self):
-        for field, value in (("unit_amount_decimal", "5.05"), ("tax_behavior", "inclusive"),
-                             ("currency_options", {"usd": {}, "eur": {}})):
-            with self.subTest(field=field):
-                stripe = FakeStripe(apply=True)
-                run_quiet(stripe)
-                next(p for p in stripe.data["price"] if p["lookup_key"] == "superserve_vcpu_hours_monthly")[
-                    field] = value
-                stripe.writes.clear()
-                with self.assertRaises(ProvisionError):
+    def test_existing_price_that_differs_in_any_validated_term_stops_before_writing(self):
+        changes = {
+            "superserve_vcpu_hours_monthly": [
+                ("unit_amount_decimal", "5.05"), ("tax_behavior", "inclusive"),
+                ("currency_options", {"usd": {}, "eur": {}}), ("custom_unit_amount", {"minimum": 1}),
+                ("recurring", {"trial_period_days": 7}), ("recurring", {"meter": "mtr_other"}),
+            ],
+            "superserve_pro_monthly": [
+                ("unit_amount_decimal", "120000.00"), ("tax_behavior", "inclusive"),
+                ("currency_options", {"usd": {}, "eur": {}}), ("recurring", {"trial_period_days": 7}),
+                ("recurring", {"interval": "year"}),
+            ],
+        }
+        for lookup, edits in changes.items():
+            for field, value in edits:
+                with self.subTest(lookup=lookup, field=field, value=value):
+                    stripe = FakeStripe(apply=True)
                     run_quiet(stripe)
-                self.assertEqual(stripe.writes, [])
+                    price = next(p for p in stripe.data["price"] if p["lookup_key"] == lookup)
+                    if field == "recurring":
+                        price["recurring"].update(value)
+                    else:
+                        price[field] = value
+                    stripe.writes.clear()
+                    with self.assertRaises(ProvisionError):
+                        run_quiet(stripe)
+                    self.assertEqual(stripe.writes, [])
 
 
 class SourceAgreementTests(unittest.TestCase):
