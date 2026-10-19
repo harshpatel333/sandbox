@@ -76,8 +76,14 @@ devbox_load_local_secrets() {
   done
 }
 
+# The checkout's revision, which must be the one CI selected when it says.
 devbox_revision() {
-  git -C "$DEVBOX_REPO" rev-parse HEAD 2>/dev/null || devbox_die "cannot read the sandbox revision at $DEVBOX_REPO"
+  local head
+  head=$(git -C "$DEVBOX_REPO" rev-parse HEAD 2>/dev/null) || devbox_die "cannot read the sandbox revision at $DEVBOX_REPO"
+  if [ -n "${DEVBOX_SANDBOX_SHA:-}" ] && [ "$head" != "$DEVBOX_SANDBOX_SHA" ]; then
+    devbox_die "$DEVBOX_REPO is at $head, not the selected $DEVBOX_SANDBOX_SHA"
+  fi
+  printf '%s\n' "$head"
 }
 
 devbox_require_bootstrapped() {

@@ -41,6 +41,7 @@ So the order is:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DEVBOX_NAME`, `DEVBOX_ID` | required | Box name and id |
+| `DEVBOX_SANDBOX_SHA` | unset | Selected revision. When it is set, the scripts refuse a checkout at any other revision |
 | `DEVBOX_BUCKET` | `superserve-devbox-$DEVBOX_ID` | The box's bucket. Artifacts are fetched from `hostprep/` in it, and VMD uploads template builds to it |
 | `DEVBOX_DATA_DISK_DEVICE` | `$DEVBOX_NAME-data` | GCE device name of the data disk, as in `/dev/disk/by-id/google-<name>` |
 | `DEVBOX_FIRECRACKER_VERSION`, `DEVBOX_FIRECRACKER_SHA256` | `runtime-pins.env` | Firecracker release and binary digest |
