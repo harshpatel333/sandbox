@@ -176,6 +176,27 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(recovered["state"], "ready")
         self.assertEqual(len(recovered["deploys"]), 2)
 
+    def test_failed_deploy_moves_only_what_finished(self):
+        at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
+        target = {"sandbox": {"branch": "feature", "sha": SHA_C}, "ui": {"branch": "feature", "sha": SHA_C}}
+        after = contract.record_deploy(manifest(), at=at, actor="x", components=["api", "ui"], revisions=target,
+                                       migrations="failed", result="failed", checked_out=["sandbox", "ui"],
+                                       deployed=[])
+        self.assertEqual(after["revisions"], target)
+        self.assertEqual(after["components"]["api"], {"branch": "main", "sha": SHA_A})
+        self.assertEqual(after["components"]["ui"], {"branch": "main", "sha": SHA_B})
+        self.assertEqual(after["deploys"][-1]["to"], {"sandbox": SHA_C, "ui": SHA_C})
+        nothing = contract.record_deploy(manifest(), at=at, actor="x", components=["vmd"], migrations="none",
+                                         result="failed", revisions={"sandbox": target["sandbox"]},
+                                         checked_out=[], deployed=[])
+        self.assertEqual(nothing["revisions"]["sandbox"], {"branch": "main", "sha": SHA_A})
+        for checked_out, deployed, result in ((["sandbox"], ["vmd"], "failed"), (["ui"], ["api"], "failed"),
+                                              (None, ["api"], "succeeded")):
+            with self.subTest(checked_out=checked_out, deployed=deployed), self.assertRaises(contract.ContractError):
+                contract.record_deploy(manifest(), at=at, actor="x", components=["api", "ui"],
+                                       revisions=target, migrations="none", result=result,
+                                       checked_out=checked_out, deployed=deployed)
+
     def test_record_deploy_rejects_unknown_outcomes_and_mismatched_revisions(self):
         at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
         sandbox = {"sandbox": {"branch": "main", "sha": SHA_C}}

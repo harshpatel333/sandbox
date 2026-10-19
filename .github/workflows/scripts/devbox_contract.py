@@ -307,7 +307,15 @@ def component_scripts(components):
     return [script for component in components for script in COMPONENT_SCRIPTS[component]]
 
 
-def record_deploy(manifest, *, at, actor, components, revisions, migrations, result):
+def record_deploy(manifest, *, at, actor, components, revisions, migrations, result,
+                  checked_out=None, deployed=None):
+    """Append a deploy and move only what actually changed on the box.
+
+    `revisions` is what the deploy targeted. `checked_out` lists the
+    repositories whose checkout moved and `deployed` the components whose
+    install finished; both default to everything targeted, which is only
+    right for a deploy that succeeded.
+    """
     if migrations not in MIGRATION_RESULTS:
         raise ContractError(f"Unknown migration result {migrations!r}")
     if result not in DEPLOY_RESULTS:
@@ -315,21 +323,28 @@ def record_deploy(manifest, *, at, actor, components, revisions, migrations, res
     repositories = {COMPONENT_REPOSITORIES[component] for component in components}
     if set(revisions) != repositories:
         raise ContractError(f"Deploy of {', '.join(components)} must resolve exactly {', '.join(sorted(repositories))}")
+    checked_out = set(revisions if checked_out is None else checked_out)
+    deployed = set(components if deployed is None else deployed)
+    if not checked_out <= repositories or not deployed <= set(components) \
+            or any(COMPONENT_REPOSITORIES[component] not in checked_out for component in deployed):
+        raise ContractError("Deployed components must be a targeted subset built from checked-out repositories")
+    if result == "succeeded" and (checked_out != repositories or deployed != set(components)):
+        raise ContractError("A succeeded deploy must have checked out and deployed everything it targeted")
     updated = copy.deepcopy(manifest)
-    moved = {**updated["revisions"],
-             **{key: revision(value["branch"], value["sha"]) for key, value in revisions.items()}}
+    target = {key: revision(value["branch"], value["sha"]) for key, value in revisions.items()}
     updated["deploys"].append({
         "at": iso(at),
         "actor": actor,
         "components": list(components),
         "from": {key: value["sha"] for key, value in updated["revisions"].items()},
-        "to": {key: value["sha"] for key, value in moved.items()},
+        "to": {key: value["sha"] for key, value in {**updated["revisions"], **target}.items()},
         "migrations": migrations,
         "result": result,
     })
-    updated["revisions"] = moved
+    updated["revisions"].update({key: target[key] for key in checked_out})
     for component in components:
-        updated["components"][component] = dict(moved[COMPONENT_REPOSITORIES[component]])
+        if component in deployed:
+            updated["components"][component] = dict(target[COMPONENT_REPOSITORIES[component]])
     updated["state"] = "ready" if result == "succeeded" else "failed"
     return validate_manifest(updated)
 
