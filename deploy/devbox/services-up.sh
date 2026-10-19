@@ -41,10 +41,11 @@ ensure_docker() {
   local changed=0
   helper docker-daemon-config /etc/docker/daemon.json || changed=$?
   [[ $changed -le 1 ]] || die "could not write /etc/docker/daemon.json"
-  if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1; then
+  if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1 ||
+    ! docker buildx version >/dev/null 2>&1; then
     log "installing Docker"
     apt-get update -q
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io docker-compose-v2
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io docker-compose-v2 docker-buildx
   fi
   if [[ $changed -eq 1 ]]; then
     log "restarting Docker to apply daemon configuration"
