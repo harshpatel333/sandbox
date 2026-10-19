@@ -77,7 +77,7 @@ class Box:
     def unhandled(self):
         known = {(r['type'], r['name'], r.get('zone')) for r in contract.resources(self.name, self.devbox_id)}
         recorded = self.instance.recorded if self.instance else []
-        return [f'{r.get("type")} {r.get("name")}' if isinstance(r, dict) else repr(r) for r in recorded
+        return [f'{r.get("type")} {r.get("name")}' if isinstance(r, dict) else str(r) for r in recorded
                 if not isinstance(r, dict) or (r.get('type'), r.get('name'), r.get('zone')) not in known]
 
     def identity_labels(self):
@@ -110,7 +110,7 @@ class Gcloud:
         return json.loads(self._run(*args, '--format=json').stdout or '[]')
 
     def instances(self):
-        return self._list('compute', 'instances', 'list', f'--filter={contract.discovery_filter()}')
+        return self._list('compute', 'instances', 'list')
 
     def disks(self):
         return self._list('compute', 'disks', 'list')
@@ -162,13 +162,16 @@ def _last(url):
     return (url or '').rsplit('/', 1)[-1]
 
 
+UNREADABLE = 'unreadable devbox-manifest metadata'
+
+
 def _raw_manifest(instance):
     for item in (instance.get('metadata') or {}).get('items') or []:
         if item.get('key') == contract.MANIFEST_METADATA_KEY:
             try:
                 return json.loads(item.get('value') or '')
             except ValueError:
-                return None
+                return UNREADABLE
     return None
 
 
@@ -180,6 +183,8 @@ def _manifest(raw):
 
 
 def _recorded(raw):
+    if raw == UNREADABLE:
+        return [UNREADABLE]
     resources = raw.get('resources') if isinstance(raw, dict) else None
     return resources if isinstance(resources, list) else []
 
@@ -249,6 +254,8 @@ def _unadoptable(resource, group):
         return 'unlabelled and its creation time or its devbox creation time is unknown'
     if created < min(born) - ADOPTION_SLACK_SECONDS:
         return 'unlabelled and older than the devbox that would claim it'
+    if created > max(born) + ADOPTION_SLACK_SECONDS:
+        return 'unlabelled and newer than the create run of the devbox that would claim it'
     return None
 
 
@@ -400,11 +407,6 @@ def by_name(targets):
     return [{'name': name, 'devbox_ids': ','.join(ids)} for name, ids in sorted(names.items())]
 
 
-def find(cloud, project, name, devbox_id):
-    box, _ = find_with_blocked(cloud, project, name, devbox_id)
-    return box
-
-
 def find_with_blocked(cloud, project, name, devbox_id):
     """Return the box and every resource at one of its contract names that neither it nor another devbox
     provably owns; destroy refuses rather than leave such a resource behind and report the box gone."""
@@ -415,8 +417,15 @@ def find_with_blocked(cloud, project, name, devbox_id):
     reasons = {id(r): reason for r, reason in ignored}
     wanted = expected(name, devbox_id)
     return box, [(r, reasons.get(id(r), 'is not labelled as this devbox'))
-                 for r in resources if (r.kind, r.name) in wanted and id(r) not in claimed
-                 and not _owned_elsewhere(r, name, devbox_id)]
+                 for r in resources if id(r) not in claimed
+                 and (((r.kind, r.name) in wanted and not _owned_elsewhere(r, name, devbox_id))
+                      or _labelled_as(r, name, devbox_id))]
+
+
+def _labelled_as(resource, name, devbox_id):
+    labels = resource.labels
+    return (labels.get('managed-by') == contract.MANAGED_BY and labels.get('devbox-name') == name
+            and labels.get('devbox-id') == devbox_id)
 
 
 def _owned_elsewhere(resource, name, devbox_id):
@@ -468,12 +477,13 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
     failures = [cloud.delete_instance(instance.name, instance.zone)] if instance else []
     failures += [_delete(cloud, r, instance) for r in box.resources if r.kind != 'instance']
     try:
-        remaining = find(cloud, project, name, devbox_id)
+        remaining, left = find_with_blocked(cloud, project, name, devbox_id)
     except CLOUD_ERRORS as error:
         raise SystemExit(f'Could not verify destroy of {name} ({devbox_id}): {error}\n'
                          + '\n'.join(f'- {f}' for f in failures if f)) from None
-    if remaining:
-        details = [f'- {r.kind} {r.name}' for r in remaining.resources] + [f'- {f}' for f in failures if f]
+    if remaining or left:
+        details = ([f'- {r.kind} {r.name}' for r in remaining.resources] if remaining else []) \
+            + [f'- {r.kind} {r.name}: {reason}' for r, reason in left] + [f'- {f}' for f in failures if f]
         raise SystemExit(f'Destroy of {name} ({devbox_id}) incomplete; rerun to retry. Remaining:\n' + '\n'.join(details))
     return f'Destroyed `{name}` ({devbox_id}): ' + ', '.join(f'{r.kind} {r.name}' for r in box.resources)
 

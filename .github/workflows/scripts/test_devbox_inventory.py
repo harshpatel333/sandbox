@@ -430,6 +430,37 @@ class UnlabelledResourceTest(unittest.TestCase):
                     inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
                 self.assertEqual(cloud.calls, [])
 
+    def test_resource_labelled_as_the_box_under_another_name_blocks_destroy(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        extra = gce('alice-dev-a7f3c9')[2] + '2'
+        cloud.disks_.append({'name': extra, 'zone': f'projects/{PROJECT}/zones/{ZONE}', 'creationTimestamp': CREATED,
+                             'labels': labels('alice-dev-a7f3c9', '3f9c0a1b2c4d'), 'selfLink': link('disks', extra)})
+        with self.assertRaises(SystemExit) as stop:
+            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertIn(extra, stop.exception.code)
+        self.assertEqual(cloud.calls, [])
+
+    def test_unlabelled_disk_newer_than_the_box_is_not_adopted(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False, unlabelled=('boot',))
+        cloud.disks_[0]['creationTimestamp'] = '2027-03-01T00:00:00+00:00'
+        [box], _ = boxes(cloud)
+        self.assertFalse(any(r.adopted for r in box.resources))
+        with self.assertRaises(SystemExit) as stop:
+            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertIn('newer than the create run', stop.exception.code)
+        self.assertEqual(cloud.calls, [])
+
+    def test_unreadable_manifest_refuses_destroy(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        cloud.instances_[0]['metadata']['items'][0]['value'] = '{"resources": ['
+        with self.assertRaises(SystemExit) as stop:
+            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertIn(inv.UNREADABLE, stop.exception.code)
+        self.assertEqual(cloud.calls, [])
+
     def test_old_partially_labelled_or_foreign_attached_resources_are_not_adopted(self):
         _, boot, _ = gce('alice-dev-a7f3c9')
         cases = {'older than the devbox': {'creationTimestamp': '2027-01-15T04:59:59+00:00'},
