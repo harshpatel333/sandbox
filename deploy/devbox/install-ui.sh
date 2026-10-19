@@ -12,8 +12,8 @@
 #                                        RECAPTCHA_PROJECT_ID, optional)
 #   /etc/superserve-devbox/secrets.env   CI secrets (RECAPTCHA_API_KEY,
 #                                        optional)
-#   $SECRETS_DIR/local.env               keys services-up.sh generates and
-#   $SECRETS_DIR/promotion-account-key.pem  shares with the API
+#   $SECRETS_DIR/local.env               plain KEY=value keys services-up.sh
+#   $SECRETS_DIR/promotion-account-key.pem  generates and shares with the API
 #   /opt/superserve-devbox/src/superserve  UI checkout
 #
 # Console-only secrets are generated once into $SECRETS_DIR/console.env.
@@ -65,20 +65,23 @@ require_file() {
   [[ -r "$1" ]] || die "$1 is missing or unreadable ($2)"
 }
 
-# Reads one key from a sourceable env file without letting the file's other
-# keys leak into (or clobber) this script's variables.
+# Reads one key from a shell-quoted env file written by CI, in a clean
+# environment so neither the file's other keys nor this script's variables
+# leak across. Parse errors are silenced so they can't echo secret values.
 env_get() {
-  (
-    set +u -a
-    # shellcheck disable=SC1090
-    . "$1" >/dev/null
-    printf '%s' "${!2:-}"
-  )
+  # shellcheck disable=SC2016
+  env -i bash -c 'set -a; . "$1" >/dev/null 2>&1; printf "%s" "${!2:-}"' _ "$1" "$2"
+}
+
+# Reads one key from a plain KEY=value file, taking the value verbatim.
+env_literal() {
+  awk -v key="$2" 'index($0, key "=") == 1 { value = substr($0, length(key) + 2); sub(/\r$/, "", value) }
+    END { printf "%s", value }' "$1"
 }
 
 shared() {
   local value
-  value="$(env_get "$LOCAL_SECRETS" "$1")"
+  value="$(env_literal "$LOCAL_SECRETS" "$1")"
   [[ -n "$value" ]] || die "$1 is not set in $LOCAL_SECRETS (re-run services-up.sh)"
   printf '%s' "$value"
 }
@@ -86,13 +89,13 @@ shared() {
 ensure_console_secrets() {
   local proxy="" proof=""
   if [[ -r "$CONSOLE_SECRETS" ]]; then
-    proxy="$(env_get "$CONSOLE_SECRETS" CONSOLE_PROXY_SECRET)"
-    proof="$(env_get "$CONSOLE_SECRETS" GOOGLE_SIGNUP_PROOF_SECRET)"
+    proxy="$(env_literal "$CONSOLE_SECRETS" CONSOLE_PROXY_SECRET)"
+    proof="$(env_literal "$CONSOLE_SECRETS" GOOGLE_SIGNUP_PROOF_SECRET)"
   fi
   if ((${#proxy} < 32 || ${#proof} < 32)); then
-    log "generating console secrets in $CONSOLE_SECRETS"
-    proxy="$(openssl rand -hex 32)"
-    proof="$(openssl rand -hex 32)"
+    log "generating missing console secrets in $CONSOLE_SECRETS"
+    if ((${#proxy} < 32)); then proxy="$(openssl rand -hex 32)"; fi
+    if ((${#proof} < 32)); then proof="$(openssl rand -hex 32)"; fi
     install -d -m 0700 "$SECRETS_DIR"
     (
       umask 077

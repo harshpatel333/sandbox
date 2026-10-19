@@ -53,6 +53,13 @@ class InstallUiDryRunTest(unittest.TestCase):
             self.assertNotIn(secret, result.stdout)
         self.assertFalse((self.secrets / 'console.env').exists())
 
+    def test_shared_values_are_read_verbatim_without_echoing_them(self):
+        result = self.run_script({'ANON_KEY': "an$on key's", **LOCAL_SECRETS, 'OTHER': 'abc def-leaked'})
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY=an$on key's", result.stdout.splitlines())
+        self.assertEqual(result.stderr, '')
+
     def test_missing_shared_key_fails_with_its_name(self):
         local = {'ANON_KEY': 'anon-key', **LOCAL_SECRETS}
         del local['SERVICE_ROLE_KEY']
