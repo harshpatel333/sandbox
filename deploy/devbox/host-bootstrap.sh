@@ -96,16 +96,17 @@ check_rerun_pins() {
 }
 
 verify_vmd_env() {
-  local key want have
+  local key want have expected
+  expected=$(printf '%s' "$BOOTSTRAP_VARS" | python3 -c '
+import json, sys
+for key, value in sorted(json.load(sys.stdin)["vmd_env"].items()):
+    print(f"{key}={value}")') || devbox_die "cannot read the bootstrap settings"
+  expected+=$(printf '\nKERNEL_PATH=/var/lib/sandbox/kernel/%s\nBASE_ROOTFS_PATH=/var/lib/sandbox/rootfs/base.ext4' "$DEVBOX_KERNEL_OBJECT")
   while IFS='=' read -r key want; do
     have=$(sed -n "s/^$key=//p" /etc/sandbox/vmd.env | tail -n 1)
     [ "$have" = "$want" ] \
       || devbox_die "/etc/sandbox/vmd.env has $key=$have, not $want; settings changed after bootstrap, recreate the box"
-  done < <(printf '%s' "$BOOTSTRAP_VARS" | python3 -c '
-import json, sys
-for key, value in sorted(json.load(sys.stdin)["vmd_env"].items()):
-    print(f"{key}={value}")'
-    printf 'KERNEL_PATH=/var/lib/sandbox/kernel/%s\nBASE_ROOTFS_PATH=/var/lib/sandbox/rootfs/base.ext4\n' "$DEVBOX_KERNEL_OBJECT")
+  done <<< "$expected"
 }
 
 # Run directories and snapshots on the data disk, bind-mounted under the

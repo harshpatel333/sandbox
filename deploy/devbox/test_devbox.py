@@ -134,12 +134,14 @@ class HostTests(unittest.TestCase):
                 self.assertFalse(Path(root, "etc/sandbox/host-identity.json").exists())
 
     def test_pin_drift_names_every_changed_runtime_input(self):
-        manifest = {"artifacts": {
-            "source": "gs://example-artifacts/hostprep/",
-            "firecracker": {"version": "v0.0.0", "sha256": "2" * 64},
-            "kernel": {"object": "vmlinux-example", "digest": "3" * 64},
-            "rootfs": {"object": "base.ext4", "digest": "4" * 64},
-        }}
+        args = devbox_host.argparse.Namespace(
+            revision="a" * 40, instance="example-box", zone="us-central1-a", region="us-central1",
+            bucket="example-artifacts", firecracker_version="v0.0.0", firecracker_sha256="2" * 64,
+            kernel_object="vmlinux-example", kernel_digest="3" * 64, rootfs_object="base.ext4",
+            rootfs_digest="4" * 64, data_disk_device="devbox-data", go_version="go0.0.0",
+            memory_mib=4096, vcpus=8)
+        identity = {"host_id": "example-box-0", "instance_id": "100", "project_id": "example-project"}
+        manifest = json.loads(json.dumps(devbox_host.runtime_manifest(args, identity)))
         env = {"DEVBOX_ARTIFACT_BUCKET": "example-artifacts", "DEVBOX_FIRECRACKER_VERSION": "v0.0.0",
                "DEVBOX_FIRECRACKER_SHA256": "2" * 64, "DEVBOX_KERNEL_OBJECT": "vmlinux-example",
                "DEVBOX_KERNEL_DIGEST": "3" * 64, "DEVBOX_ROOTFS_OBJECT": "base.ext4",
