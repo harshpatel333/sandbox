@@ -303,13 +303,19 @@ class Box:
     def record(self, manifest, devbox_id, *, copy_to_box=True):
         contract.validate_manifest(manifest)
         self.verify(devbox_id)
-        if copy_to_box:
-            self.write_file(f"{contract.BOX_CONFIG_DIR}/manifest.json", json.dumps(manifest, indent=2) + "\n", "0644")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "manifest.json"
             path.write_text(json.dumps(manifest, sort_keys=True))
             run(["gcloud", "compute", "instances", "add-metadata", self.instance, *self.where,
                  f"--metadata-from-file={contract.MANIFEST_METADATA_KEY}={path}"])
+        if copy_to_box:
+            # The metadata is authoritative; a lost on-box copy must not turn
+            # a recorded outcome into a failure.
+            try:
+                self.write_file(f"{contract.BOX_CONFIG_DIR}/manifest.json",
+                                json.dumps(manifest, indent=2) + "\n", "0644")
+            except StepError as error:
+                print(f"::warning::Could not copy the manifest to {self.name}: {error}")
 
 
 def box_config(manifest, env):
@@ -462,8 +468,10 @@ def create(env, profile_path=PROFILE_PATH):
         for key in ("sandbox", "ui"):
             box.checkout(key, revisions[key]["sha"])
         box.require_scripts(contract.CREATE_SCRIPTS)
+        box.verify(devbox_id)
         deliver_configuration(box, manifest, env)
         for script in contract.CREATE_SCRIPTS:
+            box.verify(devbox_id)
             box.run_script(script)
         manifest = contract.with_state(collect_state(box, manifest), "ready")
         box.record(manifest, devbox_id)
