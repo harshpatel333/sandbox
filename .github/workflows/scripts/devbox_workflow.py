@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create devboxes from selected revisions from GitHub Actions.
+"""Create devboxes and deploy selected revisions to them from GitHub Actions.
 
 Runs on the credentialed runner from main only. It never executes code from
 the selected branches: branches are resolved to SHAs here, then checked out
@@ -11,6 +11,9 @@ Subcommands:
   prepare-create  validate create inputs and resolve SHAs (no cloud access)
   create          provision, install and record a new devbox
   finish-create   mark a cancelled or timed-out create failed
+  prepare-deploy  validate deploy inputs and resolve SHAs (no cloud access)
+  deploy          deploy selected components to an existing devbox
+  finish-deploy   mark a cancelled or timed-out deploy failed
 """
 
 import argparse
@@ -34,7 +37,9 @@ SOURCE_DIRS = {"sandbox": "sandbox", "ui": "superserve"}
 PROFILE_PATH = Path(__file__).resolve().parents[3] / "deploy" / "devbox" / "profile.json"
 SECRET_PREFIX = "DEVBOX_SECRET_"
 CONFIG_PREFIX = "DEVBOX_CONFIG_"
+DEPLOYABLE_STATES = ("ready", "failed")
 LOG_DIR = "/var/log/superserve-devbox"
+MIGRATIONS_FILE = contract.BOX_STATE_DIR + "/migrations"
 SSH_ATTEMPTS = 40
 SSH_RETRY_SECONDS = 15
 # Kept below the job's timeout-minutes so a slow step fails here, with the box
@@ -175,6 +180,22 @@ def prepare_create(env, profile_path=PROFILE_PATH):
                         f"ui `{ui['branch']}` @ `{ui['sha']}`, lifetime {lifetime}h")
 
 
+def prepare_deploy(env):
+    require_main(env)
+    name = contract.validate_name((env.get("INPUT_NAME") or "").strip())
+    components = contract.parse_components(env.get("INPUT_COMPONENTS"))
+    keys = sorted({contract.COMPONENT_REPOSITORIES[component] for component in components})
+    outputs = {"name": name, "components": ",".join(components)}
+    for key in ("sandbox", "ui"):
+        if key in keys:
+            resolved = resolve_branch(key, env.get(f"INPUT_{key.upper()}_BRANCH"))
+            outputs[f"{key}_branch"], outputs[f"{key}_sha"] = resolved["branch"], resolved["sha"]
+        else:
+            outputs[f"{key}_branch"] = outputs[f"{key}_sha"] = ""
+    write_outputs(env, outputs)
+    append_summary(env, f"## Deploy to devbox `{name}`\n\ncomponents: {', '.join(components)}")
+
+
 def load_profile(path=PROFILE_PATH):
     try:
         profile = json.loads(Path(path).read_text())
@@ -295,6 +316,9 @@ class Box:
             raise StepError(f"{path} on {self.name} is not a JSON object")
         return value
 
+    def read_word(self, path):
+        return self.ssh(f"sudo cat {shlex.quote(path)} 2>/dev/null || true").stdout.strip()
+
     def checkout(self, key, sha):
         self.guard()
         source = f"{contract.BOX_SOURCE_DIR}/{SOURCE_DIRS[key]}"
@@ -358,6 +382,17 @@ class Box:
                 print(f"::warning::Could not copy the manifest to {self.name}: {error}")
 
 
+def manifest_from(instance):
+    items = (instance.get("metadata") or {}).get("items") or []
+    raw = next((item.get("value") for item in items if item.get("key") == contract.MANIFEST_METADATA_KEY), None)
+    if raw is None:
+        raise StepError(f"{instance.get('name')} has no {contract.MANIFEST_METADATA_KEY} metadata")
+    try:
+        return contract.validate_manifest(json.loads(raw))
+    except ValueError as error:
+        raise StepError(f"{instance.get('name')} manifest is invalid: {error}") from None
+
+
 def box_config(manifest, env):
     values = {
         "DEVBOX_NAME": manifest["name"],
@@ -393,17 +428,6 @@ def collect_state(box, manifest):
     updated["runtime"] = box.read_json(f"{contract.BOX_STATE_DIR}/runtime.json")
     updated["services"] = box.read_json(f"{contract.BOX_STATE_DIR}/services.json")
     return contract.validate_manifest(updated)
-
-
-def manifest_from(instance):
-    items = (instance.get("metadata") or {}).get("items") or []
-    raw = next((item.get("value") for item in items if item.get("key") == contract.MANIFEST_METADATA_KEY), None)
-    if raw is None:
-        raise StepError(f"{instance.get('name')} has no {contract.MANIFEST_METADATA_KEY} metadata")
-    try:
-        return contract.validate_manifest(json.loads(raw))
-    except ValueError as error:
-        raise StepError(f"{instance.get('name')} manifest is invalid: {error}") from None
 
 
 def ensure_unused(name, project=contract.PROJECT):
@@ -648,9 +672,154 @@ def finish_create(env):
                               attempt.get("instance_started", True))
 
 
+def find_box(name):
+    result = run(["gcloud", "compute", "instances", "list", f"--project={contract.PROJECT}",
+                  f"--filter={contract.discovery_filter(name)}", "--format=json"])
+    instances = json.loads(result.stdout or "[]")
+    for instance in instances:
+        instance["zone"] = (instance.get("zone") or "").rsplit("/", 1)[-1]
+    try:
+        return contract.select_instance(instances, name)
+    except contract.ContractError as error:
+        raise StepError(str(error)) from None
+
+
+def deploy_request(env):
+    components = contract.parse_components(env["COMPONENTS"])
+    keys = sorted({contract.COMPONENT_REPOSITORIES[component] for component in components})
+    revisions = {key: contract.revision(env[f"{key.upper()}_BRANCH"], env[f"{key.upper()}_SHA"]) for key in keys}
+    return contract.validate_name(env["NAME"]), components, revisions
+
+
+def deploy(env, now=contract.utc_now):
+    require_main(env)
+    name, components, revisions = deploy_request(env)
+    prefixed(env, SECRET_PREFIX, "secrets")
+    prefixed(env, CONFIG_PREFIX, "variables")
+
+    instance = find_box(name)
+    box = Box(name, zone=instance["zone"])
+    manifest = manifest_from(instance)
+    devbox_id = contract.check_labels(instance.get("labels"), name, manifest["devbox_id"])
+    if manifest["state"] not in DEPLOYABLE_STATES:
+        raise StepError(f"{name} is {manifest['state']}; deploys need one of {', '.join(DEPLOYABLE_STATES)}")
+    if not manifest["runtime"]:
+        raise StepError(f"{name} never finished its first install; destroy it and create a new box")
+    if contract.parse_iso(manifest["expires_at"]) <= now():
+        raise StepError(f"{name} expired at {manifest['expires_at']} and is due for deletion")
+
+    box.wait_for_ssh(attempts=5)
+    scripts = contract.component_scripts(components)
+    progress = {"checked_out": [], "deployed": [], "api_started": False}
+    save = lambda: save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "progress": progress})
+    save()
+    state, failure = manifest, None
+    try:
+        box.record(contract.with_state(manifest, "deploying"), devbox_id)
+        for key in revisions:
+            box.checkout(key, revisions[key]["sha"])
+            progress["checked_out"].append(key)
+            save()
+        box.require_scripts(scripts)
+        box.verify(devbox_id)
+        deliver_configuration(box, {**manifest, "revisions": {**manifest["revisions"], **revisions}}, env)
+        if "api" in components:
+            box.ssh("sudo rm -f " + shlex.quote(MIGRATIONS_FILE))
+        for component in components:
+            for script in contract.COMPONENT_SCRIPTS[component]:
+                box.verify(devbox_id)
+                if script == "install-api.sh":
+                    progress["api_started"] = True
+                    save()
+                box.run_script(script)
+            progress["deployed"].append(component)
+            save()
+        state = collect_state(box, manifest)
+    except (Exception, KeyboardInterrupt) as error:
+        failure = error
+    return conclude_deploy(env, box, manifest, state, devbox_id, components, revisions, progress, failure, now)
+
+
+def conclude_deploy(env, box, manifest, state, devbox_id, components, revisions, progress, failure, now):
+    DEADLINE.stop()
+    migrations = "none"
+    if progress["api_started"]:
+        migrations = read_migrations(box) or ("failed" if failure else "none")
+    recorded = contract.record_deploy(state, at=now(), actor=env["GITHUB_ACTOR"], components=components,
+                                      revisions=revisions, migrations=migrations,
+                                      result="failed" if failure else "succeeded",
+                                      checked_out=progress["checked_out"], deployed=progress["deployed"])
+    reported = True
+    try:
+        box.record(recorded, devbox_id)
+    except Exception as error:
+        failure, reported = failure or error, False
+    save_attempt(env, {"name": box.name, "devbox_id": devbox_id, "reported": reported, "progress": progress})
+    append_summary(env, deploy_summary(recorded, manifest, components, progress["deployed"], migrations, failure))
+    if failure is not None:
+        print(f"::error::Deploy to {box.name} failed: {describe(failure)}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def finish_deploy(env, now=contract.utc_now):
+    path = env.get("DEVBOX_ATTEMPT_FILE")
+    if not path or not Path(path).exists():
+        return
+    attempt = json.loads(Path(path).read_text())
+    if attempt["reported"]:
+        return
+    name, components, revisions = deploy_request(env)
+    instance = find_box(name)
+    box = Box(name, zone=instance["zone"])
+    manifest = manifest_from(instance)
+    contract.check_labels(instance.get("labels"), name, attempt["devbox_id"])
+    if manifest["state"] == "deploying":
+        conclude_deploy(env, box, manifest, manifest, attempt["devbox_id"], components, revisions,
+                        attempt["progress"], StepError("The deploy run was cancelled or timed out"), now)
+
+
+def read_migrations(box):
+    try:
+        result = box.read_word(MIGRATIONS_FILE)
+    except Exception:
+        return None
+    return result if result in contract.MIGRATION_RESULTS else None
+
+
+def deploy_summary(manifest, before, components, deployed, migrations, failure):
+    rows = []
+    for component in contract.COMPONENTS:
+        previous, current = before["components"][component], manifest["components"][component]
+        if component in deployed:
+            new = f"`{current['sha'][:12]}` (`{current['branch']}`)"
+        else:
+            new = "not deployed" if component in components else "unchanged"
+        rows.append(f"| {component} | `{previous['sha'][:12]}` (`{previous['branch']}`) | {new} |")
+    services = manifest.get("services") or {}
+    status = "failed" if failure else "succeeded"
+    return "\n".join([
+        f"# Deploy to `{manifest['name']}` {status}",
+        "",
+        *([f"**Error:** {describe(failure)}", ""] if failure else []),
+        "| Component | Previous | New |", "|--|--|--|", *rows,
+        "",
+        f"**Migrations:** {migrations}",
+        f"**State:** {manifest['state']} (expires {manifest['expires_at']}, unchanged)",
+        "",
+        "**Services (before this deploy):**" if failure else "**Services:**",
+        "```json", json.dumps(services, indent=2, sort_keys=True), "```",
+        "",
+        access_section(manifest["name"]),
+        "",
+        manifest_details(manifest),
+    ])
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=("prepare-create", "create", "finish-create"))
+    parser.add_argument("command", choices=("prepare-create", "create", "finish-create",
+                                            "prepare-deploy", "deploy", "finish-deploy"))
     args = parser.parse_args(argv)
     env = dict(os.environ)
     try:
@@ -659,9 +828,16 @@ def main(argv=None):
         elif args.command == "finish-create":
             DEADLINE.report()
             finish_create(env)
-        else:
+        elif args.command == "prepare-deploy":
+            prepare_deploy(env)
+        elif args.command == "finish-deploy":
+            finish_deploy(env)
+        elif args.command == "create":
             DEADLINE.start(DEADLINE_SECONDS)
             return create(env)
+        else:
+            DEADLINE.start(DEADLINE_SECONDS)
+            return deploy(env)
     except (StepError, contract.ContractError) as error:
         print(f"::error::{error}", file=sys.stderr)
         return 1

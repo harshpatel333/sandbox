@@ -293,7 +293,48 @@ the sandbox proxy on 8090 (sandbox hosts are `*.sandbox.localhost:8090`).
 If any step fails, times out or is cancelled, the run fails, sets state
 `failed` on the VM when it exists, and lists every resource of the attempt it
 finds by `devbox-id` label or name. A failed box is never reported
-as ready; destroy it and create a new one.
+as ready; destroy it, or fix the branch and deploy to it.
+
+## Deploy to a devbox
+
+Run **Devbox Deploy** (`.github/workflows/devbox-deploy.yml`) from `main` to
+move an existing box to other revisions, for example to test an upgrade from
+`main` to a branch:
+
+```sh
+gh workflow run devbox-deploy.yml --repo superserve-ai/sandbox --ref main \
+  -f name=<name> -f sandbox_branch=my-feature -f components=all
+```
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `name` | required | The devbox name (without the `devbox-` prefix) |
+| `sandbox_branch` | `main` | Used when `vmd`, `proxy` or `api` is selected |
+| `ui_branch` | `main` | Used when `ui` is selected |
+| `components` | `all` | `all`, or a comma-separated subset of `vmd`, `proxy`, `api`, `ui` |
+
+The box is found by its labels, not by name prefix, and must be `ready` or
+`failed`, have finished its first install, and not be expired. The workflow
+sets state `deploying`, checks out the new commit of each repository the
+selected components are built from, and reruns the same box scripts the
+create workflow uses, in the production upgrade order: `install-vmd.sh`,
+`install-proxy.sh`, `services-up.sh` and `install-api.sh` (both for `api`),
+then `install-ui.sh`. `install-api.sh` applies pending
+database migrations forward to the existing database; a failing migration
+stops the deploy. There is no rollback or downgrade: deploy a fixed revision
+instead. Existing sandboxes and data are kept.
+
+Each deploy, successful or not, is appended to the manifest's `deploys` with
+the actor, components, previous and new commits, the migration result
+(`applied`, `none` or `failed`) and the outcome (`succeeded` or `failed`).
+Only components whose install finished move in the manifest's `components`,
+and `revisions` moves only for the repositories that were checked out, so a
+deploy that fails partway records exactly what changed. The migration result
+is `failed` only when `install-api.sh` ran and did not report success.
+`expires-at` never changes. The run summary shows previous and new commits per
+component, the migration result, service readiness and log access. A failed
+deploy leaves the box in state `failed`, possibly partly upgraded; a later
+successful deploy returns it to `ready`. `seed-base.sh` is not rerun.
 
 ## Workflow safety
 
