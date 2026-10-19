@@ -39,7 +39,7 @@ SECRET_PREFIX = "DEVBOX_SECRET_"
 CONFIG_PREFIX = "DEVBOX_CONFIG_"
 DEPLOYABLE_STATES = ("ready", "failed")
 LOG_DIR = "/var/log/superserve-devbox"
-MIGRATIONS_FILE = contract.BOX_STATE_DIR + "/migrations"
+API_DEPLOY_FILE = contract.BOX_STATE_DIR + "/api-deploy.json"
 SSH_ATTEMPTS = 40
 SSH_RETRY_SECONDS = 15
 # Kept below the job's timeout-minutes so a slow step fails here, with the box
@@ -316,8 +316,6 @@ class Box:
             raise StepError(f"{path} on {self.name} is not a JSON object")
         return value
 
-    def read_word(self, path):
-        return self.ssh(f"sudo cat {shlex.quote(path)} 2>/dev/null || true").stdout.strip()
 
     def checkout(self, key, sha):
         self.guard()
@@ -724,7 +722,7 @@ def deploy(env, now=contract.utc_now):
         box.verify(devbox_id)
         deliver_configuration(box, {**manifest, "revisions": {**manifest["revisions"], **revisions}}, env)
         if "api" in components:
-            box.ssh("sudo rm -f " + shlex.quote(MIGRATIONS_FILE))
+            box.ssh("sudo rm -f " + shlex.quote(API_DEPLOY_FILE))
         for component in components:
             for script in contract.COMPONENT_SCRIPTS[component]:
                 box.verify(devbox_id)
@@ -744,7 +742,7 @@ def conclude_deploy(env, box, manifest, state, devbox_id, components, revisions,
     DEADLINE.stop()
     migrations = "none"
     if progress["api_started"]:
-        migrations = read_migrations(box) or ("failed" if failure else "none")
+        migrations = read_migrations(box, revisions["sandbox"]["sha"]) or ("failed" if failure else "none")
     recorded = contract.record_deploy(state, at=now(), actor=env["GITHUB_ACTOR"], components=components,
                                       revisions=revisions, migrations=migrations,
                                       result="failed" if failure else "succeeded",
@@ -779,12 +777,14 @@ def finish_deploy(env, now=contract.utc_now):
                         attempt["progress"], StepError("The deploy run was cancelled or timed out"), now)
 
 
-def read_migrations(box):
+def read_migrations(box, sha):
     try:
-        result = box.read_word(MIGRATIONS_FILE)
+        report = box.read_json(API_DEPLOY_FILE)
     except Exception:
         return None
-    return result if result in contract.MIGRATION_RESULTS else None
+    if report.get("sha") != sha or report.get("migrations") not in contract.MIGRATION_RESULTS:
+        return None
+    return report["migrations"]
 
 
 def deploy_summary(manifest, before, components, deployed, migrations, failure):

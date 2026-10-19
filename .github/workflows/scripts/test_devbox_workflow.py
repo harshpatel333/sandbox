@@ -48,6 +48,7 @@ class FakeCloud:
                  relabel_after=None, decoys=(), fail_after_create=False, expire_on_script=None):
         self.commands, self.inputs = [], {}
         self.decoys, self.fail_after_create, self.expire_on_script = decoys, fail_after_create, expire_on_script
+        self.deployed_sha = NEW_SHA
         self.disks, self.buckets, self.unlabelled = [], [], set()
         self.relabel_after_checkouts = None
         self.pending_instance = False
@@ -149,10 +150,11 @@ class FakeCloud:
             if script.group(1) == self.expire_on_script:
                 workflow.DEADLINE.end = 0
             if script.group(1) == "install-api.sh":
-                self.box_files[workflow.MIGRATIONS_FILE] = self.migrations
+                self.box_files[workflow.API_DEPLOY_FILE] = json.dumps(
+                    {"sha": self.deployed_sha, "migrations": self.migrations, "applied": []})
             return fail() if script.group(1) == self.fail_script else ok()
         if command.startswith("sudo rm -f"):
-            self.box_files.pop(workflow.MIGRATIONS_FILE, None)
+            self.box_files.pop(workflow.API_DEPLOY_FILE, None)
             return ok()
         if command.startswith("sudo cat"):
             path = shlex.split(command)[2]
@@ -518,9 +520,15 @@ class DeployTests(WorkflowCase):
         self.assertIn("| api | `" + SANDBOX_SHA[:12] + "` (`main`) | not deployed |", summary)
         self.assertIn("Services (before this deploy)", summary)
 
+    def test_migration_report_for_another_revision_is_ignored(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.deployed_sha = SANDBOX_SHA
+        self.assertEqual(self.deploy(cloud, "api"), 0)
+        self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["migrations"], "none")
+
     def test_stale_migration_marker_is_not_reported(self):
         cloud = FakeCloud(instances=self.box(), fail_script="services-up.sh")
-        cloud.box_files[workflow.MIGRATIONS_FILE] = "applied"
+        cloud.box_files[workflow.API_DEPLOY_FILE] = json.dumps({"sha": NEW_SHA, "migrations": "applied"})
         self.assertEqual(self.deploy(cloud, "api"), 1)
         self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["migrations"], "none")
 
