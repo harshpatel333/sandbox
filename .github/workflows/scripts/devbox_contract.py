@@ -1,0 +1,304 @@
+"""Shared devbox identity, label and manifest contract.
+
+Imported by the create, deploy and destroy workflows so every workflow names,
+labels and records a devbox the same way. Pure functions only: callers own
+the cloud calls and pass clocks and randomness in where tests need them.
+"""
+
+import copy
+from datetime import datetime, timedelta, timezone
+import re
+import secrets
+
+
+SCHEMA_VERSION = 1
+MANAGED_BY = "superserve-devbox"
+PROJECT = "rayai-dev"
+ZONE = "us-central1-a"
+MANIFEST_METADATA_KEY = "devbox-manifest"
+BUCKET_PREFIX = "superserve-devbox-"
+
+DEFAULT_LIFETIME_HOURS = 24
+MAX_LIFETIME_HOURS = 168
+MAX_NAME_LENGTH = 40
+MAX_OWNER_LENGTH = 63
+
+NAME_PATTERN = re.compile(r"[a-z][a-z0-9-]{0,38}[a-z0-9]")
+DEVBOX_ID_PATTERN = re.compile(r"[0-9a-f]{12}")
+SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+
+LABEL_KEYS = ("managed-by", "devbox-name", "devbox-id", "owner", "expires-at")
+# Staging and production discover their hosts through these labels; a devbox
+# carrying any of them could be swept into a real deployment.
+FORBIDDEN_LABELS = ("sandbox_role", "sandbox_status", "environment", "region")
+
+STATES = ("creating", "ready", "failed", "deploying", "destroying")
+RESOURCE_TYPES = ("instance", "disk", "bucket", "artifact_repo")
+MIGRATION_RESULTS = ("applied", "none", "failed")
+
+COMPONENTS = ("vmd", "proxy", "api", "ui")
+CREATE_SCRIPTS = ("host-bootstrap.sh", "install-vmd.sh", "install-proxy.sh",
+                  "services-up.sh", "install-api.sh", "install-ui.sh")
+COMPONENT_SCRIPTS = {
+    "vmd": ("install-vmd.sh",),
+    "proxy": ("install-proxy.sh",),
+    "api": ("services-up.sh", "install-api.sh"),
+    "ui": ("install-ui.sh",),
+}
+
+FORWARDED_PORTS = (
+    ("Console", 3000),
+    ("API", 8080),
+    ("Auth/data gateway", 54321),
+    ("Mailpit", 8025),
+    ("Sandbox proxy", 8090),
+)
+
+BOX_SOURCE_DIR = "/opt/superserve-devbox/src"
+BOX_CONFIG_DIR = "/etc/superserve-devbox"
+BOX_STATE_DIR = "/var/lib/superserve-devbox"
+BOX_SCRIPT_DIR = BOX_SOURCE_DIR + "/sandbox/deploy/devbox"
+
+
+class ContractError(ValueError):
+    pass
+
+
+def normalize_owner(actor):
+    owner = re.sub(r"[^a-z0-9_-]", "-", (actor or "").strip().lower())[:MAX_OWNER_LENGTH]
+    if not owner:
+        raise ContractError("GitHub actor is empty; cannot derive an owner")
+    return owner
+
+
+def validate_name(name):
+    if not isinstance(name, str) or not NAME_PATTERN.fullmatch(name):
+        raise ContractError(
+            f"Invalid devbox name {name!r}: use 2-{MAX_NAME_LENGTH} lowercase letters, digits "
+            "or hyphens, starting with a letter and ending with a letter or digit")
+    return name
+
+
+def generate_name(owner, suffix=None):
+    suffix = suffix if suffix is not None else secrets.token_hex(3)
+    if not re.fullmatch(r"[0-9a-f]{6}", suffix):
+        raise ContractError(f"Invalid generated name suffix {suffix!r}")
+    tail = f"-dev-{suffix}"
+    stem = re.sub(r"[^a-z0-9-]", "-", owner.lower())
+    stem = re.sub(r"^[^a-z]+", "", stem)[:MAX_NAME_LENGTH - len(tail)].rstrip("-")
+    return validate_name((stem or "box") + tail)
+
+
+def resolve_name(requested, owner, suffix=None):
+    requested = (requested or "").strip()
+    return validate_name(requested) if requested else generate_name(owner, suffix)
+
+
+def new_devbox_id():
+    return secrets.token_hex(6)
+
+
+def validate_devbox_id(devbox_id):
+    if not isinstance(devbox_id, str) or not DEVBOX_ID_PATTERN.fullmatch(devbox_id):
+        raise ContractError(f"Invalid devbox-id {devbox_id!r}")
+    return devbox_id
+
+
+def parse_lifetime_hours(value):
+    text = str(value if value is not None else "").strip() or str(DEFAULT_LIFETIME_HOURS)
+    if not re.fullmatch(r"[0-9]+", text):
+        raise ContractError(f"Lifetime must be a whole number of hours, got {value!r}")
+    hours = int(text)
+    if not 1 <= hours <= MAX_LIFETIME_HOURS:
+        raise ContractError(f"Lifetime must be between 1 and {MAX_LIFETIME_HOURS} hours, got {hours}")
+    return hours
+
+
+def utc_now():
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def iso(moment):
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(text):
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        raise ContractError(f"Timestamp {text!r} is not UTC ISO-8601 (YYYY-MM-DDTHH:MM:SSZ)") from None
+
+
+def expiry(created_at, lifetime_hours):
+    return created_at + timedelta(hours=parse_lifetime_hours(lifetime_hours))
+
+
+def concurrency_group(name):
+    return "devbox-" + validate_name(name)
+
+
+def bucket_name(devbox_id):
+    return BUCKET_PREFIX + validate_devbox_id(devbox_id)
+
+
+def labels(name, devbox_id, owner, expires_at):
+    return {
+        "managed-by": MANAGED_BY,
+        "devbox-name": validate_name(name),
+        "devbox-id": validate_devbox_id(devbox_id),
+        "owner": normalize_owner(owner),
+        "expires-at": str(int(expires_at.timestamp())),
+    }
+
+
+def format_labels(values):
+    return ",".join(f"{key}={values[key]}" for key in LABEL_KEYS)
+
+
+def check_labels(found, name, devbox_id=None):
+    found = found or {}
+    if found.get("managed-by") != MANAGED_BY or found.get("devbox-name") != name:
+        raise ContractError(f"{name} is not a devbox managed by {MANAGED_BY}")
+    leaked = sorted(set(found) & set(FORBIDDEN_LABELS))
+    if leaked:
+        raise ContractError(f"{name} carries deployment discovery labels {leaked}; refusing to touch it")
+    if devbox_id is not None and found.get("devbox-id") != devbox_id:
+        raise ContractError(
+            f"{name} devbox-id changed from {devbox_id} to {found.get('devbox-id')!r}; "
+            "the box was replaced, refusing to continue")
+    return validate_devbox_id(found.get("devbox-id"))
+
+
+def discovery_filter(name=None):
+    expression = f"labels.managed-by={MANAGED_BY}"
+    if name is not None:
+        expression += f" AND labels.devbox-name={validate_name(name)}"
+    return expression
+
+
+def select_instance(instances, name):
+    matches = [inst for inst in instances
+               if (inst.get("labels") or {}).get("managed-by") == MANAGED_BY
+               and (inst.get("labels") or {}).get("devbox-name") == name]
+    if not matches:
+        raise ContractError(f"No devbox named {name} found")
+    if len(matches) > 1:
+        raise ContractError(f"{len(matches)} instances claim devbox name {name}; refusing to guess")
+    instance = matches[0]
+    if instance.get("name") != name:
+        raise ContractError(f"Instance {instance.get('name')!r} is labelled as devbox {name}")
+    check_labels(instance["labels"], name)
+    return instance
+
+
+def resources(name, devbox_id, zone=ZONE):
+    return [
+        {"type": "instance", "name": name, "zone": zone},
+        {"type": "disk", "name": name, "zone": zone},
+        {"type": "disk", "name": name + "-data", "zone": zone},
+        {"type": "bucket", "name": bucket_name(devbox_id)},
+    ]
+
+
+def revision(branch, sha):
+    if not branch:
+        raise ContractError("Branch name is empty")
+    if not isinstance(sha, str) or not SHA_PATTERN.fullmatch(sha):
+        raise ContractError(f"Branch {branch!r} did not resolve to a full commit SHA")
+    return {"branch": branch, "sha": sha}
+
+
+def new_manifest(*, name, devbox_id, owner, actor, created_at, expires_at, revisions,
+                 project=PROJECT, zone=ZONE):
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "name": validate_name(name),
+        "devbox_id": validate_devbox_id(devbox_id),
+        "owner": normalize_owner(owner),
+        "actor": actor,
+        "project": project,
+        "zone": zone,
+        "created_at": iso(created_at),
+        "expires_at": iso(expires_at),
+        "state": "creating",
+        "resources": resources(name, devbox_id, zone),
+        "revisions": {key: revision(value["branch"], value["sha"]) for key, value in revisions.items()},
+        "runtime": {},
+        "services": {},
+        "deploys": [],
+    }
+    return validate_manifest(manifest)
+
+
+def validate_manifest(manifest):
+    if not isinstance(manifest, dict):
+        raise ContractError("Manifest is not a JSON object")
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise ContractError(f"Unsupported manifest schema_version {manifest.get('schema_version')!r}")
+    for key in ("name", "devbox_id", "owner", "actor", "project", "zone",
+                "created_at", "expires_at", "state"):
+        if not isinstance(manifest.get(key), str) or not manifest[key]:
+            raise ContractError(f"Manifest field {key!r} is missing")
+    validate_name(manifest["name"])
+    validate_devbox_id(manifest["devbox_id"])
+    parse_iso(manifest["created_at"])
+    parse_iso(manifest["expires_at"])
+    if manifest["state"] not in STATES:
+        raise ContractError(f"Manifest state {manifest['state']!r} is not one of {STATES}")
+    for key, kind in (("resources", list), ("revisions", dict), ("runtime", dict),
+                      ("services", dict), ("deploys", list)):
+        if not isinstance(manifest.get(key), kind):
+            raise ContractError(f"Manifest field {key!r} must be a {kind.__name__}")
+    for resource in manifest["resources"]:
+        if not isinstance(resource, dict) or resource.get("type") not in RESOURCE_TYPES or not resource.get("name"):
+            raise ContractError(f"Manifest resource {resource!r} is malformed")
+    for value in manifest["revisions"].values():
+        revision(value.get("branch"), value.get("sha"))
+    return manifest
+
+
+def with_state(manifest, state):
+    if state not in STATES:
+        raise ContractError(f"Unknown devbox state {state!r}")
+    updated = copy.deepcopy(manifest)
+    updated["state"] = state
+    return validate_manifest(updated)
+
+
+def parse_components(value):
+    selected = {part.strip() for part in (value or "").split(",") if part.strip()}
+    if selected == {"all"}:
+        return list(COMPONENTS)
+    unknown = sorted(selected - set(COMPONENTS))
+    if not selected or unknown:
+        raise ContractError(
+            f"Components must be 'all' or a comma-separated subset of {', '.join(COMPONENTS)}"
+            + (f"; unknown: {', '.join(unknown)}" if unknown else ""))
+    return [component for component in COMPONENTS if component in selected]
+
+
+def component_scripts(components):
+    return [script for component in components for script in COMPONENT_SCRIPTS[component]]
+
+
+def record_deploy(manifest, *, at, actor, components, revisions, migrations):
+    if migrations not in MIGRATION_RESULTS:
+        raise ContractError(f"Unknown migration result {migrations!r}")
+    updated = copy.deepcopy(manifest)
+    previous = updated["revisions"]
+    updated["deploys"].append({
+        "at": iso(at),
+        "actor": actor,
+        "components": list(components),
+        "from": {key: value["sha"] for key, value in previous.items()},
+        "to": {key: value["sha"] for key, value in revisions.items()},
+        "migrations": migrations,
+    })
+    updated["revisions"] = {key: revision(value["branch"], value["sha"]) for key, value in revisions.items()}
+    return validate_manifest(updated)
+
+
+def forwarding_command(name, zone=ZONE, project=PROJECT):
+    forwards = " ".join(f"-L {port}:127.0.0.1:{port}" for _, port in FORWARDED_PORTS)
+    return (f"gcloud compute ssh {name} --zone={zone} --project={project} "
+            f"--tunnel-through-iap -- -N {forwards}")
