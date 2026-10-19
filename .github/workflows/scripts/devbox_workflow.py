@@ -41,7 +41,6 @@ SSH_RETRY_SECONDS = 15
 # marked failed, rather than being killed by the runner.
 DEADLINE_SECONDS = 165 * 60
 MAX_STATE_BYTES = 32 * 1024
-BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 
 
 class StepError(Exception):
@@ -54,18 +53,25 @@ def describe(error):
     return f"{type(error).__name__}: {error}"
 
 
+class DeadlineExceeded(StepError):
+    pass
+
+
 class Deadline:
     end = None
 
     def start(self, seconds):
         self.end = time.monotonic() + seconds
 
+    def stop(self):
+        self.end = None
+
     def cap(self, timeout):
         if self.end is None:
             return timeout
         remaining = int(self.end - time.monotonic())
         if remaining <= 0:
-            raise StepError("Ran out of time before the job timeout")
+            raise DeadlineExceeded("Ran out of time before the job timeout")
         return min(timeout, remaining)
 
 
@@ -93,7 +99,7 @@ def require_main(env):
 def resolve_branch(key, branch):
     branch = (branch or "").strip() or "main"
     check = subprocess.run(["git", "check-ref-format", "--branch", branch], capture_output=True, text=True)
-    if check.returncode or not BRANCH_PATTERN.fullmatch(branch):
+    if check.returncode or not contract.BRANCH_PATTERN.fullmatch(branch):
         raise StepError(f"{key} branch {branch!r} is not a valid branch name (letters, digits, '.', '_', '-', '/')")
     url = f"https://github.com/{GITHUB_REPOSITORIES[key]}.git"
     ref = f"refs/heads/{branch}"
@@ -215,10 +221,12 @@ class Box:
             try:
                 self.ssh("true", timeout=120)
                 return
+            except DeadlineExceeded:
+                raise
             except StepError as error:
                 print(f"waiting for SSH over IAP ({attempt}/{attempts}): {error}")
                 if attempt < attempts:
-                    time.sleep(delay)
+                    time.sleep(DEADLINE.cap(delay))
         raise StepError(f"{self.name} did not accept SSH over IAP")
 
     def describe(self):
@@ -289,7 +297,7 @@ class Box:
         except StepError as error:
             raise StepError(f"{script} failed on {self.name}; see {log} on the box ({error})") from None
         finally:
-            print(f"::{token}::", flush=True)
+            print(f"\n::{token}::", flush=True)
             print("::endgroup::", flush=True)
 
     def record(self, manifest, devbox_id, *, copy_to_box=True):
@@ -481,7 +489,10 @@ def create(env, profile_path=PROFILE_PATH):
 
 def save_attempt(env, attempt):
     if env.get("DEVBOX_ATTEMPT_FILE"):
-        Path(env["DEVBOX_ATTEMPT_FILE"]).write_text(json.dumps(attempt))
+        path = Path(env["DEVBOX_ATTEMPT_FILE"])
+        staged = path.with_name(path.name + ".new")
+        staged.write_text(json.dumps(attempt))
+        os.replace(staged, path)
 
 
 def discover(name, devbox_id):
@@ -502,6 +513,8 @@ def discover(name, devbox_id):
                             capture_output=True, text=True, timeout=120)
     if exists.returncode == 0:
         found.append({"type": "bucket", "name": bucket})
+    elif "not found" not in exists.stderr.lower():
+        raise StepError(f"Could not check bucket {bucket}: {exists.stderr.strip()}")
     return found
 
 
@@ -509,21 +522,24 @@ def mark_failed(name, devbox_id):
     box = Box(name)
     try:
         manifest = manifest_from(box.verify(devbox_id))
-        if manifest["state"] == "creating":
-            box.record(contract.with_state(manifest, "failed"), devbox_id, copy_to_box=False)
+        if manifest["state"] != "creating":
+            return None, f"The instance is already {manifest['state']}; left unchanged"
+        box.record(contract.with_state(manifest, "failed"), devbox_id, copy_to_box=False)
     except Exception as error:
-        return f"Could not record state=failed on the instance: {describe(error)}"
-    return ""
+        return False, f"Could not record state=failed on the instance: {describe(error)}"
+    return True, ""
 
 
 def report_create_failure(env, name, devbox_id, error):
+    DEADLINE.stop()
     try:
         found = discover(name, devbox_id)
         discovery = ""
     except Exception as discover_error:
         found = contract.resources(name, devbox_id)
         discovery = f" (could not list them: {describe(discover_error)}; these may exist)"
-    note = mark_failed(name, devbox_id) if any(r["type"] == "instance" for r in found) else ""
+    has_instance = any(resource["type"] == "instance" for resource in found)
+    marked, note = mark_failed(name, devbox_id) if has_instance else (None, "")
     listing = "\n".join(f"- {resource['type']} `{resource['name']}`"
                         + (f" ({resource['zone']})" if resource.get("zone") else "") for resource in found)
     append_summary(env, "\n".join([
@@ -538,7 +554,7 @@ def report_create_failure(env, name, devbox_id, error):
         "Clean up with:",
         "```sh", destroy_command(name), "```",
     ]))
-    save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": True})
+    save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": marked is not False})
     print(f"::error::Devbox {name} failed: {describe(error)}", file=sys.stderr)
 
 

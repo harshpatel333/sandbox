@@ -44,9 +44,9 @@ class FakeCloud:
     """Stands in for gcloud, git ls-remote and the box behind IAP SSH."""
 
     def __init__(self, *, existing=(), branches=None, fail_script=None, instances=None, relabel_after=None,
-                 decoys=(), fail_after_create=False):
+                 decoys=(), fail_after_create=False, expire_on_script=None):
         self.commands, self.inputs = [], {}
-        self.decoys, self.fail_after_create = decoys, fail_after_create
+        self.decoys, self.fail_after_create, self.expire_on_script = decoys, fail_after_create, expire_on_script
         self.disks, self.buckets = [], []
         self.existing = list(existing)
         self.branches = branches if branches is not None else {"main": SANDBOX_SHA, "feature": NEW_SHA}
@@ -86,7 +86,7 @@ class FakeCloud:
             self.buckets.append(args[4])
             return ok()
         if verb == ["storage", "buckets", "describe"]:
-            return ok(args[4]) if args[4] in self.buckets else fail()
+            return ok(args[4]) if args[4] in self.buckets else fail(1, "ERROR: gs://x not found: 404.")
         if verb == ["compute", "instances", "create"]:
             labels = dict(pair.split("=") for pair in arg(args, "--labels").split(","))
             manifest = Path(arg(args, "--metadata-from-file").split("=", 1)[1]).read_text()
@@ -122,6 +122,8 @@ class FakeCloud:
         script = re.search(r"deploy/devbox/([a-z-]+\.sh)'? 2>&1", unquote(command))
         if script:
             self.scripts.append(script.group(1))
+            if script.group(1) == self.expire_on_script:
+                workflow.DEADLINE.end = 0
             return fail() if script.group(1) == self.fail_script else ok()
         if command.startswith("sudo cat"):
             path = shlex.split(command)[2]
@@ -156,6 +158,7 @@ class WorkflowCase(unittest.TestCase):
         patcher = patch.object(workflow.time, "sleep")
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.addCleanup(workflow.DEADLINE.stop)
 
     def env(self, **values):
         return {"GITHUB_REF": "refs/heads/main", "GITHUB_ACTOR": "AWille-AI", "GITHUB_OUTPUT": str(self.output),
@@ -310,6 +313,16 @@ class CreateTests(WorkflowCase):
         self.run_with(cloud, workflow.finish_create, self.create_env(DEVBOX_ATTEMPT_FILE=str(attempt)))
         self.assertEqual(cloud.metadata_writes[-1]["state"], "failed")
         self.assertIn("cancelled or timed out", self.summary.read_text())
+
+    def test_deadline_still_leaves_the_box_marked_failed(self):
+        attempt = Path(self.directory.name) / "attempt.json"
+        cloud = FakeCloud(expire_on_script="install-api.sh")
+        workflow.DEADLINE.start(3600)
+        self.assertEqual(self.create(cloud, DEVBOX_ATTEMPT_FILE=str(attempt)), 1)
+        self.assertEqual(cloud.scripts, ["host-bootstrap.sh", "services-up.sh", "install-api.sh"])
+        self.assertEqual(cloud.metadata_writes[-1]["state"], "failed")
+        self.assertIn("Ran out of time", self.summary.read_text())
+        self.assertTrue(json.loads(attempt.read_text())["reported"])
 
     def test_replaced_box_is_never_written(self):
         cloud = FakeCloud(relabel_after=0)
