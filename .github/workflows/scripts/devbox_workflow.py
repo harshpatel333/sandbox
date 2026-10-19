@@ -746,7 +746,7 @@ def deploy(env, now=contract.utc_now):
 
 
 def conclude_deploy(env, box, manifest, state, devbox_id, components, revisions, progress, failure, now):
-    DEADLINE.stop()
+    DEADLINE.start(REPORT_SECONDS)
     migrations = "none"
     if progress["api_started"]:
         migrations = read_migrations(box, revisions["sandbox"]["sha"]) or "none"
