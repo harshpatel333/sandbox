@@ -8,14 +8,15 @@
 #
 # Migrations go through the same pinned Supabase CLI and `db push` history as
 # the staging and production deployments, plus the shared-Auth history entry
-# the east production database carries, because the API's account promotion
-# checks read it from this same database. A failing migration stops the
+# of the production database that also hosts Auth, because the API's account
+# promotion checks read it from this same database. A failing migration stops the
 # install before the running API is touched. The outcome is recorded in
 # /var/lib/superserve-devbox/api-deploy.json.
 #
 # --dry-run checks configuration and lists pending migrations without building,
 # migrating or restarting anything.
 set -euo pipefail
+shopt -s inherit_errexit
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=services/common.sh
@@ -34,7 +35,7 @@ esac
 load_box_config
 load_local_secrets
 src=$(cd -- "$here/../.." && pwd)
-sha=$(git -C "$src" rev-parse HEAD)
+sha=$(git -C "$src" rev-parse HEAD 2>/dev/null) || die "$src is not a git checkout"
 runtime_json="$DEVBOX_STATE_DIR/runtime.json"
 [[ -r $runtime_json ]] || die "missing $runtime_json; run host-bootstrap.sh first"
 deploy_record="$DEVBOX_STATE_DIR/api-deploy.json"
@@ -44,8 +45,13 @@ psql_admin() {
   compose exec -T db psql --no-psqlrc -v ON_ERROR_STOP=1 -q -At -U supabase_admin -d postgres -p 54322 "$@"
 }
 
+# The history table appears with the first migration; until then nothing is
+# applied. Any other query failure must stop the install.
 applied_versions() {
-  psql_admin -c "SELECT version FROM supabase_migrations.schema_migrations ORDER BY version" 2>/dev/null || true
+  local table
+  table=$(psql_admin -c "SELECT to_regclass('supabase_migrations.schema_migrations')") || die "cannot query the database"
+  [[ -n $table ]] || return 0
+  psql_admin -c "SELECT version FROM supabase_migrations.schema_migrations ORDER BY version" || die "cannot read migration history"
 }
 
 record() {
@@ -69,11 +75,13 @@ ensure_go() {
 name = sys.argv[1]
 print(next(f["sha256"] for r in json.load(sys.stdin) for f in r["files"] if f["filename"] == name))' "$tarball") ||
       die "no published checksum for $tarball"
-    tmp=$(mktemp -d)
+    tmp=$(mktemp -d "$DEVBOX_INSTALL_DIR/tools/.go.XXXXXX")
     curl -fsSL -o "$tmp/$tarball" "https://go.dev/dl/$tarball"
     echo "$want  $tmp/$tarball" | sha256sum --check --quiet - || die "checksum mismatch for $tarball"
-    mkdir -p "$root"
-    tar -xzf "$tmp/$tarball" -C "$root" --strip-components=1
+    mkdir "$tmp/go"
+    tar -xzf "$tmp/$tarball" -C "$tmp/go" --strip-components=1
+    rm -rf "$root"
+    mv "$tmp/go" "$root"
     rm -rf "$tmp"
   fi
   export PATH="$root/bin:$PATH" GOTOOLCHAIN=local GOFLAGS=-mod=readonly
@@ -84,12 +92,13 @@ ensure_supabase_cli() {
   supabase="$dir/supabase"
   [[ -x $supabase ]] && return
   local tmp
-  tmp=$(mktemp -d)
+  tmp=$(mktemp -d "$DEVBOX_INSTALL_DIR/tools/.supabase.XXXXXX")
   curl -fsSL -o "$tmp/cli.tar.gz" \
     "https://github.com/supabase/cli/releases/download/v$SUPABASE_CLI_VERSION/supabase_linux_amd64.tar.gz"
   echo "$SUPABASE_CLI_SHA256  $tmp/cli.tar.gz" | sha256sum --check --quiet - || die "Supabase CLI checksum mismatch"
+  tar -xzf "$tmp/cli.tar.gz" -C "$tmp" supabase
   mkdir -p "$dir"
-  tar -xzf "$tmp/cli.tar.gz" -C "$dir" supabase
+  mv "$tmp/supabase" "$supabase"
   rm -rf "$tmp"
 }
 
@@ -135,6 +144,10 @@ if [[ $dry_run == true ]]; then
   exit 0
 fi
 
+[[ $PROMOTION_EVIDENCE_PROXY_PASSWORD =~ ^[0-9a-f]+$ ]] || die "PROMOTION_EVIDENCE_PROXY_PASSWORD in $local_secrets must be hex"
+[[ $SYSTEM_TEAM_ID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "SYSTEM_TEAM_ID in $local_secrets must be a UUID"
+rm -f "$deploy_record"
+mkdir -p "$DEVBOX_INSTALL_DIR/tools"
 ensure_go
 ensure_supabase_cli
 
@@ -142,13 +155,16 @@ log "building control plane at $sha"
 mkdir -p "$release"
 (cd "$src" && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$release/" ./cmd/controlplane ./cmd/seed-templates ./cmd/hostctl)
 
-mapfile -t pending < <(pending_migrations)
+pending_list=$(pending_migrations)
+mapfile -t pending <<<"$pending_list"
+[[ -n ${pending[0]} ]] || pending=()
 workdir=$(migration_workdir)
 log "applying ${#pending[@]} pending migration(s)"
-if ! (cd "$workdir" && SUPABASE_TELEMETRY_DISABLED=1 "$supabase" db push --yes \
-  --db-url "postgresql://postgres:$POSTGRES_PASSWORD@127.0.0.1:54322/postgres?sslmode=disable"); then
+if ! (cd "$workdir" && PGPASSWORD=$POSTGRES_PASSWORD SUPABASE_TELEMETRY_DISABLED=1 "$supabase" db push --yes \
+  --db-url "postgresql://postgres@127.0.0.1:54322/postgres?sslmode=disable"); then
   rm -rf "$workdir"
-  mapfile -t done_versions < <(comm -23 <(printf '%s\n' "${pending[@]}") <(pending_migrations))
+  still_pending=$(pending_migrations)
+  mapfile -t done_versions < <(comm -23 <(printf '%s\n' "${pending[@]}") <(printf '%s\n' "$still_pending"))
   record failed "${done_versions[@]}"
   die "migrations failed; the running API was not changed"
 fi
@@ -161,8 +177,12 @@ fi
 
 # The API reads promotion evidence through this RPC-only role, as production
 # does. The system team owns the curated templates; the API lifts its quotas
-# at startup, so it must exist before the API starts.
+# at startup, so it must exist before the API starts. The session never logs
+# the statement, which carries a password.
 psql_admin <<SQL
+SET log_statement = 'none';
+SET log_min_error_statement = 'panic';
+SET pgaudit.log = 'none';
 ALTER ROLE promotion_evidence_proxy PASSWORD '$PROMOTION_EVIDENCE_PROXY_PASSWORD';
 INSERT INTO team (id, name) VALUES ('$SYSTEM_TEAM_ID', 'superserve-system') ON CONFLICT (id) DO NOTHING;
 SQL

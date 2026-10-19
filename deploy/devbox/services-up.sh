@@ -10,6 +10,7 @@
 # --dry-run validates configuration and prints the compose plan without
 # installing packages or starting containers.
 set -euo pipefail
+shopt -s inherit_errexit
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=services/common.sh
@@ -30,6 +31,9 @@ load_box_config
 # daemon immediately.
 ensure_docker() {
   if [[ $dry_run == true ]]; then
+    if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1; then
+      die "dry run needs Docker with the compose plugin to validate the stack"
+    fi
     log "would ensure Docker with iptables management disabled"
     return
   fi
@@ -41,7 +45,8 @@ ensure_docker() {
     log "installing Docker"
     apt-get update -q
     DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io docker-compose-v2
-  elif [[ $changed -eq 1 ]]; then
+  fi
+  if [[ $changed -eq 1 ]]; then
     log "restarting Docker to apply daemon configuration"
     systemctl restart docker
   fi
@@ -55,7 +60,6 @@ render_compose_env() {
     "CONSOLE_URL=$CONSOLE_URL" \
     "EMAIL_FROM_ADDRESS=$EMAIL_FROM_ADDRESS" \
     "API_PORT=$API_PORT" \
-    "STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}" \
     "STRIPE_DEVICE_NAME=superserve-devbox-$DEVBOX_ID"
 }
 
@@ -79,7 +83,8 @@ capture_stripe_secret() {
     [[ -n $secret || $SECONDS -lt $deadline ]] || die "stripe listen did not report a signing secret; check: docker compose -p superserve-devbox logs stripe"
     [[ -n $secret ]] || sleep 2
   done
-  helper write-env "$stripe_env" "STRIPE_WEBHOOK_SECRET=$secret" "STRIPE_METER_ERROR_WEBHOOK_SECRET=$secret"
+  STRIPE_WEBHOOK_SECRET=$secret STRIPE_METER_ERROR_WEBHOOK_SECRET=$secret \
+    helper env-file "$stripe_env" STRIPE_WEBHOOK_SECRET STRIPE_METER_ERROR_WEBHOOK_SECRET
   log "stripe listen forwarding to 127.0.0.1:$API_PORT/stripe/webhook"
 }
 
@@ -91,9 +96,9 @@ if [[ $dry_run == true ]]; then
   local_secrets=$scratch/local.env promotion_key=$scratch/key.pem compose_env=$scratch/services.env
 else
   install -d -m 0755 "$DEVBOX_DATA_DIR" "$DEVBOX_STATE_DIR"
-  install -d -m 0700 "$DEVBOX_DATA_DIR/secrets"
 fi
 helper secrets "$local_secrets" "$promotion_key"
+[[ $dry_run == true ]] || ln -sfn "$local_secrets" "$DEVBOX_CONFIG_DIR/local-secrets.env"
 render_compose_env
 
 profiles=()
@@ -111,7 +116,7 @@ if [[ $dry_run == true ]]; then
 fi
 
 install -d -m 0700 "$DEVBOX_DATA_DIR/postgres"
-install -d -m 0755 "$DEVBOX_DATA_DIR/mailpit"
+install -d -m 0700 "$DEVBOX_DATA_DIR/mailpit"
 compose "${profiles[@]}" up --detach --wait --remove-orphans
 
 load_local_secrets

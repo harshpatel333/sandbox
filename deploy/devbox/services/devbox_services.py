@@ -89,8 +89,15 @@ def write_file(path, content, mode=0o600):
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "w") as f:
         f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
     os.chmod(tmp, mode)
     os.replace(tmp, p)
+    dir_fd = os.open(p.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def _b64url(data):
@@ -113,12 +120,18 @@ def ed25519_keypair():
     return pem, base64.b64encode(der[-32:]).decode()
 
 
+def database_url(user, password):
+    return f"postgresql://{user}:{password}@127.0.0.1:54322/postgres?sslmode=disable"
+
+
 def generate_secrets(existing, now=None):
     """Return existing plus every missing generated value."""
     values = dict(existing)
     for key, generate in GENERATED.items():
         if not values.get(key):
             values[key] = generate()
+    if not values.get("DATABASE_URL"):
+        values["DATABASE_URL"] = database_url("postgres", values["POSTGRES_PASSWORD"])
     issued = int(now if now is not None else time.time())
     for key, role in (("ANON_KEY", "anon"), ("SERVICE_ROLE_KEY", "service_role")):
         if not values.get(key):
@@ -190,12 +203,11 @@ def api_env(env, runtime):
             raise ValueError(f"{key} is required")
         return value
 
-    database = f"127.0.0.1:{env.get('POSTGRES_PORT', '54322')}/postgres?sslmode=disable"
     values = {
         "API_HOST": "127.0.0.1",
         "API_PORT": env.get("API_PORT", "8080"),
-        "DATABASE_URL": f"postgresql://postgres:{need(env, 'POSTGRES_PASSWORD')}@{database}",
-        "PROMOTION_AUTH_DATABASE_URL": f"postgresql://promotion_evidence_proxy:{need(env, 'PROMOTION_EVIDENCE_PROXY_PASSWORD')}@{database}",
+        "DATABASE_URL": database_url("postgres", need(env, "POSTGRES_PASSWORD")),
+        "PROMOTION_AUTH_DATABASE_URL": database_url("promotion_evidence_proxy", need(env, "PROMOTION_EVIDENCE_PROXY_PASSWORD")),
         "SANDBOX_ACCESS_TOKEN_SEED": need(env, "SANDBOX_ACCESS_TOKEN_SEED"),
         "INTERNAL_API_TOKEN": need(env, "INTERNAL_API_TOKEN"),
         "OPERATOR_API_TOKEN": need(env, "OPERATOR_API_TOKEN"),
@@ -228,10 +240,10 @@ def main(argv=None):
     cmd = commands.add_parser("secrets", help="create missing local secrets")
     cmd.add_argument("path")
     cmd.add_argument("key_path")
-    cmd = commands.add_parser("write-env", help="write KEY=value pairs to a 0600 file")
+    cmd = commands.add_parser("env-file", help="write the named process environment variables to a 0600 file")
     cmd.add_argument("path")
-    cmd.add_argument("pairs", nargs="*")
-    cmd = commands.add_parser("compose-env", help="render the compose environment file")
+    cmd.add_argument("keys", nargs="+")
+    cmd = commands.add_parser("compose-env", help="render the compose environment file; STRIPE_SECRET_KEY comes from the environment")
     cmd.add_argument("secrets_path")
     cmd.add_argument("path")
     cmd.add_argument("pairs", nargs="*")
@@ -258,11 +270,12 @@ def main(argv=None):
     try:
         if args.command == "secrets":
             ensure_secrets(args.path, args.key_path)
-        elif args.command == "write-env":
-            write_env(args.path, pairs(args.pairs))
+        elif args.command == "env-file":
+            write_env(args.path, {key: os.environ.get(key, "") for key in args.keys})
         elif args.command == "compose-env":
             local = read_env(args.secrets_path)
-            write_env(args.path, {**{k: local[k] for k in COMPOSE_SECRETS}, **pairs(args.pairs)})
+            stripe = {"STRIPE_SECRET_KEY": os.environ.get("STRIPE_SECRET_KEY", "")}
+            write_env(args.path, {**{k: local[k] for k in COMPOSE_SECRETS}, **stripe, **pairs(args.pairs)})
         elif args.command == "docker-daemon-config":
             return 1 if merge_docker_daemon(args.path) else 0
         elif args.command == "services-json":

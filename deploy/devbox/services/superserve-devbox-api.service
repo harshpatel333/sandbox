@@ -2,6 +2,7 @@
 Description=Superserve devbox API (control plane and background jobs)
 After=network-online.target docker.service
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

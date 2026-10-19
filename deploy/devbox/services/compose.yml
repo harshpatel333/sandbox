@@ -44,7 +44,7 @@ services:
       GOTRUE_DB_DRIVER: postgres
       GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@127.0.0.1:54322/postgres
       GOTRUE_SITE_URL: ${CONSOLE_URL:?}
-      GOTRUE_URI_ALLOW_LIST: ${CONSOLE_URL}/**
+      GOTRUE_URI_ALLOW_LIST: ${CONSOLE_URL},${CONSOLE_URL}/**
       GOTRUE_DISABLE_SIGNUP: "false"
       # supabase-js sends apikey on every request, including browser preflights.
       GOTRUE_CORS_ALLOWED_HEADERS: apikey
@@ -79,7 +79,6 @@ services:
       PGRST_DB_ANON_ROLE: anon
       PGRST_DB_MAX_ROWS: "1000"
       PGRST_JWT_SECRET: ${JWT_SECRET}
-      PGRST_DB_USE_LEGACY_GUCS: "false"
       PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
       PGRST_APP_SETTINGS_JWT_EXP: "3600"
 

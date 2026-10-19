@@ -170,7 +170,7 @@ func TestSMTPEmailSenderErrorClassification(t *testing.T) {
 		rejected bool
 	}{
 		{"recipient rejected", map[string]string{"RCPT": "550 no such user"}, true},
-		{"sender rejected", map[string]string{"MAIL": "553 sender not allowed"}, true},
+		{"sender refused is configuration", map[string]string{"MAIL": "553 sender not allowed"}, false},
 		{"message rejected", map[string]string{"DATA": "554 message refused"}, true},
 		{"recipient deferred", map[string]string{"RCPT": "451 try later"}, false},
 		{"message deferred", map[string]string{"DATA": "452 insufficient storage"}, false},
@@ -245,9 +245,12 @@ func TestSMTPMessageRejectsHeaderInjection(t *testing.T) {
 			t.Fatalf("message %q/%q accepted, want address error", m.From, m.To)
 		}
 	}
-	err := (&SMTPEmailSender{addr: "127.0.0.1:1", timeout: time.Second}).SendEmail(context.Background(), EmailMessage{From: "bad", To: "owner@example.com"})
+	sender := &SMTPEmailSender{addr: "127.0.0.1:1", timeout: time.Second}
 	var rejected *rejectedEmailError
-	if !errors.As(err, &rejected) {
-		t.Fatalf("invalid address error = %v, want permanent rejection", err)
+	if err := sender.SendEmail(context.Background(), EmailMessage{From: "billing@example.com", To: "bad"}); !errors.As(err, &rejected) {
+		t.Fatalf("invalid recipient error = %v, want permanent rejection", err)
+	}
+	if err := sender.SendEmail(context.Background(), EmailMessage{From: "bad", To: "owner@example.com"}); err == nil || errors.As(err, &rejected) {
+		t.Fatalf("invalid sender error = %v, want retryable configuration error", err)
 	}
 }

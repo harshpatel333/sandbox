@@ -34,14 +34,14 @@ for every TCP connection.
 | Path | Contents |
 | --- | --- |
 | `/mnt/sandbox-data/superserve-devbox/postgres`, `mailpit` | Service data; destroying the box is the only reset |
-| `/mnt/sandbox-data/superserve-devbox/secrets/local.env` | Generated on first run, never rotated (0600) |
-| `/mnt/sandbox-data/superserve-devbox/secrets/promotion-account-key.pem` | Ed25519 key the console signs account assertions with (0600) |
+| `/mnt/sandbox-data/superserve-devbox/local-secrets.env` | Generated on first run, never rotated (0600); linked from `/etc/superserve-devbox/local-secrets.env` |
+| `/mnt/sandbox-data/superserve-devbox/promotion-account-key.pem` | Ed25519 key the console signs account assertions with (0600) |
 | `/var/lib/superserve-devbox/services.json` | Images, digests and endpoints for the manifest (no secrets) |
 | `/var/lib/superserve-devbox/api.env` | Rendered API environment (0600) |
 | `/var/lib/superserve-devbox/api-deploy.json` | Last install: commit, migration result (`applied`, `none`, `failed`) and applied versions |
 | `/opt/superserve-devbox/api/releases/<sha>` | Built `controlplane`, `seed-templates`, `hostctl`; `current` links to the running one |
 
-`local.env` holds `POSTGRES_PASSWORD`, `PROMOTION_EVIDENCE_PROXY_PASSWORD`,
+`local-secrets.env` holds `POSTGRES_PASSWORD`, `DATABASE_URL` (as `postgres`), `PROMOTION_EVIDENCE_PROXY_PASSWORD`,
 `JWT_SECRET`, `ANON_KEY`, `SERVICE_ROLE_KEY`, `SANDBOX_ACCESS_TOKEN_SEED`,
 `INTERNAL_API_TOKEN`, `OPERATOR_API_TOKEN`, `PROMOTION_CAPTURE_TOKEN`,
 `PROMOTION_ACCOUNT_TOKEN`, `PROMOTION_ACCOUNT_PUBLIC_KEY` and `SYSTEM_TEAM_ID`.
@@ -76,8 +76,8 @@ YC claims stay unconfigured.
 
 `install-api.sh` applies `supabase/migrations` with the same pinned Supabase CLI
 and `db push` history table as the deployment migrations, plus the shared-Auth
-history entry (`supabase/shared-auth-history`) that the east production
-database carries, because account promotion reads it from the same database
+history entry (`supabase/shared-auth-history`) of the production database that
+also hosts Auth, because account promotion reads it from the same database
 through the RPC-only `promotion_evidence_proxy` role. Only versions missing from
 `supabase_migrations.schema_migrations` run. A failing migration stops the
 install before the API is restarted. A checkout that lacks an applied version

@@ -159,7 +159,7 @@ type SMTPEmailSender struct {
 func (s *SMTPEmailSender) SendEmail(ctx context.Context, m EmailMessage) error {
 	from, to, data, err := smtpMessage(m, time.Now())
 	if err != nil {
-		return &rejectedEmailError{err: err}
+		return err
 	}
 	dialer := net.Dialer{Timeout: s.timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", s.addr)
@@ -181,16 +181,18 @@ func (s *SMTPEmailSender) SendEmail(ctx context.Context, m EmailMessage) error {
 	}
 	defer client.Close()
 	// Nothing is submitted until the server answers the end of DATA, so
-	// failures before then are definitive.
+	// failures before then are definitive. Greeting and sender failures are
+	// server or configuration problems, retryable once fixed; only replies
+	// about this recipient or this message can reject it permanently.
 	if err := client.Mail(from); err != nil {
-		return smtpReplyError(err)
+		return err
 	}
 	if err := client.Rcpt(to); err != nil {
 		return smtpReplyError(err)
 	}
 	w, err := client.Data()
 	if err != nil {
-		return smtpReplyError(err)
+		return err
 	}
 	if _, err := w.Write(data); err != nil {
 		return err
@@ -218,6 +220,8 @@ func smtpReplyError(err error) error {
 
 // smtpMessage renders m as an RFC 5322 message and returns the envelope
 // addresses. Addresses are parsed so header values cannot carry line breaks.
+// An invalid sender is a configuration error and stays retryable; an invalid
+// recipient is a permanent rejection.
 func smtpMessage(m EmailMessage, now time.Time) (string, string, []byte, error) {
 	from, err := mail.ParseAddress(m.From)
 	if err != nil {
@@ -225,7 +229,7 @@ func smtpMessage(m EmailMessage, now time.Time) (string, string, []byte, error) 
 	}
 	to, err := mail.ParseAddress(m.To)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("invalid recipient address: %w", err)
+		return "", "", nil, &rejectedEmailError{err: fmt.Errorf("invalid recipient address: %w", err)}
 	}
 	contentType, body := "text/plain", m.Text
 	if m.HTML != "" {

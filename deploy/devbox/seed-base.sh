@@ -10,6 +10,7 @@
 # heartbeat, hostctl activates it, and cmd/seed-templates seeds and builds
 # superserve/base under the system team, waiting for the build to finish.
 set -euo pipefail
+shopt -s inherit_errexit
 
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=services/common.sh
@@ -34,7 +35,9 @@ bin="$DEVBOX_INSTALL_DIR/api/current"
 export CONTROL_PLANE_URL="http://127.0.0.1:$API_PORT"
 
 host_status() {
-  "$bin/hostctl" list | awk -v id="$host_id" 'NR > 1 && $1 == id { print $2 }'
+  local hosts
+  hosts=$("$bin/hostctl" list) || die "hostctl list failed against $CONTROL_PLANE_URL"
+  awk -v id="$host_id" 'NR > 1 && $1 == id { print $2 }' <<<"$hosts"
 }
 
 if [[ $dry_run == true ]]; then
@@ -43,14 +46,18 @@ if [[ $dry_run == true ]]; then
 fi
 
 deadline=$((SECONDS + 300))
-while [[ -z $(host_status) ]]; do
+status=$(host_status)
+while [[ -z $status ]]; do
   [[ $SECONDS -lt $deadline ]] || die "host $host_id never registered; check VMD's heartbeat to $CONTROL_PLANE_URL"
   sleep 5
+  status=$(host_status)
 done
-if [[ $(host_status) != active ]]; then
+if [[ $status != active ]]; then
   "$bin/hostctl" activate "$host_id"
+  status=$(host_status)
+  [[ $status == active ]] || die "host $host_id is '$status' after activation"
 fi
-log "host $host_id is $(host_status)"
+log "host $host_id is active"
 
 specs=$(mktemp -d)
 trap 'rm -rf "$specs"' EXIT

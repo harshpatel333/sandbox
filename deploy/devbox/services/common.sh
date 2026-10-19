@@ -15,8 +15,8 @@ EDGE_PROXY_DOMAIN=sandbox.localhost
 EMAIL_FROM_ADDRESS=noreply@devbox.localhost
 
 services_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-local_secrets="$DEVBOX_DATA_DIR/secrets/local.env"
-promotion_key="$DEVBOX_DATA_DIR/secrets/promotion-account-key.pem"
+local_secrets="$DEVBOX_DATA_DIR/local-secrets.env"
+promotion_key="$DEVBOX_DATA_DIR/promotion-account-key.pem"
 compose_env="$DEVBOX_STATE_DIR/services.env"
 stripe_env="$DEVBOX_STATE_DIR/stripe.env"
 
