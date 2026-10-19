@@ -37,7 +37,7 @@ PROFILE = {
                "soft_delete_retention_seconds": 0},
 }
 SECRETS = {"DEVBOX_SECRET_STRIPE_SECRET_KEY": "sk_test_example", "DEVBOX_SECRET_RECAPTCHA_API_KEY": "recaptcha-secret",
-           "DEVBOX_CONFIG_STRIPE_PUBLISHABLE_KEY": "pk_test_example", "DEVBOX_CONFIG_RECAPTCHA_SITE_KEY": "site-key"}
+           "DEVBOX_CONFIG_STRIPE_PRO_MONTHLY_PRICE_ID": "price_example", "DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG": "{\"cpu\": 1, \"memory_mib\": 1024}", "DEVBOX_CONFIG_RECAPTCHA_SITE_KEY": "site-key"}
 
 
 class FakeCloud:
@@ -256,7 +256,9 @@ class CreateTests(WorkflowCase):
         self.assertEqual(self.create(cloud), 0)
         secrets_file = cloud.box_files["/etc/superserve-devbox/secrets.env"]
         self.assertEqual(secrets_file, "RECAPTCHA_API_KEY=recaptcha-secret\nSTRIPE_SECRET_KEY=sk_test_example\n")
-        self.assertIn("STRIPE_PUBLISHABLE_KEY=pk_test_example\n", cloud.box_files["/etc/superserve-devbox/devbox.env"])
+        devbox_env = cloud.box_files["/etc/superserve-devbox/devbox.env"]
+        self.assertIn("STRIPE_PRO_MONTHLY_PRICE_ID=price_example\n", devbox_env)
+        self.assertIn("""BILLING_RESOURCE_CONFIG='{"cpu": 1, "memory_mib": 1024}'\n""", devbox_env)
         self.assertIn(f"DEVBOX_SANDBOX_SHA={SANDBOX_SHA}\n", cloud.box_files["/etc/superserve-devbox/devbox.env"])
         command = next(c for c in cloud.inputs if "secrets.env" in c)
         self.assertIn("chmod 0600", command)
