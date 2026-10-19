@@ -293,7 +293,7 @@ the sandbox proxy on 8090 (sandbox hosts are `*.sandbox.localhost:8090`).
 If any step fails, times out or is cancelled, the run fails, sets state
 `failed` on the VM when it exists, and lists every resource of the attempt it
 finds by `devbox-id` label or name. A failed box is never reported
-as ready; destroy it, or fix the branch and deploy to it.
+as ready; destroy it and create a new one.
 
 ## Deploy to a devbox
 
