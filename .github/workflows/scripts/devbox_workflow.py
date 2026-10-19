@@ -39,9 +39,10 @@ SSH_ATTEMPTS = 40
 SSH_RETRY_SECONDS = 15
 # Kept below the job's timeout-minutes so a slow step fails here, with the box
 # marked failed, rather than being killed by the runner.
-DEADLINE_SECONDS = 165 * 60
-# Reporting a failure gets its own budget, so a deadline hit at 165 minutes
-# still records it before the job's 180-minute timeout.
+DEADLINE_SECONDS = 160 * 60
+# Reporting a failure gets its own budget, so a deadline hit at 160 minutes
+# still records it, with room for job setup and the backstop step, before the
+# job's 180-minute timeout.
 REPORT_SECONDS = 10 * 60
 MAX_STATE_BYTES = 32 * 1024
 
@@ -566,7 +567,7 @@ def discover(name, devbox_id):
         add("disk", disk["name"], (disk.get("zone") or "").rsplit("/", 1)[-1])
     bucket = contract.bucket_name(devbox_id)
     exists = subprocess.run(["gcloud", "storage", "buckets", "describe", "gs://" + bucket, "--format=value(name)"],
-                            capture_output=True, text=True, timeout=120)
+                            capture_output=True, text=True, timeout=DEADLINE.cap(120))
     if exists.returncode == 0:
         found.append({"type": "bucket", "name": bucket})
     elif "not found" not in exists.stderr.lower():
