@@ -152,6 +152,38 @@ class HostTests(unittest.TestCase):
         self.assertEqual(devbox_host.pin_drift(manifest, changed),
                          ["DEVBOX_DATA_DISK_DEVICE", "DEVBOX_KERNEL_OBJECT", "DEVBOX_ROOTFS_DIGEST"])
 
+    def test_ca_is_minted_only_on_a_box_that_never_bootstrapped(self):
+        source = (HERE / "host-bootstrap.sh").read_text()
+        start = source.index("install_secretsproxy_ca() {")
+        function = source[start:source.index("\n}\n", start) + 3]
+        for files, traces, minted in (((), (), True), ((), ("runtime.json",), False),
+                                      ((), ("vmd.db",), False), (("ca.crt",), (), False),
+                                      (("ca.crt", "ca.key"), ("runtime.json",), None)):
+            with self.subTest(files=files, traces=traces), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ca = root / "ca"
+                ca.mkdir()
+                for name in files:
+                    (ca / name).write_text("existing")
+                for name in traces:
+                    (root / name).write_text("")
+                script = function.replace("/var/lib/secretsproxy", str(ca)).replace(
+                    "/var/lib/sandbox/vmd.db", str(root / "vmd.db"))
+                stubs = f"""
+set -euo pipefail
+DEVBOX_RUNTIME_JSON={root}/runtime.json
+DEVBOX_STATE={root}/state
+devbox_die() {{ echo "DIE $*" >&2; exit 1; }}
+devbox_build() {{ :; }}
+systemd-run() {{ echo pem > {ca}/ca.crt; echo pem > {ca}/ca.key; echo minted > {root}/minted; }}
+"""
+                result = subprocess.run(["bash", "-c", stubs + script + "install_secretsproxy_ca\n"],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, minted is not False, result.stderr)
+                self.assertEqual((root / "minted").exists(), minted is True)
+                for name in files:
+                    self.assertEqual((ca / name).read_text(), "existing")
+
     def test_capacity_reserves_host_memory_and_honours_overrides(self):
         meminfo = "MemTotal:       32873024 kB\nMemFree:  1 kB\n"
         self.assertEqual(devbox_host.capacity(meminfo, "8", "8192"), (32102 - 8192, 8))
