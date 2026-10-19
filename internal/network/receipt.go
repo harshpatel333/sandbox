@@ -253,11 +253,12 @@ func (p *Pool) fastAdoptVouched(idx int, nsSet, vethSet map[string]bool, occupie
 				}
 				var aerr error
 				fw, aerr = reinstallFirewallFunc(FirewallConfig{
-					TAPInterface: TAPName,
-					VethPeer:     "eth0",
-					VMIP:         VMInternalIP,
-					HostIP:       hostIPForSlot(idx),
-					GatewayIP:    VMGatewayIP,
+					TAPInterface:   TAPName,
+					VethPeer:       "eth0",
+					VMIP:           VMInternalIP,
+					HostIP:         hostIPForSlot(idx),
+					GatewayIP:      VMGatewayIP,
+					SecretsProxyIP: p.mgr.secretsProxyAllowIP(),
 				})
 				return aerr
 			})
