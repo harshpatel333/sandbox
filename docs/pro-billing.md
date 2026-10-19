@@ -260,8 +260,10 @@ failure: validate selectors using descriptors and staging/fixture evidence,
 then verify live observations after enablement. Normal issuance still targets
 one minute; escalation thresholds are not the normal service target.
 
-The recovery policy extracts no labels, so 100 customer events within five
-minutes produce one incident and one initial notification. Subsequent matching
+The recovery selector covers the API's current console `ERR` lines in
+`textPayload` as well as structured JSON `ERROR` entries, scoped to the expected
+Cloud Run services and regions. The recovery policy extracts no labels, so 100
+customer events within five minutes produce one incident and one initial notification. Subsequent matching
 events can notify again no sooner than five minutes later; there is no initial
 five-minute delay, including near-expiry events. Cloud Monitoring limits direct
 log policies to 20 notifications per day. Treat a notification as a prompt to

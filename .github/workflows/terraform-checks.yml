@@ -75,6 +75,10 @@ jobs:
           terraform -chdir=infra/modules/observability init -backend=false -input=false
           terraform -chdir=infra/modules/observability test
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
       - name: Test billing alert behavior
         run: |
           terraform -chdir=infra/modules/billing-alerts init -backend=false -input=false

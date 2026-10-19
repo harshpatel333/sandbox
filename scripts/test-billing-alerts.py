@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Exercise the Terraform-rendered PromQL with promtool, without cloud writes."""
+"""Exercise rendered alert predicates against PromQL and real console fixtures."""
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -19,6 +20,9 @@ def main():
             continue
         policy = change['change']['after']
         for condition in policy['conditions']:
+            for log in condition.get('condition_matched_log') or []:
+                pattern = json.loads(re.search(r'textPayload=~("(?:\\.|[^"\\])*")', log['filter']).group(1))
+                subprocess.run(['go', 'run', './scripts/testdata/billing-console', pattern], check=True)
             for query in condition.get('condition_prometheus_query_language') or []:
                 rules.append({'alert': change['index'], 'expr': query['query'], 'for': query['duration']})
     queries = plan['output_changes']['metric_queries']['after']

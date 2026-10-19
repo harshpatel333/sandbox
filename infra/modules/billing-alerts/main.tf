@@ -55,11 +55,17 @@ locals {
       detail   = "No sampler progress for five minutes in ${check.cell}, sustained for another minute to tolerate startup/export delay. Includes absent, never-seen and frozen counters. Both success and error count as progress; errors have their own policy. Check the process and collector before interpreting backlog counts. Coverage liveness must be disarmed when issuance is intentionally disabled."
     }
   })
-  recovery_log_filter = <<-EOT
+  # The API currently uses zerolog ConsoleWriter on stderr. Accept structured
+  # entries too so switching to JSON logging does not break recovery paging.
+  console_error_pattern = "^[^ ]+ (\\x1b\\[[0-9;]*m)*ERR(\\x1b\\[[0-9;]*m)* "
+  recovery_log_filter   = <<-EOT
     resource.type="cloud_run_revision"
     (${join(" OR ", [for cell in values(var.cells) : "(resource.labels.service_name=\"${cell.cloud_run_service}\" AND resource.labels.location=\"${cell.cloud_run_region}\")"])})
-    (severity=ERROR OR jsonPayload.level="error")
-    jsonPayload.message="usage entitlement requires operator recovery; inspect pending grants before collecting invoices"
+    (
+      ((severity=ERROR OR jsonPayload.level="error") AND jsonPayload.message="usage entitlement requires operator recovery; inspect pending grants before collecting invoices")
+      OR
+      (textPayload:"usage entitlement requires operator recovery; inspect pending grants before collecting invoices" AND textPayload=~${jsonencode(local.console_error_pattern)})
+    )
   EOT
   triage_labels = merge(var.labels, {
     environment          = var.environment

@@ -24,6 +24,16 @@ run "enabled" {
   command = plan
   assert {
     condition = (
+      strcontains(local.recovery_log_filter, "textPayload:") &&
+      strcontains(local.recovery_log_filter, "textPayload=~") &&
+      strcontains(local.recovery_log_filter, "jsonPayload.message=") &&
+      strcontains(local.recovery_log_filter, "example-api-east") &&
+      strcontains(local.recovery_log_filter, "example-api-west")
+    )
+    error_message = "Recovery logs must cover current console ERR output and structured ERROR output in both API cells."
+  }
+  assert {
+    condition = (
       google_monitoring_alert_policy.entitlement_recovery.conditions[0].condition_matched_log[0].label_extractors == null &&
       google_monitoring_alert_policy.entitlement_recovery.alert_strategy[0].notification_rate_limit[0].period == "300s"
     )
