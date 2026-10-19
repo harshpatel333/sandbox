@@ -31,6 +31,7 @@ MAX_OWNER_LENGTH = 63
 NAME_PATTERN = re.compile(r"[a-z][a-z0-9-]{0,38}[a-z0-9]")
 DEVBOX_ID_PATTERN = re.compile(r"[0-9a-f]{12}")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 
 LABEL_KEYS = ("managed-by", "devbox-name", "devbox-id", "owner", "expires-at")
 # Staging and production discover their hosts through these labels; a devbox
@@ -38,7 +39,7 @@ LABEL_KEYS = ("managed-by", "devbox-name", "devbox-id", "owner", "expires-at")
 FORBIDDEN_LABELS = ("sandbox_role", "sandbox_status", "environment", "region")
 
 STATES = ("creating", "ready", "failed", "deploying", "destroying")
-RESOURCE_TYPES = ("instance", "disk", "bucket", "artifact_repo")
+RESOURCE_TYPES = ("instance", "disk", "bucket")
 MIGRATION_RESULTS = ("applied", "none", "failed")
 DEPLOY_RESULTS = ("succeeded", "failed")
 
@@ -219,8 +220,8 @@ def resources(name, devbox_id, zone=ZONE):
 
 
 def revision(branch, sha):
-    if not branch:
-        raise ContractError("Branch name is empty")
+    if not isinstance(branch, str) or not BRANCH_PATTERN.fullmatch(branch) or ".." in branch:
+        raise ContractError(f"Branch {branch!r} is not a plain branch name (letters, digits, '.', '_', '-', '/')")
     if not isinstance(sha, str) or not SHA_PATTERN.fullmatch(sha):
         raise ContractError(f"Branch {branch!r} did not resolve to a full commit SHA")
     return {"branch": branch, "sha": sha}
@@ -329,6 +330,7 @@ def record_deploy(manifest, *, at, actor, components, revisions, migrations, res
     updated["revisions"] = moved
     for component in components:
         updated["components"][component] = dict(moved[COMPONENT_REPOSITORIES[component]])
+    updated["state"] = "ready" if result == "succeeded" else "failed"
     return validate_manifest(updated)
 
 

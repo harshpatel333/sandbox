@@ -126,8 +126,10 @@ class ManifestTests(unittest.TestCase):
     def test_revisions_require_full_shas(self):
         with self.assertRaises(contract.ContractError):
             contract.revision("main", "abc123")
-        with self.assertRaises(contract.ContractError):
-            contract.revision("", SHA_A)
+        for branch in ("", "-main", "a..b", "x`[y](z)", "has space"):
+            with self.subTest(branch=branch), self.assertRaises(contract.ContractError):
+                contract.revision(branch, SHA_A)
+        self.assertEqual(contract.revision("feature/x_1.2-y", SHA_A)["branch"], "feature/x_1.2-y")
 
     def test_validate_rejects_unknown_schema_and_state(self):
         for key, value in (("schema_version", 2), ("state", "running"), ("deploys", {}),
@@ -153,6 +155,7 @@ class ManifestTests(unittest.TestCase):
             revisions={"sandbox": {"branch": "feature", "sha": SHA_C}})
         self.assertEqual(before["deploys"], [])
         self.assertEqual(after["expires_at"], before["expires_at"])
+        self.assertEqual(after["state"], "ready")
         self.assertEqual(after["revisions"], {"sandbox": {"branch": "feature", "sha": SHA_C},
                                               "ui": {"branch": "main", "sha": SHA_B}})
         self.assertEqual(after["components"]["api"], {"branch": "feature", "sha": SHA_C})
