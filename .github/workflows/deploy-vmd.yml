@@ -86,6 +86,7 @@ on:
       - 'deploy/sandboxes.slice'
       - 'deploy/needrestart-superserve.conf'
       - 'deploy/apt-no-auto-upgrades.conf'
+      - 'deploy/superserve-cpufreq.conf'
       - 'deploy/maintenance-watch.sh'
       - 'deploy/superserve-maintenance-watch.service'
       - 'deploy/superserve-maintenance-watch.timer'

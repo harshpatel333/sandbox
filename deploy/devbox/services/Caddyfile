@@ -1,0 +1,45 @@
+# Exposes Auth at /auth/v1 and the data API at /rest/v1 the way hosted
+# Supabase does: requests must carry the anon or service-role key, except CORS
+# preflights and the browser-facing Auth redirects that email links land on.
+{
+	admin off
+	auto_https off
+}
+
+(upstream) {
+	handle_path /auth/v1/* {
+		reverse_proxy 127.0.0.1:54324
+	}
+	handle_path /rest/v1/* {
+		reverse_proxy 127.0.0.1:54325
+	}
+	handle {
+		respond 404
+	}
+}
+
+http://:54321 {
+	bind 127.0.0.1
+
+	@open path /auth/v1/verify /auth/v1/callback /auth/v1/authorize
+	@preflight method OPTIONS
+	@anon header apikey {env.ANON_KEY}
+	@service header apikey {env.SERVICE_ROLE_KEY}
+
+	handle @preflight {
+		import upstream
+	}
+	handle @open {
+		import upstream
+	}
+	handle @anon {
+		import upstream
+	}
+	handle @service {
+		import upstream
+	}
+	handle {
+		header Content-Type application/json
+		respond `{"message":"Invalid API key"}` 401
+	}
+}

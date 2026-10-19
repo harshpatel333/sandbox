@@ -25,8 +25,8 @@ func TestTrialWarningPreTransmissionFailuresAreRetryable(t *testing.T) {
 				return nil, failure.err
 			}}
 			defer transport.CloseIdleConnections()
-			sender := &ResendTrialCreditWarningSender{endpoint: "https://example.com/emails", client: &http.Client{Transport: transport, Timeout: time.Second}}
-			err := sender.sendEmail(context.Background(), []byte(`{}`))
+			sender := &ResendEmailSender{endpoint: "https://example.com/emails", client: &http.Client{Transport: transport, Timeout: time.Second}}
+			err := sender.SendEmail(context.Background(), EmailMessage{})
 			if !errors.Is(err, failure.err) {
 				t.Fatalf("error = %v, want %v", err, failure.err)
 			}
@@ -42,8 +42,8 @@ func TestTrialWarningPreTransmissionFailuresAreRetryable(t *testing.T) {
 		// The test server's certificate is deliberately not trusted.
 		transport := &http.Transport{}
 		defer transport.CloseIdleConnections()
-		sender := &ResendTrialCreditWarningSender{endpoint: server.URL, client: &http.Client{Transport: transport, Timeout: time.Second}}
-		assertTrialWarningTransportOutcome(t, sender.sendEmail(context.Background(), []byte(`{}`)), false)
+		sender := &ResendEmailSender{endpoint: server.URL, client: &http.Client{Transport: transport, Timeout: time.Second}}
+		assertTrialWarningTransportOutcome(t, sender.SendEmail(context.Background(), EmailMessage{}), false)
 		if requests.Load() != 0 {
 			t.Fatal("TLS failure reached the request handler")
 		}
@@ -64,8 +64,8 @@ func TestTrialWarningAmbiguousTransportFailuresRemainUnknown(t *testing.T) {
 			_ = conn.Close()
 		}))
 		defer server.Close()
-		sender := &ResendTrialCreditWarningSender{endpoint: server.URL, client: server.Client()}
-		assertTrialWarningTransportOutcome(t, sender.sendEmail(context.Background(), []byte(`{}`)), true)
+		sender := &ResendEmailSender{endpoint: server.URL, client: server.Client()}
+		assertTrialWarningTransportOutcome(t, sender.SendEmail(context.Background(), EmailMessage{}), true)
 		if requests.Load() != 1 {
 			t.Fatalf("provider requests = %d, want 1", requests.Load())
 		}
@@ -78,15 +78,15 @@ func TestTrialWarningAmbiguousTransportFailuresRemainUnknown(t *testing.T) {
 			return conn, nil
 		}}
 		defer transport.CloseIdleConnections()
-		sender := &ResendTrialCreditWarningSender{endpoint: "http://example.com/emails", client: &http.Client{Transport: transport, Timeout: time.Second}}
-		assertTrialWarningTransportOutcome(t, sender.sendEmail(context.Background(), []byte(`{}`)), true)
+		sender := &ResendEmailSender{endpoint: "http://example.com/emails", client: &http.Client{Transport: transport, Timeout: time.Second}}
+		assertTrialWarningTransportOutcome(t, sender.SendEmail(context.Background(), EmailMessage{}), true)
 		if !conn.wrote.Load() {
 			t.Fatal("request never attempted a write")
 		}
 	})
 	t.Run("untraced transport", func(t *testing.T) {
-		sender := &ResendTrialCreditWarningSender{endpoint: "https://example.com/emails", client: &http.Client{Transport: trialWarningUntracedTransport{}}}
-		assertTrialWarningTransportOutcome(t, sender.sendEmail(context.Background(), []byte(`{}`)), true)
+		sender := &ResendEmailSender{endpoint: "https://example.com/emails", client: &http.Client{Transport: trialWarningUntracedTransport{}}}
+		assertTrialWarningTransportOutcome(t, sender.SendEmail(context.Background(), EmailMessage{}), true)
 	})
 }
 
@@ -95,8 +95,8 @@ func assertTrialWarningTransportOutcome(t *testing.T, err error, wantUnknown boo
 	if err == nil {
 		t.Fatal("transport failure returned success")
 	}
-	var unknown UnknownTrialCreditWarningOutcome
-	if got := errors.As(err, &unknown) && unknown.UnknownTrialCreditWarning(); got != wantUnknown {
+	var unknown *unknownEmailOutcomeError
+	if got := errors.As(err, &unknown); got != wantUnknown {
 		t.Fatalf("unknown outcome = %v, want %v: %v", got, wantUnknown, err)
 	}
 }

@@ -366,6 +366,7 @@ BUNDLE_FILES = [
     "deploy/sandboxes.slice",
     "deploy/needrestart-superserve.conf",
     "deploy/apt-no-auto-upgrades.conf",
+    "deploy/superserve-cpufreq.conf",
     "deploy/maintenance-watch.sh",
     "deploy/superserve-maintenance-watch.service",
     "deploy/superserve-maintenance-watch.timer",
@@ -936,6 +937,12 @@ def main() -> int:
             sudo install -D -m 0644 {extract_dir}/deploy/needrestart-superserve.conf /etc/needrestart/conf.d/50-superserve.conf
             sudo install -D -m 0644 {extract_dir}/deploy/apt-no-auto-upgrades.conf /etc/apt/apt.conf.d/99superserve-no-auto-upgrades
             sudo systemctl disable --now apt-daily-upgrade.timer 2>/dev/null || true
+
+            # CPU frequency policy, applied now and at every boot. A host it
+            # cannot be applied to keeps deploying.
+            sudo install -D -m 0644 {extract_dir}/deploy/superserve-cpufreq.conf /etc/tmpfiles.d/superserve-cpufreq.conf
+            sudo systemd-tmpfiles --create /etc/tmpfiles.d/superserve-cpufreq.conf \
+                || echo "WARNING: CPU frequency policy did not apply; host keeps its current governor" >&2
 
             # Inject boxd + rebuild rootfs only when the new binary differs
             # from what's already installed. `-trimpath -ldflags '-s -w'`
