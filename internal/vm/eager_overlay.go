@@ -22,10 +22,11 @@ var eagerOverlayPSI = func() (mem, io float64) {
 }
 
 // eagerOverlayEnabled reports whether a fork restore may ask Firecracker to
-// pre-copy its overlay: whenever the binary advertises it and the host is not
-// under pressure. PSI reads -1 when unavailable, which does not block.
+// pre-copy its overlay: whenever the host allows it, the binary advertises it
+// and the host is not under pressure. PSI reads -1 when unavailable, which
+// does not block.
 func (m *Manager) eagerOverlayEnabled() bool {
-	if !m.eagerOverlayCapable.Load() {
+	if m.cfg.EagerOverlayDisabled || !m.eagerOverlayCapable.Load() {
 		return false
 	}
 	mem, io := eagerOverlayPSI()

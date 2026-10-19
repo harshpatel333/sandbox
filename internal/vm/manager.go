@@ -415,6 +415,11 @@ type ManagerConfig struct {
 	// layers to the kernel instead of copying it. Default false.
 	SkipZeroHolesEnabled bool
 
+	// EagerOverlayDisabled keeps forks from asking Firecracker to pre-copy
+	// their overlay even when the binary advertises it, so a host can serve
+	// fork memory on demand instead. Default false.
+	EagerOverlayDisabled bool
+
 	// RequirePresenceSidecar controls refusing a layered UFFD restore whose
 	// overlay has no .presence side-car next to it. Without the side-car,
 	// Firecracker falls back to inferring page presence from the overlay's

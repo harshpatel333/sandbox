@@ -44,6 +44,11 @@ func TestEagerOverlayEnabled(t *testing.T) {
 	if m.eagerOverlayEnabled() {
 		t.Fatal("a host under IO pressure should skip the pre-copy")
 	}
+	withPSI(t, 0, 0)
+	m.cfg.EagerOverlayDisabled = true
+	if m.eagerOverlayEnabled() {
+		t.Fatal("a host that disables the pre-copy must not get it")
+	}
 }
 
 // forkLoadBody runs a fork of a fresh saved snapshot of a paused source until

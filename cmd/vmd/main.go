@@ -824,6 +824,9 @@ func main() {
 	// Off by default: on, template builds punch all-zero memory into holes and
 	// restores leave it to the kernel once the binary advertises skip-zero-holes.
 	skipZeroHoles := envOrDefault("VMD_SKIP_ZERO_HOLES", "false") == "true"
+	// On by default: forks pre-copy their overlay whenever the binary
+	// advertises it. False serves fork memory on demand instead.
+	eagerOverlayDisabled := envOrDefault("VMD_EAGER_OVERLAY", "true") == "false"
 	// Pause-side wait for the guest to stop its workload before a frozen-clock
 	// snapshot; only paid when the restore would freeze the clock.
 	savedSnapshotConcurrency := 0
@@ -1017,6 +1020,7 @@ func main() {
 		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
 		TemplateFreezeWorkload:              templateFreezeWorkload,
 		SkipZeroHolesEnabled:                skipZeroHoles,
+		EagerOverlayDisabled:                eagerOverlayDisabled,
 		GuestFreezeBudget:                   guestFreezeBudget,
 		SavedSnapshotConcurrency:            savedSnapshotConcurrency,
 		RequirePresenceSidecar:              requirePresenceSidecar,
