@@ -1,0 +1,37 @@
+name: Devbox Checks
+
+# Devbox changes stay off every deploy trigger path, so their checks live here
+# rather than in ci.yml.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'deploy/devbox/**'
+      - '.github/workflows/scripts/devbox*'
+      - '.github/workflows/devbox-checks.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/devbox/**'
+      - '.github/workflows/scripts/devbox*'
+      - '.github/workflows/devbox-checks.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Devbox Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive deploy/devbox/terraform
+
+      - name: Run profile tests
+        run: python3 -m unittest discover -s deploy/devbox -p 'test_*.py'

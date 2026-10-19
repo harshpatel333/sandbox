@@ -18,6 +18,12 @@ const (
 	// AllTrafficCIDR is a special value meaning "match all IPv4 traffic".
 	// nftables rejects 0.0.0.0 as "unspecified", so we handle it specially.
 	AllTrafficCIDR = "0.0.0.0/0"
+
+	// Ports the host redirects to the egress proxy (see hostfw.go). User
+	// egress rules skip these in the filter chain because enforcement for
+	// them happens at the proxy, not here.
+	proxyHTTPDport  = 80
+	proxyHTTPSDport = 443
 )
 
 // Firewall manages nftables rules for a single sandbox namespace.
@@ -41,13 +47,13 @@ type Firewall struct {
 	userDenySet        *nftables.Set
 	userAllowSet       *nftables.Set
 
-	tapIface  string
-	vethPeer  string // namespace-side veth (e.g. "eth0")
-	vmIP      string // VM internal IP (169.254.0.21)
-	hostIP    string // host-side IP for this sandbox
-	gatewayIP string // orchestrator IP allowed through firewall
-
-	// TCP proxy ports for domain-based filtering.
+	tapIface         string
+	vethPeer         string // namespace-side veth (e.g. "eth0")
+	vmIP             string // VM internal IP (169.254.0.21)
+	hostIP           string // host-side IP for this sandbox
+	gatewayIP        string // orchestrator IP allowed through firewall
+	secretsProxyIP   string // secrets-proxy dst, exempted on its TCP port (empty = none)
+	secretsProxyPort uint16 // secrets-proxy TCP port for the exemption (0 = none)
 }
 
 // FirewallConfig holds the parameters needed to create a Firewall.
@@ -57,6 +63,12 @@ type FirewallConfig struct {
 	VMIP         string
 	HostIP       string
 	GatewayIP    string // IP always allowed (orchestrator/gateway)
+	// SecretsProxyIP/Port, when set, is the secrets-proxy destination the
+	// sandbox dials. Its one redirected TCP port is exempted from customer
+	// deny rules so a deny-all policy can't cut off secret injection. Empty
+	// when the secrets proxy isn't configured.
+	SecretsProxyIP   string
+	SecretsProxyPort uint16
 }
 
 // NewFirewall creates nftables rules inside the current network namespace.
@@ -179,6 +191,8 @@ func NewFirewall(cfg FirewallConfig) (*Firewall, error) {
 		vmIP:               cfg.VMIP,
 		hostIP:             cfg.HostIP,
 		gatewayIP:          cfg.GatewayIP,
+		secretsProxyIP:     cfg.SecretsProxyIP,
+		secretsProxyPort:   cfg.SecretsProxyPort,
 	}
 
 	if err := fw.installRules(); err != nil {
@@ -222,6 +236,8 @@ func AttachFirewall(cfg FirewallConfig) (*Firewall, error) {
 		vmIP:               cfg.VMIP,
 		hostIP:             cfg.HostIP,
 		gatewayIP:          cfg.GatewayIP,
+		secretsProxyIP:     cfg.SecretsProxyIP,
+		secretsProxyPort:   cfg.SecretsProxyPort,
 	}, nil
 }
 
@@ -281,10 +297,19 @@ func (fw *Firewall) installRules() error {
 //   0. Any IPv6 from TAP → drop (fail-closed; sandboxes are IPv4-only)
 //   1. ESTABLISHED/RELATED → accept
 //   2. predefinedAllowSet → accept (all protocols)
+//   2b. secrets-proxy dst + its TCP port → accept (when configured)
 //   3. predefinedDenySet  → drop   (all protocols)
 //   4. Non-TCP: userAllowSet → accept
 //   5. Non-TCP: userDenySet  → drop
-//   6. Default: accept (TCP goes to proxy via REDIRECT)
+//   6. TCP (dport ≠ 80,443): userAllowSet → accept
+//   7. TCP (dport ≠ 80,443): userDenySet  → drop
+//   8. Default: accept (TCP/80,443 goes to proxy via REDIRECT)
+//
+// Rules 6–7 exist because the host only redirects TCP 80/443 to the egress
+// proxy (hostfw.go); without them, customer allow/deny rules were silently
+// ignored for TCP on every other port. 80/443 stay excluded here so their
+// enforcement remains at the proxy. Infra destinations (gateway, secrets
+// proxy) sit in predefinedAllowSet and are accepted by rule 2 first.
 
 func (fw *Firewall) installFilterRules() {
 	// Rule 0: drop all IPv6 traffic from the TAP interface.
@@ -320,6 +345,14 @@ func (fw *Firewall) installFilterRules() {
 	// Rule 2: predefinedAllowSet → accept (all protocols).
 	fw.addSetFilterRule(fw.predefinedAllowSet, false)
 
+	// Rule 2b: secrets-proxy dst on its one redirected TCP port → accept.
+	// Placed before predefinedDeny so it overrides the private-range drop for
+	// that host-local endpoint, but scoped to the single TCP port the host
+	// actually redirects — not the whole address.
+	if fw.secretsProxyIP != "" && fw.secretsProxyPort != 0 {
+		fw.addSecretsProxyExemption()
+	}
+
 	// Rule 3: predefinedDenySet → drop (all protocols).
 	fw.addSetFilterRule(fw.predefinedDenySet, true)
 
@@ -328,6 +361,12 @@ func (fw *Firewall) installFilterRules() {
 
 	// Rule 5: non-TCP + userDenySet → drop.
 	fw.addNonTCPSetFilterRule(fw.userDenySet, true)
+
+	// Rule 6: TCP (non-proxy ports) + userAllowSet → accept.
+	fw.addTCPNonProxySetFilterRule(fw.userAllowSet, false)
+
+	// Rule 7: TCP (non-proxy ports) + userDenySet → drop.
+	fw.addTCPNonProxySetFilterRule(fw.userDenySet, true)
 }
 
 // addSetFilterRule matches destination IPs in a set for ALL protocols.
@@ -362,6 +401,51 @@ func (fw *Firewall) addNonTCPSetFilterRule(ipSet *nftables.Set, drop bool) {
 			protoNotTCP(),
 			ipv4DstLookup(ipSet),
 			verdict,
+		),
+	})
+}
+
+// addTCPNonProxySetFilterRule matches TCP to destinations in a set, excluding
+// the proxy-redirected ports (80/443) whose enforcement lives at the egress
+// proxy. This is what makes customer allow/deny rules apply to TCP that the
+// host does not redirect.
+func (fw *Firewall) addTCPNonProxySetFilterRule(ipSet *nftables.Set, drop bool) {
+	verdict := verdictAccept()
+	if drop {
+		verdict = verdictDrop()
+	}
+	fw.conn.AddRule(&nftables.Rule{
+		Table: fw.table,
+		Chain: fw.filterChain,
+		Exprs: flatten(
+			fw.tapIfaceMatch(),
+			protoTCP(),
+			tcpDportNeq(proxyHTTPDport),
+			tcpDportNeq(proxyHTTPSDport),
+			ipv4DstLookup(ipSet),
+			verdict,
+		),
+	})
+}
+
+// addSecretsProxyExemption accepts TCP to the secrets-proxy IP on its single
+// redirected port, so a customer deny-all can't block secret injection. Scoped
+// to that one TCP port — not the whole (host-local) address — so it can't widen
+// access to other ports/protocols there. No-op if the IP isn't a v4 address.
+func (fw *Firewall) addSecretsProxyExemption() {
+	addr, err := netip.ParseAddr(fw.secretsProxyIP)
+	if err != nil || !addr.Is4() {
+		return
+	}
+	fw.conn.AddRule(&nftables.Rule{
+		Table: fw.table,
+		Chain: fw.filterChain,
+		Exprs: flatten(
+			fw.tapIfaceMatch(),
+			protoTCP(),
+			ipv4DstMatch(addr),
+			tcpDportMatch(fw.secretsProxyPort),
+			verdictAccept(),
 		),
 	})
 }
@@ -444,7 +528,10 @@ func (fw *Firewall) ReplaceUserRules(allowedCIDRs, deniedCIDRs []string) error {
 		return fmt.Errorf("populate predefined deny set: %w", err)
 	}
 
-	// 2. Predefined allow set → gateway/orchestrator IP.
+	// 2. Predefined allow set → gateway/orchestrator IP. The secrets-proxy
+	//    exemption is a narrow static filter rule (see installFilterRules),
+	//    not an all-protocol entry here, so it can't widen access to its
+	//    host-local IP beyond the one redirected TCP port.
 	fw.conn.FlushSet(fw.predefinedAllowSet)
 	allowElems, err := cidrsToElements([]string{fw.gatewayIP + "/32"})
 	if err != nil {
@@ -644,6 +731,16 @@ func tcpDportMatch(port uint16) []expr.Any {
 	return []expr.Any{
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: binaryutil.BigEndian.PutUint16(port)},
+	}
+}
+
+// tcpDportNeq matches when the TCP destination port is not `port`. Chain two
+// of these for an "and" over distinct ports. Caller must assert proto TCP
+// first (reads the transport header unconditionally otherwise).
+func tcpDportNeq(port uint16) []expr.Any {
+	return []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+		&expr.Cmp{Register: 1, Op: expr.CmpOpNeq, Data: binaryutil.BigEndian.PutUint16(port)},
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -26,7 +27,9 @@ type Config struct {
 	TemplateBackupBucket      string                       // BACKUP_BUCKET, cell-local durable template storage
 	ComputeRestrictionsFile   string                       // COMPUTE_RESTRICTIONS_FILE; empty disables config loading
 	ComputeRestrictionsSource string                       // COMPUTE_RESTRICTIONS_SOURCE; file (default) or database
+	Host                      string                       // API_HOST; empty listens on every interface
 	Port                      string                       // API_PORT, default "8080"
+	SMTPAddr                  string                       // SMTP_HOST:SMTP_PORT when EMAIL_TRANSPORT=smtp; empty sends email through Resend
 	VMDAddress                string                       // VMD_GRPC_ADDRESS, default "localhost:50051"
 	DatabaseURL               string                       // DATABASE_URL, required
 	TeamCreationRegion        string                       // TEAM_CREATION_REGION; receiving cell identifier
@@ -138,6 +141,10 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("BILLING_ENTITLEMENT_WORKERS must be between 2 and 32")
 	}
 	checkoutPriceIDs := checkoutPriceIDs()
+	smtpAddr, err := emailSMTPAddr(os.Getenv("EMAIL_TRANSPORT"), os.Getenv("SMTP_HOST"), os.Getenv("SMTP_PORT"))
+	if err != nil {
+		return nil, err
+	}
 
 	cfg := &Config{
 		BillingUsageEntitlementsEnabled: boolEnv("BILLING_USAGE_ENTITLEMENTS_ENABLED", false),
@@ -147,7 +154,9 @@ func Load() (*Config, error) {
 		TeamCreationKeys:              teamCreationKeys(os.Getenv("TEAM_CREATION_PUBLIC_KEYS")),
 		ComputeRestrictionsFile:       os.Getenv("COMPUTE_RESTRICTIONS_FILE"),
 		ComputeRestrictionsSource:     envOrDefault("COMPUTE_RESTRICTIONS_SOURCE", "file"),
+		Host:                          os.Getenv("API_HOST"),
 		Port:                          envOrDefault("API_PORT", "8080"),
+		SMTPAddr:                      smtpAddr,
 		VMDAddress:                    envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
 		DatabaseURL:                   dbURL,
 		StripeSecretKey:               os.Getenv("STRIPE_SECRET_KEY"),
@@ -184,6 +193,25 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("COMPUTE_RESTRICTIONS_SOURCE must be file or database")
 	}
 	return cfg, nil
+}
+
+// emailSMTPAddr validates the email transport selection. Resend (the default)
+// returns an empty address; smtp requires a host and port and never falls
+// back to Resend.
+func emailSMTPAddr(transport, host, port string) (string, error) {
+	switch strings.TrimSpace(transport) {
+	case "", "resend":
+		return "", nil
+	case "smtp":
+		host = strings.TrimSpace(host)
+		n, err := strconv.Atoi(strings.TrimSpace(port))
+		if host == "" || err != nil || n < 1 || n > 65535 {
+			return "", fmt.Errorf("EMAIL_TRANSPORT=smtp requires SMTP_HOST and a valid SMTP_PORT")
+		}
+		return net.JoinHostPort(host, strconv.Itoa(n)), nil
+	default:
+		return "", fmt.Errorf("EMAIL_TRANSPORT must be resend or smtp")
+	}
 }
 
 // Invalid or missing verifier configuration disables only team creation.
