@@ -7,7 +7,7 @@ FROM node:22-bookworm-slim
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 WORKDIR /src
 COPY . .
-RUN bun install --frozen-lockfile
+RUN --mount=type=cache,target=/root/.bun/install/cache bun install --frozen-lockfile
 
 ARG NEXT_PUBLIC_APP_URL
 ARG NEXT_PUBLIC_WEBSITE_URL

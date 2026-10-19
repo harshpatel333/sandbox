@@ -84,17 +84,23 @@ shared() {
 }
 
 ensure_console_secrets() {
-  if [[ ! -s "$CONSOLE_SECRETS" ]]; then
+  local proxy="" proof=""
+  if [[ -r "$CONSOLE_SECRETS" ]]; then
+    proxy="$(env_get "$CONSOLE_SECRETS" CONSOLE_PROXY_SECRET)"
+    proof="$(env_get "$CONSOLE_SECRETS" GOOGLE_SIGNUP_PROOF_SECRET)"
+  fi
+  if ((${#proxy} < 32 || ${#proof} < 32)); then
     log "generating console secrets in $CONSOLE_SECRETS"
+    proxy="$(openssl rand -hex 32)"
+    proof="$(openssl rand -hex 32)"
     install -d -m 0700 "$SECRETS_DIR"
     (
       umask 077
-      printf 'CONSOLE_PROXY_SECRET=%q\nGOOGLE_SIGNUP_PROOF_SECRET=%q\n' \
-        "$(openssl rand -base64 48 | tr -d '\n')" \
-        "$(openssl rand -base64 48 | tr -d '\n')" >"$CONSOLE_SECRETS.tmp"
+      printf 'CONSOLE_PROXY_SECRET=%s\nGOOGLE_SIGNUP_PROOF_SECRET=%s\n' "$proxy" "$proof" >"$CONSOLE_SECRETS.tmp"
     )
     mv "$CONSOLE_SECRETS.tmp" "$CONSOLE_SECRETS"
   fi
+  RUNTIME_VARS+=("CONSOLE_PROXY_SECRET=$proxy" "GOOGLE_SIGNUP_PROOF_SECRET=$proof")
 }
 
 require_file "$DEVBOX_ENV" "written by the create workflow"
@@ -144,9 +150,10 @@ After=docker.service
 
 [Service]
 ExecStartPre=-$DOCKER rm -f $SERVICE
-ExecStart=$DOCKER run --rm --name $SERVICE --network host -v $RUNTIME_DIR/runtime.env:/run/superserve/console.env:ro $IMAGE
+ExecStart=$DOCKER run --rm --pull=never --name $SERVICE --network host --mount type=bind,src=$RUNTIME_DIR/runtime.env,dst=/run/superserve/console.env,readonly $IMAGE
 ExecStop=$DOCKER stop $SERVICE
 Restart=always
+SuccessExitStatus=143
 RestartSec=5
 
 [Install]
@@ -161,13 +168,11 @@ if ((DRY_RUN)); then
 fi
 
 [[ $EUID -eq 0 ]] || die "must run as root"
-command -v docker >/dev/null || die "docker is not installed"
+for tool in docker curl openssl; do
+  command -v "$tool" >/dev/null || die "$tool is not installed"
+done
 
 ensure_console_secrets
-RUNTIME_VARS+=(
-  "CONSOLE_PROXY_SECRET=$(env_get "$CONSOLE_SECRETS" CONSOLE_PROXY_SECRET)"
-  "GOOGLE_SIGNUP_PROOF_SECRET=$(env_get "$CONSOLE_SECRETS" GOOGLE_SIGNUP_PROOF_SECRET)"
-)
 
 revision="$(env_get "$DEVBOX_ENV" DEVBOX_UI_SHA)"
 revision="${revision:-$(git -C "$UI_SRC" rev-parse HEAD 2>/dev/null || echo unknown)}"
@@ -192,7 +197,7 @@ mv "$RUNTIME_DIR/runtime.env.tmp" "$RUNTIME_DIR/runtime.env"
 
 printf '%s' "$UNIT" >"$UNIT_FILE"
 systemctl daemon-reload
-systemctl enable "$SERVICE" >/dev/null 2>&1
+systemctl enable --quiet "$SERVICE" || die "could not enable $SERVICE"
 log "restarting $SERVICE"
 systemctl restart "$SERVICE"
 
