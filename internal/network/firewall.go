@@ -18,6 +18,12 @@ const (
 	// AllTrafficCIDR is a special value meaning "match all IPv4 traffic".
 	// nftables rejects 0.0.0.0 as "unspecified", so we handle it specially.
 	AllTrafficCIDR = "0.0.0.0/0"
+
+	// Ports the host redirects to the egress proxy (see hostfw.go). User
+	// egress rules skip these in the filter chain because enforcement for
+	// them happens at the proxy, not here.
+	proxyHTTPDport  = 80
+	proxyHTTPSDport = 443
 )
 
 // Firewall manages nftables rules for a single sandbox namespace.
@@ -41,13 +47,12 @@ type Firewall struct {
 	userDenySet        *nftables.Set
 	userAllowSet       *nftables.Set
 
-	tapIface  string
-	vethPeer  string // namespace-side veth (e.g. "eth0")
-	vmIP      string // VM internal IP (169.254.0.21)
-	hostIP    string // host-side IP for this sandbox
-	gatewayIP string // orchestrator IP allowed through firewall
-
-	// TCP proxy ports for domain-based filtering.
+	tapIface       string
+	vethPeer       string // namespace-side veth (e.g. "eth0")
+	vmIP           string // VM internal IP (169.254.0.21)
+	hostIP         string // host-side IP for this sandbox
+	gatewayIP      string // orchestrator IP allowed through firewall
+	secretsProxyIP string // secrets-proxy dst, always allowed (empty = none)
 }
 
 // FirewallConfig holds the parameters needed to create a Firewall.
@@ -57,6 +62,10 @@ type FirewallConfig struct {
 	VMIP         string
 	HostIP       string
 	GatewayIP    string // IP always allowed (orchestrator/gateway)
+	// SecretsProxyIP, when set, is the secrets-proxy destination the sandbox
+	// dials; it is always allowed so customer deny rules can't cut off secret
+	// injection. Empty when the secrets proxy isn't configured.
+	SecretsProxyIP string
 }
 
 // NewFirewall creates nftables rules inside the current network namespace.
@@ -179,6 +188,7 @@ func NewFirewall(cfg FirewallConfig) (*Firewall, error) {
 		vmIP:               cfg.VMIP,
 		hostIP:             cfg.HostIP,
 		gatewayIP:          cfg.GatewayIP,
+		secretsProxyIP:     cfg.SecretsProxyIP,
 	}
 
 	if err := fw.installRules(); err != nil {
@@ -222,6 +232,7 @@ func AttachFirewall(cfg FirewallConfig) (*Firewall, error) {
 		vmIP:               cfg.VMIP,
 		hostIP:             cfg.HostIP,
 		gatewayIP:          cfg.GatewayIP,
+		secretsProxyIP:     cfg.SecretsProxyIP,
 	}, nil
 }
 
@@ -284,7 +295,15 @@ func (fw *Firewall) installRules() error {
 //   3. predefinedDenySet  → drop   (all protocols)
 //   4. Non-TCP: userAllowSet → accept
 //   5. Non-TCP: userDenySet  → drop
-//   6. Default: accept (TCP goes to proxy via REDIRECT)
+//   6. TCP (dport ≠ 80,443): userAllowSet → accept
+//   7. TCP (dport ≠ 80,443): userDenySet  → drop
+//   8. Default: accept (TCP/80,443 goes to proxy via REDIRECT)
+//
+// Rules 6–7 exist because the host only redirects TCP 80/443 to the egress
+// proxy (hostfw.go); without them, customer allow/deny rules were silently
+// ignored for TCP on every other port. 80/443 stay excluded here so their
+// enforcement remains at the proxy. Infra destinations (gateway, secrets
+// proxy) sit in predefinedAllowSet and are accepted by rule 2 first.
 
 func (fw *Firewall) installFilterRules() {
 	// Rule 0: drop all IPv6 traffic from the TAP interface.
@@ -328,6 +347,12 @@ func (fw *Firewall) installFilterRules() {
 
 	// Rule 5: non-TCP + userDenySet → drop.
 	fw.addNonTCPSetFilterRule(fw.userDenySet, true)
+
+	// Rule 6: TCP (non-proxy ports) + userAllowSet → accept.
+	fw.addTCPNonProxySetFilterRule(fw.userAllowSet, false)
+
+	// Rule 7: TCP (non-proxy ports) + userDenySet → drop.
+	fw.addTCPNonProxySetFilterRule(fw.userDenySet, true)
 }
 
 // addSetFilterRule matches destination IPs in a set for ALL protocols.
@@ -360,6 +385,29 @@ func (fw *Firewall) addNonTCPSetFilterRule(ipSet *nftables.Set, drop bool) {
 		Exprs: flatten(
 			fw.tapIfaceMatch(),
 			protoNotTCP(),
+			ipv4DstLookup(ipSet),
+			verdict,
+		),
+	})
+}
+
+// addTCPNonProxySetFilterRule matches TCP to destinations in a set, excluding
+// the proxy-redirected ports (80/443) whose enforcement lives at the egress
+// proxy. This is what makes customer allow/deny rules apply to TCP that the
+// host does not redirect.
+func (fw *Firewall) addTCPNonProxySetFilterRule(ipSet *nftables.Set, drop bool) {
+	verdict := verdictAccept()
+	if drop {
+		verdict = verdictDrop()
+	}
+	fw.conn.AddRule(&nftables.Rule{
+		Table: fw.table,
+		Chain: fw.filterChain,
+		Exprs: flatten(
+			fw.tapIfaceMatch(),
+			protoTCP(),
+			tcpDportNeq(proxyHTTPDport),
+			tcpDportNeq(proxyHTTPSDport),
 			ipv4DstLookup(ipSet),
 			verdict,
 		),
@@ -444,11 +492,16 @@ func (fw *Firewall) ReplaceUserRules(allowedCIDRs, deniedCIDRs []string) error {
 		return fmt.Errorf("populate predefined deny set: %w", err)
 	}
 
-	// 2. Predefined allow set → gateway/orchestrator IP.
+	// 2. Predefined allow set → gateway/orchestrator IP, plus the secrets-proxy
+	//    destination so customer deny rules can't cut off secret injection.
 	fw.conn.FlushSet(fw.predefinedAllowSet)
-	allowElems, err := cidrsToElements([]string{fw.gatewayIP + "/32"})
+	predefinedAllowCIDRs := []string{fw.gatewayIP + "/32"}
+	if fw.secretsProxyIP != "" {
+		predefinedAllowCIDRs = append(predefinedAllowCIDRs, fw.secretsProxyIP+"/32")
+	}
+	allowElems, err := cidrsToElements(predefinedAllowCIDRs)
 	if err != nil {
-		return fmt.Errorf("parse gateway CIDR: %w", err)
+		return fmt.Errorf("parse predefined allow CIDRs: %w", err)
 	}
 	if err := fw.conn.SetAddElements(fw.predefinedAllowSet, allowElems); err != nil {
 		return fmt.Errorf("populate predefined allow set: %w", err)
@@ -644,6 +697,16 @@ func tcpDportMatch(port uint16) []expr.Any {
 	return []expr.Any{
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 		&expr.Cmp{Register: 1, Op: expr.CmpOpEq, Data: binaryutil.BigEndian.PutUint16(port)},
+	}
+}
+
+// tcpDportNeq matches when the TCP destination port is not `port`. Chain two
+// of these for an "and" over distinct ports. Caller must assert proto TCP
+// first (reads the transport header unconditionally otherwise).
+func tcpDportNeq(port uint16) []expr.Any {
+	return []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+		&expr.Cmp{Register: 1, Op: expr.CmpOpNeq, Data: binaryutil.BigEndian.PutUint16(port)},
 	}
 }
 

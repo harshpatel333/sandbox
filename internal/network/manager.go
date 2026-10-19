@@ -277,6 +277,16 @@ func WithSecretsProxyAddr(host string, port uint16) ManagerOption {
 	}
 }
 
+// secretsProxyAllowIP returns the secrets-proxy destination when it's a literal
+// IP the firewall can always-allow, else "". The firewall allows by address, so
+// a hostname (or unset) yields nothing to add.
+func (m *Manager) secretsProxyAllowIP() string {
+	if net.ParseIP(m.secretsProxyDst) == nil {
+		return ""
+	}
+	return m.secretsProxyDst
+}
+
 // WithBlockedEgressPorts sets destination ports dropped in the host FORWARD
 // chain for all sandbox traffic (TCP and UDP). Ports come from the operator
 // blocklist config.
@@ -561,11 +571,12 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	if err := nsExecGo(nsName, func() error {
 		var fwErr error
 		fw, fwErr = NewFirewall(FirewallConfig{
-			TAPInterface: TAPName,
-			VethPeer:     vpeerName,
-			VMIP:         VMInternalIP,
-			HostIP:       hostIP,
-			GatewayIP:    VMGatewayIP,
+			TAPInterface:   TAPName,
+			VethPeer:       vpeerName,
+			VMIP:           VMInternalIP,
+			HostIP:         hostIP,
+			GatewayIP:      VMGatewayIP,
+			SecretsProxyIP: m.secretsProxyAllowIP(),
 		})
 		return fwErr
 	}); err != nil {
@@ -826,11 +837,12 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	// Rebind in-namespace nftables handle. Non-fatal on failure: kernel
 	// rules already enforce traffic; only future updates would be lost.
 	fwCfg := FirewallConfig{
-		TAPInterface: TAPName,
-		VethPeer:     "eth0",
-		VMIP:         VMInternalIP,
-		HostIP:       hostIP,
-		GatewayIP:    VMGatewayIP,
+		TAPInterface:   TAPName,
+		VethPeer:       "eth0",
+		VMIP:           VMInternalIP,
+		HostIP:         hostIP,
+		GatewayIP:      VMGatewayIP,
+		SecretsProxyIP: m.secretsProxyAllowIP(),
 	}
 	var fw *Firewall
 	if err := nsExecGo(namespace, func() error {
@@ -1527,11 +1539,12 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	}
 
 	fwCfg := FirewallConfig{
-		TAPInterface: TAPName,
-		VethPeer:     "eth0",
-		VMIP:         VMInternalIP,
-		HostIP:       hostIP,
-		GatewayIP:    VMGatewayIP,
+		TAPInterface:   TAPName,
+		VethPeer:       "eth0",
+		VMIP:           VMInternalIP,
+		HostIP:         hostIP,
+		GatewayIP:      VMGatewayIP,
+		SecretsProxyIP: m.secretsProxyAllowIP(),
 	}
 	// The in-namespace work (netlink, nftables) cannot observe ctx once it is
 	// on the pinned thread, and a wedged netlink socket would otherwise hang

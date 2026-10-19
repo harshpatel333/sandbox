@@ -1,8 +1,12 @@
 package network
 
 import (
+	"bytes"
 	"net/netip"
 	"testing"
+
+	"github.com/google/nftables/binaryutil"
+	"github.com/google/nftables/expr"
 )
 
 func TestCoalescePrefixes(t *testing.T) {
@@ -125,5 +129,27 @@ func TestCidrsToElementsUnmapsIPv4Mapped(t *testing.T) {
 	plainPrefix, _ := cidrsToElements([]string{"203.0.113.0/24"})
 	if len(mappedPrefix) != 2 || string(mappedPrefix[1].Key) != string(plainPrefix[1].Key) {
 		t.Errorf("mapped prefix not applied as its IPv4 equivalent: %v vs %v", mappedPrefix, plainPrefix)
+	}
+}
+
+// tcpDportNeq feeds the 80/443 exclusion that keeps customer egress rules off
+// the proxy-redirected ports. A wrong comparison op or byte order would
+// silently stop excluding them, breaking proxy enforcement.
+func TestTCPDportNeq(t *testing.T) {
+	exprs := tcpDportNeq(443)
+	var cmp *expr.Cmp
+	for _, e := range exprs {
+		if c, ok := e.(*expr.Cmp); ok {
+			cmp = c
+		}
+	}
+	if cmp == nil {
+		t.Fatal("no Cmp expr produced")
+	}
+	if cmp.Op != expr.CmpOpNeq {
+		t.Errorf("op = %v, want Neq", cmp.Op)
+	}
+	if want := binaryutil.BigEndian.PutUint16(443); !bytes.Equal(cmp.Data, want) {
+		t.Errorf("data = %v, want %v (big-endian 443)", cmp.Data, want)
 	}
 }
