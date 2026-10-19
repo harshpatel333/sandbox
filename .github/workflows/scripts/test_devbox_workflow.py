@@ -254,9 +254,9 @@ class PrepareTests(WorkflowCase):
         with self.assertRaises(contract.ContractError):
             self.run_with(FakeCloud(), workflow.prepare_deploy, self.env(INPUT_NAME="my-box", INPUT_COMPONENTS="db"))
         cloud = FakeCloud()
-        cloud.repo_scripts.remove("install-api.sh")
-        with self.assertRaisesRegex(workflow.StepError, "install-api.sh"):
-            self.run_with(cloud, workflow.prepare_deploy, self.env(INPUT_NAME="my-box", INPUT_COMPONENTS="api"))
+        cloud.repo_scripts.remove("install-ui.sh")
+        with self.assertRaisesRegex(workflow.StepError, "install-ui.sh"):
+            self.run_with(cloud, workflow.prepare_deploy, self.env(INPUT_NAME="my-box", INPUT_COMPONENTS="all"))
 
 
 class CreateTests(WorkflowCase):

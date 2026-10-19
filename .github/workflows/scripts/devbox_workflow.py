@@ -193,9 +193,7 @@ def prepare_deploy(env):
         else:
             outputs[f"{key}_branch"] = outputs[f"{key}_sha"] = ""
     if outputs["sandbox_sha"]:
-        sandbox_scripts = [script for component in components if contract.COMPONENT_REPOSITORIES[component] == "sandbox"
-                           for script in contract.COMPONENT_SCRIPTS[component]]
-        require_scripts_at("sandbox", outputs["sandbox_sha"], sandbox_scripts)
+        require_scripts_at("sandbox", outputs["sandbox_sha"], contract.component_scripts(components))
     write_outputs(env, outputs)
     append_summary(env, f"## Deploy to devbox `{name}`\n\ncomponents: {', '.join(components)}")
 
@@ -704,11 +702,11 @@ def deploy(env, now=contract.utc_now):
     devbox_id = contract.check_labels(instance.get("labels"), name, manifest["devbox_id"])
     if manifest["state"] not in DEPLOYABLE_STATES:
         raise StepError(f"{name} is {manifest['state']}; deploys need one of {', '.join(DEPLOYABLE_STATES)}")
-    if manifest["state"] == "failed" and components != list(contract.COMPONENTS):
-        raise StepError(f"{name} is failed; recover it with components=all so every component is reinstalled "
-                        "before it is marked ready again")
     if not manifest["runtime"]:
         raise StepError(f"{name} never finished its first install; destroy it and create a new box")
+    if manifest["state"] == "failed" and components != list(contract.COMPONENTS):
+        raise StepError(f"{name} is failed; recover it with components=all (passing the branches it should run) "
+                        "so every component is reinstalled before it is marked ready again")
     if contract.parse_iso(manifest["expires_at"]) <= now():
         raise StepError(f"{name} expired at {manifest['expires_at']} and is due for deletion")
 
