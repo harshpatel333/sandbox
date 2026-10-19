@@ -52,13 +52,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Stripe:
-    def __init__(self, key, live, account, apply=False):
+    def __init__(self, key, live, account, apply=False, api_version=API_VERSION, scope="storage-catalog-v1"):
         prefix = "live" if live else "test"
         if not re.fullmatch(r"[sr]k_" + prefix + r"_[A-Za-z0-9]+", key):
             raise ProvisionError("Credential does not match the requested environment")
         if not re.fullmatch(r"acct_[A-Za-z0-9]+", account):
             raise ProvisionError("Expected account must be a Stripe account ID")
         self.key, self.live, self.account, self.apply = key, live, account, apply
+        self.api_version, self.scope = api_version, scope
         self.opener = urllib.request.build_opener(NoRedirect())
 
     def request(self, method, path, params=None):
@@ -68,13 +69,13 @@ class Stripe:
             raise ProvisionError("Writes require --apply and a catalog endpoint")
         params = params or {}
         encoded = urllib.parse.urlencode(params).encode()
-        headers = {"Authorization": "Bearer " + self.key, "Stripe-Version": API_VERSION}
+        headers = {"Authorization": "Bearer " + self.key, "Stripe-Version": self.api_version}
         url = "https://api.stripe.com" + path
         if method == "GET":
             url += "?" + encoded.decode()
         else:
-            fingerprint = json.dumps([self.account, API_VERSION, path, params], sort_keys=True)
-            headers["Idempotency-Key"] = "storage-catalog-v1-" + hashlib.sha256(fingerprint.encode()).hexdigest()
+            fingerprint = json.dumps([self.account, self.api_version, path, params], sort_keys=True)
+            headers["Idempotency-Key"] = self.scope + "-" + hashlib.sha256(fingerprint.encode()).hexdigest()
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         req = urllib.request.Request(url, data=encoded if method == "POST" else None, headers=headers, method=method)
         try:
