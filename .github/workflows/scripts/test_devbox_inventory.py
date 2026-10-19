@@ -412,6 +412,19 @@ class UnlabelledResourceTest(unittest.TestCase):
         self.assertEqual(cloud.calls, [('bucket', 'superserve-devbox-3f9c0a1b2c4d')])
         self.assertEqual(len(cloud.disks_), 2)
 
+    def test_remnants_not_attributable_to_another_identity_still_block(self):
+        _, boot, _ = gce('alice-dev-a7f3c9')
+        for kind, change in (('disk', {'devbox-id': 'BADID'}), ('bucket', {'devbox-id': 'ffffffffffff'})):
+            with self.subTest(kind=kind):
+                cloud = FakeCloud()
+                cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False)
+                cloud.disks_ = cloud.disks_[:1] if kind == 'disk' else []
+                cloud.buckets_ = cloud.buckets_ if kind == 'bucket' else []
+                (cloud.disks_ or cloud.buckets_)[0]['labels'].update(change)
+                with self.assertRaises(SystemExit):
+                    inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+                self.assertEqual(cloud.calls, [])
+
     def test_old_partially_labelled_or_foreign_attached_resources_are_not_adopted(self):
         _, boot, _ = gce('alice-dev-a7f3c9')
         cases = {'older than the devbox': {'creationTimestamp': '2027-01-15T04:59:59+00:00'},

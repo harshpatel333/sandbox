@@ -410,8 +410,14 @@ def find_with_blocked(cloud, project, name, devbox_id):
     boxes, ignored = inventory(collect(cloud), project)
     box = next((b for b in boxes if b.name == name and b.devbox_id == devbox_id), None)
     wanted = expected(name, devbox_id)
-    return box, [(r, reason) for r, reason in ignored if (r.kind, r.name) in wanted
-                 and r.labels.get('devbox-id', devbox_id) == devbox_id]
+    return box, [(r, reason) for r, reason in ignored
+                 if (r.kind, r.name) in wanted and not _owned_elsewhere(r, name, devbox_id)]
+
+
+def _owned_elsewhere(resource, name, devbox_id):
+    other = resource.labels.get('devbox-id')
+    return (other != devbox_id and isinstance(other, str) and contract.DEVBOX_ID_PATTERN.fullmatch(other) is not None
+            and (resource.kind, resource.name) in expected(name, other))
 
 
 def _delete(cloud, resource, instance):
