@@ -31,6 +31,7 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     environment: devbox
+    timeout-minutes: 15
     outputs:
       targets: ${{ steps.plan.outputs.targets }}
       count: ${{ steps.plan.outputs.count }}
@@ -42,26 +43,28 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ vars.DEVBOX_GCP_WORKLOAD_IDENTITY }}
+          service_account: ${{ vars.DEVBOX_GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v2
       - name: Inventory and resolve targets
         id: plan
         env:
           NAME: ${{ inputs.name }}
           CONFIRM: ${{ inputs.confirm }}
-          ACTOR: ${{ github.actor }}
+          ACTOR: ${{ github.triggering_actor }}
         run: >-
           python3 .github/workflows/scripts/devbox_inventory.py plan
           --action "$ACTION" --name "$NAME" --actor "$ACTOR" --confirm "$CONFIRM"
 
   destroy:
     needs: plan
-    if: needs.plan.outputs.count != '0'
+    if: fromJSON(needs.plan.outputs.count || '0') > 0
     runs-on: ubuntu-latest
     environment: devbox
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -70,7 +73,7 @@ jobs:
     concurrency:
       group: devbox-${{ matrix.target.name }}
       cancel-in-progress: false
-    name: destroy ${{ matrix.target.name }} (${{ matrix.target.devbox_id }})
+    name: destroy ${{ matrix.target.name }} (${{ matrix.target.devbox_ids }})
     steps:
       - name: Require main
         env:
@@ -79,16 +82,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
       - uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ vars.DEVBOX_GCP_WORKLOAD_IDENTITY }}
+          service_account: ${{ vars.DEVBOX_GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v2
       - name: Re-validate identity and destroy
         env:
           NAME: ${{ matrix.target.name }}
-          DEVBOX_ID: ${{ matrix.target.devbox_id }}
+          DEVBOX_IDS: ${{ matrix.target.devbox_ids }}
           EXPIRED_ONLY: ${{ env.ACTION == 'auto-delete' && '--require-expired' || '' }}
         run: >-
           python3 .github/workflows/scripts/devbox_inventory.py destroy
-          --name "$NAME" --devbox-id "$DEVBOX_ID" $EXPIRED_ONLY
+          --name "$NAME" --devbox-ids "$DEVBOX_IDS" $EXPIRED_ONLY

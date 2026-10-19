@@ -111,14 +111,15 @@ class Gcloud:
                                  f'--metadata-from-file={key}={handle.name}')
 
     def delete_instance(self, name, zone):
-        return self._failure('compute', 'instances', 'delete', name, f'--zone={zone}', '--quiet')
+        return self._failure('compute', 'instances', 'delete', name, f'--zone={zone}', '--keep-disks=all', '--quiet')
 
     def delete_disk(self, name, zone):
         return self._failure('compute', 'disks', 'delete', name, f'--zone={zone}', '--quiet')
 
     def delete_bucket(self, name):
-        self._run('storage', 'rm', '--recursive', '--all-versions', f'gs://{name}/**', check=False)
-        return self._failure('storage', 'buckets', 'delete', f'gs://{name}', '--quiet')
+        emptied = self._run('storage', 'rm', '--recursive', '--all-versions', f'gs://{name}/**', check=False)
+        failure = self._failure('storage', 'buckets', 'delete', f'gs://{name}', '--quiet')
+        return failure and '\n'.join(filter(None, [emptied.stderr.strip() if emptied.returncode else '', failure]))
 
     def _failure(self, *args):
         result = self._run(*args, check=False)
@@ -133,10 +134,9 @@ def _manifest(instance):
     for item in (instance.get('metadata') or {}).get('items') or []:
         if item.get('key') == contract.MANIFEST_METADATA_KEY:
             try:
-                value = json.loads(item.get('value') or '')
-            except json.JSONDecodeError:
+                return contract.validate_manifest(json.loads(item.get('value') or ''))
+            except (json.JSONDecodeError, contract.ContractError):
                 return None
-            return value if isinstance(value, dict) else None
     return None
 
 
@@ -166,6 +166,8 @@ def ineligibility(resource, project):
         match = PROJECT_IN_LINK.search(resource.link)
         if not match or match.group(1) != project:
             return f'not in project {project}'
+        if resource.zone != contract.ZONE:
+            return f'not in zone {contract.ZONE}'
     return None
 
 
@@ -215,22 +217,28 @@ def _age(box, now):
     return f'{hours // 24}d {hours % 24}h' if hours >= 24 else f'{hours}h'
 
 
-def _revision(box, component):
-    revision = ((box.manifest or {}).get('revisions') or {}).get(component) or {}
-    return f'{revision.get("branch", "?")} @ {revision.get("sha", "?")[:12]}' if revision else '?'
+def _revisions(box):
+    manifest = box.manifest or {}
+    running = manifest.get('components') or manifest.get('revisions') or {}
+    groups = {}
+    for component, revision in running.items():
+        if isinstance(revision, dict):
+            key = f'{revision.get("branch") or "?"} @ {str(revision.get("sha") or "?")[:12]}'
+            groups.setdefault(key, []).append(str(component))
+    return '; '.join(f'{key} ({", ".join(parts)})' for key, parts in groups.items()) or '?'
 
 
 def render(boxes, ignored, now):
     if not boxes:
         lines = ['No workflow-managed devboxes found.']
     else:
-        lines = ['| Name | Owner | Zone | State | Age | Expires at | Sandbox | UI | devbox-id |',
-                 '| -- | -- | -- | -- | -- | -- | -- | -- | -- |']
+        lines = ['| Name | Owner | Zone | State | Age | Expires at | Revisions | devbox-id |',
+                 '| -- | -- | -- | -- | -- | -- | -- | -- |']
         for box in boxes:
             state = box.state + (f' (partial: missing {", ".join(box.missing)})' if box.missing else '')
-            expires = _utc(box.expires_at) if box.expires_at is not None else 'unset'
+            expires = _utc(box.expires_at) if box.expires_at is not None else 'unset (never auto-deleted)'
             lines.append(f'| `{box.name}` | {box.owner or "?"} | {box.zone or "-"} | {state} | {_age(box, now)} '
-                         f'| {expires} | {_revision(box, "sandbox")} | {_revision(box, "ui")} | `{box.devbox_id}` |')
+                         f'| {expires} | {_revisions(box)} | `{box.devbox_id}` |')
         reachable = [b for b in boxes if b.instance]
         if reachable:
             lines += ['', 'Access (IAP tunnel):', '']
@@ -276,6 +284,13 @@ def plan(cloud, project, action, *, name='', actor='', confirm='', now=0):
     return targets, '\n'.join(report)
 
 
+def by_name(targets):
+    names = {}
+    for target in targets:
+        names.setdefault(target['name'], []).append(target['devbox_id'])
+    return [{'name': name, 'devbox_ids': ','.join(ids)} for name, ids in sorted(names.items())]
+
+
 def find(cloud, project, name, devbox_id):
     boxes, _ = inventory(collect(cloud), project)
     return next((b for b in boxes if b.name == name and b.devbox_id == devbox_id), None)
@@ -307,9 +322,18 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
         failures.append(cloud.delete_disk(disk.name, disk.zone))
     for bucket in box.of('bucket'):
         failures.append(cloud.delete_bucket(bucket.name))
-    remaining = find(cloud, project, name, devbox_id)
-    if remaining:
-        details = [f'- {r.kind} {r.name}' for r in remaining.resources] + [f'- {f}' for f in failures if f]
+    known = {(r['type'], r['name']) for r in contract.resources(name, devbox_id)}
+    unhandled = [f'{r.get("type")} {r.get("name")}' for r in (box.manifest or {}).get('resources', [])
+                 if (r.get('type'), r.get('name')) not in known]
+    try:
+        remaining = find(cloud, project, name, devbox_id)
+    except RuntimeError as error:
+        raise SystemExit(f'Could not verify destroy of {name} ({devbox_id}): {error}\n'
+                         + '\n'.join(f'- {f}' for f in failures if f)) from None
+    if remaining or unhandled:
+        details = ([f'- {r.kind} {r.name}' for r in remaining.resources] if remaining else []) + \
+            [f'- recorded in the manifest but not handled by destroy: {u}' for u in unhandled] + \
+            [f'- {f}' for f in failures if f]
         raise SystemExit(f'Destroy of {name} ({devbox_id}) incomplete; rerun to retry. Remaining:\n' + '\n'.join(details))
     return f'Destroyed `{name}` ({devbox_id}): ' + ', '.join(f'{r.kind} {r.name}' for r in box.resources)
 
@@ -334,7 +358,7 @@ def main(argv=None):
     planning.add_argument('--confirm', default='')
     destroying = commands.add_parser('destroy')
     destroying.add_argument('--name', required=True)
-    destroying.add_argument('--devbox-id', required=True)
+    destroying.add_argument('--devbox-ids', required=True, help='comma-separated devbox-ids for this name')
     destroying.add_argument('--require-expired', action='store_true')
     args = parser.parse_args(argv)
     cloud, now = Gcloud(contract.PROJECT), int(time.time())
@@ -342,15 +366,27 @@ def main(argv=None):
         if args.command == 'plan':
             targets, report = plan(cloud, contract.PROJECT, args.action, name=args.name, actor=args.actor,
                                    confirm=args.confirm, now=now)
-            _publish(report, {'targets': json.dumps(targets), 'count': len(targets)})
-        else:
-            _publish(destroy(cloud, contract.PROJECT, args.name, args.devbox_id,
-                             require_expired_at=now if args.require_expired else None))
+            matrix = by_name(targets)
+            _publish(report, {'targets': json.dumps(matrix), 'count': len(matrix)})
+            return
+        incomplete = []
+        for devbox_id in args.devbox_ids.split(','):
+            try:
+                _publish(destroy(cloud, contract.PROJECT, args.name, devbox_id,
+                                 require_expired_at=now if args.require_expired else None))
+            except SystemExit as stop:
+                _publish(str(stop.code))
+                incomplete.append(devbox_id)
+        if incomplete:
+            raise SystemExit(f'Destroy incomplete for {args.name}: {", ".join(incomplete)}')
     except SystemExit as stop:
         if isinstance(stop.code, str):
             _publish(stop.code)
             raise SystemExit(1) from None
         raise
+    except (RuntimeError, subprocess.TimeoutExpired, contract.ContractError) as error:
+        _publish(f'Failed: {error}. Rerun to retry.')
+        raise SystemExit(1) from None
 
 
 if __name__ == '__main__':
