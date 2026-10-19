@@ -1,0 +1,303 @@
+"""Exercise the devbox create workflow against a mocked gcloud."""
+
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).parent))
+import devbox_contract as contract
+import devbox_workflow as workflow
+
+
+SANDBOX_SHA = "1" * 40
+UI_SHA = "2" * 40
+NEW_SHA = "3" * 40
+PROFILE = {
+    "schema_version": 1, "project": "rayai-dev", "zone": "us-central1-a", "region": "us-central1",
+    "resource_name_prefix": "devbox-", "labels": {"managed-by": "superserve-devbox"},
+    "instance": {"machine_type": "n2-standard-8", "enable_nested_virtualization": True,
+                 "image_project": "ubuntu-os-cloud", "image_family": "ubuntu-2404-lts-amd64",
+                 "network": "superserve-devbox", "subnetwork": "superserve-devbox-usc1", "external_ip": False,
+                 "network_tags": ["superserve-devbox"],
+                 "service_account": "devbox-vm@example-project.iam.gserviceaccount.com",
+                 "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+                 "metadata": {"enable-oslogin": "TRUE", "block-project-ssh-keys": "TRUE"}},
+    "boot_disk": {"type": "pd-balanced", "size_gb": 50, "auto_delete": False},
+    "data_disk": {"name_suffix": "-data", "type": "pd-balanced", "size_gb": 150, "device_name": "devbox-data",
+                  "filesystem": "xfs", "mount_path": "/mnt/sandbox-data", "auto_delete": False},
+    "bucket": {"name_prefix": "superserve-devbox-", "location": "us-central1", "storage_class": "STANDARD",
+               "uniform_bucket_level_access": True, "public_access_prevention": "enforced",
+               "soft_delete_retention_seconds": 0},
+}
+SECRETS = {"DEVBOX_SECRET_STRIPE_SECRET_KEY": "sk_test_example", "DEVBOX_SECRET_RECAPTCHA_API_KEY": "recaptcha-secret",
+           "DEVBOX_CONFIG_STRIPE_PUBLISHABLE_KEY": "pk_test_example", "DEVBOX_CONFIG_RECAPTCHA_SITE_KEY": "site-key"}
+
+
+class FakeCloud:
+    """Stands in for gcloud, git ls-remote and the box behind IAP SSH."""
+
+    def __init__(self, *, existing=(), branches=None, fail_script=None, instances=None, relabel_after=None):
+        self.commands, self.inputs = [], {}
+        self.existing = list(existing)
+        self.branches = branches if branches is not None else {"main": SANDBOX_SHA, "feature": NEW_SHA}
+        self.fail_script = fail_script
+        self.instances = instances or {}
+        self.metadata_writes, self.box_files, self.scripts, self.checkouts = [], {}, [], []
+        self.relabel_after = relabel_after
+
+    def __call__(self, args, input=None, **kwargs):
+        self.commands.append(args)
+        ok = lambda stdout="": subprocess.CompletedProcess(args, 0, stdout, "")
+        fail = lambda code=1, stderr="failed": subprocess.CompletedProcess(args, code, "", stderr)
+        if args[:2] == ["git", "check-ref-format"]:
+            return ok() if re.fullmatch(r"[A-Za-z0-9/_.-]+", args[-1]) and ".." not in args[-1] else fail()
+        if args[:2] == ["git", "ls-remote"]:
+            branch = args[-1].removeprefix("refs/heads/")
+            return ok(f"{self.branches[branch]}\t{args[-1]}\n") if branch in self.branches else fail(2, "")
+        assert args[0] == "gcloud", args
+        verb = args[1:4]
+        if verb == ["compute", "instances", "list"]:
+            if "--format=json" in args:
+                return ok(json.dumps(list(self.instances.values())))
+            return ok("".join(f"{name}\tus-central1-a\n" for name in self.existing))
+        if verb == ["compute", "disks", "list"]:
+            return ok()
+        if verb == ["compute", "instances", "create"]:
+            labels = dict(pair.split("=") for pair in arg(args, "--labels").split(","))
+            manifest = Path(arg(args, "--metadata-from-file").split("=", 1)[1]).read_text()
+            self.instances[args[4]] = {"name": args[4], "zone": "projects/p/zones/us-central1-a", "labels": labels,
+                                       "metadata": {"items": [{"key": "devbox-manifest", "value": manifest}]}}
+            return ok()
+        if verb == ["compute", "instances", "describe"]:
+            instance = self.instances[args[4]]
+            if self.relabel_after is not None and len(self.metadata_writes) >= self.relabel_after:
+                instance = {**instance, "labels": {**instance["labels"], "devbox-id": "ffffffffffff"}}
+            return ok(json.dumps(instance))
+        if verb == ["compute", "instances", "add-metadata"]:
+            value = Path(arg(args, "--metadata-from-file").split("=", 1)[1]).read_text()
+            self.metadata_writes.append(json.loads(value))
+            self.instances[args[4]]["metadata"] = {"items": [{"key": "devbox-manifest", "value": value}]}
+            return ok()
+        if verb == ["compute", "ssh", args[3]]:
+            return self.ssh(args, args[args.index("--command") + 1], input, ok, fail)
+        return ok()
+
+    def ssh(self, args, command, input, ok, fail):
+        self.inputs[command] = input
+        if command == "true":
+            return ok()
+        target = re.search(r"mv -f \S+ (/\S+?)'?$", unquote(command))
+        if target and input is not None and "cat >" in unquote(command):
+            self.box_files[target.group(1)] = input
+            return ok()
+        if "git -C" in unquote(command):
+            self.checkouts.append(re.search(r"checkout -q --force --detach ([0-9a-f]{40})", unquote(command)).group(1))
+            return ok()
+        script = re.search(r"deploy/devbox/([a-z-]+\.sh)'? 2>&1", unquote(command))
+        if script:
+            self.scripts.append(script.group(1))
+            return fail() if script.group(1) == self.fail_script else ok()
+        if command.startswith("sudo cat"):
+            path = shlex.split(command)[2]
+            if path.endswith("runtime.json"):
+                return ok(json.dumps({"firecracker": "1.10.1"}))
+            if path.endswith("services.json"):
+                return ok(json.dumps({"api": {"ready": True}}))
+            return ok(self.box_files.get(path, ""))
+        return ok()
+
+    def gcloud(self, *verb):
+        return [c for c in self.commands if c[0] == "gcloud" and c[1:1 + len(verb)] == list(verb)]
+
+
+def arg(args, flag):
+    return next(a.split("=", 1)[1] for a in args if a.startswith(flag + "="))
+
+
+def unquote(command):
+    return command.replace("'\"'\"'", "'")
+
+
+class WorkflowCase(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name)
+        self.output, self.summary, self.profile = root / "output", root / "summary", root / "profile.json"
+        self.output.write_text("")
+        self.summary.write_text("")
+        self.profile.write_text(json.dumps(PROFILE))
+        patcher = patch.object(workflow.time, "sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def env(self, **values):
+        return {"GITHUB_REF": "refs/heads/main", "GITHUB_ACTOR": "AWille-AI", "GITHUB_OUTPUT": str(self.output),
+                "GITHUB_STEP_SUMMARY": str(self.summary), **SECRETS, **values}
+
+    def outputs(self):
+        return dict(line.split("=", 1) for line in self.output.read_text().splitlines())
+
+    def run_with(self, cloud, function, *args, **kwargs):
+        with patch.object(workflow.subprocess, "run", side_effect=cloud), \
+             patch("sys.stdout", new=open(os.devnull, "w")), patch("sys.stderr", new=open(os.devnull, "w")):
+            return function(*args, **kwargs)
+
+
+class PrepareTests(WorkflowCase):
+    def test_prepare_create_generates_name_and_resolves_shas(self):
+        cloud = FakeCloud(branches={"main": SANDBOX_SHA, "feature": NEW_SHA})
+        self.run_with(cloud, workflow.prepare_create, self.env(INPUT_NAME="", INPUT_SANDBOX_BRANCH="feature",
+                                                            INPUT_UI_BRANCH="", INPUT_LIFETIME_HOURS="48"))
+        outputs = self.outputs()
+        self.assertRegex(outputs["name"], r"^awille-ai-dev-[0-9a-f]{6}$")
+        self.assertEqual(outputs["owner"], "awille-ai")
+        self.assertEqual(outputs["lifetime_hours"], "48")
+        self.assertEqual((outputs["sandbox_branch"], outputs["sandbox_sha"]), ("feature", NEW_SHA))
+        self.assertEqual((outputs["ui_branch"], outputs["ui_sha"]), ("main", SANDBOX_SHA))
+        self.assertEqual([c[:2] for c in cloud.commands if c[0] != "git"], [])
+
+    def test_prepare_create_rejects_bad_inputs(self):
+        for values in ({"INPUT_SANDBOX_BRANCH": "missing"}, {"INPUT_UI_BRANCH": "a..b"},
+                       {"INPUT_LIFETIME_HOURS": "169"}, {"INPUT_NAME": "Bad_Name"},
+                       {"GITHUB_REF": "refs/heads/feature"}):
+            with self.subTest(values=values), self.assertRaises((workflow.StepError, contract.ContractError)):
+                self.run_with(FakeCloud(), workflow.prepare_create, self.env(**values))
+
+class CreateTests(WorkflowCase):
+    def create_env(self, **values):
+        return self.env(NAME="my-box", OWNER="awille-ai", LIFETIME_HOURS="24", SANDBOX_BRANCH="main",
+                        SANDBOX_SHA=SANDBOX_SHA, UI_BRANCH="main", UI_SHA=UI_SHA, **values)
+
+    def create(self, cloud, **values):
+        return self.run_with(cloud, workflow.create, self.create_env(**values), profile_path=self.profile)
+
+    def test_create_provisions_installs_and_records_ready(self):
+        cloud = FakeCloud()
+        self.assertEqual(self.create(cloud), 0)
+
+        creates = [c[1:4] for c in cloud.commands if c[0] == "gcloud" and ("create" in c[1:4])]
+        self.assertEqual(creates, [["compute", "disks", "create"], ["compute", "instances", "create"],
+                                   ["storage", "buckets", "create"]])
+        instance = cloud.gcloud("compute", "instances", "create")[0]
+        self.assertEqual(instance[4], "devbox-my-box")
+        self.assertEqual(cloud.gcloud("compute", "disks", "create")[0][4], "devbox-my-box-data")
+        self.assertEqual(cloud.gcloud("compute", "disks", "add-labels")[0][4], "devbox-my-box")
+        for flag in ("--no-address", "--no-boot-disk-auto-delete", "--enable-nested-virtualization",
+                     "--disk=name=devbox-my-box-data,device-name=devbox-data,mode=rw,auto-delete=no",
+                     "--subnet=superserve-devbox-usc1", "--tags=superserve-devbox",
+                     "--metadata=block-project-ssh-keys=TRUE,enable-oslogin=TRUE"):
+            self.assertIn(flag, instance)
+        labelled = [arg(c, "--labels") for c in cloud.commands if any(a.startswith("--labels=") for a in c)]
+        labelled += [arg(c, "--update-labels") for c in cloud.gcloud("storage", "buckets", "update")]
+        self.assertEqual(len(labelled), 4)
+        for labels in labelled:
+            values = dict(pair.split("=") for pair in labels.split(","))
+            self.assertEqual(set(values), set(contract.LABEL_KEYS))
+            self.assertEqual(values["managed-by"], "superserve-devbox")
+        devbox_id = dict(pair.split("=") for pair in labelled[0].split(","))["devbox-id"]
+        self.assertIn(f"gs://superserve-devbox-{devbox_id}", cloud.gcloud("storage", "buckets", "create")[0])
+        self.assertIn("--soft-delete-duration=0", cloud.gcloud("storage", "buckets", "create")[0])
+
+        self.assertEqual(cloud.checkouts, [SANDBOX_SHA, UI_SHA])
+        self.assertEqual(cloud.scripts, list(contract.CREATE_SCRIPTS))
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["state"], "ready")
+        self.assertEqual(final["runtime"], {"firecracker": "1.10.1"})
+        self.assertEqual(final["services"], {"api": {"ready": True}})
+        self.assertEqual(final["revisions"], {"sandbox": {"branch": "main", "sha": SANDBOX_SHA},
+                                              "ui": {"branch": "main", "sha": UI_SHA}})
+        self.assertEqual(json.loads(cloud.box_files["/etc/superserve-devbox/manifest.json"]), final)
+        summary = self.summary.read_text()
+        self.assertIn("is ready", summary)
+        self.assertIn(contract.forwarding_command("my-box"), summary)
+        self.assertIn(workflow.destroy_command("my-box"), summary)
+
+    def test_secrets_travel_over_stdin_only(self):
+        cloud = FakeCloud()
+        self.assertEqual(self.create(cloud), 0)
+        secrets_file = cloud.box_files["/etc/superserve-devbox/secrets.env"]
+        self.assertEqual(secrets_file, "RECAPTCHA_API_KEY=recaptcha-secret\nSTRIPE_SECRET_KEY=sk_test_example\n")
+        self.assertIn("STRIPE_PUBLISHABLE_KEY=pk_test_example\n", cloud.box_files["/etc/superserve-devbox/devbox.env"])
+        self.assertIn(f"DEVBOX_SANDBOX_SHA={SANDBOX_SHA}\n", cloud.box_files["/etc/superserve-devbox/devbox.env"])
+        command = next(c for c in cloud.inputs if "secrets.env" in c)
+        self.assertIn("chmod 0600", command)
+        for args in cloud.commands:
+            self.assertFalse(any("sk_test_example" in a or "recaptcha-secret" in a for a in args), args)
+
+    def test_runner_never_executes_branch_code(self):
+        cloud = FakeCloud()
+        self.assertEqual(self.create(cloud), 0)
+        for args in cloud.commands:
+            self.assertEqual(args[0], "gcloud", args)
+        for args in cloud.gcloud("compute", "ssh"):
+            self.assertIn("--tunnel-through-iap", args)
+
+    def test_unset_secret_fails_before_provisioning(self):
+        cloud = FakeCloud()
+        with self.assertRaises(workflow.StepError):
+            self.create(cloud, DEVBOX_SECRET_STRIPE_SECRET_KEY="")
+        self.assertEqual(cloud.commands, [])
+
+    def test_name_collision_is_refused_before_creating_anything(self):
+        cloud = FakeCloud(existing=["my-box"])
+        self.assertEqual(self.create(cloud), 1)
+        self.assertFalse([c for c in cloud.commands if "create" in c])
+        self.assertIn("already in use", self.summary.read_text())
+
+    def test_failed_install_marks_failed_and_reports_resources(self):
+        cloud = FakeCloud(fail_script="install-api.sh")
+        self.assertEqual(self.create(cloud), 1)
+        self.assertEqual(cloud.scripts, ["host-bootstrap.sh", "services-up.sh", "install-api.sh"])
+        self.assertEqual(cloud.metadata_writes[-1]["state"], "failed")
+        summary = self.summary.read_text()
+        self.assertNotIn("is ready", summary)
+        for resource in ("disk `devbox-my-box-data`", "instance `devbox-my-box`", "disk `devbox-my-box`",
+                         "bucket `superserve-devbox-"):
+            self.assertIn(resource, summary)
+        self.assertIn(workflow.destroy_command("my-box"), summary)
+
+    def test_replaced_box_is_never_written(self):
+        cloud = FakeCloud(relabel_after=0)
+        self.assertEqual(self.create(cloud), 1)
+        self.assertEqual(cloud.scripts, [])
+        self.assertEqual(cloud.metadata_writes, [])
+        self.assertIn("devbox-id changed", self.summary.read_text())
+
+    def test_profile_must_agree_with_the_contract(self):
+        for profile in ({**PROFILE, "labels": {**PROFILE["labels"], "sandbox_role": "vmd"}},
+                        {**PROFILE, "resource_name_prefix": "box-"},
+                        {**PROFILE, "project": "other-project"},
+                        {**PROFILE, "instance": {**PROFILE["instance"], "external_ip": True}},
+                        {**PROFILE, "data_disk": {**PROFILE["data_disk"], "auto_delete": True}},
+                        {key: value for key, value in PROFILE.items() if key != "bucket"}):
+            self.profile.write_text(json.dumps(profile))
+            cloud = FakeCloud()
+            with self.subTest(profile=profile), self.assertRaises(workflow.StepError):
+                self.create(cloud)
+            self.assertEqual(cloud.commands, [])
+
+
+class WorkflowFileTests(unittest.TestCase):
+    def test_mutating_jobs_share_the_box_concurrency_group(self):
+        for name, job in (("devbox-create.yml", "create"),):
+            text = (Path(__file__).parent.parent / name).read_text()
+            body = text.split(f"\n  {job}:\n", 1)[1]
+            with self.subTest(workflow=name):
+                self.assertIn("    if: github.ref == 'refs/heads/main'\n", body)
+                self.assertIn("    environment: devbox\n", body)
+                self.assertIn("      group: devbox-${{ needs.prepare.outputs.name }}\n"
+                              "      cancel-in-progress: false\n", body)
+                self.assertNotIn("secrets.", text.split(f"\n  {job}:\n", 1)[0])
+                self.assertIn(f"devbox_workflow.py {job}\n", body)
+
+
+if __name__ == "__main__":
+    unittest.main()
