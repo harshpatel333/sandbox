@@ -226,10 +226,18 @@ def prefixed(env, prefix, kind):
 class Box:
     """One devbox, reached over IAP SSH with the runner's credentials."""
 
-    def __init__(self, name, zone=contract.ZONE, project=contract.PROJECT):
+    def __init__(self, name, zone=contract.ZONE, project=contract.PROJECT, devbox_id=None):
         self.name, self.zone, self.project = name, zone, project
         self.instance = contract.instance_name(name)
         self.where = [f"--zone={zone}", f"--project={project}"]
+        # Once known, every step that changes the box first re-reads its labels:
+        # steps can take many minutes, and a box replaced meanwhile must never be
+        # touched under the old identity.
+        self.devbox_id = devbox_id
+
+    def guard(self):
+        if self.devbox_id is not None:
+            self.verify(self.devbox_id)
 
     def ssh(self, command, *, input=None, capture=True, timeout=600):
         return run(["gcloud", "compute", "ssh", self.instance, *self.where, "--quiet", "--tunnel-through-iap",
@@ -260,6 +268,7 @@ class Box:
         return instance
 
     def write_file(self, path, content, mode):
+        self.guard()
         directory = os.path.dirname(path)
         script = (f"set -eu; umask 077; install -d -m 0755 {shlex.quote(directory)}; "
                   f"cat > {shlex.quote(path + '.new')}; chmod {mode} {shlex.quote(path + '.new')}; "
@@ -279,6 +288,7 @@ class Box:
         return value
 
     def checkout(self, key, sha):
+        self.guard()
         source = f"{contract.BOX_SOURCE_DIR}/{SOURCE_DIRS[key]}"
         url = f"https://github.com/{GITHUB_REPOSITORIES[key]}.git"
         script = "; ".join([
@@ -305,6 +315,7 @@ class Box:
                             f"this workflow runs: {error}") from None
 
     def run_script(self, script):
+        self.guard()
         path = f"{contract.BOX_SCRIPT_DIR}/{script}"
         log = f"{LOG_DIR}/{script.removesuffix('.sh')}.log"
         command = (f"set -eu -o pipefail; install -d -m 0755 {LOG_DIR}; "
@@ -464,9 +475,11 @@ def create(env, profile_path=PROFILE_PATH):
     manifest = contract.new_manifest(name=name, devbox_id=devbox_id, owner=owner, actor=env["GITHUB_ACTOR"],
                                      created_at=created_at, expires_at=expires_at, revisions=revisions)
     box = Box(name)
+    # A taken name belongs to another box; it must never reach the failure
+    # path, whose summary lists resources by name and offers to destroy them.
+    ensure_unused(name)
     save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False})
     try:
-        ensure_unused(name)
         where = [f"--zone={contract.ZONE}", f"--project={contract.PROJECT}"]
         data = profile["data_disk"]
         run(["gcloud", "compute", "disks", "create", contract.data_disk_name(name), *where,
@@ -485,14 +498,12 @@ def create(env, profile_path=PROFILE_PATH):
         run(["gcloud", "storage", "buckets", "update", bucket, "--update-labels=" + contract.format_labels(labels)])
 
         box.wait_for_ssh()
-        box.verify(devbox_id)
+        box.devbox_id = devbox_id
         for key in ("sandbox", "ui"):
             box.checkout(key, revisions[key]["sha"])
         box.require_scripts(contract.CREATE_SCRIPTS)
-        box.verify(devbox_id)
         deliver_configuration(box, manifest, env)
         for script in contract.CREATE_SCRIPTS:
-            box.verify(devbox_id)
             box.run_script(script)
         manifest = contract.with_state(collect_state(box, manifest), "ready")
         box.record(manifest, devbox_id)
@@ -526,18 +537,29 @@ def save_attempt(env, attempt):
 
 
 def discover(name, devbox_id):
+    # Ownership is this run's devbox-id only: labelled resources, disks attached
+    # to a labelled instance (the boot disk is labelled just after the VM), and
+    # the bucket whose name carries the id. Never match by box name.
     project = f"--project={contract.PROJECT}"
-    instances = run(["gcloud", "compute", "instances", "list", project, f"--filter=labels.devbox-id={devbox_id}",
-                     "--format=value(name,zone.basename())"], timeout=120)
-    disks = run(["gcloud", "compute", "disks", "list", project,
-                 f"--filter=labels.devbox-id={devbox_id} OR name={contract.instance_name(name)}",
-                 "--format=value(name,zone.basename())"], timeout=120)
-    found = []
-    for kind, result in (("instance", instances), ("disk", disks)):
-        for line in result.stdout.splitlines():
-            if line.strip():
-                resource_name, _, zone = line.partition("\t")
-                found.append({"type": kind, "name": resource_name, "zone": zone.strip()})
+    owned = f"--filter=labels.devbox-id={devbox_id}"
+    instances = json.loads(run(["gcloud", "compute", "instances", "list", project, owned, "--format=json"],
+                               timeout=120).stdout or "[]")
+    disks = json.loads(run(["gcloud", "compute", "disks", "list", project, owned, "--format=json"],
+                           timeout=120).stdout or "[]")
+    found, seen = [], set()
+
+    def add(kind, resource_name, zone):
+        if (kind, resource_name) not in seen:
+            seen.add((kind, resource_name))
+            found.append({"type": kind, "name": resource_name, "zone": zone})
+
+    for instance in instances:
+        zone = (instance.get("zone") or "").rsplit("/", 1)[-1]
+        add("instance", instance["name"], zone)
+        for disk in instance.get("disks") or []:
+            add("disk", (disk.get("source") or "").rsplit("/", 1)[-1], zone)
+    for disk in disks:
+        add("disk", disk["name"], (disk.get("zone") or "").rsplit("/", 1)[-1])
     bucket = contract.bucket_name(devbox_id)
     exists = subprocess.run(["gcloud", "storage", "buckets", "describe", "gs://" + bucket, "--format=value(name)"],
                             capture_output=True, text=True, timeout=120)

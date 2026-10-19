@@ -47,7 +47,8 @@ class FakeCloud:
                  decoys=(), fail_after_create=False, expire_on_script=None):
         self.commands, self.inputs = [], {}
         self.decoys, self.fail_after_create, self.expire_on_script = decoys, fail_after_create, expire_on_script
-        self.disks, self.buckets = [], []
+        self.disks, self.buckets, self.unlabelled = [], [], set()
+        self.relabel_after_checkouts = None
         self.repo_scripts = list(contract.CREATE_SCRIPTS)
         self.existing = list(existing)
         self.branches = branches if branches is not None else {"main": SANDBOX_SHA, "feature": NEW_SHA}
@@ -77,12 +78,14 @@ class FakeCloud:
         if verb == ["compute", "instances", "list"]:
             if "--format=json" in args:
                 return ok(json.dumps(list(self.instances.values())))
-            if "labels.devbox-id=" in arg(args, "--filter"):
-                return ok("".join(f"{name}\tus-central1-a\n" for name in self.instances))
             return ok("".join(f"{name}\tus-central1-a\n" for name in self.existing))
         if verb == ["compute", "disks", "list"]:
-            if "labels.devbox-id=" in arg(args, "--filter"):
-                return ok("".join(f"{name}\tus-central1-a\n" for name in self.disks))
+            if "--format=json" in args:
+                return ok(json.dumps([{"name": name, "zone": "projects/p/zones/us-central1-a"}
+                                      for name in self.disks if name not in self.unlabelled]))
+            return ok()
+        if verb == ["compute", "disks", "add-labels"]:
+            self.unlabelled.discard(args[4])
             return ok()
         if verb == ["compute", "disks", "create"]:
             self.disks.append(args[4])
@@ -96,12 +99,16 @@ class FakeCloud:
             labels = dict(pair.split("=") for pair in arg(args, "--labels").split(","))
             manifest = Path(arg(args, "--metadata-from-file").split("=", 1)[1]).read_text()
             self.instances[args[4]] = {"name": args[4], "zone": "projects/p/zones/us-central1-a", "labels": labels,
-                                       "metadata": {"items": [{"key": "devbox-manifest", "value": manifest}]}}
+                                       "metadata": {"items": [{"key": "devbox-manifest", "value": manifest}]},
+                                       "disks": [{"boot": True, "source": f"projects/p/zones/us-central1-a/disks/{args[4]}"},
+                                                 {"source": f"projects/p/zones/us-central1-a/disks/{args[4]}-data"}]}
             self.disks.append(args[4])
+            self.unlabelled.add(args[4])
             return fail(1, "operation timed out") if self.fail_after_create else ok()
         if verb == ["compute", "instances", "describe"]:
             instance = self.instances[args[4]]
-            if self.relabel_after is not None and len(self.metadata_writes) >= self.relabel_after:
+            if (self.relabel_after is not None and len(self.metadata_writes) >= self.relabel_after) or \
+                    (self.relabel_after_checkouts is not None and len(self.checkouts) >= self.relabel_after_checkouts):
                 instance = {**instance, "labels": {**instance["labels"], "devbox-id": "ffffffffffff"}}
             return ok(json.dumps(instance))
         if verb == ["compute", "instances", "add-metadata"]:
@@ -287,11 +294,13 @@ class CreateTests(WorkflowCase):
             self.create(cloud, DEVBOX_SECRET_STRIPE_SECRET_KEY="")
         self.assertEqual(cloud.commands, [])
 
-    def test_name_collision_is_refused_before_creating_anything(self):
+    def test_name_collision_is_refused_without_offering_cleanup(self):
         cloud = FakeCloud(existing=["my-box"])
-        self.assertEqual(self.create(cloud), 1)
+        with self.assertRaisesRegex(workflow.StepError, "already in use"):
+            self.create(cloud)
         self.assertFalse([c for c in cloud.commands if "create" in c])
-        self.assertIn("already in use", self.summary.read_text())
+        self.assertNotIn("devbox-manage.yml", self.summary.read_text())
+        self.assertFalse(cloud.gcloud("compute", "instances", "add-metadata"))
 
     def test_failed_install_marks_failed_and_reports_resources(self):
         cloud = FakeCloud(fail_script="install-api.sh")
@@ -312,7 +321,11 @@ class CreateTests(WorkflowCase):
         summary = self.summary.read_text()
         self.assertIn("instance `devbox-my-box`", summary)
         self.assertIn("disk `devbox-my-box-data`", summary)
+        self.assertIn("disk `devbox-my-box` ", summary)
+        self.assertIn("devbox-my-box", cloud.unlabelled)
         self.assertNotIn("bucket `", summary)
+        self.assertFalse([c for c in cloud.commands if any("name=" in a for a in c) and "list" in c
+                          and any("devbox-id" in a for a in c)])
 
     def test_interrupted_create_is_marked_failed_by_the_backstop(self):
         attempt = Path(self.directory.name) / "attempt.json"
@@ -341,6 +354,15 @@ class CreateTests(WorkflowCase):
         self.assertEqual(cloud.metadata_writes[-1]["state"], "failed")
         self.assertIn("Ran out of time", self.summary.read_text())
         self.assertTrue(json.loads(attempt.read_text())["reported"])
+
+    def test_box_replaced_during_a_checkout_is_not_touched_again(self):
+        cloud = FakeCloud()
+        cloud.relabel_after_checkouts = 1
+        self.assertEqual(self.create(cloud), 1)
+        self.assertEqual(cloud.checkouts, [SANDBOX_SHA])
+        self.assertEqual(cloud.scripts, [])
+        self.assertFalse([path for path in cloud.box_files if path.endswith(".env")])
+        self.assertIn("devbox-id changed", self.summary.read_text())
 
     def test_replaced_box_is_never_written(self):
         cloud = FakeCloud(relabel_after=0)
