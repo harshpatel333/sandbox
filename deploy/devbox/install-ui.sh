@@ -108,6 +108,9 @@ ensure_console_secrets() {
 
 require_file "$DEVBOX_ENV" "written by the create workflow"
 require_file "$CI_SECRETS" "written by the create workflow"
+for file in "$DEVBOX_ENV" "$CI_SECRETS"; do
+  bash -n "$file" 2>/dev/null || die "$file is not valid shell syntax (check the create workflow's quoting)"
+done
 require_file "$LOCAL_SECRETS" "run services-up.sh first"
 require_file "$PROMOTION_KEY" "run services-up.sh first"
 [[ -s "$PROMOTION_KEY" ]] || die "$PROMOTION_KEY is empty (re-run services-up.sh)"
