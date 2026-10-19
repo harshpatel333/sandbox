@@ -11,6 +11,7 @@ terraform_dirs=(
   infra/envs/production/us-central1
   infra/envs/production/us-west2
   infra/envs/production/us-east4
+  deploy/devbox/terraform
 )
 
 if [[ ${#terraform_dirs[@]} -eq 0 ]]; then
