@@ -16,6 +16,7 @@ import devbox_contract as contract
 ACTIONS = ('list', 'destroy-named', 'destroy-mine', 'destroy-all', 'auto-delete')
 PROJECT_IN_LINK = re.compile(r'/projects/([^/]+)/')
 CLOUD_ERRORS = (RuntimeError, subprocess.TimeoutExpired, ValueError)
+ADOPTION_SLACK_SECONDS = 3600
 
 
 @dataclass
@@ -74,10 +75,10 @@ class Box:
 
     @property
     def unhandled(self):
-        known = expected(self.name, self.devbox_id)
+        known = {(r['type'], r['name'], r.get('zone')) for r in contract.resources(self.name, self.devbox_id)}
         recorded = self.instance.recorded if self.instance else []
-        return [f'{r.get("type")} {r.get("name")}' for r in recorded
-                if not isinstance(r, dict) or (r.get('type'), r.get('name')) not in known]
+        return [f'{r.get("type")} {r.get("name")}' if isinstance(r, dict) else repr(r) for r in recorded
+                if not isinstance(r, dict) or (r.get('type'), r.get('name'), r.get('zone')) not in known]
 
     def identity_labels(self):
         anchor = self.primary
@@ -151,6 +152,12 @@ def expected(name, devbox_id):
     return {(r['type'], r['name']) for r in contract.resources(name, devbox_id)}
 
 
+def leftovers(name, devbox_id):
+    instances = {n for kind, n in expected(name, devbox_id) if kind == 'instance'}
+    return {(kind, n) for kind, n in expected(name, devbox_id)
+            if kind == 'bucket' or (kind == 'disk' and n in instances)}
+
+
 def _last(url):
     return (url or '').rsplit('/', 1)[-1]
 
@@ -189,11 +196,12 @@ def _created(stamp):
 
 
 def collect(cloud):
-    resources = [Resource('instance', i.get('name', ''), _last(i.get('zone')), _dict(i.get('labels')),
-                          i.get('creationTimestamp', ''), i.get('selfLink', ''),
-                          manifest=_manifest(_raw_manifest(i)), recorded=_recorded(_raw_manifest(i)),
-                          status=i.get('status', ''))
-                 for i in cloud.instances()]
+    resources = []
+    for i in cloud.instances():
+        raw = _raw_manifest(i)
+        resources.append(Resource('instance', i.get('name', ''), _last(i.get('zone')), _dict(i.get('labels')),
+                                  i.get('creationTimestamp', ''), i.get('selfLink', ''), manifest=_manifest(raw),
+                                  recorded=_recorded(raw), status=i.get('status', '')))
     resources += [Resource('disk', d.get('name', ''), _last(d.get('zone')), _dict(d.get('labels')),
                            d.get('creationTimestamp', ''), d.get('selfLink', ''), users=d.get('users') or [])
                   for d in cloud.disks()]
@@ -235,9 +243,11 @@ def _unadoptable(resource, group):
     foreign = [u for u in resource.users if u not in links]
     if foreign:
         return f'unlabelled and attached to {", ".join(map(_last, foreign))}'
-    expires = next((r.labels['expires-at'] for r in group if r.labels.get('expires-at', '').isdigit()), None)
     created = _created(resource.created)
-    if expires is None or created is None or created < int(expires) - contract.MAX_LIFETIME_HOURS * 3600:
+    born = [t for t in (_created(r.created) for r in group) if t is not None]
+    if created is None or not born:
+        return 'unlabelled and its creation time or its devbox creation time is unknown'
+    if created < min(born) - ADOPTION_SLACK_SECONDS:
         return 'unlabelled and older than the devbox that would claim it'
     return None
 
@@ -245,7 +255,7 @@ def _unadoptable(resource, group):
 def inventory(resources, project):
     """Group labelled resources by identity, then adopt the unlabelled boot disk or bucket that create
     can leave between its create and label calls: only by exact name under exactly one labelled box,
-    only when detached or attached to that box, and only when created within that box's lifetime."""
+    only when detached or attached to that box, and only when not older than that box."""
     groups, ignored = {}, []
     for resource in resources:
         reason = ineligibility(resource, project)
@@ -257,7 +267,7 @@ def inventory(resources, project):
         groups.setdefault(key, []).append(resource)
     claims = {}
     for key in groups:
-        for item in expected(*key):
+        for item in leftovers(*key):
             claims.setdefault(item, []).append(key)
     for resource in resources:
         owners = claims.get((resource.kind, resource.name), [])
@@ -388,8 +398,16 @@ def by_name(targets):
 
 
 def find(cloud, project, name, devbox_id):
-    boxes, _ = inventory(collect(cloud), project)
-    return next((b for b in boxes if b.name == name and b.devbox_id == devbox_id), None)
+    box, _ = find_with_blocked(cloud, project, name, devbox_id)
+    return box
+
+
+def find_with_blocked(cloud, project, name, devbox_id):
+    """Return the box and any resource it expects that was refused, which destroy must not leave behind silently."""
+    boxes, ignored = inventory(collect(cloud), project)
+    box = next((b for b in boxes if b.name == name and b.devbox_id == devbox_id), None)
+    wanted = expected(name, devbox_id)
+    return box, [(r, reason) for r, reason in ignored if (r.kind, r.name) in wanted]
 
 
 def _delete(cloud, resource, instance):
@@ -405,7 +423,7 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
     """Delete exactly the resources of this devbox identity; succeed only when none remain.
 
     Unlabelled resources are labelled first so that any partial failure stays findable by a retry."""
-    box = find(cloud, project, name, devbox_id)
+    box, blocked = find_with_blocked(cloud, project, name, devbox_id)
     if box is None:
         return f'`{name}` ({devbox_id}) is already gone.'
     if require_expired_at is not None and (box.expires_at is None or box.expires_at > require_expired_at):
@@ -413,6 +431,9 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
     if box.unhandled:
         raise SystemExit(f'Refusing to destroy {name} ({devbox_id}): its manifest records resources destroy cannot '
                          f'remove ({", ".join(box.unhandled)}); nothing was deleted.')
+    if blocked:
+        raise SystemExit(f'Refusing to destroy {name} ({devbox_id}): ' + '; '.join(
+            f'{r.kind} {r.name} {reason}' for r, reason in blocked) + '. Nothing was deleted; resolve it and rerun.')
     for resource in [r for r in box.resources if r.adopted]:
         error = cloud.label(resource, box.identity_labels())
         if error:

@@ -374,9 +374,20 @@ class UnlabelledResourceTest(unittest.TestCase):
             inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
         self.assertEqual([c[0] for c in cloud.calls], ['label'])
 
+    def test_unlabelled_disk_named_like_a_data_disk_is_never_adopted(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', disks=False)
+        _, _, data = gce('alice-dev-a7f3c9')
+        cloud.disks_.append({'name': data, 'zone': f'projects/{PROJECT}/zones/{ZONE}', 'labels': {},
+                             'creationTimestamp': CREATED, 'selfLink': link('disks', data), 'users': []})
+        [box], _ = boxes(cloud)
+        self.assertNotIn(('disk', data), [(r.kind, r.name) for r in box.resources])
+        inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertNotIn(('disk', data), cloud.calls)
+
     def test_old_partially_labelled_or_foreign_attached_resources_are_not_adopted(self):
         _, boot, _ = gce('alice-dev-a7f3c9')
-        cases = {'older than the devbox': {'creationTimestamp': '2020-01-01T00:00:00+00:00'},
+        cases = {'older than the devbox': {'creationTimestamp': '2027-01-15T04:59:59+00:00'},
                  'devbox-name': {'labels': {'devbox-name': 'bob-dev-0d1e2f', 'env': 'staging'}},
                  'attached to staging-vmd-1': {'users': [link('instances', 'staging-vmd-1')]}}
         for reason, change in cases.items():
@@ -386,10 +397,15 @@ class UnlabelledResourceTest(unittest.TestCase):
                 cloud.disks_[0].update(change)
                 [box], ignored = boxes(cloud)
                 self.assertNotIn(('disk', boot), [(r.kind, r.name) for r in box.resources])
-                if reason != 'devbox-name':
-                    self.assertIn(reason, ignored[0][1])
-                inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
-                self.assertNotIn(('disk', boot), cloud.calls)
+                if reason == 'devbox-name':
+                    inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+                    self.assertNotIn(('disk', boot), cloud.calls)
+                    continue
+                self.assertIn(reason, ignored[0][1])
+                with self.assertRaises(SystemExit) as stop:
+                    inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+                self.assertIn(reason, stop.exception.code)
+                self.assertEqual(cloud.calls, [])
 
 
 class DestroyNameTest(unittest.TestCase):
