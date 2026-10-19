@@ -176,7 +176,9 @@ type Handlers struct {
 	Signer             *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
 	Stripe             StripeBillingClient
 	TrialWarningSender TrialCreditWarningSender
-	Now                func() time.Time // when set, returns the current UTC time for testable handlers
+	// EmailTransport selects how every API email is delivered.
+	EmailTransport EmailTransport
+	Now            func() time.Time // when set, returns the current UTC time for testable handlers
 
 	trialWarningDiscovery bool
 	trialWarningAfter     uuid.UUID

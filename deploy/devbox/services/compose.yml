@@ -1,0 +1,123 @@
+# Local database, Auth, data API, gateway, mail capture and Stripe event
+# forwarding for one devbox. services-up.sh renders the environment file this
+# reads. Every container uses host networking and binds 127.0.0.1 only, so
+# Docker never creates bridges or rewrites the host firewall that VMD relies
+# on (the daemon runs with iptables disabled).
+name: superserve-devbox
+
+x-service: &service
+  network_mode: host
+  restart: unless-stopped
+  logging:
+    driver: journald
+
+services:
+  # Statement logging stays off: the image's first initialization sets role
+  # passwords with DDL that it would otherwise write to the journal.
+  db:
+    <<: *service
+    image: supabase/postgres:17.11.0.002
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql-devbox/pg_hba.conf -c listen_addresses=127.0.0.1 -c log_statement=none
+    environment:
+      PGPORT: "54322"
+      POSTGRES_PORT: "54322"
+      POSTGRES_HOST: /var/run/postgresql
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+    volumes:
+      - ${DEVBOX_DATA_DIR:?}/postgres:/var/lib/postgresql/data
+      - ./db-roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-devbox-roles.sql:ro
+      - ./pg_hba.conf:/etc/postgresql-devbox/pg_hba.conf:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "54322", "-U", "postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  auth:
+    <<: *service
+    image: supabase/gotrue:v2.197.0
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOTRUE_API_HOST: 127.0.0.1
+      GOTRUE_API_PORT: "54324"
+      API_EXTERNAL_URL: ${AUTH_EXTERNAL_URL:?}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD}@127.0.0.1:54322/postgres
+      GOTRUE_SITE_URL: ${CONSOLE_URL:?}
+      GOTRUE_URI_ALLOW_LIST: ${CONSOLE_URL},${CONSOLE_URL}/**
+      GOTRUE_DISABLE_SIGNUP: "false"
+      # supabase-js sends apikey on every request, including browser preflights.
+      GOTRUE_CORS_ALLOWED_HEADERS: apikey
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: "3600"
+      GOTRUE_JWT_SECRET: ${JWT_SECRET:?}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "false"
+      GOTRUE_SMTP_HOST: 127.0.0.1
+      GOTRUE_SMTP_PORT: "1025"
+      GOTRUE_SMTP_ADMIN_EMAIL: ${EMAIL_FROM_ADDRESS:?}
+      GOTRUE_SMTP_SENDER_NAME: Superserve
+      GOTRUE_MAILER_URLPATHS_INVITE: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_RECOVERY: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: /auth/v1/verify
+
+  rest:
+    <<: *service
+    image: postgrest/postgrest:v16.4
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGRST_SERVER_HOST: 127.0.0.1
+      PGRST_SERVER_PORT: "54325"
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD}@127.0.0.1:54322/postgres
+      PGRST_DB_SCHEMAS: public,graphql_public
+      PGRST_DB_EXTRA_SEARCH_PATH: public,extensions
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_DB_MAX_ROWS: "1000"
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET}
+      PGRST_APP_SETTINGS_JWT_EXP: "3600"
+
+  gateway:
+    <<: *service
+    image: caddy:2.10.2-alpine
+    depends_on: [auth, rest]
+    environment:
+      ANON_KEY: ${ANON_KEY:?}
+      SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY:?}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+
+  mailpit:
+    <<: *service
+    image: axllent/mailpit:v1.31.3
+    environment:
+      MP_UI_BIND_ADDR: 127.0.0.1:8025
+      MP_SMTP_BIND_ADDR: 127.0.0.1:1025
+      MP_DATABASE: /data/mailpit.db
+      MP_MAX_MESSAGES: "5000"
+    volumes:
+      - ${DEVBOX_DATA_DIR}/mailpit:/data
+
+  stripe:
+    <<: *service
+    image: stripe/stripe-cli:v1.31.0
+    profiles: [stripe]
+    environment:
+      STRIPE_API_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_DEVICE_NAME: ${STRIPE_DEVICE_NAME:-}
+    command:
+      - listen
+      - --skip-update
+      - --forward-to
+      - http://127.0.0.1:${API_PORT:-8080}/stripe/webhook
+      - --forward-thin-to
+      - http://127.0.0.1:${API_PORT:-8080}/stripe/webhook
+      - --thin-events
+      - v1.billing.meter.error_report_triggered,v1.billing.meter.no_meter_found
