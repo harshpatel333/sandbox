@@ -404,6 +404,14 @@ class UnlabelledResourceTest(unittest.TestCase):
         self.assertIn(f'disk {gce("alice-dev-a7f3c9")[1]}', stop.exception.code)
         self.assertEqual(cloud.calls, [])
 
+    def test_refused_resources_of_another_identity_do_not_block_destroy(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False, disks=False, expires_at=NOW - 1)
+        cloud.add_box('alice-dev-a7f3c9', '5b6c7d8e9f0a', vm=False, bucket=False, environment='staging')
+        inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d', require_expired_at=NOW)
+        self.assertEqual(cloud.calls, [('bucket', 'superserve-devbox-3f9c0a1b2c4d')])
+        self.assertEqual(len(cloud.disks_), 2)
+
     def test_old_partially_labelled_or_foreign_attached_resources_are_not_adopted(self):
         _, boot, _ = gce('alice-dev-a7f3c9')
         cases = {'older than the devbox': {'creationTimestamp': '2027-01-15T04:59:59+00:00'},

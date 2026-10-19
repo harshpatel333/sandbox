@@ -410,7 +410,8 @@ def find_with_blocked(cloud, project, name, devbox_id):
     boxes, ignored = inventory(collect(cloud), project)
     box = next((b for b in boxes if b.name == name and b.devbox_id == devbox_id), None)
     wanted = expected(name, devbox_id)
-    return box, [(r, reason) for r, reason in ignored if (r.kind, r.name) in wanted]
+    return box, [(r, reason) for r, reason in ignored if (r.kind, r.name) in wanted
+                 and r.labels.get('devbox-id', devbox_id) == devbox_id]
 
 
 def _delete(cloud, resource, instance):
@@ -429,7 +430,7 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
     box, blocked = find_with_blocked(cloud, project, name, devbox_id)
     if blocked:
         raise SystemExit(f'Refusing to destroy {name} ({devbox_id}): ' + '; '.join(
-            f'{r.kind} {r.name} {reason}' for r, reason in blocked) + '. Nothing was deleted; resolve it and rerun.')
+            f'{r.kind} {r.name}: {reason}' for r, reason in blocked) + '. Nothing was deleted; resolve it and rerun.')
     if box is None:
         return f'`{name}` ({devbox_id}) is already gone.'
     if require_expired_at is not None and (box.expires_at is None or box.expires_at > require_expired_at):
