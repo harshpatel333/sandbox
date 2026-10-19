@@ -571,12 +571,13 @@ func (m *Manager) setupSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	if err := nsExecGo(nsName, func() error {
 		var fwErr error
 		fw, fwErr = NewFirewall(FirewallConfig{
-			TAPInterface:   TAPName,
-			VethPeer:       vpeerName,
-			VMIP:           VMInternalIP,
-			HostIP:         hostIP,
-			GatewayIP:      VMGatewayIP,
-			SecretsProxyIP: m.secretsProxyAllowIP(),
+			TAPInterface:     TAPName,
+			VethPeer:         vpeerName,
+			VMIP:             VMInternalIP,
+			HostIP:           hostIP,
+			GatewayIP:        VMGatewayIP,
+			SecretsProxyIP:   m.secretsProxyAllowIP(),
+			SecretsProxyPort: m.secretsProxyPort,
 		})
 		return fwErr
 	}); err != nil {
@@ -837,12 +838,13 @@ func (m *Manager) ReattachVM(vmID, namespace, hostIP, macAddress string) error {
 	// Rebind in-namespace nftables handle. Non-fatal on failure: kernel
 	// rules already enforce traffic; only future updates would be lost.
 	fwCfg := FirewallConfig{
-		TAPInterface:   TAPName,
-		VethPeer:       "eth0",
-		VMIP:           VMInternalIP,
-		HostIP:         hostIP,
-		GatewayIP:      VMGatewayIP,
-		SecretsProxyIP: m.secretsProxyAllowIP(),
+		TAPInterface:     TAPName,
+		VethPeer:         "eth0",
+		VMIP:             VMInternalIP,
+		HostIP:           hostIP,
+		GatewayIP:        VMGatewayIP,
+		SecretsProxyIP:   m.secretsProxyAllowIP(),
+		SecretsProxyPort: m.secretsProxyPort,
 	}
 	var fw *Firewall
 	if err := nsExecGo(namespace, func() error {
@@ -1539,12 +1541,13 @@ func (m *Manager) adoptSlot(ctx context.Context, idx int) (*VMNetInfo, string, e
 	}
 
 	fwCfg := FirewallConfig{
-		TAPInterface:   TAPName,
-		VethPeer:       "eth0",
-		VMIP:           VMInternalIP,
-		HostIP:         hostIP,
-		GatewayIP:      VMGatewayIP,
-		SecretsProxyIP: m.secretsProxyAllowIP(),
+		TAPInterface:     TAPName,
+		VethPeer:         "eth0",
+		VMIP:             VMInternalIP,
+		HostIP:           hostIP,
+		GatewayIP:        VMGatewayIP,
+		SecretsProxyIP:   m.secretsProxyAllowIP(),
+		SecretsProxyPort: m.secretsProxyPort,
 	}
 	// The in-namespace work (netlink, nftables) cannot observe ctx once it is
 	// on the pinned thread, and a wedged netlink socket would otherwise hang
