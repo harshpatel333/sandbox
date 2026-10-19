@@ -340,12 +340,22 @@ class UnlabelledResourceTest(unittest.TestCase):
         cloud.disks_ = []
         self.assertEqual(boxes(cloud), ([], []))
 
-    def test_unlabelled_boot_disk_claimed_by_two_identities_is_refused(self):
+    def test_unlabelled_boot_disk_goes_to_the_identity_whose_vm_it_is_attached_to(self):
         cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '5b6c7d8e9f0a', vm=False, disks=False)
         cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', unlabelled=('boot',))
-        cloud.add_box('alice-dev-a7f3c9', '5b6c7d8e9f0a', vm=False, bucket=False)
-        cloud.disks_ = [d for d in cloud.disks_ if d['labels'].get('devbox-id') != '5b6c7d8e9f0a'
-                        or d['name'] != gce('alice-dev-a7f3c9')[1]]
+        found, ignored = boxes(cloud)
+        self.assertEqual(ignored, [])
+        self.assertEqual([(b.devbox_id, any(r.adopted for r in b.resources)) for b in found],
+                         [('3f9c0a1b2c4d', True), ('5b6c7d8e9f0a', False)])
+        inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '5b6c7d8e9f0a')
+        inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertEqual((cloud.instances_, cloud.disks_, cloud.buckets_), ([], [], []))
+
+    def test_detached_unlabelled_boot_disk_claimed_by_two_identities_is_refused(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False, disks=False)
+        cloud.add_box('alice-dev-a7f3c9', '5b6c7d8e9f0a', vm=False, unlabelled=('boot',))
         found, ignored = boxes(cloud)
         self.assertFalse(any(r.adopted for b in found for r in b.resources))
         self.assertIn('claimed by 2 devboxes', ignored[0][1])

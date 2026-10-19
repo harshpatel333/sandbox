@@ -244,7 +244,7 @@ def _unadoptable(resource, group):
     if foreign:
         return f'unlabelled and attached to {", ".join(map(_last, foreign))}'
     created = _created(resource.created)
-    born = [t for t in (_created(r.created) for r in group) if t is not None]
+    born = [t for t in (_created(r.created) for r in group if not r.adopted) if t is not None]
     if created is None or not born:
         return 'unlabelled and its creation time or its devbox creation time is unknown'
     if created < min(born) - ADOPTION_SLACK_SECONDS:
@@ -273,6 +273,9 @@ def inventory(resources, project):
         owners = claims.get((resource.kind, resource.name), [])
         if not owners or not _unlabelled(resource, project):
             continue
+        if len(owners) > 1:
+            owners = [key for key in owners if any(r.kind == 'instance' and r.link in resource.users
+                                                   for r in groups[key])] or owners
         reason = (f'unlabelled and claimed by {len(owners)} devboxes' if len(owners) > 1
                   else _unadoptable(resource, groups[owners[0]]))
         if reason:
