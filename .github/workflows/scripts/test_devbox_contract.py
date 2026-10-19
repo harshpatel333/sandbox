@@ -165,6 +165,17 @@ class ManifestTests(unittest.TestCase):
             "from": {"sandbox": SHA_A, "ui": SHA_B}, "to": {"sandbox": SHA_C, "ui": SHA_B},
             "migrations": "applied", "result": "succeeded"}])
 
+    def test_failed_deploy_is_recorded_and_marks_the_box_failed(self):
+        at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
+        failed = contract.record_deploy(manifest(), at=at, actor="x", components=["vmd"], migrations="none",
+                                        result="failed", revisions={"sandbox": {"branch": "main", "sha": SHA_C}})
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["deploys"][-1]["result"], "failed")
+        recovered = contract.record_deploy(failed, at=at, actor="x", components=["vmd"], migrations="none",
+                                           result="succeeded", revisions={"sandbox": {"branch": "main", "sha": SHA_A}})
+        self.assertEqual(recovered["state"], "ready")
+        self.assertEqual(len(recovered["deploys"]), 2)
+
     def test_record_deploy_rejects_unknown_outcomes_and_mismatched_revisions(self):
         at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
         sandbox = {"sandbox": {"branch": "main", "sha": SHA_C}}
