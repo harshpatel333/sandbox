@@ -42,6 +42,20 @@ class SecretsTest(unittest.TestCase):
         self.assertNotEqual(values["PROMOTION_CAPTURE_TOKEN"], values["PROMOTION_ACCOUNT_TOKEN"])
         self.assertNotEqual(values["PROMOTION_ACCOUNT_TOKEN"], values["INTERNAL_API_TOKEN"])
 
+    def test_file_is_unquoted_for_literal_readers(self):
+        values = ds.ensure_secrets(self.env, self.key, keypair=fake_keypair)
+        for line in self.env.read_text().splitlines():
+            key, _, value = line.partition("=")
+            self.assertEqual(value, values[key], f"{key} must be written literally")
+        self.assertIn("?sslmode=disable", values["DATABASE_URL"])
+
+    def test_quoted_file_from_older_runs_is_rewritten_unquoted(self):
+        values = ds.ensure_secrets(self.env, self.key, keypair=fake_keypair)
+        ds.write_env(self.env, values)
+        self.assertIn("'", self.env.read_text())
+        self.assertEqual(ds.ensure_secrets(self.env, self.key, keypair=fake_keypair), values)
+        self.assertNotIn("'", self.env.read_text())
+
     def test_rerun_never_rotates_existing_values(self):
         first = ds.ensure_secrets(self.env, self.key, keypair=fake_keypair)
         pem = self.key.read_text()

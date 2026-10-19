@@ -83,6 +83,24 @@ def write_env(path, values, mode=0o600):
     write_file(path, "".join(lines), mode)
 
 
+# Shared secrets are read literally by some consumers and sourced by bash by
+# others, so values are restricted to characters that need no quoting in a
+# shell assignment.
+PLAIN_VALUE = re.compile(r"[A-Za-z0-9@%+=:,./?_-]*")
+
+
+def write_plain_env(path, values, mode=0o600):
+    """Atomically write unquoted KEY=value lines; reject values that would need quoting."""
+    for key, value in values.items():
+        if not ENV_KEY.fullmatch(key) or not PLAIN_VALUE.fullmatch(value):
+            raise ValueError(f"{key} must be an unquoted shell word")
+    write_file(path, plain_env_text(values), mode)
+
+
+def plain_env_text(values):
+    return "".join(f"{k}={v}\n" for k, v in values.items())
+
+
 def write_file(path, content, mode=0o600):
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -149,8 +167,9 @@ def ensure_secrets(path, key_path, keypair=ed25519_keypair):
         pem, public = keypair()
         write_file(key_file, pem)
         values["PROMOTION_ACCOUNT_PUBLIC_KEY"] = public
-    if values != existing:
-        write_env(path, values)
+    current = Path(path).read_text() if Path(path).exists() else None
+    if current != plain_env_text(values):
+        write_plain_env(path, values)
     return values
 
 
