@@ -396,7 +396,8 @@ def instance_args(name, profile, labels, manifest_path):
 
 
 def destroy_command(name):
-    return f"gh workflow run devbox-destroy.yml --repo {GITHUB_REPOSITORIES['sandbox']} -f name={name}"
+    return (f"gh workflow run devbox-manage.yml --repo {GITHUB_REPOSITORIES['sandbox']} --ref main "
+            f"-f action=destroy-named -f name={name}")
 
 
 def access_section(name):
