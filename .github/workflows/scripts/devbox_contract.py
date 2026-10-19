@@ -313,8 +313,8 @@ def record_deploy(manifest, *, at, actor, components, revisions, migrations, res
 
     `revisions` is what the deploy targeted. `checked_out` lists the
     repositories whose checkout moved and `deployed` the components whose
-    install finished; both default to everything targeted, which is only
-    right for a deploy that succeeded.
+    install finished. A succeeded deploy moved everything it targeted; a
+    failed one must say what it moved.
     """
     if migrations not in MIGRATION_RESULTS:
         raise ContractError(f"Unknown migration result {migrations!r}")
@@ -323,6 +323,8 @@ def record_deploy(manifest, *, at, actor, components, revisions, migrations, res
     repositories = {COMPONENT_REPOSITORIES[component] for component in components}
     if set(revisions) != repositories:
         raise ContractError(f"Deploy of {', '.join(components)} must resolve exactly {', '.join(sorted(repositories))}")
+    if result == "failed" and (checked_out is None or deployed is None):
+        raise ContractError("A failed deploy must record which checkouts and components it moved")
     checked_out = set(revisions if checked_out is None else checked_out)
     deployed = set(components if deployed is None else deployed)
     if not checked_out <= repositories or not deployed <= set(components) \

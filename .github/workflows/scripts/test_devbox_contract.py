@@ -168,7 +168,12 @@ class ManifestTests(unittest.TestCase):
     def test_failed_deploy_is_recorded_and_marks_the_box_failed(self):
         at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
         failed = contract.record_deploy(manifest(), at=at, actor="x", components=["vmd"], migrations="none",
-                                        result="failed", revisions={"sandbox": {"branch": "main", "sha": SHA_C}})
+                                        result="failed", revisions={"sandbox": {"branch": "main", "sha": SHA_C}},
+                                        checked_out=["sandbox"], deployed=[])
+        self.assertEqual(failed["components"]["vmd"], {"branch": "main", "sha": SHA_A})
+        with self.assertRaises(contract.ContractError):
+            contract.record_deploy(manifest(), at=at, actor="x", components=["vmd"], migrations="none",
+                                   result="failed", revisions={"sandbox": {"branch": "main", "sha": SHA_C}})
         self.assertEqual(failed["state"], "failed")
         self.assertEqual(failed["deploys"][-1]["result"], "failed")
         recovered = contract.record_deploy(failed, at=at, actor="x", components=["vmd"], migrations="none",
