@@ -305,7 +305,7 @@ func TestTrialCreditWarningSenderReturnsRecoverableFailure(t *testing.T) {
 }
 
 func TestResendTrialCreditWarningRequiresProviderConfiguration(t *testing.T) {
-	sender := NewResendTrialCreditWarningSender("", "", nil)
+	sender := NewEmailTrialCreditWarningSender(nil, "", nil)
 	if err := sender.SendTrialCreditWarning(context.Background(), uuid.New(), 1); err == nil {
 		t.Fatal("missing provider configuration must not be treated as a successful send")
 	}
@@ -319,8 +319,8 @@ func TestResendTrialCreditWarningProviderAcceptance(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer srv.Close()
-	s := &ResendTrialCreditWarningSender{apiKey: "key", from: "team@example.com", endpoint: srv.URL, client: srv.Client()}
-	if err := s.sendEmail(context.Background(), []byte(`{"html":"Less than 24 hours","remaining":"$1.23"}`)); err != nil {
+	s := &ResendEmailSender{apiKey: "key", endpoint: srv.URL, client: srv.Client()}
+	if err := s.SendEmail(context.Background(), EmailMessage{HTML: "Less than 24 hours, $1.23 remaining"}); err != nil {
 		t.Fatalf("accepted provider response returned error: %v", err)
 	}
 	if !strings.Contains(gotBody, "Less than 24 hours") || !strings.Contains(gotBody, "$1.23") {
@@ -328,7 +328,7 @@ func TestResendTrialCreditWarningProviderAcceptance(t *testing.T) {
 	}
 }
 
-func TestResendTrialCreditWarningSenderIncludesAuthoritativeBalanceAndCoarseCopy(t *testing.T) {
+func TestTrialCreditWarningEmailIncludesAuthoritativeBalanceAndCoarseCopy(t *testing.T) {
 	var gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -336,9 +336,8 @@ func TestResendTrialCreditWarningSenderIncludesAuthoritativeBalanceAndCoarseCopy
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer srv.Close()
-	s := &ResendTrialCreditWarningSender{apiKey: "key", from: "team@example.com", endpoint: srv.URL, client: srv.Client()}
-	body := []byte(trialCreditWarningHTML("example-team", 1.234))
-	if err := s.sendEmail(context.Background(), body); err != nil {
+	s := &ResendEmailSender{apiKey: "key", endpoint: srv.URL, client: srv.Client()}
+	if err := s.SendEmail(context.Background(), EmailMessage{HTML: trialCreditWarningHTML("example-team", 1.234)}); err != nil {
 		t.Fatalf("warning send returned error: %v", err)
 	}
 	for _, want := range []string{"example-team", "$1.23", "Less than 24 hours", "within the next 24 hours"} {
@@ -362,11 +361,11 @@ func TestResendTrialCreditWarningProviderFailureIsRetryable(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer srv.Close()
-	s := &ResendTrialCreditWarningSender{apiKey: "key", from: "team@example.com", endpoint: srv.URL, client: srv.Client()}
-	if err := s.sendEmail(context.Background(), []byte(`{}`)); err == nil || !strings.Contains(err.Error(), "503") {
+	s := &ResendEmailSender{apiKey: "key", endpoint: srv.URL, client: srv.Client()}
+	if err := s.SendEmail(context.Background(), EmailMessage{}); err == nil || !strings.Contains(err.Error(), "503") {
 		t.Fatalf("provider failure = %v, want retryable status error", err)
 	}
-	if err := s.sendEmail(context.Background(), []byte(`{}`)); err != nil {
+	if err := s.SendEmail(context.Background(), EmailMessage{}); err != nil {
 		t.Fatalf("retry after provider failure returned error: %v", err)
 	}
 	if calls != 2 {
@@ -374,11 +373,11 @@ func TestResendTrialCreditWarningProviderFailureIsRetryable(t *testing.T) {
 	}
 }
 
-func TestUnknownTrialCreditWarningErrorPreservesOutcome(t *testing.T) {
+func TestUnknownEmailOutcomeErrorPreservesCause(t *testing.T) {
 	want := errors.New("connection reset after submit")
-	err := &unknownTrialCreditWarningError{err: want}
-	var unknown UnknownTrialCreditWarningOutcome
-	if !errors.As(err, &unknown) || !unknown.UnknownTrialCreditWarning() {
+	err := &unknownEmailOutcomeError{err: want}
+	var unknown *unknownEmailOutcomeError
+	if !errors.As(err, &unknown) {
 		t.Fatal("transport failure must be classified as an unknown provider outcome")
 	}
 	if !errors.Is(err, want) {
@@ -590,8 +589,7 @@ func TestTrialCreditWarningSenderKeepsRecipientsPrivate(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
-	sender := NewResendTrialCreditWarningSender("test-key", "billing@example.com", queries)
-	sender.endpoint, sender.client = server.URL, server.Client()
+	sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", queries)
 	if err := sender.SendTrialCreditWarningWithKey(context.Background(), uuid.New(), 1.23, uuid.New()); err != nil {
 		t.Fatal(err)
 	}
@@ -696,11 +694,10 @@ func TestTrialCreditWarningPartialDeliverySurvivesNewClaim(t *testing.T) {
 				w.WriteHeader(http.StatusAccepted)
 			}))
 			defer server.Close()
-			sender := NewResendTrialCreditWarningSender("test-key", "billing@example.com", queries)
-			sender.endpoint, sender.client = server.URL, server.Client()
+			sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", queries)
 			err := sender.SendTrialCreditWarningWithKey(context.Background(), teamID, 1.23, claimToken)
-			var unknown UnknownTrialCreditWarningOutcome
-			var permanent *permanentTrialCreditWarningError
+			var unknown *unknownEmailOutcomeError
+			var permanent *rejectedEmailError
 			if err == nil || errors.As(err, &unknown) || errors.As(err, &permanent) {
 				t.Fatalf("partial delivery must leave a retryable error: %v", err)
 			}
@@ -728,10 +725,10 @@ func TestTrialWarningProviderIdentityFollowsRecipient(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
-	sender := &ResendTrialCreditWarningSender{endpoint: server.URL, client: server.Client()}
+	sender := &ResendEmailSender{endpoint: server.URL, client: server.Client()}
 	token := uuid.New()
 	for _, recipient := range []string{"first@example.com", "second@example.com", "second@example.com", "first@example.com"} {
-		if err := sender.sendEmailWithKey(context.Background(), []byte(`{}`), token, recipient); err != nil {
+		if err := sender.SendEmail(context.Background(), EmailMessage{IdempotencyKey: trialCreditWarningIdempotencyKey(token, recipient)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -762,9 +759,9 @@ func TestTrialCreditWarningProviderRejectionClassification(t *testing.T) {
 				_, _ = io.WriteString(w, tc.body)
 			}))
 			defer server.Close()
-			sender := &ResendTrialCreditWarningSender{endpoint: server.URL, client: server.Client()}
-			err := sender.sendEmail(context.Background(), []byte(`{}`))
-			var permanent *permanentTrialCreditWarningError
+			sender := &ResendEmailSender{endpoint: server.URL, client: server.Client()}
+			err := sender.SendEmail(context.Background(), EmailMessage{})
+			var permanent *rejectedEmailError
 			if err == nil || errors.As(err, &permanent) != tc.permanent {
 				t.Fatalf("error = %v, want permanent=%t", err, tc.permanent)
 			}
@@ -960,11 +957,10 @@ func TestTrialCreditWarningAllRecipientsRevokedRemainsRetryable(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
-	sender := NewResendTrialCreditWarningSender("test-key", "billing@example.com", queries)
-	sender.endpoint, sender.client = server.URL, server.Client()
+	sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", queries)
 	err := sender.SendTrialCreditWarningWithKey(context.Background(), uuid.New(), 1, uuid.New())
-	var unknown UnknownTrialCreditWarningOutcome
-	var permanent *permanentTrialCreditWarningError
+	var unknown *unknownEmailOutcomeError
+	var permanent *rejectedEmailError
 	if err == nil || errors.As(err, &unknown) || errors.As(err, &permanent) {
 		t.Fatalf("expected retryable no-recipient error, got %v", err)
 	}

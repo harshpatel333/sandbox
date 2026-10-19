@@ -1,0 +1,14 @@
+[Unit]
+Description=Superserve devbox API (control plane and background jobs)
+After=network-online.target docker.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c 'set -a; . @STATE_DIR@/api.env; exec @INSTALL_DIR@/api/current/controlplane'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
