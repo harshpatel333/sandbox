@@ -48,6 +48,7 @@ class FakeCloud:
         self.commands, self.inputs = [], {}
         self.decoys, self.fail_after_create, self.expire_on_script = decoys, fail_after_create, expire_on_script
         self.disks, self.buckets = [], []
+        self.repo_scripts = list(contract.CREATE_SCRIPTS)
         self.existing = list(existing)
         self.branches = branches if branches is not None else {"main": SANDBOX_SHA, "feature": NEW_SHA}
         self.fail_script = fail_script
@@ -61,6 +62,10 @@ class FakeCloud:
         fail = lambda code=1, stderr="failed": subprocess.CompletedProcess(args, code, "", stderr)
         if args[:2] == ["git", "check-ref-format"]:
             return ok() if re.fullmatch(r"[A-Za-z0-9/_.-]+", args[-1]) and ".." not in args[-1] else fail()
+        if args[:2] == ["git", "init"] or (args[0] == "git" and "fetch" in args):
+            return ok()
+        if args[0] == "git" and "ls-tree" in args:
+            return ok("".join(f"deploy/devbox/{script}\n" for script in self.repo_scripts))
         if args[:2] == ["git", "ls-remote"]:
             refs = {f"refs/heads/{branch}": sha for branch, sha in self.branches.items()}
             refs.update({ref: "f" * 40 for ref in self.decoys})
@@ -177,7 +182,8 @@ class PrepareTests(WorkflowCase):
     def test_prepare_create_generates_name_and_resolves_shas(self):
         cloud = FakeCloud(branches={"main": SANDBOX_SHA, "feature": NEW_SHA})
         self.run_with(cloud, workflow.prepare_create, self.env(INPUT_NAME="", INPUT_SANDBOX_BRANCH="feature",
-                                                            INPUT_UI_BRANCH="", INPUT_LIFETIME_HOURS="48"))
+                                                            INPUT_UI_BRANCH="", INPUT_LIFETIME_HOURS="48"),
+                      profile_path=self.profile)
         outputs = self.outputs()
         self.assertRegex(outputs["name"], r"^awille-ai-dev-[0-9a-f]{6}$")
         self.assertEqual(outputs["owner"], "awille-ai")
@@ -185,6 +191,16 @@ class PrepareTests(WorkflowCase):
         self.assertEqual((outputs["sandbox_branch"], outputs["sandbox_sha"]), ("feature", NEW_SHA))
         self.assertEqual((outputs["ui_branch"], outputs["ui_sha"]), ("main", SANDBOX_SHA))
         self.assertEqual([c[:2] for c in cloud.commands if c[0] != "git"], [])
+        self.assertIn(NEW_SHA, next(c for c in cloud.commands if "fetch" in c))
+
+    def test_prepare_create_refuses_revisions_without_the_box_scripts(self):
+        cloud = FakeCloud()
+        cloud.repo_scripts.remove("seed-base.sh")
+        with self.assertRaisesRegex(workflow.StepError, "seed-base.sh"):
+            self.run_with(cloud, workflow.prepare_create, self.env(), profile_path=self.profile)
+        self.assertEqual(self.output.read_text(), "")
+        with self.assertRaisesRegex(workflow.StepError, "devbox profile"):
+            self.run_with(FakeCloud(), workflow.prepare_create, self.env(), profile_path=self.profile.with_name("x"))
 
     def test_branch_resolution_ignores_suffix_matches(self):
         cloud = FakeCloud(decoys=["refs/heads/evil/refs/heads/main"])
@@ -198,7 +214,7 @@ class PrepareTests(WorkflowCase):
                        {"INPUT_LIFETIME_HOURS": "169"}, {"INPUT_NAME": "Bad_Name"},
                        {"GITHUB_REF": "refs/heads/feature"}):
             with self.subTest(values=values), self.assertRaises((workflow.StepError, contract.ContractError)):
-                self.run_with(FakeCloud(), workflow.prepare_create, self.env(**values))
+                self.run_with(FakeCloud(), workflow.prepare_create, self.env(**values), profile_path=self.profile)
 
 class CreateTests(WorkflowCase):
     def create_env(self, **values):

@@ -114,6 +114,25 @@ def resolve_branch(key, branch):
     return contract.revision(branch, shas[0])
 
 
+def require_scripts_at(key, sha, scripts):
+    # Lists the commit's tree without checking it out, so no branch code runs
+    # on the runner and nothing is provisioned for a revision that can't work.
+    url = f"https://github.com/{GITHUB_REPOSITORIES[key]}.git"
+    with tempfile.TemporaryDirectory() as directory:
+        for args in (["git", "init", "-q", "--bare", directory],
+                     ["git", "-C", directory, "fetch", "-q", "--depth=1", "--filter=blob:none", url, sha]):
+            result = subprocess.run(args, capture_output=True, text=True, timeout=300)
+            if result.returncode:
+                raise StepError(f"Could not read {key} {sha}: {result.stderr.strip()}")
+        listing = subprocess.run(["git", "-C", directory, "ls-tree", "--name-only", "FETCH_HEAD", "deploy/devbox/"],
+                                 capture_output=True, text=True, timeout=60)
+    present = {Path(line).name for line in listing.stdout.splitlines()}
+    missing = [script for script in scripts if script not in present]
+    if listing.returncode or missing:
+        raise StepError(f"{key} {sha} does not contain the devbox scripts this workflow runs: "
+                        f"{', '.join(missing) or 'deploy/devbox'}")
+
+
 def write_outputs(env, values):
     with open(env["GITHUB_OUTPUT"], "a") as output:
         for key, value in values.items():
@@ -130,13 +149,15 @@ def append_summary(env, text):
     print(text)
 
 
-def prepare_create(env):
+def prepare_create(env, profile_path=PROFILE_PATH):
     require_main(env)
+    load_profile(profile_path)
     owner = contract.normalize_owner(env.get("GITHUB_ACTOR"))
     name = contract.resolve_name(env.get("INPUT_NAME"), owner)
     lifetime = contract.parse_lifetime_hours(env.get("INPUT_LIFETIME_HOURS"))
     sandbox = resolve_branch("sandbox", env.get("INPUT_SANDBOX_BRANCH"))
     ui = resolve_branch("ui", env.get("INPUT_UI_BRANCH"))
+    require_scripts_at("sandbox", sandbox["sha"], contract.CREATE_SCRIPTS)
     write_outputs(env, {
         "name": name, "owner": owner, "lifetime_hours": lifetime,
         "sandbox_branch": sandbox["branch"], "sandbox_sha": sandbox["sha"],

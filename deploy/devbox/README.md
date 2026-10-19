@@ -248,7 +248,9 @@ gh workflow run devbox-create.yml --repo superserve-ai/sandbox --ref main \
 | `lifetime_hours` | `24` | 1 to 168. The box is deleted when it expires; lifetimes cannot be extended |
 
 Each branch is resolved once to an exact commit, and every later step uses
-that commit. The workflow then:
+that commit. Before taking any cloud action, the workflow checks the profile
+and that the selected sandbox commit contains every box script it will run.
+It then:
 
 1. creates the data disk `devbox-<name>-data`, the VM `devbox-<name>` (boot
    disk of the same name) from `profile.json`, and the bucket
