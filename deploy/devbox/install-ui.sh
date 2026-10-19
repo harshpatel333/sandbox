@@ -8,12 +8,15 @@
 #
 # Inputs:
 #   /etc/superserve-devbox/devbox.env    non-secret settings from CI
-#                                        (RECAPTCHA_SITE_KEY, optional)
-#   /etc/superserve-devbox/secrets.env   CI secrets (RECAPTCHA_API_KEY,
+#                                        (DEVBOX_UI_SHA; RECAPTCHA_SITE_KEY and
 #                                        RECAPTCHA_PROJECT_ID, optional)
-#   $SHARED_SECRETS_FILE                 secrets services-up.sh generates for
-#                                        the console and the API to share
+#   /etc/superserve-devbox/secrets.env   CI secrets (RECAPTCHA_API_KEY,
+#                                        optional)
+#   $SECRETS_DIR/local.env               keys services-up.sh generates and
+#   $SECRETS_DIR/promotion-account-key.pem  shares with the API
 #   /opt/superserve-devbox/src/superserve  UI checkout
+#
+# Console-only secrets are generated once into $SECRETS_DIR/console.env.
 #
 # Public values (NEXT_PUBLIC_*) are compiled into the browser bundle at build
 # time; everything else is only given to the server at runtime. The browser
@@ -28,11 +31,14 @@ set -euo pipefail
 CONFIG_DIR="${DEVBOX_CONFIG_DIR:-/etc/superserve-devbox}"
 UI_SRC="${DEVBOX_UI_SRC:-/opt/superserve-devbox/src/superserve}"
 SECRETS_DIR="${DEVBOX_SECRETS_DIR:-/mnt/sandbox-data/superserve-devbox/secrets}"
-SHARED_SECRETS_FILE="${DEVBOX_SHARED_SECRETS_FILE:-$SECRETS_DIR/console.env}"
-CONSOLE_SECRETS_FILE="$SECRETS_DIR/console-local.env"
 RUNTIME_DIR="${DEVBOX_CONSOLE_RUNTIME_DIR:-/var/lib/superserve-devbox/console}"
 UNIT_FILE="${DEVBOX_CONSOLE_UNIT_FILE:-/etc/systemd/system/superserve-devbox-console.service}"
 READY_TIMEOUT="${DEVBOX_CONSOLE_READY_TIMEOUT:-180}"
+DEVBOX_ENV="$CONFIG_DIR/devbox.env"
+CI_SECRETS="$CONFIG_DIR/secrets.env"
+LOCAL_SECRETS="$SECRETS_DIR/local.env"
+PROMOTION_KEY="$SECRETS_DIR/promotion-account-key.pem"
+CONSOLE_SECRETS="$SECRETS_DIR/console.env"
 
 SERVICE=superserve-devbox-console
 IMAGE=superserve-devbox-console:current
@@ -55,71 +61,79 @@ log() {
   echo "install-ui: $*"
 }
 
-load_env() {
-  [[ -r "$1" ]] || die "$1 is missing or unreadable${2:+ ($2)}"
-  set -a
-  # shellcheck disable=SC1090
-  . "$1"
-  set +a
+require_file() {
+  [[ -r "$1" ]] || die "$1 is missing or unreadable ($2)"
 }
 
-require() {
-  local name
-  for name in "$@"; do
-    [[ -n "${!name:-}" ]] || die "$name is not set in $SHARED_SECRETS_FILE (re-run services-up.sh)"
-  done
+# Reads one key from a sourceable env file without letting the file's other
+# keys leak into (or clobber) this script's variables.
+env_get() {
+  (
+    set +u -a
+    # shellcheck disable=SC1090
+    . "$1" >/dev/null
+    printf '%s' "${!2:-}"
+  )
+}
+
+shared() {
+  local value
+  value="$(env_get "$LOCAL_SECRETS" "$1")"
+  [[ -n "$value" ]] || die "$1 is not set in $LOCAL_SECRETS (re-run services-up.sh)"
+  printf '%s' "$value"
 }
 
 ensure_console_secrets() {
-  if [[ ! -s "$CONSOLE_SECRETS_FILE" ]]; then
-    log "generating console secrets in $CONSOLE_SECRETS_FILE"
+  if [[ ! -s "$CONSOLE_SECRETS" ]]; then
+    log "generating console secrets in $CONSOLE_SECRETS"
     install -d -m 0700 "$SECRETS_DIR"
     (
       umask 077
       printf 'CONSOLE_PROXY_SECRET=%q\nGOOGLE_SIGNUP_PROOF_SECRET=%q\n' \
         "$(openssl rand -base64 48 | tr -d '\n')" \
-        "$(openssl rand -base64 48 | tr -d '\n')" >"$CONSOLE_SECRETS_FILE.tmp"
+        "$(openssl rand -base64 48 | tr -d '\n')" >"$CONSOLE_SECRETS.tmp"
     )
-    mv "$CONSOLE_SECRETS_FILE.tmp" "$CONSOLE_SECRETS_FILE"
+    mv "$CONSOLE_SECRETS.tmp" "$CONSOLE_SECRETS"
   fi
-  load_env "$CONSOLE_SECRETS_FILE"
 }
 
-load_env "$CONFIG_DIR/devbox.env" "written by the create workflow"
-load_env "$CONFIG_DIR/secrets.env" "written by the create workflow"
-load_env "$SHARED_SECRETS_FILE" "run services-up.sh first"
-require NEXT_PUBLIC_SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY \
-  INTERNAL_API_TOKEN SANDBOX_INTERNAL_API_TOKEN \
-  PROMOTION_CAPTURE_TOKEN PROMOTION_ACCOUNT_TOKEN PROMOTION_ACCOUNT_PRIVATE_KEY \
-  YC_CLAIM_CONSOLE_TOKEN
+require_file "$DEVBOX_ENV" "written by the create workflow"
+require_file "$CI_SECRETS" "written by the create workflow"
+require_file "$LOCAL_SECRETS" "run services-up.sh first"
+require_file "$PROMOTION_KEY" "run services-up.sh first"
+[[ -s "$PROMOTION_KEY" ]] || die "$PROMOTION_KEY is empty (re-run services-up.sh)"
 [[ -f "$UI_SRC/apps/console/package.json" ]] || die "$UI_SRC is not a superserve checkout"
+
+anon_key="$(shared ANON_KEY)"
+service_role_key="$(shared SERVICE_ROLE_KEY)"
+internal_api_token="$(shared INTERNAL_API_TOKEN)"
+promotion_capture_token="$(shared PROMOTION_CAPTURE_TOKEN)"
+promotion_account_token="$(shared PROMOTION_ACCOUNT_TOKEN)"
 
 BUILD_ARGS=(
   "NEXT_PUBLIC_APP_URL=$CONSOLE_URL"
   "NEXT_PUBLIC_WEBSITE_URL=https://www.superserve.ai"
   "NEXT_PUBLIC_SUPABASE_URL=http://localhost:54321"
-  "NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY"
+  "NEXT_PUBLIC_SUPABASE_ANON_KEY=$anon_key"
   "NEXT_PUBLIC_SANDBOX_SCHEME=http"
   "NEXT_PUBLIC_SANDBOX_HOST=sandbox.localhost"
   "NEXT_PUBLIC_SANDBOX_PORT=8090"
-  "NEXT_PUBLIC_RECAPTCHA_SITE_KEY=${RECAPTCHA_SITE_KEY:-}"
+  "NEXT_PUBLIC_RECAPTCHA_SITE_KEY=$(env_get "$DEVBOX_ENV" RECAPTCHA_SITE_KEY)"
 )
 
 RUNTIME_VARS=(
-  SANDBOX_API_URL=http://localhost:8080
+  SANDBOX_API_URL=http://127.0.0.1:8080
   EMAIL_TRANSPORT=smtp
   SMTP_HOST=127.0.0.1
   SMTP_PORT=1025
   "RESEND_FROM_ADDRESS=Superserve <team@superserve.localhost>"
-  "SUPABASE_SERVICE_ROLE_KEY=$SUPABASE_SERVICE_ROLE_KEY"
-  "INTERNAL_API_TOKEN=$INTERNAL_API_TOKEN"
-  "SANDBOX_INTERNAL_API_TOKEN=$SANDBOX_INTERNAL_API_TOKEN"
-  "PROMOTION_CAPTURE_TOKEN=$PROMOTION_CAPTURE_TOKEN"
-  "PROMOTION_ACCOUNT_TOKEN=$PROMOTION_ACCOUNT_TOKEN"
-  "PROMOTION_ACCOUNT_PRIVATE_KEY=$PROMOTION_ACCOUNT_PRIVATE_KEY"
-  "YC_CLAIM_CONSOLE_TOKEN=$YC_CLAIM_CONSOLE_TOKEN"
-  "RECAPTCHA_API_KEY=${RECAPTCHA_API_KEY:-}"
-  "RECAPTCHA_PROJECT_ID=${RECAPTCHA_PROJECT_ID:-}"
+  "SUPABASE_SERVICE_ROLE_KEY=$service_role_key"
+  "INTERNAL_API_TOKEN=$internal_api_token"
+  "PROMOTION_CAPTURE_TOKEN=$promotion_capture_token"
+  "PROMOTION_ACCOUNT_TOKEN=$promotion_account_token"
+  "PROMOTION_ACCOUNT_PRIVATE_KEY=$(<"$PROMOTION_KEY")"
+  "RECAPTCHA_PROJECT_ID=$(env_get "$DEVBOX_ENV" RECAPTCHA_PROJECT_ID)"
+  "RECAPTCHA_API_KEY=$(env_get "$CI_SECRETS" RECAPTCHA_API_KEY)"
 )
 
 DOCKER="$(command -v docker || echo /usr/bin/docker)"
@@ -151,11 +165,12 @@ command -v docker >/dev/null || die "docker is not installed"
 
 ensure_console_secrets
 RUNTIME_VARS+=(
-  "CONSOLE_PROXY_SECRET=$CONSOLE_PROXY_SECRET"
-  "GOOGLE_SIGNUP_PROOF_SECRET=$GOOGLE_SIGNUP_PROOF_SECRET"
+  "CONSOLE_PROXY_SECRET=$(env_get "$CONSOLE_SECRETS" CONSOLE_PROXY_SECRET)"
+  "GOOGLE_SIGNUP_PROOF_SECRET=$(env_get "$CONSOLE_SECRETS" GOOGLE_SIGNUP_PROOF_SECRET)"
 )
 
-revision="$(git -C "$UI_SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+revision="$(env_get "$DEVBOX_ENV" DEVBOX_UI_SHA)"
+revision="${revision:-$(git -C "$UI_SRC" rev-parse HEAD 2>/dev/null || echo unknown)}"
 log "building console at $revision"
 docker_args=()
 for arg in "${BUILD_ARGS[@]}"; do
