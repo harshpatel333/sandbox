@@ -260,7 +260,10 @@ that commit. The workflow then:
 3. waits for SSH over IAP, checks out both commits on the box under
    `/opt/superserve-devbox/src/{sandbox,superserve}`, and writes
    `/etc/superserve-devbox/devbox.env` and, over SSH stdin,
-   `/etc/superserve-devbox/secrets.env` (mode 0600);
+   `/etc/superserve-devbox/secrets.env` (mode 0600). Each `devbox`
+   environment secret `DEVBOX_SECRET_<NAME>` becomes `<NAME>` in
+   `secrets.env`, and each variable `DEVBOX_CONFIG_<NAME>` becomes `<NAME>` in
+   `devbox.env`. The workflow refuses to run if any value it forwards is unset;
 4. runs, as root on the box and from the checked-out sandbox commit,
    `host-bootstrap.sh`, `services-up.sh`, `install-api.sh`,
    `install-vmd.sh`, `install-proxy.sh`, `seed-base.sh` and `install-ui.sh`
