@@ -10,10 +10,12 @@ IAP SSH.
 Subcommands:
   prepare-create  validate create inputs and resolve SHAs (no cloud access)
   create          provision, install and record a new devbox
+  finish-create   mark a cancelled or timed-out create failed
 """
 
 import argparse
 import json
+import secrets
 import os
 from pathlib import Path
 import re
@@ -35,6 +37,11 @@ CONFIG_PREFIX = "DEVBOX_CONFIG_"
 LOG_DIR = "/var/log/superserve-devbox"
 SSH_ATTEMPTS = 40
 SSH_RETRY_SECONDS = 15
+# Kept below the job's timeout-minutes so a slow step fails here, with the box
+# marked failed, rather than being killed by the runner.
+DEADLINE_SECONDS = 165 * 60
+MAX_STATE_BYTES = 32 * 1024
+BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 
 
 class StepError(Exception):
@@ -47,7 +54,26 @@ def describe(error):
     return f"{type(error).__name__}: {error}"
 
 
+class Deadline:
+    end = None
+
+    def start(self, seconds):
+        self.end = time.monotonic() + seconds
+
+    def cap(self, timeout):
+        if self.end is None:
+            return timeout
+        remaining = int(self.end - time.monotonic())
+        if remaining <= 0:
+            raise StepError("Ran out of time before the job timeout")
+        return min(timeout, remaining)
+
+
+DEADLINE = Deadline()
+
+
 def run(args, *, input=None, capture=True, timeout=600):
+    timeout = DEADLINE.cap(timeout)
     try:
         result = subprocess.run(args, input=input, capture_output=capture, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -67,17 +93,19 @@ def require_main(env):
 def resolve_branch(key, branch):
     branch = (branch or "").strip() or "main"
     check = subprocess.run(["git", "check-ref-format", "--branch", branch], capture_output=True, text=True)
-    if check.returncode or branch.startswith("-"):
-        raise StepError(f"{key} branch {branch!r} is not a valid branch name")
+    if check.returncode or not BRANCH_PATTERN.fullmatch(branch):
+        raise StepError(f"{key} branch {branch!r} is not a valid branch name (letters, digits, '.', '_', '-', '/')")
     url = f"https://github.com/{GITHUB_REPOSITORIES[key]}.git"
-    result = subprocess.run(["git", "ls-remote", "--exit-code", url, f"refs/heads/{branch}"],
-                            capture_output=True, text=True, timeout=60)
-    if result.returncode == 2:
-        raise StepError(f"{key} branch {branch!r} does not exist in {GITHUB_REPOSITORIES[key]}")
-    if result.returncode:
+    ref = f"refs/heads/{branch}"
+    result = subprocess.run(["git", "ls-remote", "--exit-code", url, ref], capture_output=True, text=True, timeout=60)
+    if result.returncode and result.returncode != 2:
         raise StepError(f"Could not resolve {key} branch {branch!r}: {result.stderr.strip()}")
-    sha = result.stdout.split()[0] if result.stdout.split() else ""
-    return contract.revision(branch, sha)
+    # ls-remote matches ref suffixes, so refs/heads/x/refs/heads/main also
+    # matches "refs/heads/main"; only an exact ref counts.
+    shas = [line.split("\t", 1)[0] for line in result.stdout.splitlines() if line.split("\t", 1)[-1] == ref]
+    if not shas:
+        raise StepError(f"{key} branch {branch!r} does not exist in {GITHUB_REPOSITORIES[key]}")
+    return contract.revision(branch, shas[0])
 
 
 def write_outputs(env, values):
@@ -126,6 +154,9 @@ def load_profile(path=PROFILE_PATH):
             "bucket.name_prefix": (bucket.get("name_prefix"), contract.BUCKET_PREFIX),
             "labels.managed-by": ((profile.get("labels") or {}).get("managed-by"), contract.MANAGED_BY),
             "instance.external_ip": (instance.get("external_ip"), False),
+            "instance.metadata.enable-oslogin": ((instance.get("metadata") or {}).get("enable-oslogin"), "TRUE"),
+            "instance.metadata.block-project-ssh-keys":
+                ((instance.get("metadata") or {}).get("block-project-ssh-keys"), "TRUE"),
             "boot_disk.auto_delete": (boot.get("auto_delete"), False),
             "data_disk.auto_delete": (data.get("auto_delete"), False),
         }
@@ -175,7 +206,9 @@ class Box:
 
     def ssh(self, command, *, input=None, capture=True, timeout=600):
         return run(["gcloud", "compute", "ssh", self.instance, *self.where, "--quiet", "--tunnel-through-iap",
-                    "--command", command], input=input, capture=capture, timeout=timeout)
+                    "--ssh-key-expire-after=4h", "--ssh-flag=-o ServerAliveInterval=30",
+                    "--ssh-flag=-o ServerAliveCountMax=6", "--command", command],
+                   input=input, capture=capture, timeout=timeout)
 
     def wait_for_ssh(self, attempts=SSH_ATTEMPTS, delay=SSH_RETRY_SECONDS):
         for attempt in range(1, attempts + 1):
@@ -206,6 +239,8 @@ class Box:
 
     def read_json(self, path):
         result = self.ssh("sudo cat " + shlex.quote(path))
+        if len(result.stdout.encode()) > MAX_STATE_BYTES:
+            raise StepError(f"{path} on {self.name} is larger than {MAX_STATE_BYTES} bytes")
         try:
             value = json.loads(result.stdout)
         except ValueError:
@@ -246,24 +281,27 @@ class Box:
         command = (f"set -eu -o pipefail; install -d -m 0755 {LOG_DIR}; "
                    f"echo \"=== $(date -u +%FT%TZ) {script}\" >> {shlex.quote(log)}; "
                    f"bash {shlex.quote(path)} 2>&1 | tee -a {shlex.quote(log)}")
+        token = secrets.token_hex(16)
         print(f"::group::{script}", flush=True)
+        print(f"::stop-commands::{token}", flush=True)
         try:
             self.ssh("sudo bash -c " + shlex.quote(command), input="", capture=False, timeout=3600)
         except StepError as error:
             raise StepError(f"{script} failed on {self.name}; see {log} on the box ({error})") from None
         finally:
+            print(f"::{token}::", flush=True)
             print("::endgroup::", flush=True)
 
     def record(self, manifest, devbox_id, *, copy_to_box=True):
         contract.validate_manifest(manifest)
         self.verify(devbox_id)
+        if copy_to_box:
+            self.write_file(f"{contract.BOX_CONFIG_DIR}/manifest.json", json.dumps(manifest, indent=2) + "\n", "0644")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "manifest.json"
             path.write_text(json.dumps(manifest, sort_keys=True))
             run(["gcloud", "compute", "instances", "add-metadata", self.instance, *self.where,
                  f"--metadata-from-file={contract.MANIFEST_METADATA_KEY}={path}"])
-        if copy_to_box:
-            self.write_file(f"{contract.BOX_CONFIG_DIR}/manifest.json", json.dumps(manifest, indent=2) + "\n", "0644")
 
 
 def box_config(manifest, env):
@@ -297,6 +335,17 @@ def collect_state(box, manifest):
     updated["runtime"] = box.read_json(f"{contract.BOX_STATE_DIR}/runtime.json")
     updated["services"] = box.read_json(f"{contract.BOX_STATE_DIR}/services.json")
     return contract.validate_manifest(updated)
+
+
+def manifest_from(instance):
+    items = (instance.get("metadata") or {}).get("items") or []
+    raw = next((item.get("value") for item in items if item.get("key") == contract.MANIFEST_METADATA_KEY), None)
+    if raw is None:
+        raise StepError(f"{instance.get('name')} has no {contract.MANIFEST_METADATA_KEY} metadata")
+    try:
+        return contract.validate_manifest(json.loads(raw))
+    except ValueError as error:
+        raise StepError(f"{instance.get('name')} manifest is invalid: {error}") from None
 
 
 def ensure_unused(name, project=contract.PROJECT):
@@ -350,7 +399,7 @@ def access_section(name):
         f"Forward {ports} to localhost:",
         "```sh", contract.forwarding_command(name), "```",
         "Shell and logs:",
-        "```sh", ssh, f"{ssh} -- sudo tail -n 200 -f {LOG_DIR}/*.log", f"{ssh} -- sudo journalctl -f", "```",
+        "```sh", ssh, f"{ssh} -- 'sudo tail -n 200 -f {LOG_DIR}/*.log'", f"{ssh} -- sudo journalctl -f", "```",
         "Destroy:",
         "```sh", destroy_command(name), "```",
     ])
@@ -379,20 +428,17 @@ def create(env, profile_path=PROFILE_PATH):
     manifest = contract.new_manifest(name=name, devbox_id=devbox_id, owner=owner, actor=env["GITHUB_ACTOR"],
                                      created_at=created_at, expires_at=expires_at, revisions=revisions)
     box = Box(name)
-    created = []
+    save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False})
     try:
         ensure_unused(name)
         where = [f"--zone={contract.ZONE}", f"--project={contract.PROJECT}"]
         data = profile["data_disk"]
         run(["gcloud", "compute", "disks", "create", contract.data_disk_name(name), *where,
              f"--size={data['size_gb']}GB", f"--type={data['type']}", f"--labels={contract.format_labels(labels)}"])
-        created.append({"type": "disk", "name": contract.data_disk_name(name), "zone": contract.ZONE})
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
             manifest_path.write_text(json.dumps(manifest, sort_keys=True))
             run(instance_args(name, profile, labels, manifest_path))
-        created.append({"type": "instance", "name": box.instance, "zone": contract.ZONE})
-        created.append({"type": "disk", "name": box.instance, "zone": contract.ZONE})
         run(["gcloud", "compute", "disks", "add-labels", box.instance, *where,
              f"--labels={contract.format_labels(labels)}"])
         bucket = "gs://" + contract.bucket_name(devbox_id)
@@ -400,7 +446,6 @@ def create(env, profile_path=PROFILE_PATH):
              f"--location={profile['bucket']['location']}",
              f"--default-storage-class={profile['bucket']['storage_class']}",
              "--uniform-bucket-level-access", "--public-access-prevention", "--soft-delete-duration=0"])
-        created.append({"type": "bucket", "name": contract.bucket_name(devbox_id)})
         run(["gcloud", "storage", "buckets", "update", bucket, "--update-labels=" + contract.format_labels(labels)])
 
         box.wait_for_ssh()
@@ -413,9 +458,10 @@ def create(env, profile_path=PROFILE_PATH):
             box.run_script(script)
         manifest = contract.with_state(collect_state(box, manifest), "ready")
         box.record(manifest, devbox_id)
-    except Exception as error:
-        report_create_failure(env, box, manifest, devbox_id, created, error)
+    except (Exception, KeyboardInterrupt) as error:
+        report_create_failure(env, name, devbox_id, error)
         return 1
+    save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": True})
 
     append_summary(env, "\n".join([
         f"# Devbox `{name}` is ready",
@@ -433,38 +479,91 @@ def create(env, profile_path=PROFILE_PATH):
     return 0
 
 
-def report_create_failure(env, box, manifest, devbox_id, created, error):
-    note = ""
-    if any(resource["type"] == "instance" for resource in created):
-        try:
+def save_attempt(env, attempt):
+    if env.get("DEVBOX_ATTEMPT_FILE"):
+        Path(env["DEVBOX_ATTEMPT_FILE"]).write_text(json.dumps(attempt))
+
+
+def discover(name, devbox_id):
+    project = f"--project={contract.PROJECT}"
+    instances = run(["gcloud", "compute", "instances", "list", project, f"--filter=labels.devbox-id={devbox_id}",
+                     "--format=value(name,zone.basename())"], timeout=120)
+    disks = run(["gcloud", "compute", "disks", "list", project,
+                 f"--filter=labels.devbox-id={devbox_id} OR name={contract.instance_name(name)}",
+                 "--format=value(name,zone.basename())"], timeout=120)
+    found = []
+    for kind, result in (("instance", instances), ("disk", disks)):
+        for line in result.stdout.splitlines():
+            if line.strip():
+                resource_name, _, zone = line.partition("\t")
+                found.append({"type": kind, "name": resource_name, "zone": zone.strip()})
+    bucket = contract.bucket_name(devbox_id)
+    exists = subprocess.run(["gcloud", "storage", "buckets", "describe", "gs://" + bucket, "--format=value(name)"],
+                            capture_output=True, text=True, timeout=120)
+    if exists.returncode == 0:
+        found.append({"type": "bucket", "name": bucket})
+    return found
+
+
+def mark_failed(name, devbox_id):
+    box = Box(name)
+    try:
+        manifest = manifest_from(box.verify(devbox_id))
+        if manifest["state"] == "creating":
             box.record(contract.with_state(manifest, "failed"), devbox_id, copy_to_box=False)
-        except Exception as mark_error:
-            note = f"\n\nCould not record state=failed on the instance: {describe(mark_error)}"
+    except Exception as error:
+        return f"Could not record state=failed on the instance: {describe(error)}"
+    return ""
+
+
+def report_create_failure(env, name, devbox_id, error):
+    try:
+        found = discover(name, devbox_id)
+        discovery = ""
+    except Exception as discover_error:
+        found = contract.resources(name, devbox_id)
+        discovery = f" (could not list them: {describe(discover_error)}; these may exist)"
+    note = mark_failed(name, devbox_id) if any(r["type"] == "instance" for r in found) else ""
     listing = "\n".join(f"- {resource['type']} `{resource['name']}`"
-                        + (f" ({resource['zone']})" if resource.get("zone") else "") for resource in created)
+                        + (f" ({resource['zone']})" if resource.get("zone") else "") for resource in found)
     append_summary(env, "\n".join([
-        f"# Devbox `{box.name}` failed",
+        f"# Devbox `{name}` failed",
         "",
-        f"**Error:** {describe(error)}{note}",
+        f"**Error:** {describe(error)}",
+        *([f"**Warning:** {note}"] if note else []),
         "",
-        "The devbox is **not** ready. Created resources:",
+        f"The devbox is **not** ready. Resources{discovery}:",
         listing or "- none",
         "",
         "Clean up with:",
-        "```sh", destroy_command(box.name), "```",
+        "```sh", destroy_command(name), "```",
     ]))
-    print(f"::error::Devbox {box.name} failed: {describe(error)}", file=sys.stderr)
+    save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": True})
+    print(f"::error::Devbox {name} failed: {describe(error)}", file=sys.stderr)
+
+
+def finish_create(env):
+    path = env.get("DEVBOX_ATTEMPT_FILE")
+    if not path or not Path(path).exists():
+        return
+    attempt = json.loads(Path(path).read_text())
+    if not attempt["reported"]:
+        report_create_failure(env, attempt["name"], attempt["devbox_id"],
+                              StepError("The create run was cancelled or timed out"))
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=("prepare-create", "create"))
+    parser.add_argument("command", choices=("prepare-create", "create", "finish-create"))
     args = parser.parse_args(argv)
     env = dict(os.environ)
     try:
         if args.command == "prepare-create":
             prepare_create(env)
+        elif args.command == "finish-create":
+            finish_create(env)
         else:
+            DEADLINE.start(DEADLINE_SECONDS)
             return create(env)
     except (StepError, contract.ContractError) as error:
         print(f"::error::{error}", file=sys.stderr)

@@ -62,13 +62,14 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: devbox
-    timeout-minutes: 120
+    timeout-minutes: 180
     # Shared with Devbox Deploy and Devbox Destroy so operations on one box
-    # never overlap. Never cancel: a cancelled create strands half-made
-    # resources without a failed state.
+    # never overlap. Queued runs are kept rather than replaced, and a running
+    # create is never cancelled for another run.
     concurrency:
       group: devbox-${{ needs.prepare.outputs.name }}
       cancel-in-progress: false
+      queue: max
     permissions:
       contents: read
       id-token: write
@@ -88,6 +89,7 @@ jobs:
 
       - name: Create devbox
         env:
+          DEVBOX_ATTEMPT_FILE: ${{ runner.temp }}/devbox-attempt.json
           NAME: ${{ needs.prepare.outputs.name }}
           OWNER: ${{ needs.prepare.outputs.owner }}
           LIFETIME_HOURS: ${{ needs.prepare.outputs.lifetime_hours }}
@@ -101,3 +103,9 @@ jobs:
           DEVBOX_CONFIG_RECAPTCHA_SITE_KEY: ${{ vars.DEVBOX_RECAPTCHA_SITE_KEY }}
           DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID: ${{ vars.DEVBOX_RECAPTCHA_PROJECT_ID }}
         run: python3 .github/workflows/scripts/devbox_workflow.py create
+
+      - name: Mark an interrupted create failed
+        if: failure() || cancelled()
+        env:
+          DEVBOX_ATTEMPT_FILE: ${{ runner.temp }}/devbox-attempt.json
+        run: python3 .github/workflows/scripts/devbox_workflow.py finish-create

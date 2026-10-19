@@ -284,14 +284,16 @@ Then open the console at http://localhost:3000 and Mailpit at
 http://localhost:8025. The API is on 8080, the auth/data gateway on 54321 and
 the sandbox proxy on 8090 (sandbox hosts are `*.sandbox.localhost:8090`).
 
-If any step fails, the run fails, sets state `failed` on the VM when it
-exists, and lists every resource it created. A failed box is never reported
+If any step fails, times out or is cancelled, the run fails, sets state
+`failed` on the VM when it exists, and lists every resource of the attempt it
+finds by `devbox-id` label or name. A failed box is never reported
 as ready; destroy it and create a new one.
 
 ## Workflow safety
 
 - Create, deploy and destroy for one box share the concurrency group
-  `devbox-<name>` and never cancel each other, so they cannot overlap. Each
+  `devbox-<name>` with `queue: max`, so they run one at a time in the order
+  they were started and none is cancelled for another. Each
   re-reads the box's labels before writing and stops if its `devbox-id`
   changed.
 - The workflows refuse to run from any ref but `main`; the `devbox`
@@ -304,7 +306,7 @@ as ready; destroy it and create a new one.
 ### Verified only on a real box
 
 The unit tests (`.github/workflows/scripts/test_devbox_*.py`) cover naming,
-lifetime bounds, branch handling, labels, the manifest, target resolution,
-component selection and the order of cloud calls with `gcloud` mocked. IAP
+lifetime bounds, branch handling, labels, the manifest and the order of cloud
+calls with `gcloud` mocked. IAP
 reachability, OS Login, on-box checkouts and the box scripts themselves are
 exercised by the end-to-end smoke run.
