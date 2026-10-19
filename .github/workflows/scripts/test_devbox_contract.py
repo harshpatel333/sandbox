@@ -44,10 +44,11 @@ class NamingTests(unittest.TestCase):
     def test_supplied_names_are_validated(self):
         self.assertEqual(contract.resolve_name("  my-box  ", "owner"), "my-box")
         self.assertEqual(contract.resolve_name("", "owner", "abcdef"), "owner-dev-abcdef")
-        for bad in ("a", "1box", "box-", "Box", "my_box", "a" * 41, "box.dev", "box dev"):
+        for bad in ("a", "1box", "box-", "Box", "my_box", "a" * 41, "box.dev", "box dev", "foo-data"):
             with self.subTest(name=bad), self.assertRaises(contract.ContractError):
                 contract.resolve_name(bad, "owner")
         contract.validate_name("a" * 40)
+        contract.validate_name("foo-database")
 
     def test_devbox_id(self):
         self.assertRegex(contract.new_devbox_id(), r"^[0-9a-f]{12}$")

@@ -87,6 +87,10 @@ def validate_name(name):
         raise ContractError(
             f"Invalid devbox name {name!r}: use 2-{MAX_NAME_LENGTH} lowercase letters, digits "
             "or hyphens, starting with a letter and ending with a letter or digit")
+    # Box <name>'s data disk is devbox-<name>-data, which is also the VM and
+    # boot disk name of a box called <name>-data.
+    if name.endswith(DATA_DISK_SUFFIX):
+        raise ContractError(f"Invalid devbox name {name!r}: names may not end in {DATA_DISK_SUFFIX!r}")
     return name
 
 
