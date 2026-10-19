@@ -453,13 +453,25 @@ class UnlabelledResourceTest(unittest.TestCase):
         self.assertEqual(cloud.calls, [])
 
     def test_unreadable_manifest_refuses_destroy(self):
+        for value in ('{"resources": [', '{}', 'null', '[]', '{"resources": null}'):
+            with self.subTest(value=value):
+                cloud = FakeCloud()
+                cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d')
+                cloud.instances_[0]['metadata']['items'][0]['value'] = value
+                with self.assertRaises(SystemExit) as stop:
+                    inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+                self.assertIn(inv.UNREADABLE, stop.exception.code)
+                self.assertEqual(cloud.calls, [])
+
+    def test_doubly_claimed_leftover_goes_to_the_only_box_whose_create_window_fits(self):
         cloud = FakeCloud()
-        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d')
-        cloud.instances_[0]['metadata']['items'][0]['value'] = '{"resources": ['
-        with self.assertRaises(SystemExit) as stop:
-            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
-        self.assertIn(inv.UNREADABLE, stop.exception.code)
-        self.assertEqual(cloud.calls, [])
+        cloud.add_box('alice-dev-a7f3c9', '5b6c7d8e9f0a', vm=False, disks=False)
+        cloud.buckets_[0]['creation_time'] = '2026-12-01T00:00:00+00:00'
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False, unlabelled=('boot',))
+        found, ignored = boxes(cloud)
+        self.assertEqual(ignored, [])
+        self.assertEqual([(b.devbox_id, any(r.adopted for r in b.resources)) for b in found],
+                         [('3f9c0a1b2c4d', True), ('5b6c7d8e9f0a', False)])
 
     def test_old_partially_labelled_or_foreign_attached_resources_are_not_adopted(self):
         _, boot, _ = gce('alice-dev-a7f3c9')

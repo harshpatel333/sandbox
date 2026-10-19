@@ -162,7 +162,8 @@ def _last(url):
     return (url or '').rsplit('/', 1)[-1]
 
 
-UNREADABLE = 'unreadable devbox-manifest metadata'
+UNREADABLE = 'devbox-manifest metadata without a readable resources list (fix or remove it on the instance)'
+ABSENT = object()
 
 
 def _raw_manifest(instance):
@@ -172,7 +173,7 @@ def _raw_manifest(instance):
                 return json.loads(item.get('value') or '')
             except ValueError:
                 return UNREADABLE
-    return None
+    return ABSENT
 
 
 def _manifest(raw):
@@ -183,10 +184,10 @@ def _manifest(raw):
 
 
 def _recorded(raw):
-    if raw == UNREADABLE:
-        return [UNREADABLE]
+    if raw is ABSENT:
+        return []
     resources = raw.get('resources') if isinstance(raw, dict) else None
-    return resources if isinstance(resources, list) else []
+    return resources if isinstance(resources, list) else [UNREADABLE]
 
 
 def _dict(value):
@@ -283,6 +284,8 @@ def inventory(resources, project):
         if len(owners) > 1:
             owners = [key for key in owners if any(r.kind == 'instance' and r.link in resource.users
                                                    for r in groups[key])] or owners
+        if len(owners) > 1:
+            owners = [key for key in owners if _unadoptable(resource, groups[key]) is None] or owners
         reason = (f'unlabelled and claimed by {len(owners)} devboxes' if len(owners) > 1
                   else _unadoptable(resource, groups[owners[0]]))
         if reason:
