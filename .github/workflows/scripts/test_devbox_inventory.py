@@ -395,6 +395,15 @@ class UnlabelledResourceTest(unittest.TestCase):
         inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
         self.assertNotIn(('disk', data), cloud.calls)
 
+    def test_blocked_remnant_is_not_reported_gone_when_nothing_else_remains(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False, bucket=False, environment='staging')
+        cloud.disks_ = cloud.disks_[:1]
+        with self.assertRaises(SystemExit) as stop:
+            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertIn(f'disk {gce("alice-dev-a7f3c9")[1]}', stop.exception.code)
+        self.assertEqual(cloud.calls, [])
+
     def test_old_partially_labelled_or_foreign_attached_resources_are_not_adopted(self):
         _, boot, _ = gce('alice-dev-a7f3c9')
         cases = {'older than the devbox': {'creationTimestamp': '2027-01-15T04:59:59+00:00'},

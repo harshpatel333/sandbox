@@ -427,6 +427,9 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
 
     Unlabelled resources are labelled first so that any partial failure stays findable by a retry."""
     box, blocked = find_with_blocked(cloud, project, name, devbox_id)
+    if blocked:
+        raise SystemExit(f'Refusing to destroy {name} ({devbox_id}): ' + '; '.join(
+            f'{r.kind} {r.name} {reason}' for r, reason in blocked) + '. Nothing was deleted; resolve it and rerun.')
     if box is None:
         return f'`{name}` ({devbox_id}) is already gone.'
     if require_expired_at is not None and (box.expires_at is None or box.expires_at > require_expired_at):
@@ -434,9 +437,6 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
     if box.unhandled:
         raise SystemExit(f'Refusing to destroy {name} ({devbox_id}): its manifest records resources destroy cannot '
                          f'remove ({", ".join(box.unhandled)}); nothing was deleted.')
-    if blocked:
-        raise SystemExit(f'Refusing to destroy {name} ({devbox_id}): ' + '; '.join(
-            f'{r.kind} {r.name} {reason}' for r, reason in blocked) + '. Nothing was deleted; resolve it and rerun.')
     for resource in [r for r in box.resources if r.adopted]:
         error = cloud.label(resource, box.identity_labels())
         if error:
