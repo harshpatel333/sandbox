@@ -230,11 +230,9 @@ install_secretsproxy_ca() {
 }
 
 write_runtime() {
-  local revision
-  revision=$(devbox_revision)
   install -d -m 0755 "$DEVBOX_STATE"
   python3 "$DEVBOX_REPO/deploy/devbox/devbox_host.py" runtime --out "$DEVBOX_RUNTIME_JSON" \
-    --revision "$revision" --instance "$DEVBOX_INSTANCE" --zone "$DEVBOX_ZONE" \
+    --revision "$REVISION" --instance "$DEVBOX_INSTANCE" --zone "$DEVBOX_ZONE" \
     --region "$DEVBOX_REGION" --bucket "$DEVBOX_ARTIFACT_BUCKET" \
     --firecracker-version "$DEVBOX_FIRECRACKER_VERSION" --firecracker-sha256 "$DEVBOX_FIRECRACKER_SHA256" \
     --kernel-object "$DEVBOX_KERNEL_OBJECT" --kernel-digest "$DEVBOX_KERNEL_DIGEST" \
@@ -247,6 +245,7 @@ main() {
   devbox_require_root
   devbox_load_env
   devbox_instance
+  REVISION=$(devbox_revision)
   check_prerequisites
   # A rerun keeps the capacity sized at create (memory reported by the kernel
   # drifts across updates); explicit overrides still apply and are verified.

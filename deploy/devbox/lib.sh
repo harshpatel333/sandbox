@@ -81,9 +81,13 @@ devbox_load_local_secrets() {
 }
 
 # The checkout's revision, which must be the one CI selected when it says.
+# Builds compile the working tree, so it must be exactly that revision.
 devbox_revision() {
-  local head selected
+  local head selected dirty
   head=$(git -c safe.directory="$DEVBOX_REPO" -C "$DEVBOX_REPO" rev-parse HEAD) || devbox_die "cannot read the sandbox revision at $DEVBOX_REPO"
+  dirty=$(git -c safe.directory="$DEVBOX_REPO" -C "$DEVBOX_REPO" status --porcelain --untracked-files=all) \
+    || devbox_die "cannot read the checkout status at $DEVBOX_REPO"
+  [ -z "$dirty" ] || devbox_die "$DEVBOX_REPO has changes outside revision $head; push them to a branch and deploy that branch"
   if [ -n "${DEVBOX_SANDBOX_SHA:-}" ]; then
     [[ "$DEVBOX_SANDBOX_SHA" =~ ^[0-9a-fA-F]{7,40}$ ]] || devbox_die "DEVBOX_SANDBOX_SHA must be a commit SHA"
     selected=$(git -c safe.directory="$DEVBOX_REPO" -C "$DEVBOX_REPO" rev-parse --verify --quiet "$DEVBOX_SANDBOX_SHA^{commit}") || selected=$DEVBOX_SANDBOX_SHA

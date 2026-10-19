@@ -184,6 +184,36 @@ systemd-run() {{ echo pem > {ca}/ca.crt; echo pem > {ca}/ca.key; echo minted > {
                 for name in files:
                     self.assertEqual((ca / name).read_text(), "existing")
 
+    def test_revision_refuses_a_checkout_with_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            git = ["git", "-c", "user.name=example", "-c", "user.email=example@example.com", "-C", tmp]
+            subprocess.run(git + ["init", "-q"], check=True)
+            (repo / ".gitignore").write_text("bin/\n")
+            (repo / "main.go").write_text("package main\n")
+            subprocess.run(git + ["add", "."], check=True)
+            subprocess.run(git + ["commit", "-qm", "base"], check=True)
+            head = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+
+            def revision(selected=""):
+                script = (f". {HERE / 'lib.sh'}\nDEVBOX_REPO={tmp}\nDEVBOX_SANDBOX_SHA={selected}\n"
+                          "devbox_revision\n")
+                return subprocess.run(["bash", "-euc", script], capture_output=True, text=True)
+
+            (repo / "bin").mkdir()
+            (repo / "bin" / "vmd").write_text("built")
+            self.assertEqual(revision(head).stdout.strip(), head)
+            self.assertNotEqual(revision("0" * 40).returncode, 0)
+            for change in ("modified", "untracked"):
+                with self.subTest(change=change):
+                    target = repo / ("main.go" if change == "modified" else "extra.go")
+                    target.write_text("package main\n// local\n")
+                    result = revision(head)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("push them to a branch", result.stderr)
+                    subprocess.run(git + ["checkout", "-q", "--", "."], check=True)
+                    (repo / "extra.go").unlink(missing_ok=True)
+
     def test_capacity_reserves_host_memory_and_honours_overrides(self):
         meminfo = "MemTotal:       32873024 kB\nMemFree:  1 kB\n"
         self.assertEqual(devbox_host.capacity(meminfo, "8", "8192"), (32102 - 8192, 8))

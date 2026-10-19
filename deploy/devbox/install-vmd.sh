@@ -16,6 +16,8 @@ main() {
   devbox_instance
   devbox_load_local_secrets INTERNAL_API_TOKEN DATABASE_URL
   local revision bin
+  # A deploy killed mid-run leaves its bundle in the checkout.
+  rm -f "$DEVBOX_REPO"/deploy-bundle-*.tar.gz
   revision=$(devbox_revision)
   bin=$DEVBOX_REPO/bin
   mkdir -p "$bin"
