@@ -97,6 +97,7 @@ on:
       - '.github/workflows/deploy-proxy.yml'
       - '.github/workflows/scripts/deploy-proxy.py'
       - '.github/workflows/scripts/deploy-proxy-legacy.py'
+      - '.github/workflows/scripts/host_transport.py'
       - '.github/workflows/scripts/legacy_proxy_preflight.py'
       - '.github/workflows/scripts/select-deploy-target.sh'
 

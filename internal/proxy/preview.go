@@ -14,7 +14,7 @@ import (
 // exact per-port access. Phase 3 token policy remains header-only; the Phase 4
 // browser sentinel additively permits query bootstrap and the resulting
 // host-only cookie. Unknown modes always fail closed.
-func enforcePreviewPublication(w http.ResponseWriter, r *http.Request, instanceID string, port int, info InstanceInfo, seed []byte, preflightOriginAllowed bool) bool {
+func enforcePreviewPublication(w http.ResponseWriter, r *http.Request, instanceID string, port int, info InstanceInfo, seed []byte, preflightOriginAllowed bool, publicScheme string) bool {
 	switch info.PreviewAccess {
 	case "", preview.AccessLegacyPublic:
 		// Preserve legacy all-port routing unless an additive Phase 2 record
@@ -85,7 +85,7 @@ func enforcePreviewPublication(w http.ResponseWriter, r *http.Request, instanceI
 		// redirecting removes the live credential from the address bar and gives
 		// subsequent subresources and WebSockets the host-only cookie.
 		if token, ok := firstValidPreviewToken(queryTokens, verify); ok {
-			redirectWithPreviewCookie(w, r, token)
+			redirectWithPreviewCookie(w, r, token, publicScheme)
 			return false
 		}
 	}
@@ -237,8 +237,10 @@ func previewQueryTokens(rawQuery string) []string {
 // redirectWithPreviewCookie moves a valid signed-link credential into a
 // secure host-only cookie and redirects to an absolute URL on the already
 // validated preview origin. An absolute target keeps a path such as
-// "//attacker.example/x" from becoming a network-path redirect.
-func redirectWithPreviewCookie(w http.ResponseWriter, r *http.Request, token string) {
+// "//attacker.example/x" from becoming a network-path redirect. The scheme is
+// the one browsers reach the proxy on, which TLS termination in front of it
+// hides from the request itself.
+func redirectWithPreviewCookie(w http.ResponseWriter, r *http.Request, token, publicScheme string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:        auth.PreviewTokenCookie,
 		Value:       token,
@@ -252,7 +254,7 @@ func redirectWithPreviewCookie(w http.ResponseWriter, r *http.Request, token str
 	w.Header().Set("Referrer-Policy", "no-referrer")
 
 	target := *r.URL
-	target.Scheme = "https"
+	target.Scheme = publicScheme
 	target.Host = r.Host
 	target.User = nil
 	target.Opaque = ""
