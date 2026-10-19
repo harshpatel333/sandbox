@@ -1,13 +1,9 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"time"
@@ -31,29 +27,18 @@ func ycConsoleOrigin() (string, error) {
 	return u.Scheme + "://" + u.Host, nil
 }
 
-func sendYCClaimMail(ctx context.Context, client *http.Client, endpoint, origin, key, from string, j ycMailJob) error {
-	if key == "" || from == "" || !validYCToken(j.Token) || j.ClaimID == uuid.Nil || j.MessageID == uuid.Nil {
+func sendYCClaimMail(ctx context.Context, sender EmailSender, origin, from string, j ycMailJob) error {
+	if sender == nil || from == "" || !validYCToken(j.Token) || j.ClaimID == uuid.Nil || j.MessageID == uuid.Nil {
 		return errors.New("YC email configuration unavailable")
 	}
 	link := origin + "/yc/confirm#claim=" + j.ClaimID.String() + "&token=" + j.Token
-	body, _ := json.Marshal(map[string]any{"from": from, "to": []string{j.Email}, "subject": "Confirm your email for the Superserve YC offer", "text": "Confirm your email address to continue your YC claim:\n\n" + link + "\n\nThis link expires in 24 hours. After confirmation, sign up or sign in using this email and select your authorized team. Eligibility approval does not enable Pro access or issue credits; billing activation and a payment method are separate steps. If you did not request this, ignore this email."})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Idempotency-Key", "yc-claim/"+j.MessageID.String())
-	resp, err := client.Do(req)
-	if err != nil {
-		return errors.New("YC email transport failed")
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("YC email provider status %d", resp.StatusCode)
-	}
-	return nil
+	return sender.SendEmail(ctx, EmailMessage{
+		From:           from,
+		To:             j.Email,
+		Subject:        "Confirm your email for the Superserve YC offer",
+		Text:           "Confirm your email address to continue your YC claim:\n\n" + link + "\n\nThis link expires in 24 hours. After confirmation, sign up or sign in using this email and select your authorized team. Eligibility approval does not enable Pro access or issue credits; billing activation and a payment method are separate steps. If you did not request this, ignore this email.",
+		IdempotencyKey: "yc-claim/" + j.MessageID.String(),
+	})
 }
 
 // Durable leases and provider idempotency allow every replica to poll safely.
@@ -63,12 +48,11 @@ func (h *Handlers) StartYCClaimMail(ctx context.Context) {
 		return
 	}
 	origin, err := ycConsoleOrigin()
-	key, from := os.Getenv("YC_EMAIL_API_KEY"), os.Getenv("YC_EMAIL_FROM")
-	if err != nil || key == "" || from == "" {
+	sender, from := h.EmailTransport.Sender(os.Getenv("YC_EMAIL_API_KEY")), os.Getenv("YC_EMAIL_FROM")
+	if err != nil || sender == nil || from == "" {
 		log.Warn().Msg("YC confirmation mail disabled; configure console origin and email provider before enabling claim capture")
 		return
 	}
-	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -92,7 +76,7 @@ func (h *Handlers) StartYCClaimMail(ctx context.Context) {
 					cancel()
 					break
 				}
-				e = sendYCClaimMail(jobctx, client, resendEmailEndpoint, origin, key, from, j)
+				e = sendYCClaimMail(jobctx, sender, origin, from, j)
 				_, ack := h.ycClaimRPC(jobctx, "mail-finish", map[string]any{"id": j.ClaimID, "lease_id": lease, "success": e == nil})
 				cancel()
 				if e != nil || ack != nil {

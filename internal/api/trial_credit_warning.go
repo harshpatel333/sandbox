@@ -4,17 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
-	"io"
 	"math"
-	"net/http"
-	"net/http/httptrace"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -132,31 +127,30 @@ type trialCreditWarningIdempotentSender interface {
 	SendTrialCreditWarningWithKey(context.Context, uuid.UUID, float64, uuid.UUID) error
 }
 
-// ResendTrialCreditWarningSender delivers the warning to all current billing
+// EmailTrialCreditWarningSender delivers the warning to all current billing
 // recipients without exposing addresses to one another.
-type ResendTrialCreditWarningSender struct {
-	apiKey, from string
-	queries      *db.Queries
-	endpoint     string
-	client       *http.Client
+type EmailTrialCreditWarningSender struct {
+	sender  EmailSender
+	from    string
+	queries *db.Queries
 }
 
-func NewResendTrialCreditWarningSender(apiKey, from string, queries *db.Queries) *ResendTrialCreditWarningSender {
-	return &ResendTrialCreditWarningSender{apiKey: apiKey, from: from, queries: queries, endpoint: resendEmailEndpoint, client: &http.Client{Timeout: 10 * time.Second}}
+func NewEmailTrialCreditWarningSender(sender EmailSender, from string, queries *db.Queries) *EmailTrialCreditWarningSender {
+	return &EmailTrialCreditWarningSender{sender: sender, from: from, queries: queries}
 }
-func (s *ResendTrialCreditWarningSender) SendTrialCreditWarning(ctx context.Context, teamID uuid.UUID, remaining float64) error {
+func (s *EmailTrialCreditWarningSender) SendTrialCreditWarning(ctx context.Context, teamID uuid.UUID, remaining float64) error {
 	return s.sendTrialCreditWarning(ctx, teamID, remaining, uuid.Nil)
 }
 
-func (s *ResendTrialCreditWarningSender) SendTrialCreditWarningWithKey(ctx context.Context, teamID uuid.UUID, remaining float64, claimToken uuid.UUID) error {
+func (s *EmailTrialCreditWarningSender) SendTrialCreditWarningWithKey(ctx context.Context, teamID uuid.UUID, remaining float64, claimToken uuid.UUID) error {
 	return s.sendTrialCreditWarning(ctx, teamID, remaining, claimToken)
 }
 
-func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Context, teamID uuid.UUID, remaining float64, claimToken uuid.UUID) error {
-	if s == nil || s.apiKey == "" || s.from == "" || s.queries == nil {
+func (s *EmailTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Context, teamID uuid.UUID, remaining float64, claimToken uuid.UUID) error {
+	if s == nil || s.sender == nil || s.from == "" || s.queries == nil {
 		// A missing provider configuration is a delivery failure, not a
 		// successful no-op. Returning nil here would mark the durable warning
-		// state as sent even though Resend never accepted a message.
+		// state as sent even though no provider accepted a message.
 		return errors.New("trial credit warning provider is not configured")
 	}
 	if claimToken == uuid.Nil {
@@ -190,8 +184,8 @@ func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Cont
 		return err
 	}
 	handled := len(resolved)
-	// Submit one message per recipient. Resend's `to` array is rendered as a
-	// shared To header, which would disclose other billing members' addresses.
+	// Submit one message per recipient. A shared To header would disclose
+	// other billing members' addresses.
 	for _, recipient := range recipients {
 		if resolved[recipient] {
 			continue
@@ -228,22 +222,26 @@ func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Cont
 		if !current {
 			return errors.New("trial credit warning lifecycle changed after claim")
 		}
-		payload, _ := json.Marshal(map[string]any{"from": s.from, "to": []string{recipient}, "subject": "Your trial credit may run out soon", "html": trialCreditWarningHTML(team.Name, remaining)})
-		// Provider identity uses the recipient, independent of list order.
 		// Persisted recipient outcomes suppress repeats across new claims.
-		if err := s.sendEmailWithKey(ctx, payload, claimToken, recipient); err != nil {
-			var permanent *permanentTrialCreditWarningError
-			if !errors.As(err, &permanent) {
+		if err := s.sender.SendEmail(ctx, EmailMessage{
+			From:           s.from,
+			To:             recipient,
+			Subject:        "Your trial credit may run out soon",
+			HTML:           trialCreditWarningHTML(team.Name, remaining),
+			IdempotencyKey: trialCreditWarningIdempotencyKey(claimToken, recipient),
+		}); err != nil {
+			var rejected *rejectedEmailError
+			if !errors.As(err, &rejected) {
 				return err
 			}
 			rows, recordErr := s.queries.RecordTrialCreditWarningRejection(ctx, db.RecordTrialCreditWarningRejectionParams{
 				TeamID: teamID, Recipient: recipient, ClaimToken: pgtype.UUID{Bytes: claimToken, Valid: true},
 			})
 			if recordErr != nil {
-				return &unknownTrialCreditWarningError{err: fmt.Errorf("record trial warning rejection: %w", recordErr)}
+				return &unknownEmailOutcomeError{err: fmt.Errorf("record trial warning rejection: %w", recordErr)}
 			}
 			if rows != 1 {
-				return &unknownTrialCreditWarningError{err: errors.New("trial warning rejection claim no longer current")}
+				return &unknownEmailOutcomeError{err: errors.New("trial warning rejection claim no longer current")}
 			}
 			handled++
 			log.Warn().Err(err).Str("team_id", teamID.String()).Msg("trial credit warning recipient permanently rejected; not retrying")
@@ -255,10 +253,10 @@ func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Cont
 		// Acceptance without durable progress must never release the claim:
 		// a later attempt could otherwise resend this recipient's message.
 		if err != nil {
-			return &unknownTrialCreditWarningError{err: fmt.Errorf("record trial warning delivery: %w", err)}
+			return &unknownEmailOutcomeError{err: fmt.Errorf("record trial warning delivery: %w", err)}
 		}
 		if rows != 1 {
-			return &unknownTrialCreditWarningError{err: errors.New("trial warning delivery claim no longer current")}
+			return &unknownEmailOutcomeError{err: errors.New("trial warning delivery claim no longer current")}
 		}
 		handled++
 	}
@@ -268,73 +266,11 @@ func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Cont
 	return nil
 }
 
-func (s *ResendTrialCreditWarningSender) sendEmail(ctx context.Context, payload []byte) error {
-	return s.sendEmailWithKey(ctx, payload, uuid.Nil, "")
+// trialCreditWarningIdempotencyKey identifies one claim's message to one
+// recipient, independent of recipient list order.
+func trialCreditWarningIdempotencyKey(claimToken uuid.UUID, recipient string) string {
+	return fmt.Sprintf("trial-credit-warning/%s/%x", claimToken, sha256.Sum256([]byte(recipient)))
 }
-
-func (s *ResendTrialCreditWarningSender) sendEmailWithKey(ctx context.Context, payload []byte, claimToken uuid.UUID, recipient string) error {
-	var gettingConn, gotConn atomic.Bool
-	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-		GetConn: func(string) { gettingConn.Store(true) },
-		GotConn: func(httptrace.GotConnInfo) { gotConn.Store(true) },
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	if claimToken != uuid.Nil {
-		req.Header.Set("Idempotency-Key", fmt.Sprintf("trial-credit-warning/%s/%x", claimToken, sha256.Sum256([]byte(recipient))))
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		// Failure to obtain a connection (including DNS, dial, and TLS)
-		// precedes submission. Once connected, even a partial write may
-		// have reached the provider. Untraced transports remain ambiguous.
-		if gettingConn.Load() && !gotConn.Load() {
-			return err
-		}
-		return &unknownTrialCreditWarningError{err: err}
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return nil
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	var providerError struct {
-		Name string `json:"name"`
-	}
-	_ = json.Unmarshal(body, &providerError)
-	err = fmt.Errorf("resend returned %d (%s)", resp.StatusCode, providerError.Name)
-	// Keep request timeouts and recoverable provider configuration errors retryable.
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 &&
-		resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden &&
-		resp.StatusCode != http.StatusRequestTimeout &&
-		resp.StatusCode != http.StatusTooManyRequests && providerError.Name != "invalid_from_address" {
-		return &permanentTrialCreditWarningError{err: err}
-	}
-	return err
-}
-
-type permanentTrialCreditWarningError struct{ err error }
-
-func (e *permanentTrialCreditWarningError) Error() string { return e.err.Error() }
-func (e *permanentTrialCreditWarningError) Unwrap() error { return e.err }
-
-// UnknownTrialCreditWarningOutcome indicates that delivery may have been
-// accepted despite the returned error (for example, a timeout after submit).
-// Such claims are terminal to preserve at-most-once delivery.
-type UnknownTrialCreditWarningOutcome interface{ UnknownTrialCreditWarning() bool }
-
-// Transport failures after submission have an unknown outcome: the provider
-// may have accepted the message before the connection failed. Keep the claim
-// terminal instead of releasing it for an automatic duplicate send.
-type unknownTrialCreditWarningError struct{ err error }
-
-func (e *unknownTrialCreditWarningError) Error() string                   { return e.err.Error() }
-func (e *unknownTrialCreditWarningError) Unwrap() error                   { return e.err }
-func (e *unknownTrialCreditWarningError) UnknownTrialCreditWarning() bool { return true }
 
 // Discover one bounded page per existing eligibility tick, outside reconciliation.
 func (h *Handlers) scheduleTrialCreditWarningDiscovery(ctx context.Context) {
@@ -510,8 +446,8 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 		}
 		return h.TrialWarningSender.SendTrialCreditWarning(ctx, teamID, remaining)
 	}); err != nil {
-		var unknown UnknownTrialCreditWarningOutcome
-		if errors.As(err, &unknown) && unknown.UnknownTrialCreditWarning() {
+		var unknown *unknownEmailOutcomeError
+		if errors.As(err, &unknown) {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if stateErr := h.DB.MarkTrialCreditWarningUnknown(cleanupCtx, db.MarkTrialCreditWarningUnknownParams{TeamID: teamID, ClaimToken: claimToken}); stateErr != nil {

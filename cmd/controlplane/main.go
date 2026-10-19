@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -232,8 +233,9 @@ func run() error {
 		machineAuthority.Enable()
 	}
 	handlers.MachineCredentials = machineAuthority
-	if apiKey, from := os.Getenv("RESEND_API_KEY"), os.Getenv("QUOTA_EMAIL_FROM"); apiKey != "" && from != "" {
-		handlers.TrialWarningSender = api.NewResendTrialCreditWarningSender(apiKey, from, queries)
+	handlers.EmailTransport = api.EmailTransport{SMTPAddr: cfg.SMTPAddr}
+	if sender, from := handlers.EmailTransport.Sender(os.Getenv("RESEND_API_KEY")), os.Getenv("QUOTA_EMAIL_FROM"); sender != nil && from != "" {
+		handlers.TrialWarningSender = api.NewEmailTrialCreditWarningSender(sender, from, queries)
 	}
 	handlers.Pool = dbPool
 	handlers.PromotionAuthPool = newPromotionAuthPool(ctx, os.Getenv("PROMOTION_AUTH_DATABASE_URL"))
@@ -479,18 +481,18 @@ func run() error {
 	if webhook := os.Getenv("SLACK_QUOTA_ALERT_WEBHOOK"); webhook != "" {
 		quotaNotifiers = append(quotaNotifiers, api.NewSlackQuotaNotifier(webhook))
 	}
-	if apiKey, from := os.Getenv("RESEND_API_KEY"), os.Getenv("QUOTA_EMAIL_FROM"); apiKey != "" && from != "" {
-		quotaNotifiers = append(quotaNotifiers, api.NewEmailQuotaNotifier(apiKey, from, queries))
+	if sender, from := handlers.EmailTransport.Sender(os.Getenv("RESEND_API_KEY")), os.Getenv("QUOTA_EMAIL_FROM"); sender != nil && from != "" {
+		quotaNotifiers = append(quotaNotifiers, api.NewEmailQuotaNotifier(sender, from, queries))
 	}
 	if len(quotaNotifiers) > 0 {
 		go api.StartQuotaWatcher(ctx, queries, quotaNotifiers)
 	} else {
-		log.Info().Msg("quota watcher disabled (no SLACK_QUOTA_ALERT_WEBHOOK or RESEND_API_KEY/QUOTA_EMAIL_FROM)")
+		log.Info().Msg("quota watcher disabled (no SLACK_QUOTA_ALERT_WEBHOOK or email sender/QUOTA_EMAIL_FROM)")
 	}
 
 	// Start HTTP server.
 	srv := &http.Server{
-		Addr:              ":" + cfg.Port,
+		Addr:              net.JoinHostPort(cfg.Host, cfg.Port),
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      0, // 0 = no timeout; required for streaming exec responses
