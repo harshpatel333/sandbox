@@ -60,6 +60,7 @@ resource "google_compute_instance" "this" {
       }))}"
       startup-script = trimspace(join("\n\n", compact([
         local.host_patching_policy,
+        local.host_cpu_policy,
         var.provisioning ? local.host_provisioning_hold : "",
         var.provisioning ? "if [ -f /etc/sandbox/provisioning-complete ]; then\n:\n${lookup(var.metadata, "startup-script", ":")}\nfi" : lookup(var.metadata, "startup-script", ""),
       ])))
@@ -186,6 +187,14 @@ locals {
     APT::Periodic::Unattended-Upgrade "0";
     APTCONF
     systemctl disable --now apt-daily-upgrade.timer 2>/dev/null || true
+  EOT
+
+  # CPU frequency policy, mirroring deploy/superserve-cpufreq.conf, which every
+  # vmd deploy re-asserts on running hosts.
+  host_cpu_policy = <<-EOT
+    mkdir -p /etc/tmpfiles.d
+    printf 'w /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor - - - - performance\n' > /etc/tmpfiles.d/superserve-cpufreq.conf
+    systemd-tmpfiles --create /etc/tmpfiles.d/superserve-cpufreq.conf || true
   EOT
 
   instance_labels = merge(
