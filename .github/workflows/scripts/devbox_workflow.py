@@ -40,6 +40,9 @@ SSH_RETRY_SECONDS = 15
 # Kept below the job's timeout-minutes so a slow step fails here, with the box
 # marked failed, rather than being killed by the runner.
 DEADLINE_SECONDS = 165 * 60
+# Reporting a failure gets its own budget, so a deadline hit at 165 minutes
+# still records it before the job's 180-minute timeout.
+REPORT_SECONDS = 10 * 60
 MAX_STATE_BYTES = 32 * 1024
 
 
@@ -62,9 +65,6 @@ class Deadline:
 
     def start(self, seconds):
         self.end = time.monotonic() + seconds
-
-    def stop(self):
-        self.end = None
 
     def cap(self, timeout):
         if self.end is None:
@@ -587,7 +587,7 @@ def mark_failed(name, devbox_id):
 
 
 def report_create_failure(env, name, devbox_id, error):
-    DEADLINE.stop()
+    DEADLINE.start(REPORT_SECONDS)
     try:
         found = discover(name, devbox_id)
         discovery = ""

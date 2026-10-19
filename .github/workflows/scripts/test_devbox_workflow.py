@@ -170,7 +170,7 @@ class WorkflowCase(unittest.TestCase):
         patcher = patch.object(workflow.time, "sleep")
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.addCleanup(workflow.DEADLINE.stop)
+        self.addCleanup(setattr, workflow.DEADLINE, "end", None)
 
     def env(self, **values):
         return {"GITHUB_REF": "refs/heads/main", "GITHUB_ACTOR": "AWille-AI", "GITHUB_OUTPUT": str(self.output),
