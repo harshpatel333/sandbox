@@ -166,7 +166,12 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 			if err != nil {
 				return fmt.Errorf("create %s: %w", target, err)
 			}
-			written, copyErr := io.Copy(f, tr)
+			var src io.Reader = tr
+			if maxBytes > 0 {
+				// One byte past the remaining budget is enough to detect the overflow.
+				src = io.LimitReader(tr, maxBytes-totalBytes+1)
+			}
+			written, copyErr := io.Copy(f, src)
 			closeErr := f.Close()
 			if copyErr != nil {
 				return fmt.Errorf("write %s: %w", target, copyErr)
