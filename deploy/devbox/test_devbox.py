@@ -122,6 +122,32 @@ class HostTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 devbox_host.install_identity(root, "example-project", "101", "example-box")
 
+    def test_lost_identity_record_on_a_used_box_is_refused(self):
+        for trace in ("etc/sandbox/host-identity.env", "var/lib/superserve-devbox/runtime.json",
+                      "var/lib/sandbox/vmd.db"):
+            with self.subTest(trace=trace), tempfile.TemporaryDirectory() as root:
+                path = Path(root, trace)
+                path.parent.mkdir(parents=True)
+                path.write_text("")
+                with self.assertRaises(ValueError):
+                    devbox_host.install_identity(root, "example-project", "100", "example-box")
+                self.assertFalse(Path(root, "etc/sandbox/host-identity.json").exists())
+
+    def test_pin_drift_names_every_changed_runtime_input(self):
+        manifest = {"artifacts": {
+            "source": "gs://example-artifacts/hostprep/",
+            "firecracker": {"version": "v0.0.0", "sha256": "2" * 64},
+            "kernel": {"object": "vmlinux-example", "digest": "3" * 64},
+            "rootfs": {"object": "base.ext4", "digest": "4" * 64},
+        }}
+        env = {"DEVBOX_ARTIFACT_BUCKET": "example-artifacts", "DEVBOX_FIRECRACKER_VERSION": "v0.0.0",
+               "DEVBOX_FIRECRACKER_SHA256": "2" * 64, "DEVBOX_KERNEL_OBJECT": "vmlinux-example",
+               "DEVBOX_KERNEL_DIGEST": "3" * 64, "DEVBOX_ROOTFS_OBJECT": "base.ext4",
+               "DEVBOX_ROOTFS_DIGEST": "4" * 64}
+        self.assertEqual(devbox_host.pin_drift(manifest, env), [])
+        changed = dict(env, DEVBOX_KERNEL_OBJECT="vmlinux-other", DEVBOX_ROOTFS_DIGEST="5" * 64)
+        self.assertEqual(devbox_host.pin_drift(manifest, changed), ["DEVBOX_KERNEL_OBJECT", "DEVBOX_ROOTFS_DIGEST"])
+
     def test_capacity_reserves_host_memory_and_honours_overrides(self):
         meminfo = "MemTotal:       32873024 kB\nMemFree:  1 kB\n"
         self.assertEqual(devbox_host.capacity(meminfo, "8", "8192"), (32102 - 8192, 8))

@@ -21,6 +21,8 @@ install_host_identity = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(install_host_identity)
 
 SCHEMA_VERSION = 1
+RUNTIME_JSON = "/var/lib/superserve-devbox/runtime.json"
+VMD_STATE = "/var/lib/sandbox/vmd.db"
 
 
 def write_atomic(path, text, mode):
@@ -45,12 +47,36 @@ def install_identity(root, project, instance_id, slot):
     root = Path(root)
     state = root / install_host_identity.STATE.lstrip("/")
     stored = json.loads(state.read_text()) if state.exists() else None
+    if stored is None:
+        # Minting a second identity for a box that already ran would orphan
+        # its sandboxes and host record; there is no rebind flow here.
+        traces = [p for p in (install_host_identity.ENV, RUNTIME_JSON, VMD_STATE)
+                  if (root / p.lstrip("/")).exists()]
+        if traces:
+            raise ValueError(f"host identity record is missing but {', '.join(traces)} exist; recreate the box")
     identity = install_host_identity.choose_identity(project, instance_id, slot, stored)
     for path, text in install_host_identity.identity_files(identity).items():
         target = root / path.lstrip("/")
         if not target.exists() or target.read_text() != text:
             write_atomic(target, text, 0o644 if path == install_host_identity.DROPIN else 0o600)
     return identity
+
+
+def pin_drift(manifest, env):
+    """Requested runtime inputs that differ from what this box was bootstrapped
+    with. The fleet bootstrap never replaces installed artifacts or vmd.env,
+    so a changed pin cannot take effect on an existing box."""
+    artifacts = manifest.get("artifacts") or {}
+    recorded = {
+        "DEVBOX_ARTIFACT_BUCKET": (artifacts.get("source") or "").removeprefix("gs://").removesuffix("/hostprep/"),
+        "DEVBOX_FIRECRACKER_VERSION": (artifacts.get("firecracker") or {}).get("version"),
+        "DEVBOX_FIRECRACKER_SHA256": (artifacts.get("firecracker") or {}).get("sha256"),
+        "DEVBOX_KERNEL_OBJECT": (artifacts.get("kernel") or {}).get("object"),
+        "DEVBOX_KERNEL_DIGEST": (artifacts.get("kernel") or {}).get("digest"),
+        "DEVBOX_ROOTFS_OBJECT": (artifacts.get("rootfs") or {}).get("object"),
+        "DEVBOX_ROOTFS_DIGEST": (artifacts.get("rootfs") or {}).get("digest"),
+    }
+    return sorted(key for key, value in recorded.items() if value != env.get(key))
 
 
 def capacity(meminfo, nproc, reserve_mib, memory_mib=None, vcpus=None):
@@ -102,6 +128,9 @@ def main(argv=None):
     for name in ("project", "instance-id", "slot"):
         ident.add_argument("--" + name, required=True)
 
+    drift = sub.add_parser("pin-drift")
+    drift.add_argument("--runtime", required=True)
+
     cap = sub.add_parser("capacity")
     cap.add_argument("--meminfo", default="/proc/meminfo")
     cap.add_argument("--nproc", required=True)
@@ -122,6 +151,10 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.command == "identity":
         print(install_identity(args.root, args.project, args.instance_id, args.slot)["host_id"])
+    elif args.command == "pin-drift":
+        changed = pin_drift(json.loads(Path(args.runtime).read_text()), os.environ)
+        if changed:
+            raise SystemExit(f"changed since bootstrap: {', '.join(changed)}")
     elif args.command == "capacity":
         memory, cpus = capacity(Path(args.meminfo).read_text(), args.nproc, args.reserve_mib,
                                 args.memory_mib, args.vcpus)

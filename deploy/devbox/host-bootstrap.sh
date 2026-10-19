@@ -86,8 +86,15 @@ PY
   mountpoint -q "$DATA" || devbox_die "$DATA is not mounted"
 }
 
-# The fleet bootstrap writes vmd.env only when it is absent, so a rerun with
-# changed settings would otherwise pass while VMD keeps the old ones.
+# The fleet bootstrap installs artifacts and writes vmd.env only when they
+# are absent, so a rerun with changed pins would otherwise report a runtime
+# the box is not running.
+check_rerun_pins() {
+  [ -s "$DEVBOX_RUNTIME_JSON" ] || return 0
+  python3 "$DEVBOX_REPO/deploy/devbox/devbox_host.py" pin-drift --runtime "$DEVBOX_RUNTIME_JSON" \
+    || devbox_die "runtime pins differ from this box's bootstrap; recreate the box to change them"
+}
+
 verify_vmd_env() {
   local key want have
   while IFS='=' read -r key want; do
@@ -97,7 +104,8 @@ verify_vmd_env() {
   done < <(printf '%s' "$BOOTSTRAP_VARS" | python3 -c '
 import json, sys
 for key, value in sorted(json.load(sys.stdin)["vmd_env"].items()):
-    print(f"{key}={value}")')
+    print(f"{key}={value}")'
+    printf 'KERNEL_PATH=/var/lib/sandbox/kernel/%s\nBASE_ROOTFS_PATH=/var/lib/sandbox/rootfs/base.ext4\n' "$DEVBOX_KERNEL_OBJECT")
 }
 
 # Run directories and snapshots on the data disk, bind-mounted under the
@@ -158,6 +166,13 @@ verify_artifacts() {
   [ "$("$sum" < "$kernel" | cut -d' ' -f1)" = "$DEVBOX_KERNEL_DIGEST" ] \
     || devbox_die "$kernel does not match DEVBOX_KERNEL_DIGEST; pins changed after bootstrap, recreate the box"
   [ -s /var/lib/sandbox/rootfs/base.ext4 ] || devbox_die "the base rootfs is missing"
+  # Until the first VMD install injects boxd, the rootfs is still the pinned
+  # image; a leftover from an interrupted run with other pins is not.
+  if [ ! -s "$DEVBOX_RUNTIME_JSON" ]; then
+    case ${#DEVBOX_ROOTFS_DIGEST} in 64) sum=sha256sum ;; *) sum=md5sum ;; esac
+    [ "$("$sum" < /var/lib/sandbox/rootfs/base.ext4 | cut -d' ' -f1)" = "$DEVBOX_ROOTFS_DIGEST" ] \
+      || devbox_die "the base rootfs does not match DEVBOX_ROOTFS_DIGEST; recreate the box"
+  fi
 }
 
 install_go() {
@@ -239,6 +254,7 @@ main() {
     --nproc "$(nproc)" --reserve-mib "$RESERVE_MIB" --memory-mib "$memory" --vcpus "$vcpus") \
     || devbox_die "cannot size schedulable capacity"
   devbox_log "host $DEVBOX_INSTANCE ($DEVBOX_ZONE): $MEMORY_MIB MiB, $VCPUS vCPUs schedulable"
+  check_rerun_pins
   run_host_bootstrap
   verify_vmd_env
   install_storage
