@@ -12,11 +12,12 @@
 #                                        RECAPTCHA_PROJECT_ID, optional)
 #   /etc/superserve-devbox/secrets.env   CI secrets (RECAPTCHA_API_KEY,
 #                                        optional)
-#   $SECRETS_DIR/local.env               plain KEY=value keys services-up.sh
-#   $SECRETS_DIR/promotion-account-key.pem  generates and shares with the API
+#   /etc/superserve-devbox/local-secrets.env  plain KEY=value keys and the
+#   $DATA_DIR/promotion-account-key.pem       signing key that services-up.sh
+#                                             generates and shares with the API
 #   /opt/superserve-devbox/src/superserve  UI checkout
 #
-# Console-only secrets are generated once into $SECRETS_DIR/console.env.
+# Console-only secrets are generated once into $DATA_DIR/console-secrets.env.
 #
 # Public values (NEXT_PUBLIC_*) are compiled into the browser bundle at build
 # time; everything else is only given to the server at runtime. The browser
@@ -30,15 +31,15 @@ set -euo pipefail
 
 CONFIG_DIR="${DEVBOX_CONFIG_DIR:-/etc/superserve-devbox}"
 UI_SRC="${DEVBOX_UI_SRC:-/opt/superserve-devbox/src/superserve}"
-SECRETS_DIR="${DEVBOX_SECRETS_DIR:-/mnt/sandbox-data/superserve-devbox/secrets}"
+DATA_DIR="${DEVBOX_DATA_DIR:-/mnt/sandbox-data/superserve-devbox}"
 RUNTIME_DIR="${DEVBOX_CONSOLE_RUNTIME_DIR:-/var/lib/superserve-devbox/console}"
 UNIT_FILE="${DEVBOX_CONSOLE_UNIT_FILE:-/etc/systemd/system/superserve-devbox-console.service}"
 READY_TIMEOUT="${DEVBOX_CONSOLE_READY_TIMEOUT:-180}"
 DEVBOX_ENV="$CONFIG_DIR/devbox.env"
 CI_SECRETS="$CONFIG_DIR/secrets.env"
-LOCAL_SECRETS="$SECRETS_DIR/local.env"
-PROMOTION_KEY="$SECRETS_DIR/promotion-account-key.pem"
-CONSOLE_SECRETS="$SECRETS_DIR/console.env"
+LOCAL_SECRETS="$CONFIG_DIR/local-secrets.env"
+PROMOTION_KEY="$DATA_DIR/promotion-account-key.pem"
+CONSOLE_SECRETS="$DATA_DIR/console-secrets.env"
 
 SERVICE=superserve-devbox-console
 IMAGE=superserve-devbox-console:current
@@ -96,7 +97,6 @@ ensure_console_secrets() {
     log "generating missing console secrets in $CONSOLE_SECRETS"
     if ((${#proxy} < 32)); then proxy="$(openssl rand -hex 32)"; fi
     if ((${#proof} < 32)); then proof="$(openssl rand -hex 32)"; fi
-    install -d -m 0700 "$SECRETS_DIR"
     (
       umask 077
       printf 'CONSOLE_PROXY_SECRET=%s\nGOOGLE_SIGNUP_PROOF_SECRET=%s\n' "$proxy" "$proof" >"$CONSOLE_SECRETS.tmp"
