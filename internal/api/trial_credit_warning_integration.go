@@ -19,8 +19,6 @@ func RefreshActiveTrialEligibilityForTest(h *Handlers, ctx context.Context) {
 	h.refreshActiveTrialEligibility(ctx)
 }
 
-func NewTrialCreditWarningSenderForTest(q *db.Queries, endpoint string, client *http.Client) *ResendTrialCreditWarningSender {
-	s := NewResendTrialCreditWarningSender("test-key", "team@example.com", q)
-	s.endpoint, s.client = endpoint, client
-	return s
+func NewTrialCreditWarningSenderForTest(q *db.Queries, endpoint string, client *http.Client) *EmailTrialCreditWarningSender {
+	return NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: endpoint, client: client}, "team@example.com", q)
 }

@@ -90,7 +90,7 @@ func TestShouldRearm(t *testing.T) {
 }
 
 func TestEmailQuotaNotifierHandlesAndChannel(t *testing.T) {
-	n := NewEmailQuotaNotifier("k", "from@superserve.ai", nil)
+	n := NewEmailQuotaNotifier(NewResendEmailSender("k"), "from@superserve.ai", nil)
 	if n.Channel() != "email" {
 		t.Errorf("channel = %q, want email", n.Channel())
 	}
@@ -113,7 +113,7 @@ func TestEmailQuotaNotifierSends(t *testing.T) {
 	defer srv.Close()
 
 	rcpt := &stubRecipient{email: "owner@acme.test"}
-	n := &EmailQuotaNotifier{apiKey: "rk_test", from: "alerts@superserve.ai", recipients: rcpt, endpoint: srv.URL, client: srv.Client()}
+	n := &EmailQuotaNotifier{sender: &ResendEmailSender{apiKey: "rk_test", endpoint: srv.URL, client: srv.Client()}, from: "alerts@superserve.ai", recipients: rcpt}
 
 	alert := QuotaAlert{TeamID: uuid.New(), TeamName: "Acme", Resource: "sandboxes", Used: 16, Limit: 20, Pct: 80}
 	if err := n.Notify(context.Background(), alert); err != nil {
@@ -149,7 +149,7 @@ func TestEmailQuotaNotifierServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
+	n := &EmailQuotaNotifier{sender: &ResendEmailSender{apiKey: "rk", endpoint: srv.URL, client: srv.Client()}, from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}}
 	err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 90})
 	if err == nil {
 		t.Fatal("expected error on 5xx so the watcher retries")
@@ -165,7 +165,7 @@ func TestEmailQuotaNotifierPermanentRejection(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
+	n := &EmailQuotaNotifier{sender: &ResendEmailSender{apiKey: "rk", endpoint: srv.URL, client: srv.Client()}, from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}}
 	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82}); err != nil {
 		t.Fatalf("permanent 4xx should be a quiet drop, got %v", err)
 	}
@@ -180,7 +180,7 @@ func TestEmailQuotaNotifierInvalidFromRetries(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	n := &EmailQuotaNotifier{apiKey: "rk", from: "bad", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
+	n := &EmailQuotaNotifier{sender: &ResendEmailSender{apiKey: "rk", endpoint: srv.URL, client: srv.Client()}, from: "bad", recipients: &stubRecipient{email: "o@x.test"}}
 	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82}); err == nil {
 		t.Fatal("invalid_from_address is recoverable config; should return an error to retry")
 	}
@@ -196,7 +196,7 @@ func TestEmailQuotaNotifierConfigErrorRetries(t *testing.T) {
 				w.WriteHeader(code)
 			}))
 			defer srv.Close()
-			n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
+			n := &EmailQuotaNotifier{sender: &ResendEmailSender{apiKey: "rk", endpoint: srv.URL, client: srv.Client()}, from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}}
 			err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82})
 			if err == nil {
 				t.Errorf("status %d should return an error so the watcher retries", code)
@@ -212,7 +212,7 @@ func TestEmailQuotaNotifierRateLimited(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}, endpoint: srv.URL, client: srv.Client()}
+	n := &EmailQuotaNotifier{sender: &ResendEmailSender{apiKey: "rk", endpoint: srv.URL, client: srv.Client()}, from: "f@superserve.ai", recipients: &stubRecipient{email: "o@x.test"}}
 	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 82}); err == nil {
 		t.Fatal("429 should return an error so the watcher retries")
 	}
@@ -223,7 +223,7 @@ func TestEmailQuotaNotifierNoRecipient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
 	defer srv.Close()
 
-	n := &EmailQuotaNotifier{apiKey: "rk", from: "f@superserve.ai", recipients: &stubRecipient{err: pgx.ErrNoRows}, endpoint: srv.URL, client: srv.Client()}
+	n := &EmailQuotaNotifier{sender: &ResendEmailSender{apiKey: "rk", endpoint: srv.URL, client: srv.Client()}, from: "f@superserve.ai", recipients: &stubRecipient{err: pgx.ErrNoRows}}
 	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes", Pct: 85}); err != nil {
 		t.Fatalf("missing recipient should be a quiet skip, got %v", err)
 	}
@@ -234,7 +234,7 @@ func TestEmailQuotaNotifierNoRecipient(t *testing.T) {
 
 func TestEmailQuotaNotifierDisabled(t *testing.T) {
 	rcpt := &stubRecipient{email: "o@x.test"}
-	n := &EmailQuotaNotifier{apiKey: "", from: "f@superserve.ai", recipients: rcpt, endpoint: "http://unused", client: http.DefaultClient}
+	n := &EmailQuotaNotifier{from: "f@superserve.ai", recipients: rcpt}
 	if err := n.Notify(context.Background(), QuotaAlert{TeamID: uuid.New(), Resource: "sandboxes"}); err != nil {
 		t.Fatalf("disabled notifier should no-op, got %v", err)
 	}

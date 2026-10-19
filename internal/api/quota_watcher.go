@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"io"
 	"net/http"
 	"time"
 
@@ -29,8 +28,6 @@ const (
 
 	quotaWatchInterval = 15 * time.Minute
 	quotaWatchTimeout  = 30 * time.Second
-
-	resendEmailEndpoint = "https://api.resend.com/emails"
 
 	// Shared brand assets, mirroring the console's EmailLayout.
 	emailLogoURL     = "https://superserve.ai/assets/logo-light.png"
@@ -274,25 +271,17 @@ type teamEmailLookup interface {
 }
 
 // EmailQuotaNotifier emails a team's owner when it crosses the sandbox quota
-// threshold, via the Resend API. Disabled (no-op) when apiKey or from is empty.
-// Scoped to the sandbox limit; it does not handle the template limit.
+// threshold. Disabled (no-op) when sender is nil or from is empty. Scoped to
+// the sandbox limit; it does not handle the template limit.
 type EmailQuotaNotifier struct {
-	apiKey     string
+	sender     EmailSender
 	from       string
 	recipients teamEmailLookup
-	endpoint   string
-	client     *http.Client
 }
 
-// NewEmailQuotaNotifier builds a notifier; pass "" for apiKey or from to disable.
-func NewEmailQuotaNotifier(apiKey, from string, queries *db.Queries) *EmailQuotaNotifier {
-	return &EmailQuotaNotifier{
-		apiKey:     apiKey,
-		from:       from,
-		recipients: queries,
-		endpoint:   resendEmailEndpoint,
-		client:     &http.Client{Timeout: 10 * time.Second},
-	}
+// NewEmailQuotaNotifier builds a notifier; pass a nil sender or "" for from to disable.
+func NewEmailQuotaNotifier(sender EmailSender, from string, queries *db.Queries) *EmailQuotaNotifier {
+	return &EmailQuotaNotifier{sender: sender, from: from, recipients: queries}
 }
 
 func (n *EmailQuotaNotifier) Channel() string { return "email" }
@@ -300,7 +289,7 @@ func (n *EmailQuotaNotifier) Channel() string { return "email" }
 func (n *EmailQuotaNotifier) Handles(resource string) bool { return resource == "sandboxes" }
 
 func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
-	if n == nil || n.apiKey == "" || n.from == "" {
+	if n == nil || n.sender == nil || n.from == "" {
 		return nil
 	}
 	to, err := n.recipients.GetTeamNotifyEmail(ctx, a.TeamID)
@@ -314,53 +303,24 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 		return err
 	}
 
-	payload := map[string]any{
-		"from":    n.from,
-		"to":      []string{to},
-		"subject": "Verify your team on Superserve",
-		"html":    quotaEmailHTML(a),
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+n.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := n.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		log.Info().Str("team", a.TeamID.String()).Int("pct", a.Pct).Msg("quota email sent")
+	err = n.sender.SendEmail(ctx, EmailMessage{
+		From:    n.from,
+		To:      to,
+		Subject: "Verify your team on Superserve",
+		HTML:    quotaEmailHTML(a),
+	})
+	// A permanent rejection (e.g. a bad recipient) won't self-heal, so drop
+	// rather than spin. Everything else returns an error so the watcher retries.
+	var rejected *rejectedEmailError
+	if errors.As(err, &rejected) {
+		log.Warn().Err(err).Str("team", a.TeamID.String()).Msg("quota email: permanent rejection; not retrying")
 		return nil
 	}
-
-	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	var rerr struct {
-		Name string `json:"name"`
+	if err != nil {
+		return err
 	}
-	_ = json.Unmarshal(snippet, &rerr)
-	// Retry transient errors (429/5xx) and recoverable config errors an operator
-	// will fix: bad API key / unverified domain (401/403) and a malformed
-	// QUOTA_EMAIL_FROM, which Resend reports as invalid_from_address (a 422).
-	// Other 4xx (e.g. a bad recipient) won't self-heal, so drop rather than spin.
-	switch {
-	case resp.StatusCode == http.StatusUnauthorized,
-		resp.StatusCode == http.StatusForbidden,
-		resp.StatusCode == http.StatusTooManyRequests,
-		resp.StatusCode >= 500,
-		rerr.Name == "invalid_from_address":
-		return fmt.Errorf("resend returned %d (%s): %s", resp.StatusCode, rerr.Name, string(snippet))
-	default:
-		log.Warn().Int("status", resp.StatusCode).Str("team", a.TeamID.String()).Str("body", string(snippet)).
-			Msg("quota email: permanent rejection; not retrying")
-		return nil
-	}
+	log.Info().Str("team", a.TeamID.String()).Int("pct", a.Pct).Msg("quota email sent")
+	return nil
 }
 
 // quotaEmailHTML renders the team-verification email body inside the shared shell.

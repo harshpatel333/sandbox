@@ -63,7 +63,7 @@ func TestYCEmailBindsRecipientAndIdempotency(t *testing.T) {
 	}))
 	defer server.Close()
 	for range 2 {
-		if err := sendYCClaimMail(context.Background(), server.Client(), server.URL, "https://console.example.test", "synthetic-key", "hello@example.test", j); err != nil {
+		if err := sendYCClaimMail(context.Background(), &ResendEmailSender{apiKey: "synthetic-key", endpoint: server.URL, client: server.Client()}, "https://console.example.test", "hello@example.test", j); err != nil {
 			t.Fatal(err)
 		}
 	}
