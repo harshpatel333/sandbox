@@ -253,6 +253,10 @@ class PrepareTests(WorkflowCase):
         self.assertEqual(outputs["sandbox_sha"], "")
         with self.assertRaises(contract.ContractError):
             self.run_with(FakeCloud(), workflow.prepare_deploy, self.env(INPUT_NAME="my-box", INPUT_COMPONENTS="db"))
+        cloud = FakeCloud()
+        cloud.repo_scripts.remove("install-api.sh")
+        with self.assertRaisesRegex(workflow.StepError, "install-api.sh"):
+            self.run_with(cloud, workflow.prepare_deploy, self.env(INPUT_NAME="my-box", INPUT_COMPONENTS="api"))
 
 
 class CreateTests(WorkflowCase):
@@ -578,7 +582,10 @@ class DeployTests(WorkflowCase):
 
     def test_failed_box_can_be_redeployed(self):
         cloud = FakeCloud(instances=self.box(state="failed"))
-        self.assertEqual(self.deploy(cloud, "vmd"), 0)
+        with self.assertRaisesRegex(workflow.StepError, "components=all"):
+            self.deploy(cloud, "ui")
+        self.assertEqual(cloud.metadata_writes, [])
+        self.assertEqual(self.deploy(cloud, "all"), 0)
         self.assertEqual(cloud.metadata_writes[-1]["state"], "ready")
         self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["result"], "succeeded")
 

@@ -334,8 +334,9 @@ comes from the report `install-api.sh` writes for the deployed commit
 (`/var/lib/superserve-devbox/api-deploy.json`); without one it is `none`.
 `expires-at` never changes. The run summary shows previous and new commits per
 component, the migration result, service readiness and log access. A failed
-deploy leaves the box in state `failed`, possibly partly upgraded; a later
-successful deploy returns it to `ready`. `seed-base.sh` is not rerun.
+deploy leaves the box in state `failed`, possibly partly upgraded. Recover it
+with `components=all`, which reinstalls everything and returns it to `ready`;
+a partial deploy to a failed box is refused. `seed-base.sh` is not rerun.
 
 ## Workflow safety
 
