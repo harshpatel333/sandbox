@@ -63,6 +63,9 @@ log() {
 }
 
 require_file() {
+  if [[ -L "$1" && ! -e "$1" ]]; then
+    die "$1 points to $(readlink "$1"), which is missing (is the data disk mounted?)"
+  fi
   [[ -r "$1" ]] || die "$1 is missing or unreadable ($2)"
 }
 
@@ -97,11 +100,10 @@ ensure_console_secrets() {
     log "generating missing console secrets in $CONSOLE_SECRETS"
     if ((${#proxy} < 32)); then proxy="$(openssl rand -hex 32)"; fi
     if ((${#proof} < 32)); then proof="$(openssl rand -hex 32)"; fi
-    (
-      umask 077
-      printf 'CONSOLE_PROXY_SECRET=%s\nGOOGLE_SIGNUP_PROOF_SECRET=%s\n' "$proxy" "$proof" >"$CONSOLE_SECRETS.tmp"
-    )
-    mv "$CONSOLE_SECRETS.tmp" "$CONSOLE_SECRETS"
+    local tmp
+    tmp="$(mktemp "$CONSOLE_SECRETS.XXXXXX")"
+    printf 'CONSOLE_PROXY_SECRET=%s\nGOOGLE_SIGNUP_PROOF_SECRET=%s\n' "$proxy" "$proof" >"$tmp"
+    mv -f "$tmp" "$CONSOLE_SECRETS"
   fi
   RUNTIME_VARS+=("CONSOLE_PROXY_SECRET=$proxy" "GOOGLE_SIGNUP_PROOF_SECRET=$proof")
 }
