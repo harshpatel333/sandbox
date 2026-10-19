@@ -15,6 +15,7 @@ import devbox_contract as contract
 
 ACTIONS = ('list', 'destroy-named', 'destroy-mine', 'destroy-all', 'auto-delete')
 PROJECT_IN_LINK = re.compile(r'/projects/([^/]+)/')
+CLOUD_ERRORS = (RuntimeError, subprocess.TimeoutExpired, ValueError)
 
 
 @dataclass
@@ -28,6 +29,7 @@ class Resource:
     users: list = field(default_factory=list)
     manifest: dict | None = None
     status: str = ''
+    adopted: bool = False
 
 
 @dataclass
@@ -45,7 +47,7 @@ class Box:
 
     @property
     def primary(self):
-        return self.instance or self.resources[0]
+        return self.instance or next(r for r in self.resources if not r.adopted)
 
     @property
     def zone(self):
@@ -66,8 +68,14 @@ class Box:
 
     @property
     def missing(self):
-        expected = {(r['type'], r['name']) for r in contract.resources(self.name, self.devbox_id)}
-        return sorted(f'{kind} {name}' for kind, name in expected - {(r.kind, r.name) for r in self.resources})
+        return sorted(f'{kind} {name}' for kind, name in expected(self.name, self.devbox_id)
+                      - {(r.kind, r.name) for r in self.resources})
+
+    @property
+    def unhandled(self):
+        known = expected(self.name, self.devbox_id)
+        return [f'{r.get("type")} {r.get("name")}' for r in (self.manifest or {}).get('resources', [])
+                if isinstance(r, dict) and (r.get('type'), r.get('name')) not in known]
 
     @property
     def state(self):
@@ -92,7 +100,7 @@ class Gcloud:
         return result
 
     def _list(self, *args):
-        return json.loads(self._run(*args, f'--filter={contract.discovery_filter()}', '--format=json').stdout or '[]')
+        return json.loads(self._run(*args, '--format=json').stdout or '[]')
 
     def instances(self):
         return self._list('compute', 'instances', 'list')
@@ -123,7 +131,11 @@ class Gcloud:
 
     def _failure(self, *args):
         result = self._run(*args, check=False)
-        return result.stderr.strip() if result.returncode else None
+        return (result.stderr.strip() or f'exit status {result.returncode}') if result.returncode else None
+
+
+def expected(name, devbox_id):
+    return {(r['type'], r['name']) for r in contract.resources(name, devbox_id)}
 
 
 def _last(url):
@@ -135,7 +147,7 @@ def _manifest(instance):
         if item.get('key') == contract.MANIFEST_METADATA_KEY:
             try:
                 return contract.validate_manifest(json.loads(item.get('value') or ''))
-            except (json.JSONDecodeError, contract.ContractError):
+            except Exception:
                 return None
     return None
 
@@ -153,6 +165,17 @@ def collect(cloud):
     return resources
 
 
+def _placement(resource, project):
+    if resource.kind == 'bucket':
+        return None
+    match = PROJECT_IN_LINK.search(resource.link)
+    if not match or match.group(1) != project:
+        return f'not in project {project}'
+    if resource.zone != contract.ZONE:
+        return f'not in zone {contract.ZONE}'
+    return None
+
+
 def ineligibility(resource, project):
     name = resource.labels.get('devbox-name', '')
     try:
@@ -160,18 +183,19 @@ def ineligibility(resource, project):
         devbox_id = contract.check_labels(resource.labels, name)
     except contract.ContractError as error:
         return str(error)
-    if (resource.kind, resource.name) not in {(r['type'], r['name']) for r in contract.resources(name, devbox_id)}:
+    if (resource.kind, resource.name) not in expected(name, devbox_id):
         return f'name does not match its devbox labels ({name}, {devbox_id})'
-    if resource.kind != 'bucket':
-        match = PROJECT_IN_LINK.search(resource.link)
-        if not match or match.group(1) != project:
-            return f'not in project {project}'
-        if resource.zone != contract.ZONE:
-            return f'not in zone {contract.ZONE}'
-    return None
+    return _placement(resource, project)
+
+
+def _unlabelled(resource, project):
+    return (resource.kind != 'instance' and 'managed-by' not in resource.labels
+            and not set(contract.FORBIDDEN_LABELS) & set(resource.labels) and _placement(resource, project) is None)
 
 
 def inventory(resources, project):
+    """Group labelled resources by identity, then adopt the unlabelled boot disk or bucket that create
+    can leave between its create and label calls, only by exact name under exactly one labelled box."""
     groups, ignored = {}, []
     for resource in resources:
         reason = ineligibility(resource, project)
@@ -181,6 +205,19 @@ def inventory(resources, project):
             continue
         key = (resource.labels['devbox-name'], resource.labels['devbox-id'])
         groups.setdefault(key, []).append(resource)
+    claims = {}
+    for key in groups:
+        for item in expected(*key):
+            claims.setdefault(item, []).append(key)
+    for resource in resources:
+        owners = claims.get((resource.kind, resource.name), [])
+        if not owners or not _unlabelled(resource, project):
+            continue
+        if len(owners) > 1:
+            ignored.append((resource, f'unlabelled and claimed by {len(owners)} devboxes'))
+            continue
+        resource.adopted = True
+        groups[owners[0]].append(resource)
     boxes = [Box(name, devbox_id, sorted(group, key=lambda r: (r.kind, r.name)))
              for (name, devbox_id), group in sorted(groups.items())]
     return boxes, ignored
@@ -217,15 +254,19 @@ def _age(box, now):
     return f'{hours // 24}d {hours % 24}h' if hours >= 24 else f'{hours}h'
 
 
+def _cell(value):
+    return str(value).replace('|', '\\|')
+
+
 def _revisions(box):
     manifest = box.manifest or {}
-    running = manifest.get('components') or manifest.get('revisions') or {}
+    running = next((v for v in (manifest.get('components'), manifest.get('revisions')) if isinstance(v, dict) and v), {})
     groups = {}
     for component, revision in running.items():
         if isinstance(revision, dict):
             key = f'{revision.get("branch") or "?"} @ {str(revision.get("sha") or "?")[:12]}'
             groups.setdefault(key, []).append(str(component))
-    return '; '.join(f'{key} ({", ".join(parts)})' for key, parts in groups.items()) or '?'
+    return _cell('; '.join(f'{key} ({", ".join(parts)})' for key, parts in groups.items()) or '?')
 
 
 def render(boxes, ignored, now):
@@ -235,7 +276,10 @@ def render(boxes, ignored, now):
         lines = ['| Name | Owner | Zone | State | Age | Expires at | Revisions | devbox-id |',
                  '| -- | -- | -- | -- | -- | -- | -- | -- |']
         for box in boxes:
-            state = box.state + (f' (partial: missing {", ".join(box.missing)})' if box.missing else '')
+            notes = [f'missing {", ".join(box.missing)}'] if box.missing else []
+            notes += [f'unlabelled {", ".join(f"{r.kind} {r.name}" for r in box.resources if r.adopted)}'] \
+                if any(r.adopted for r in box.resources) else []
+            state = box.state + (f' (partial: {"; ".join(notes)})' if notes else '')
             expires = _utc(box.expires_at) if box.expires_at is not None else 'unset (never auto-deleted)'
             lines.append(f'| `{box.name}` | {box.owner or "?"} | {box.zone or "-"} | {state} | {_age(box, now)} '
                          f'| {expires} | {_revisions(box)} | `{box.devbox_id}` |')
@@ -245,7 +289,7 @@ def render(boxes, ignored, now):
             for box in reachable:
                 lines += [f'`{box.name}`:', '```', contract.forwarding_command(box.name, box.zone), '```']
     if ignored:
-        lines += ['', 'Ignored resources labelled managed-by but not eligible (never destroyed by these workflows):', '']
+        lines += ['', 'Ignored resources (never destroyed by these workflows):', '']
         lines += [f'- {r.kind} `{r.name}`: {reason}' for r, reason in ignored]
     return '\n'.join(lines)
 
@@ -296,14 +340,29 @@ def find(cloud, project, name, devbox_id):
     return next((b for b in boxes if b.name == name and b.devbox_id == devbox_id), None)
 
 
+def _delete(cloud, resource, instance):
+    if resource.kind == 'bucket':
+        return cloud.delete_bucket(resource.name)
+    foreign = [u for u in resource.users if not instance or u != instance.link]
+    if foreign:
+        return f'disk {resource.name} is attached to {", ".join(map(_last, foreign))}; not deleted'
+    return cloud.delete_disk(resource.name, resource.zone)
+
+
 def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
-    """Delete exactly the resources labelled with this devbox identity; succeed only when none remain."""
+    """Delete exactly the resources of this devbox identity; succeed only when none remain.
+
+    Unlabelled resources go first and the labelled ones are kept if any of them fails,
+    because the labelled resources are what lets a retry find the unlabelled ones again."""
     box = find(cloud, project, name, devbox_id)
     if box is None:
         return f'`{name}` ({devbox_id}) is already gone.'
     if require_expired_at is not None and (box.expires_at is None or box.expires_at > require_expired_at):
         return f'`{name}` ({devbox_id}) is no longer expired; left in place.'
-    failures, instance = [], box.instance
+    if box.unhandled:
+        raise SystemExit(f'Refusing to destroy {name} ({devbox_id}): its manifest records resources destroy cannot '
+                         f'remove ({", ".join(box.unhandled)}); nothing was deleted.')
+    instance = box.instance
     if instance and box.manifest is not None:
         try:
             error = cloud.set_metadata(instance.name, instance.zone, contract.MANIFEST_METADATA_KEY,
@@ -312,30 +371,42 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
             error = str(invalid)
         if error:
             print(f'::warning::Could not mark {name} as destroying: {error}')
-    if instance:
-        failures.append(cloud.delete_instance(instance.name, instance.zone))
-    for disk in box.of('disk'):
-        foreign = [u for u in disk.users if not instance or u != instance.link]
-        if foreign:
-            failures.append(f'disk {disk.name} is attached to {", ".join(map(_last, foreign))}; not deleted')
-            continue
-        failures.append(cloud.delete_disk(disk.name, disk.zone))
-    for bucket in box.of('bucket'):
-        failures.append(cloud.delete_bucket(bucket.name))
-    known = {(r['type'], r['name']) for r in contract.resources(name, devbox_id)}
-    unhandled = [f'{r.get("type")} {r.get("name")}' for r in (box.manifest or {}).get('resources', [])
-                 if (r.get('type'), r.get('name')) not in known]
+    failures = [cloud.delete_instance(instance.name, instance.zone)] if instance else []
+    adopted = [_delete(cloud, r, instance) for r in box.resources if r.adopted]
+    failures += adopted
+    if not any(adopted):
+        failures += [_delete(cloud, r, instance) for r in box.resources if r.kind != 'instance' and not r.adopted]
     try:
         remaining = find(cloud, project, name, devbox_id)
-    except RuntimeError as error:
+    except CLOUD_ERRORS as error:
         raise SystemExit(f'Could not verify destroy of {name} ({devbox_id}): {error}\n'
                          + '\n'.join(f'- {f}' for f in failures if f)) from None
-    if remaining or unhandled:
-        details = ([f'- {r.kind} {r.name}' for r in remaining.resources] if remaining else []) + \
-            [f'- recorded in the manifest but not handled by destroy: {u}' for u in unhandled] + \
-            [f'- {f}' for f in failures if f]
+    if remaining:
+        details = [f'- {r.kind} {r.name}' for r in remaining.resources] + [f'- {f}' for f in failures if f]
         raise SystemExit(f'Destroy of {name} ({devbox_id}) incomplete; rerun to retry. Remaining:\n' + '\n'.join(details))
     return f'Destroyed `{name}` ({devbox_id}): ' + ', '.join(f'{r.kind} {r.name}' for r in box.resources)
+
+
+def destroy_name(cloud, project, name, devbox_ids, *, require_expired_at=None):
+    """Destroy every identity approved for one name; report each and fail if any is incomplete."""
+    try:
+        contract.validate_name(name)
+        ids = [contract.validate_devbox_id(i) for i in devbox_ids.split(',')]
+    except contract.ContractError as error:
+        raise SystemExit(str(error)) from None
+    reports, incomplete = [], []
+    for devbox_id in ids:
+        try:
+            reports.append(destroy(cloud, project, name, devbox_id, require_expired_at=require_expired_at))
+        except SystemExit as stop:
+            reports.append(str(stop.code))
+            incomplete.append(devbox_id)
+        except CLOUD_ERRORS as error:
+            reports.append(f'Destroy of {name} ({devbox_id}) failed: {error}; rerun to retry.')
+            incomplete.append(devbox_id)
+    if incomplete:
+        raise SystemExit('\n\n'.join(reports + [f'Destroy incomplete for {name}: {", ".join(incomplete)}']))
+    return '\n\n'.join(reports)
 
 
 def _publish(report, outputs=None):
@@ -368,23 +439,15 @@ def main(argv=None):
                                    confirm=args.confirm, now=now)
             matrix = by_name(targets)
             _publish(report, {'targets': json.dumps(matrix), 'count': len(matrix)})
-            return
-        incomplete = []
-        for devbox_id in args.devbox_ids.split(','):
-            try:
-                _publish(destroy(cloud, contract.PROJECT, args.name, devbox_id,
-                                 require_expired_at=now if args.require_expired else None))
-            except SystemExit as stop:
-                _publish(str(stop.code))
-                incomplete.append(devbox_id)
-        if incomplete:
-            raise SystemExit(f'Destroy incomplete for {args.name}: {", ".join(incomplete)}')
+        else:
+            _publish(destroy_name(cloud, contract.PROJECT, args.name, args.devbox_ids,
+                                  require_expired_at=now if args.require_expired else None))
     except SystemExit as stop:
         if isinstance(stop.code, str):
             _publish(stop.code)
             raise SystemExit(1) from None
         raise
-    except (RuntimeError, subprocess.TimeoutExpired, contract.ContractError) as error:
+    except CLOUD_ERRORS as error:
         _publish(f'Failed: {error}. Rerun to retry.')
         raise SystemExit(1) from None
 

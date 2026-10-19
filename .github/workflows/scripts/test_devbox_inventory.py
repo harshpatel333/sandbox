@@ -35,10 +35,10 @@ def gce(name, devbox_id='3f9c0a1b2c4d'):
 class FakeCloud:
     def __init__(self):
         self.instances_, self.disks_, self.buckets_ = [], [], []
-        self.calls, self.fail = [], set()
+        self.calls, self.fail, self.broken = [], set(), False
 
     def add_box(self, name, devbox_id, *, vm=True, disks=True, bucket=True, project=PROJECT, zone=ZONE,
-                manifest=None, **label_args):
+                manifest=None, unlabelled=(), **label_args):
         tags = labels(name, devbox_id, **label_args)
         instance, boot, data = gce(name, devbox_id)
         if manifest is None:
@@ -55,13 +55,17 @@ class FakeCloud:
                                                             'value': json.dumps(manifest)}]}})
         if disks:
             for disk in (boot, data):
-                self.disks_.append({'name': disk, 'zone': f'projects/{project}/zones/{zone}', 'labels': dict(tags),
+                self.disks_.append({'name': disk, 'zone': f'projects/{project}/zones/{zone}',
+                                    'labels': {} if disk == boot and 'boot' in unlabelled else dict(tags),
                                     'selfLink': link('disks', disk, project, zone),
                                     'users': [link('instances', instance, project, zone)] if vm else []})
         if bucket:
-            self.buckets_.append({'name': contract.bucket_name(devbox_id), 'labels': dict(tags)})
+            self.buckets_.append({'name': contract.bucket_name(devbox_id),
+                                  'labels': {} if 'bucket' in unlabelled else dict(tags)})
 
     def instances(self):
+        if self.broken:
+            raise RuntimeError('gcloud compute instances list failed: backend error')
         return [dict(i) for i in self.instances_]
 
     def disks(self):
@@ -185,9 +189,14 @@ class SelectionTest(unittest.TestCase):
         self.assertIn('bob-dev-0d1e2f', self.names('auto-delete'))
 
     def test_malformed_manifest_does_not_block_auto_delete(self):
-        self.cloud.add_box('dave-dev-2a3b4c', '2a3b4c5d6e7f', expires_at=NOW - 1,
-                           manifest={'schema_version': 1, 'revisions': {'sandbox': {'sha': None}}})
-        self.assertIn('dave-dev-2a3b4c', self.names('auto-delete'))
+        valid = json.loads(self.cloud.instances_[0]['metadata']['items'][0]['value'])
+        for manifest in ({'schema_version': 1, 'revisions': {'sandbox': {'sha': None}}},
+                         {**valid, 'revisions': {'sandbox': 'abc'}}, {**valid, 'components': ['api']}):
+            with self.subTest(manifest=manifest):
+                cloud = FakeCloud()
+                cloud.add_box('dave-dev-2a3b4c', '2a3b4c5d6e7f', expires_at=NOW - 1, manifest=manifest)
+                targets, _ = inv.plan(cloud, PROJECT, 'auto-delete', now=NOW)
+                self.assertEqual([t['name'] for t in targets], ['dave-dev-2a3b4c'])
 
     def test_named_mine_and_list(self):
         self.assertEqual(self.names('destroy-named', name='bob-dev-0d1e2f'), ['bob-dev-0d1e2f'])
@@ -236,7 +245,7 @@ class DestroyTest(unittest.TestCase):
         instance, boot, data = gce('alice-dev-a7f3c9')
         self.assertEqual(cloud.calls, [
             ('metadata', instance, 'destroying'), ('instance', instance),
-            ('disk', boot), ('disk', data), ('bucket', 'superserve-devbox-3f9c0a1b2c4d')])
+            ('bucket', 'superserve-devbox-3f9c0a1b2c4d'), ('disk', boot), ('disk', data)])
         [left], _ = boxes(cloud)
         self.assertEqual((left.name, len(left.resources)), ('alice-dev-a7f3c9x', 4))
 
@@ -250,7 +259,7 @@ class DestroyTest(unittest.TestCase):
         cloud = FakeCloud()
         cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False)
         inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
-        self.assertEqual([c[0] for c in cloud.calls], ['disk', 'disk', 'bucket'])
+        self.assertEqual([c[0] for c in cloud.calls], ['bucket', 'disk', 'disk'])
         self.assertIn('already gone', inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d'))
 
     def test_partial_failure_lists_remaining_and_retry_finishes(self):
@@ -271,9 +280,11 @@ class DestroyTest(unittest.TestCase):
         manifest = json.loads(cloud.instances_[0]['metadata']['items'][0]['value'])
         manifest['resources'].append({'type': 'artifact_repo', 'name': 'devbox-3f9c0a1b2c4d'})
         cloud.instances_[0]['metadata']['items'][0]['value'] = json.dumps(manifest)
-        with self.assertRaises(SystemExit) as stop:
-            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
-        self.assertIn('artifact_repo devbox-3f9c0a1b2c4d', stop.exception.code)
+        for _ in range(2):
+            with self.assertRaises(SystemExit) as stop:
+                inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+            self.assertIn('artifact_repo devbox-3f9c0a1b2c4d', stop.exception.code)
+        self.assertEqual(cloud.calls, [])
 
     def test_disk_attached_to_another_instance_is_not_deleted(self):
         cloud = FakeCloud()
@@ -293,7 +304,83 @@ class DestroyTest(unittest.TestCase):
         self.assertEqual(cloud.calls, [])
 
 
+class UnlabelledResourceTest(unittest.TestCase):
+    def test_unlabelled_boot_disk_and_bucket_join_their_box_by_exact_name(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', unlabelled=('boot', 'bucket'))
+        [box], _ = boxes(cloud)
+        _, boot, _ = gce('alice-dev-a7f3c9')
+        self.assertEqual(sorted(r.name for r in box.resources if r.adopted), [boot, 'superserve-devbox-3f9c0a1b2c4d'])
+        self.assertEqual((box.missing, box.owner), ([], 'alice'))
+        self.assertIn(f'unlabelled bucket superserve-devbox-3f9c0a1b2c4d, disk {boot}', inv.render([box], [], NOW))
+
+    def test_unlabelled_resources_without_a_single_labelled_anchor_are_never_selected(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False, unlabelled=('boot', 'bucket'))
+        cloud.disks_ = [d for d in cloud.disks_ if d['labels']]
+        cloud.disks_.append({'name': gce('alice-dev-a7f3c9')[1], 'zone': ZONE, 'labels': {'sandbox_role': 'vmd'},
+                             'selfLink': link('disks', gce('alice-dev-a7f3c9')[1])})
+        [box], _ = boxes(cloud)
+        self.assertEqual([r.adopted for r in box.resources], [True, False])
+        cloud.disks_ = []
+        self.assertEqual(boxes(cloud), ([], []))
+
+    def test_unlabelled_boot_disk_claimed_by_two_identities_is_refused(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', unlabelled=('boot',))
+        cloud.add_box('alice-dev-a7f3c9', '5b6c7d8e9f0a', vm=False, bucket=False)
+        cloud.disks_ = [d for d in cloud.disks_ if d['labels'].get('devbox-id') != '5b6c7d8e9f0a'
+                        or d['name'] != gce('alice-dev-a7f3c9')[1]]
+        found, ignored = boxes(cloud)
+        self.assertFalse(any(r.adopted for b in found for r in b.resources))
+        self.assertIn('claimed by 2 devboxes', ignored[0][1])
+
+    def test_failed_unlabelled_delete_keeps_labelled_anchor_for_retry(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', unlabelled=('bucket',))
+        cloud.fail = {('bucket', 'superserve-devbox-3f9c0a1b2c4d')}
+        with self.assertRaises(SystemExit):
+            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertNotIn('disk', [c[0] for c in cloud.calls])
+        cloud.fail = set()
+        inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertEqual((cloud.instances_, cloud.disks_, cloud.buckets_), ([], [], []))
+
+
+class DestroyNameTest(unittest.TestCase):
+    def test_one_identity_failing_does_not_skip_the_others(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False)
+        original = inv.destroy
+
+        def flaky(cloud_, project, name, devbox_id, **kwargs):
+            if devbox_id == '5b6c7d8e9f0a':
+                raise RuntimeError('gcloud compute disks list failed: backend error')
+            return original(cloud_, project, name, devbox_id, **kwargs)
+        inv.destroy = flaky
+        try:
+            with self.assertRaises(SystemExit) as stop:
+                inv.destroy_name(cloud, PROJECT, 'alice-dev-a7f3c9', '5b6c7d8e9f0a,3f9c0a1b2c4d')
+        finally:
+            inv.destroy = original
+        self.assertIn('Destroyed `alice-dev-a7f3c9` (3f9c0a1b2c4d)', stop.exception.code)
+        self.assertIn('Destroy incomplete for alice-dev-a7f3c9: 5b6c7d8e9f0a', stop.exception.code)
+
+    def test_invalid_identity_inputs_are_rejected_not_reported_gone(self):
+        for name, ids in (('alice-dev-a7f3c9', ''), ('alice-dev-a7f3c9', 'XYZ'), ('Bad_Name', '3f9c0a1b2c4d')):
+            with self.subTest(name=name, ids=ids), self.assertRaises(SystemExit):
+                inv.destroy_name(FakeCloud(), PROJECT, name, ids)
+
+
 class RenderTest(unittest.TestCase):
+    def test_revisions_group_partially_upgraded_components_and_escape_cells(self):
+        box = inv.Box('alice-dev-a7f3c9', '3f9c0a1b2c4d', [inv.Resource('instance', 'x', ZONE, {}, manifest={
+            'components': {'vmd': {'branch': 'main', 'sha': 'a' * 40}, 'proxy': {'branch': 'main', 'sha': 'a' * 40},
+                           'api': {'branch': 'fix|y', 'sha': 'c' * 40}, 'ui': {'branch': 'main', 'sha': 'b' * 40}},
+            'revisions': {'sandbox': {'branch': 'main', 'sha': 'a' * 40}}})])
+        self.assertEqual(inv._revisions(box), 'main @ aaaaaaaaaaaa (vmd, proxy); fix\\|y @ cccccccccccc (api); '
+                                              'main @ bbbbbbbbbbbb (ui)')
+
     def test_list_shows_partial_boxes_revisions_and_ignored_resources(self):
         cloud = FakeCloud()
         cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', bucket=False)
@@ -301,7 +388,7 @@ class RenderTest(unittest.TestCase):
         found, ignored = boxes(cloud)
         report = inv.render(found, ignored, NOW)
         self.assertIn('partial: missing bucket superserve-devbox-3f9c0a1b2c4d', report)
-        self.assertIn('main @ aaaaaaaaaaaa (sandbox); feature-x @ bbbbbbbbbbbb (ui)', report)
+        self.assertIn('feature-x @ bbbbbbbbbbbb', report)
         self.assertIn('1d 2h', report)
         self.assertIn(contract.forwarding_command('alice-dev-a7f3c9', ZONE), report)
         self.assertIn('superserve-devbox-ffffffffffff', report)
