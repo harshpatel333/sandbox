@@ -42,7 +42,8 @@ So the order is:
 | --- | --- | --- |
 | `DEVBOX_NAME`, `DEVBOX_ID` | required | Box name and id |
 | `DEVBOX_SANDBOX_SHA` | unset | Selected revision. When it is set, the scripts refuse a checkout at any other revision |
-| `DEVBOX_BUCKET` | `superserve-devbox-$DEVBOX_ID` | The box's bucket. Artifacts are fetched from `hostprep/` in it, and VMD uploads template builds to it |
+| `DEVBOX_BUCKET` | `superserve-devbox-$DEVBOX_ID` | The box's bucket. VMD uploads template builds and pause backups to it |
+| `DEVBOX_ARTIFACT_BUCKET` | `$DEVBOX_BUCKET` | Bucket whose `hostprep/` prefix holds the kernel and rootfs objects. The box reads it with its own identity |
 | `DEVBOX_DATA_DISK_DEVICE` | `$DEVBOX_NAME-data` | GCE device name of the data disk, as in `/dev/disk/by-id/google-<name>` |
 | `DEVBOX_FIRECRACKER_VERSION`, `DEVBOX_FIRECRACKER_SHA256` | `runtime-pins.env` | Firecracker release and binary digest |
 | `DEVBOX_KERNEL_OBJECT`, `DEVBOX_KERNEL_DIGEST` | `runtime-pins.env` | Guest kernel object under `hostprep/` and its MD5 or SHA-256 |
@@ -55,9 +56,9 @@ So the order is:
 `runtime-pins.env` holds the versions staging runs. Explicit inputs win over
 it, and `runtime.json` records what was installed.
 
-Before `host-bootstrap.sh` runs, the create workflow copies the kernel and
-rootfs objects into `gs://$DEVBOX_BUCKET/hostprep/`. The box reads them with
-its own identity; it has no access beyond its bucket. Firecracker comes from
+The kernel and rootfs are read from `gs://$DEVBOX_ARTIFACT_BUCKET/hostprep/`
+with the box's own identity. That is either the box bucket, if CI copies the
+objects there first, or a shared bucket the box has read-only access to. Firecracker comes from
 the public `superserve-ai/firecracker` release and Go from `go.dev`. Each is
 verified against its pin.
 

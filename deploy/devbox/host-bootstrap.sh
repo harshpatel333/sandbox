@@ -53,7 +53,7 @@ import json, os, sys
 region, memory, vcpus, proxy = sys.argv[1:]
 print(json.dumps({
     "localssd_script": "",
-    "artifact_bucket": os.environ["DEVBOX_BUCKET"],
+    "artifact_bucket": os.environ["DEVBOX_ARTIFACT_BUCKET"],
     "kernel_object": os.environ["DEVBOX_KERNEL_OBJECT"],
     "kernel_md5": os.environ["DEVBOX_KERNEL_DIGEST"],
     "rootfs_object": os.environ["DEVBOX_ROOTFS_OBJECT"],
@@ -200,7 +200,7 @@ write_runtime() {
   install -d -m 0755 "$DEVBOX_STATE"
   python3 "$DEVBOX_REPO/deploy/devbox/devbox_host.py" runtime --out "$DEVBOX_RUNTIME_JSON" \
     --revision "$revision" --instance "$DEVBOX_INSTANCE" --zone "$DEVBOX_ZONE" \
-    --region "$DEVBOX_REGION" --bucket "$DEVBOX_BUCKET" \
+    --region "$DEVBOX_REGION" --bucket "$DEVBOX_ARTIFACT_BUCKET" \
     --firecracker-version "$DEVBOX_FIRECRACKER_VERSION" --firecracker-sha256 "$DEVBOX_FIRECRACKER_SHA256" \
     --kernel-object "$DEVBOX_KERNEL_OBJECT" --kernel-digest "$DEVBOX_KERNEL_DIGEST" \
     --rootfs-object "$DEVBOX_ROOTFS_OBJECT" --rootfs-digest "$DEVBOX_ROOTFS_DIGEST" \

@@ -41,6 +41,7 @@ devbox_load_env() {
   [[ "${DEVBOX_NAME:-}" =~ ^[a-z][a-z0-9-]{0,38}[a-z0-9]$ ]] || devbox_die "DEVBOX_NAME is missing or invalid"
   [[ "${DEVBOX_ID:-}" =~ ^[0-9a-f]{12}$ ]] || devbox_die "DEVBOX_ID is missing or invalid"
   export DEVBOX_BUCKET=${DEVBOX_BUCKET:-superserve-devbox-$DEVBOX_ID}
+  export DEVBOX_ARTIFACT_BUCKET=${DEVBOX_ARTIFACT_BUCKET:-$DEVBOX_BUCKET}
   export DEVBOX_DATA_DISK_DEVICE=${DEVBOX_DATA_DISK_DEVICE:-$DEVBOX_NAME-data}
   export DEVBOX_PROXY_ADDR=${DEVBOX_PROXY_ADDR:-127.0.0.1:8090}
   export DEVBOX_API_URL=${DEVBOX_API_URL:-http://127.0.0.1:8080}
