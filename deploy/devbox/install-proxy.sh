@@ -52,13 +52,11 @@ main() {
   devbox_log "building proxy at ${revision:0:12}"
   devbox_build "$DEVBOX_REPO/bin/proxy" ./cmd/proxy
   install_listeners
-  cd "$DEVBOX_REPO"
   devbox_log "installing the proxy on $DEVBOX_INSTANCE"
-  DEPLOY_TRANSPORT=local DEPLOY_INSTANCE=$DEVBOX_INSTANCE DEPLOY_ZONE=$DEVBOX_ZONE \
-    GCP_REGION=$DEVBOX_REGION SHA=$revision VMD_SERVICE=superserve-vmd VMD_INSTALL_DIR=/usr/local/bin \
-    PROXY_DOMAIN=$PROXY_DOMAIN PROXY_DOMAINS='' PROXY_ALLOWED_ORIGINS=$DEVBOX_CONSOLE_ORIGIN \
-    REQUIRE_DATA_PLANE=1 PROXY_PEERLESS=1 PEER_ROUTING_ENABLED=0 PEER_PROXY_LISTEN_ADDR='' \
-    PEER_IDENTITY_HOSTS='' PROXY_PUBLIC_SCHEME=http PROXY_HEALTH_URL="http://$DEVBOX_PROXY_ADDR/health" \
+  devbox_deploy GCP_REGION="$DEVBOX_REGION" SHA="$revision" PROXY_DOMAIN="$PROXY_DOMAIN" \
+    SANDBOX_ACCESS_TOKEN_SEED="$SANDBOX_ACCESS_TOKEN_SEED" PROXY_ALLOWED_ORIGINS="$DEVBOX_CONSOLE_ORIGIN" \
+    REQUIRE_DATA_PLANE=1 PROXY_PEERLESS=1 PROXY_PUBLIC_SCHEME=http \
+    PROXY_HEALTH_URL="http://$DEVBOX_PROXY_ADDR/health" \
     python3 .github/workflows/scripts/deploy-proxy-legacy.py \
     || devbox_die "proxy install failed; see journalctl -u proxy"
   devbox_log "proxy ready on http://*.$PROXY_DOMAIN:${DEVBOX_PROXY_ADDR##*:}"

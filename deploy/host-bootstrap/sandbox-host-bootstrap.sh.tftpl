@@ -87,7 +87,7 @@ cat > /etc/systemd/system/sandbox-localssd.service <<'UNIT'
 [Unit]
 Description=Stripe and mount the local NVMe under the sandbox paths
 After=local-fs.target
-Before=superserve-vmd.socket superserve-vmd.service
+Before=superserve-vmd.service
 
 [Service]
 Type=oneshot
@@ -128,7 +128,7 @@ cat > /etc/systemd/system/sandbox-data.service <<UNIT
 Description=Mount the sandbox background-data disk
 BindsTo=$DEVUNIT
 After=$DEVUNIT
-Before=superserve-vmd.socket superserve-vmd.service
+Before=superserve-vmd.service
 
 [Service]
 Type=oneshot

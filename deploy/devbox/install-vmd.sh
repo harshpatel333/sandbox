@@ -14,7 +14,11 @@ main() {
   devbox_load_env
   devbox_require_bootstrapped
   devbox_instance
-  devbox_load_local_secrets INTERNAL_API_TOKEN DATABASE_URL
+  devbox_load_local_secrets INTERNAL_API_TOKEN
+  if [ -z "${DATABASE_URL:-}" ]; then
+    [ -n "${POSTGRES_PASSWORD:-}" ] || devbox_die "local-secrets.env has neither DATABASE_URL nor POSTGRES_PASSWORD"
+    DATABASE_URL=$(python3 -c 'import sys, urllib.parse; print("postgresql://postgres:" + urllib.parse.quote(sys.argv[1], safe="") + "@127.0.0.1:54322/postgres?sslmode=disable")' "$POSTGRES_PASSWORD")
+  fi
   local revision bin
   revision=$(devbox_revision)
   bin=$DEVBOX_REPO/bin
@@ -23,15 +27,13 @@ main() {
     devbox_log "building $binary at ${revision:0:12}"
     devbox_build "$bin/$binary" "./cmd/$binary"
   done
-  # Fleet deploys stage everything under this directory; run from the
-  # checkout so the bundle paths resolve the same way.
-  cd "$DEVBOX_REPO"
   devbox_log "installing VMD on $DEVBOX_INSTANCE"
-  DEPLOY_TRANSPORT=local DEPLOY_INSTANCE=$DEVBOX_INSTANCE DEPLOY_ZONE=$DEVBOX_ZONE \
-    SHA=$revision VMD_SERVICE=superserve-vmd VMD_INSTALL_DIR=/usr/local/bin \
-    CONTROL_PLANE_URL=$DEVBOX_API_URL BACKUP_BUCKET=$DEVBOX_BUCKET \
-    python3 .github/workflows/scripts/deploy-vmd.py \
-    || devbox_die "VMD install failed; see journalctl -u superserve-vmd -u superserve-secretsproxy"
+  local status=0
+  devbox_deploy SHA="$revision" CONTROL_PLANE_URL="$DEVBOX_API_URL" BACKUP_BUCKET="$DEVBOX_BUCKET" \
+    DATABASE_URL="$DATABASE_URL" INTERNAL_API_TOKEN="$INTERNAL_API_TOKEN" \
+    python3 .github/workflows/scripts/deploy-vmd.py || status=$?
+  rm -f "$DEVBOX_REPO"/deploy-bundle-*.tar.gz
+  [ "$status" = 0 ] || devbox_die "VMD install failed; see journalctl -u superserve-vmd -u superserve-secretsproxy"
   devbox_log "VMD ready at ${revision:0:12}"
 }
 

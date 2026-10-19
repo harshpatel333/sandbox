@@ -81,7 +81,7 @@ devbox_load_local_secrets() {
 # The checkout's revision, which must be the one CI selected when it says.
 devbox_revision() {
   local head
-  head=$(git -C "$DEVBOX_REPO" rev-parse HEAD 2>/dev/null) || devbox_die "cannot read the sandbox revision at $DEVBOX_REPO"
+  head=$(git -c safe.directory="$DEVBOX_REPO" -C "$DEVBOX_REPO" rev-parse HEAD) || devbox_die "cannot read the sandbox revision at $DEVBOX_REPO"
   if [ -n "${DEVBOX_SANDBOX_SHA:-}" ] && [ "$head" != "$DEVBOX_SANDBOX_SHA" ]; then
     devbox_die "$DEVBOX_REPO is at $head, not the selected $DEVBOX_SANDBOX_SHA"
   fi
@@ -92,7 +92,28 @@ devbox_require_bootstrapped() {
   if [ ! -s "$DEVBOX_RUNTIME_JSON" ] || [ ! -e /var/lib/sandbox/.host-bootstrapped ]; then
     devbox_die "the host is not bootstrapped; run host-bootstrap.sh first"
   fi
+  # Upgrades keep the runtime the box was created with; a revision that
+  # moves the pins is tested against the old ones until the box is recreated.
+  python3 - "$DEVBOX_RUNTIME_JSON" <<'PY' || true
+import json, os, sys
+artifacts = json.load(open(sys.argv[1]))["artifacts"]
+for name, installed, pinned in (
+    ("Firecracker", artifacts["firecracker"]["sha256"], os.environ["DEVBOX_FIRECRACKER_SHA256"]),
+    ("kernel", artifacts["kernel"]["digest"], os.environ["DEVBOX_KERNEL_DIGEST"]),
+):
+    if installed != pinned:
+        print(f"WARNING: this box runs the {name} it was created with ({installed[:12]}), "
+              f"not this revision's pin ({pinned[:12]}); recreate the box to test the new one", file=sys.stderr)
+PY
   [ -x "$DEVBOX_GO" ] || devbox_die "$DEVBOX_GO is missing; rerun host-bootstrap.sh"
+}
+
+# Run a fleet deploy script with only the variables it is given, so nothing
+# else in the box's settings is read as fleet deploy configuration.
+devbox_deploy() {
+  (cd "$DEVBOX_REPO" && env -i PATH="$PATH" HOME="${HOME:-/root}" LANG=C.UTF-8 \
+    DEPLOY_TRANSPORT=local DEPLOY_INSTANCE="$DEVBOX_INSTANCE" DEPLOY_ZONE="$DEVBOX_ZONE" \
+    VMD_SERVICE=superserve-vmd VMD_INSTALL_DIR=/usr/local/bin "$@")
 }
 
 # The same flags the fleet deploy workflows build host binaries with.

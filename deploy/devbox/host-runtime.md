@@ -68,7 +68,9 @@ which `services-up.sh` generates once and keeps on the data disk:
 
 * `INTERNAL_API_TOKEN`: VMD, and secretsproxy as `DAEMON_AUTH_TOKEN`. It must
   equal the API's token.
-* `DATABASE_URL`: VMD and the secretsproxy audit sink.
+* `DATABASE_URL`: VMD and the secretsproxy audit sink. Without it,
+  `install-vmd.sh` builds it from `POSTGRES_PASSWORD` for the local Postgres
+  on `127.0.0.1:54322`.
 * `SANDBOX_ACCESS_TOKEN_SEED`: the proxy data plane, shared with the API.
 
 ## What it configures
@@ -129,8 +131,8 @@ These need a real box (nested KVM). The single end-to-end smoke covers them:
   `xfs_info /mnt/sandbox-data | grep reflink=1` matches.
 * `sysctl net.ipv4.ip_forward net.ipv4.neigh.default.gc_thresh3 net.netfilter.nf_conntrack_max`
   prints `1`, `32768` and `4194304`.
-* `jq . /var/lib/superserve-devbox/runtime.json` shows the pins, the host id
-  and the capacity. `HOST_ID` in `/etc/sandbox/host-identity.env` matches.
+* `jq . /var/lib/superserve-devbox/runtime.json` shows `host_id`,
+  `host_region`, `vmd_grpc_address`, the pins and the capacity. `HOST_ID` in `/etc/sandbox/host-identity.env` matches.
 * After `install-vmd.sh`, the following are active:
   `systemctl is-active superserve-vmd superserve-vmd.socket superserve-secretsproxy`.
   `journalctl -u superserve-vmd` shows `gRPC serving requests`, and the host

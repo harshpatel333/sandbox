@@ -48,7 +48,7 @@ PY
 # local SSD here: sandbox storage lives on the data disk (storage below).
 run_host_bootstrap() {
   local vars rendered
-  vars=$(python3 - "$DEVBOX_REGION" "$MEMORY_MIB" "$VCPUS" "$DEVBOX_PROXY_ADDR" <<'PY'
+  BOOTSTRAP_VARS=$(python3 - "$DEVBOX_REGION" "$MEMORY_MIB" "$VCPUS" "$DEVBOX_PROXY_ADDR" <<'PY'
 import json, os, sys
 region, memory, vcpus, proxy = sys.argv[1:]
 print(json.dumps({
@@ -71,6 +71,7 @@ print(json.dumps({
 }))
 PY
 )
+  vars=$BOOTSTRAP_VARS
   rendered=$(mktemp)
   printf '%s' "$vars" | python3 "$DEVBOX_REPO/deploy/devbox/render_tftpl.py" \
     "$DEVBOX_REPO/deploy/host-bootstrap/sandbox-host-bootstrap.sh.tftpl" - > "$rendered"
@@ -83,6 +84,20 @@ PY
   rm -f "$rendered"
   systemctl start sandbox-data.service || devbox_die "the data disk did not mount; see journalctl -u sandbox-data"
   mountpoint -q "$DATA" || devbox_die "$DATA is not mounted"
+}
+
+# The fleet bootstrap writes vmd.env only when it is absent, so a rerun with
+# changed settings would otherwise pass while VMD keeps the old ones.
+verify_vmd_env() {
+  local key want have
+  while IFS='=' read -r key want; do
+    have=$(sed -n "s/^$key=//p" /etc/sandbox/vmd.env | tail -n 1)
+    [ "$have" = "$want" ] \
+      || devbox_die "/etc/sandbox/vmd.env has $key=$have, not $want; settings changed after bootstrap, recreate the box"
+  done < <(printf '%s' "$BOOTSTRAP_VARS" | python3 -c '
+import json, sys
+for key, value in sorted(json.load(sys.stdin)["vmd_env"].items()):
+    print(f"{key}={value}")')
 }
 
 # Run directories and snapshots on the data disk, bind-mounted under the
@@ -105,7 +120,7 @@ SH
 Description=Bind the sandbox run and snapshot directories onto the data disk
 Requires=sandbox-data.service
 After=sandbox-data.service
-Before=superserve-vmd.socket superserve-vmd.service
+Before=superserve-vmd.service
 
 [Service]
 Type=oneshot
@@ -181,7 +196,7 @@ install_secretsproxy_ca() {
   if [ "$crt$key" = 11 ]; then
     return
   fi
-  [ "$crt$key" = 00 ] || devbox_die "only one of $dir/ca.crt and ca.key exists; refusing to replace the cell CA"
+  [ "$crt$key" = 00 ] || devbox_die "only one of $dir/ca.crt and ca.key exists; refusing to replace the cell CA (recreate the box)"
   install -d -m 0755 "$DEVBOX_STATE/bin"
   devbox_build "$DEVBOX_STATE/bin/gen-secretsproxy-ca" ./scripts/gen-secretsproxy-ca
   systemd-run --quiet --wait --collect --unit=secretsproxy-ca-init \
@@ -219,6 +234,7 @@ main() {
     || devbox_die "cannot size schedulable capacity"
   devbox_log "host $DEVBOX_INSTANCE ($DEVBOX_ZONE): $MEMORY_MIB MiB, $VCPUS vCPUs schedulable"
   run_host_bootstrap
+  verify_vmd_env
   install_storage
   verify_reflink
   verify_artifacts

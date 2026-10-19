@@ -69,13 +69,14 @@ def runtime_manifest(args, identity):
         "schema_version": SCHEMA_VERSION,
         "bootstrapped_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "bootstrap_revision": args.revision,
+        "host_id": identity["host_id"],
+        "host_region": args.region,
+        "vmd_grpc_address": "127.0.0.1:50051",
         "host": {
-            "host_id": identity["host_id"],
             "instance": args.instance,
             "instance_id": identity["instance_id"],
             "project": identity["project_id"],
             "zone": args.zone,
-            "region": args.region,
         },
         "artifacts": {
             "source": f"gs://{args.bucket}/hostprep/",
