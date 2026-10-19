@@ -9,6 +9,7 @@ import devbox_inventory as inv
 PROJECT = contract.PROJECT
 ZONE = contract.ZONE
 NOW = 1_800_000_000
+CREATED = '2027-01-15T06:00:00+00:00'
 
 
 def link(kind, name, project=PROJECT, zone=ZONE):
@@ -35,7 +36,7 @@ def gce(name, devbox_id='3f9c0a1b2c4d'):
 class FakeCloud:
     def __init__(self):
         self.instances_, self.disks_, self.buckets_ = [], [], []
-        self.calls, self.fail, self.broken = [], set(), False
+        self.calls, self.fail = [], set()
 
     def add_box(self, name, devbox_id, *, vm=True, disks=True, bucket=True, project=PROJECT, zone=ZONE,
                 manifest=None, unlabelled=(), **label_args):
@@ -55,17 +56,15 @@ class FakeCloud:
                                                             'value': json.dumps(manifest)}]}})
         if disks:
             for disk in (boot, data):
-                self.disks_.append({'name': disk, 'zone': f'projects/{project}/zones/{zone}',
+                self.disks_.append({'name': disk, 'zone': f'projects/{project}/zones/{zone}', 'creationTimestamp': CREATED,
                                     'labels': {} if disk == boot and 'boot' in unlabelled else dict(tags),
                                     'selfLink': link('disks', disk, project, zone),
                                     'users': [link('instances', instance, project, zone)] if vm else []})
         if bucket:
-            self.buckets_.append({'name': contract.bucket_name(devbox_id),
+            self.buckets_.append({'name': contract.bucket_name(devbox_id), 'creation_time': CREATED,
                                   'labels': {} if 'bucket' in unlabelled else dict(tags)})
 
     def instances(self):
-        if self.broken:
-            raise RuntimeError('gcloud compute instances list failed: backend error')
         return [dict(i) for i in self.instances_]
 
     def disks(self):
@@ -79,6 +78,15 @@ class FakeCloud:
         if (kind, name) in self.fail:
             return f'{kind} {name}: permission denied'
         collection[:] = [item for item in collection if item['name'] != name]
+        return None
+
+    def label(self, resource, labels):
+        self.calls.append(('label', resource.name))
+        if ('label', resource.name) in self.fail:
+            return f'{resource.name}: permission denied'
+        for item in self.disks_ + self.buckets_:
+            if item['name'] == resource.name:
+                item['labels'] = {**item['labels'], **labels}
         return None
 
     def set_metadata(self, name, zone, key, value):
@@ -275,10 +283,17 @@ class DestroyTest(unittest.TestCase):
         self.assertEqual(cloud.calls, [('bucket', 'superserve-devbox-3f9c0a1b2c4d')])
 
     def test_recorded_resource_destroy_cannot_handle_is_not_reported_as_success(self):
+        for invalid in (False, True):
+            with self.subTest(invalid_manifest=invalid):
+                self.check_unhandled_refusal(invalid)
+
+    def check_unhandled_refusal(self, invalid):
         cloud = FakeCloud()
         cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d')
         manifest = json.loads(cloud.instances_[0]['metadata']['items'][0]['value'])
         manifest['resources'].append({'type': 'artifact_repo', 'name': 'devbox-3f9c0a1b2c4d'})
+        if invalid:
+            del manifest['created_at']
         cloud.instances_[0]['metadata']['items'][0]['value'] = json.dumps(manifest)
         for _ in range(2):
             with self.assertRaises(SystemExit) as stop:
@@ -335,16 +350,46 @@ class UnlabelledResourceTest(unittest.TestCase):
         self.assertFalse(any(r.adopted for b in found for r in b.resources))
         self.assertIn('claimed by 2 devboxes', ignored[0][1])
 
-    def test_failed_unlabelled_delete_keeps_labelled_anchor_for_retry(self):
+    def test_unlabelled_leftovers_are_labelled_first_so_a_failed_delete_stays_findable(self):
         cloud = FakeCloud()
-        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', unlabelled=('bucket',))
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', unlabelled=('boot', 'bucket'))
+        cloud.disks_ = [d for d in cloud.disks_ if not d['name'].endswith('-data')]
+        instance, boot, _ = gce('alice-dev-a7f3c9')
         cloud.fail = {('bucket', 'superserve-devbox-3f9c0a1b2c4d')}
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(SystemExit) as stop:
             inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
-        self.assertNotIn('disk', [c[0] for c in cloud.calls])
+        self.assertIn('bucket superserve-devbox-3f9c0a1b2c4d', stop.exception.code)
+        self.assertEqual(sorted(cloud.calls[:2]), [('label', boot), ('label', 'superserve-devbox-3f9c0a1b2c4d')])
+        [box], _ = boxes(cloud)
+        self.assertEqual([(r.kind, r.adopted) for r in box.resources], [('bucket', False)])
         cloud.fail = set()
         inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
         self.assertEqual((cloud.instances_, cloud.disks_, cloud.buckets_), ([], [], []))
+
+    def test_failed_labelling_deletes_nothing(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', unlabelled=('boot',))
+        cloud.fail = {('label', gce('alice-dev-a7f3c9')[1])}
+        with self.assertRaises(SystemExit):
+            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertEqual([c[0] for c in cloud.calls], ['label'])
+
+    def test_old_partially_labelled_or_foreign_attached_resources_are_not_adopted(self):
+        _, boot, _ = gce('alice-dev-a7f3c9')
+        cases = {'older than the devbox': {'creationTimestamp': '2020-01-01T00:00:00+00:00'},
+                 'devbox-name': {'labels': {'devbox-name': 'bob-dev-0d1e2f', 'env': 'staging'}},
+                 'attached to staging-vmd-1': {'users': [link('instances', 'staging-vmd-1')]}}
+        for reason, change in cases.items():
+            with self.subTest(reason=reason):
+                cloud = FakeCloud()
+                cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', unlabelled=('boot',))
+                cloud.disks_[0].update(change)
+                [box], ignored = boxes(cloud)
+                self.assertNotIn(('disk', boot), [(r.kind, r.name) for r in box.resources])
+                if reason != 'devbox-name':
+                    self.assertIn(reason, ignored[0][1])
+                inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+                self.assertNotIn(('disk', boot), cloud.calls)
 
 
 class DestroyNameTest(unittest.TestCase):

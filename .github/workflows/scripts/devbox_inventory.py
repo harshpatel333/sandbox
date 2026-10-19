@@ -28,6 +28,7 @@ class Resource:
     link: str = ''
     users: list = field(default_factory=list)
     manifest: dict | None = None
+    recorded: list = field(default_factory=list)
     status: str = ''
     adopted: bool = False
 
@@ -74,8 +75,13 @@ class Box:
     @property
     def unhandled(self):
         known = expected(self.name, self.devbox_id)
-        return [f'{r.get("type")} {r.get("name")}' for r in (self.manifest or {}).get('resources', [])
-                if isinstance(r, dict) and (r.get('type'), r.get('name')) not in known]
+        recorded = self.instance.recorded if self.instance else []
+        return [f'{r.get("type")} {r.get("name")}' for r in recorded
+                if not isinstance(r, dict) or (r.get('type'), r.get('name')) not in known]
+
+    def identity_labels(self):
+        anchor = self.primary
+        return {key: anchor.labels[key] for key in contract.LABEL_KEYS if key in anchor.labels}
 
     @property
     def state(self):
@@ -103,7 +109,7 @@ class Gcloud:
         return json.loads(self._run(*args, '--format=json').stdout or '[]')
 
     def instances(self):
-        return self._list('compute', 'instances', 'list')
+        return self._list('compute', 'instances', 'list', f'--filter={contract.discovery_filter()}')
 
     def disks(self):
         return self._list('compute', 'disks', 'list')
@@ -117,6 +123,13 @@ class Gcloud:
             handle.flush()
             return self._failure('compute', 'instances', 'add-metadata', name, f'--zone={zone}',
                                  f'--metadata-from-file={key}={handle.name}')
+
+    def label(self, resource, labels):
+        values = ','.join(f'{key}={value}' for key, value in labels.items())
+        if resource.kind == 'bucket':
+            return self._failure('storage', 'buckets', 'update', f'gs://{resource.name}', f'--update-labels={values}')
+        return self._failure('compute', 'disks', 'add-labels', resource.name, f'--zone={resource.zone}',
+                             f'--labels={values}')
 
     def delete_instance(self, name, zone):
         return self._failure('compute', 'instances', 'delete', name, f'--zone={zone}', '--keep-disks=all', '--quiet')
@@ -142,25 +155,49 @@ def _last(url):
     return (url or '').rsplit('/', 1)[-1]
 
 
-def _manifest(instance):
+def _raw_manifest(instance):
     for item in (instance.get('metadata') or {}).get('items') or []:
         if item.get('key') == contract.MANIFEST_METADATA_KEY:
             try:
-                return contract.validate_manifest(json.loads(item.get('value') or ''))
-            except Exception:
+                return json.loads(item.get('value') or '')
+            except ValueError:
                 return None
     return None
 
 
+def _manifest(raw):
+    try:
+        return contract.validate_manifest(raw)
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return None
+
+
+def _recorded(raw):
+    resources = raw.get('resources') if isinstance(raw, dict) else None
+    return resources if isinstance(resources, list) else []
+
+
+def _dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _created(stamp):
+    try:
+        return datetime.datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
 def collect(cloud):
-    resources = [Resource('instance', i.get('name', ''), _last(i.get('zone')), i.get('labels') or {},
+    resources = [Resource('instance', i.get('name', ''), _last(i.get('zone')), _dict(i.get('labels')),
                           i.get('creationTimestamp', ''), i.get('selfLink', ''),
-                          manifest=_manifest(i), status=i.get('status', ''))
+                          manifest=_manifest(_raw_manifest(i)), recorded=_recorded(_raw_manifest(i)),
+                          status=i.get('status', ''))
                  for i in cloud.instances()]
-    resources += [Resource('disk', d.get('name', ''), _last(d.get('zone')), d.get('labels') or {},
+    resources += [Resource('disk', d.get('name', ''), _last(d.get('zone')), _dict(d.get('labels')),
                            d.get('creationTimestamp', ''), d.get('selfLink', ''), users=d.get('users') or [])
                   for d in cloud.disks()]
-    resources += [Resource('bucket', b.get('name', ''), '', b.get('labels') or {}, b.get('creation_time', ''))
+    resources += [Resource('bucket', b.get('name', ''), '', _dict(b.get('labels')), b.get('creation_time', ''))
                   for b in cloud.buckets()]
     return resources
 
@@ -189,13 +226,26 @@ def ineligibility(resource, project):
 
 
 def _unlabelled(resource, project):
-    return (resource.kind != 'instance' and 'managed-by' not in resource.labels
-            and not set(contract.FORBIDDEN_LABELS) & set(resource.labels) and _placement(resource, project) is None)
+    return (resource.kind != 'instance' and all(key.startswith('goog-') for key in resource.labels)
+            and _placement(resource, project) is None)
+
+
+def _unadoptable(resource, group):
+    links = {r.link for r in group if r.kind == 'instance'}
+    foreign = [u for u in resource.users if u not in links]
+    if foreign:
+        return f'unlabelled and attached to {", ".join(map(_last, foreign))}'
+    expires = next((r.labels['expires-at'] for r in group if r.labels.get('expires-at', '').isdigit()), None)
+    created = _created(resource.created)
+    if expires is None or created is None or created < int(expires) - contract.MAX_LIFETIME_HOURS * 3600:
+        return 'unlabelled and older than the devbox that would claim it'
+    return None
 
 
 def inventory(resources, project):
     """Group labelled resources by identity, then adopt the unlabelled boot disk or bucket that create
-    can leave between its create and label calls, only by exact name under exactly one labelled box."""
+    can leave between its create and label calls: only by exact name under exactly one labelled box,
+    only when detached or attached to that box, and only when created within that box's lifetime."""
     groups, ignored = {}, []
     for resource in resources:
         reason = ineligibility(resource, project)
@@ -213,8 +263,10 @@ def inventory(resources, project):
         owners = claims.get((resource.kind, resource.name), [])
         if not owners or not _unlabelled(resource, project):
             continue
-        if len(owners) > 1:
-            ignored.append((resource, f'unlabelled and claimed by {len(owners)} devboxes'))
+        reason = (f'unlabelled and claimed by {len(owners)} devboxes' if len(owners) > 1
+                  else _unadoptable(resource, groups[owners[0]]))
+        if reason:
+            ignored.append((resource, reason))
             continue
         resource.adopted = True
         groups[owners[0]].append(resource)
@@ -255,7 +307,7 @@ def _age(box, now):
 
 
 def _cell(value):
-    return str(value).replace('|', '\\|')
+    return ' '.join(str(value).split()).replace('|', '\\|')
 
 
 def _revisions(box):
@@ -352,8 +404,7 @@ def _delete(cloud, resource, instance):
 def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
     """Delete exactly the resources of this devbox identity; succeed only when none remain.
 
-    Unlabelled resources go first and the labelled ones are kept if any of them fails,
-    because the labelled resources are what lets a retry find the unlabelled ones again."""
+    Unlabelled resources are labelled first so that any partial failure stays findable by a retry."""
     box = find(cloud, project, name, devbox_id)
     if box is None:
         return f'`{name}` ({devbox_id}) is already gone.'
@@ -362,6 +413,11 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
     if box.unhandled:
         raise SystemExit(f'Refusing to destroy {name} ({devbox_id}): its manifest records resources destroy cannot '
                          f'remove ({", ".join(box.unhandled)}); nothing was deleted.')
+    for resource in [r for r in box.resources if r.adopted]:
+        error = cloud.label(resource, box.identity_labels())
+        if error:
+            raise SystemExit(f'Could not label unlabelled {resource.kind} {resource.name} of {name} ({devbox_id}) '
+                             f'before deleting; nothing was deleted, rerun to retry: {error}')
     instance = box.instance
     if instance and box.manifest is not None:
         try:
@@ -372,10 +428,7 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
         if error:
             print(f'::warning::Could not mark {name} as destroying: {error}')
     failures = [cloud.delete_instance(instance.name, instance.zone)] if instance else []
-    adopted = [_delete(cloud, r, instance) for r in box.resources if r.adopted]
-    failures += adopted
-    if not any(adopted):
-        failures += [_delete(cloud, r, instance) for r in box.resources if r.kind != 'instance' and not r.adopted]
+    failures += [_delete(cloud, r, instance) for r in box.resources if r.kind != 'instance']
     try:
         remaining = find(cloud, project, name, devbox_id)
     except CLOUD_ERRORS as error:
@@ -447,6 +500,9 @@ def main(argv=None):
             _publish(stop.code)
             raise SystemExit(1) from None
         raise
+    except contract.ContractError as error:
+        _publish(f'Failed: {error}')
+        raise SystemExit(1) from None
     except CLOUD_ERRORS as error:
         _publish(f'Failed: {error}. Rerun to retry.')
         raise SystemExit(1) from None
