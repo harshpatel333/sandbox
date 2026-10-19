@@ -306,8 +306,8 @@ class Box:
                   f"mv -f {shlex.quote(path + '.new')} {shlex.quote(path)}")
         self.ssh("sudo sh -c " + shlex.quote(script), input=content)
 
-    def read_json(self, path):
-        result = self.ssh("sudo cat " + shlex.quote(path))
+    def read_json(self, path, timeout=600):
+        result = self.ssh("sudo cat " + shlex.quote(path), timeout=timeout)
         if len(result.stdout.encode()) > MAX_STATE_BYTES:
             raise StepError(f"{path} on {self.name} is larger than {MAX_STATE_BYTES} bytes")
         try:
@@ -697,9 +697,6 @@ def deploy_request(env):
 def deploy(env, now=contract.utc_now):
     require_main(env)
     name, components, revisions = deploy_request(env)
-    prefixed(env, SECRET_PREFIX, "secrets")
-    prefixed(env, CONFIG_PREFIX, "variables")
-
     instance = find_box(name)
     box = Box(name, zone=instance["zone"])
     manifest = manifest_from(instance)
@@ -714,6 +711,7 @@ def deploy(env, now=contract.utc_now):
                         "so every component is reinstalled before it is marked ready again")
     if contract.parse_iso(manifest["expires_at"]) <= now():
         raise StepError(f"{name} expired at {manifest['expires_at']} and is due for deletion")
+    files = configuration({**manifest, "revisions": {**manifest["revisions"], **revisions}}, env)
 
     box.wait_for_ssh(attempts=5)
     scripts = contract.component_scripts(components)
@@ -732,7 +730,7 @@ def deploy(env, now=contract.utc_now):
             progress["checked_out"].append(key)
             save()
         box.require_scripts(scripts)
-        deliver_configuration(box, {**manifest, "revisions": {**manifest["revisions"], **revisions}}, env)
+        deliver_configuration(box, files)
         if "api" in components:
             box.remove(API_DEPLOY_FILE)
         for component in components:
@@ -750,10 +748,12 @@ def deploy(env, now=contract.utc_now):
 
 
 def conclude_deploy(env, box, manifest, state, devbox_id, components, revisions, progress, failure, now):
-    DEADLINE.start(REPORT_SECONDS)
+    DEADLINE.report()
     migrations = "none"
     if progress["api_started"]:
-        migrations = read_migrations(box, revisions["sandbox"]["sha"]) or "none"
+        # install-api.sh ran, so without a readable report for this revision the
+        # outcome is unknown: it may have been killed after migrations committed.
+        migrations = read_migrations(box, revisions["sandbox"]["sha"]) or "unknown"
     recorded = contract.record_deploy(state, at=now(), actor=env["GITHUB_ACTOR"], components=components,
                                       revisions=revisions, migrations=migrations,
                                       result="failed" if failure else "succeeded",
@@ -780,7 +780,7 @@ def finish_deploy(env, now=contract.utc_now):
         return
     name, components, revisions = deploy_request(env)
     instance = find_box(name)
-    box = Box(name, zone=instance["zone"])
+    box = Box(name, zone=instance["zone"], devbox_id=attempt["devbox_id"])
     manifest = manifest_from(instance)
     contract.check_labels(instance.get("labels"), name, attempt["devbox_id"])
     if manifest["state"] == "deploying":
@@ -790,7 +790,7 @@ def finish_deploy(env, now=contract.utc_now):
 
 def read_migrations(box, sha):
     try:
-        report = box.read_json(API_DEPLOY_FILE)
+        report = box.read_json(API_DEPLOY_FILE, timeout=120)
     except Exception:
         return None
     if report.get("sha") != sha or report.get("migrations") not in contract.MIGRATION_RESULTS:
@@ -842,6 +842,7 @@ def main(argv=None):
         elif args.command == "prepare-deploy":
             prepare_deploy(env)
         elif args.command == "finish-deploy":
+            DEADLINE.report()
             finish_deploy(env)
         elif args.command == "create":
             DEADLINE.start(DEADLINE_SECONDS)

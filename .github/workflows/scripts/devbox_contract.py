@@ -41,7 +41,7 @@ FORBIDDEN_LABELS = ("sandbox_role", "sandbox_status", "environment", "region", "
 
 STATES = ("creating", "ready", "failed", "deploying", "destroying")
 RESOURCE_TYPES = ("instance", "disk", "bucket")
-MIGRATION_RESULTS = ("applied", "none", "failed")
+MIGRATION_RESULTS = ("applied", "none", "failed", "unknown")
 DEPLOY_RESULTS = ("succeeded", "failed")
 
 REPOSITORIES = ("sandbox", "ui")

@@ -204,6 +204,13 @@ class ManifestTests(unittest.TestCase):
                                        revisions=target, migrations="none", result=result,
                                        checked_out=checked_out, deployed=deployed)
 
+    def test_unknown_migration_outcome_is_recordable(self):
+        at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
+        after = contract.record_deploy(manifest(), at=at, actor="x", components=["api"], migrations="unknown",
+                                       result="failed", revisions={"sandbox": {"branch": "main", "sha": SHA_C}},
+                                       checked_out=["sandbox"], deployed=[])
+        self.assertEqual(after["deploys"][-1]["migrations"], "unknown")
+
     def test_record_deploy_rejects_unknown_outcomes_and_mismatched_revisions(self):
         at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
         sandbox = {"sandbox": {"branch": "main", "sha": SHA_C}}

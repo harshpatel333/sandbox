@@ -528,16 +528,16 @@ class DeployTests(WorkflowCase):
         self.assertIn("| api | `" + SANDBOX_SHA[:12] + "` (`main`) | not deployed |", summary)
         self.assertIn("Services (before this deploy)", summary)
 
-    def test_api_build_failing_before_migrations_reports_none(self):
+    def test_api_install_without_a_readable_report_is_unknown(self):
         cloud = FakeCloud(instances=self.box(), fail_script="install-api.sh", migrations=None)
         self.assertEqual(self.deploy(cloud, "api"), 1)
-        self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["migrations"], "none")
+        self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["migrations"], "unknown")
 
     def test_migration_report_for_another_revision_is_ignored(self):
         cloud = FakeCloud(instances=self.box())
         cloud.deployed_sha = SANDBOX_SHA
         self.assertEqual(self.deploy(cloud, "api"), 0)
-        self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["migrations"], "none")
+        self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["migrations"], "unknown")
 
     def test_stale_migration_marker_is_not_reported(self):
         cloud = FakeCloud(instances=self.box(), fail_script="services-up.sh")
@@ -597,6 +597,13 @@ class DeployTests(WorkflowCase):
         cloud.box_missing = {"install-ui.sh"}
         with self.assertRaisesRegex(workflow.StepError, "install-ui.sh"):
             self.deploy(cloud, "ui", SANDBOX_BRANCH="", SANDBOX_SHA="", UI_BRANCH="feature", UI_SHA=NEW_SHA)
+        self.assertEqual(cloud.metadata_writes, [])
+        self.assertEqual(cloud.checkouts, [])
+
+    def test_bad_configuration_is_refused_before_the_box_changes(self):
+        cloud = FakeCloud(instances=self.box())
+        with self.assertRaisesRegex(workflow.StepError, "newline"):
+            self.deploy(cloud, "vmd", DEVBOX_SECRET_STRIPE_SECRET_KEY="sk_test\n")
         self.assertEqual(cloud.metadata_writes, [])
         self.assertEqual(cloud.checkouts, [])
 

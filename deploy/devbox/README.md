@@ -326,12 +326,14 @@ instead. Existing sandboxes and data are kept.
 
 Each deploy, successful or not, is appended to the manifest's `deploys` with
 the actor, components, previous and new commits, the migration result
-(`applied`, `none` or `failed`) and the outcome (`succeeded` or `failed`).
+(`applied`, `none`, `failed` or `unknown`) and the outcome (`succeeded` or `failed`).
 Only components whose install finished move in the manifest's `components`,
 and `revisions` moves only for the repositories that were checked out, so a
 deploy that fails partway records exactly what changed. The migration result
 comes from the report `install-api.sh` writes for the deployed commit
-(`/var/lib/superserve-devbox/api-deploy.json`); without one it is `none`.
+(`/var/lib/superserve-devbox/api-deploy.json`). It is `none` when `install-api.sh`
+didn't run, and `unknown` when it ran but left no readable report for that
+commit, for example when the run was cancelled mid-migration.
 `expires-at` never changes. The run summary shows previous and new commits per
 component, the migration result, service readiness and log access. A failed
 deploy leaves the box in state `failed`, possibly partly upgraded. Recover it
