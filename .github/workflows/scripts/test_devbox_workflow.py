@@ -149,7 +149,7 @@ class FakeCloud:
             self.scripts.append(script.group(1))
             if script.group(1) == self.expire_on_script:
                 workflow.DEADLINE.end = 0
-            if script.group(1) == "install-api.sh":
+            if script.group(1) == "install-api.sh" and self.migrations is not None:
                 self.box_files[workflow.API_DEPLOY_FILE] = json.dumps(
                     {"sha": self.deployed_sha, "migrations": self.migrations, "applied": []})
             return fail() if script.group(1) == self.fail_script else ok()
@@ -519,6 +519,11 @@ class DeployTests(WorkflowCase):
         summary = self.summary.read_text()
         self.assertIn("| api | `" + SANDBOX_SHA[:12] + "` (`main`) | not deployed |", summary)
         self.assertIn("Services (before this deploy)", summary)
+
+    def test_api_build_failing_before_migrations_reports_none(self):
+        cloud = FakeCloud(instances=self.box(), fail_script="install-api.sh", migrations=None)
+        self.assertEqual(self.deploy(cloud, "api"), 1)
+        self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["migrations"], "none")
 
     def test_migration_report_for_another_revision_is_ignored(self):
         cloud = FakeCloud(instances=self.box())
