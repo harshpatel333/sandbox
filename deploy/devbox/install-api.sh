@@ -140,16 +140,29 @@ pending_list=$(pending_migrations)
 mapfile -t pending <<<"$pending_list"
 [[ -n ${pending[0]} ]] || pending=()
 workdir=$(migration_workdir)
+
+record_partial_failure() {
+  local still done_versions
+  still=$(pending_migrations) || still=$pending_list
+  mapfile -t done_versions < <(comm -23 <(printf '%s\n' "${pending[@]}") <(printf '%s\n' "$still"))
+  record failed "${done_versions[@]}"
+}
+
+# A run cancelled or killed while migrating still reports failed, with the
+# versions that committed before it stopped.
+migrating=true
+trap 'if [[ $migrating == true ]]; then migrating=false; record_partial_failure || true; fi; rm -rf "$workdir"' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
 log "applying ${#pending[@]} pending migration(s)"
 if ! (cd "$workdir" && PGPASSWORD=$POSTGRES_PASSWORD SUPABASE_TELEMETRY_DISABLED=1 "$supabase" db push --yes \
   --db-url "postgresql://postgres@127.0.0.1:54322/postgres?sslmode=disable"); then
-  rm -rf "$workdir"
-  still_pending=$(pending_migrations)
-  mapfile -t done_versions < <(comm -23 <(printf '%s\n' "${pending[@]}") <(printf '%s\n' "$still_pending"))
-  record failed "${done_versions[@]}"
+  migrating=false
+  record_partial_failure
   die "migrations failed; the running API was not changed"
 fi
-rm -rf "$workdir"
+migrating=false
 if [[ ${#pending[@]} -gt 0 ]]; then
   record applied "${pending[@]}"
 else
