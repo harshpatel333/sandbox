@@ -1,0 +1,96 @@
+name: Devbox Terraform
+
+# Plans the shared devbox root on pull requests and applies it from main. It
+# never runs another Terraform root, so staging and production holds do not
+# block it, and an apply that would delete or replace anything stops unless it
+# is dispatched from main with allow_destroy.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'deploy/devbox/terraform/**'
+      - 'infra/modules/network/**'
+      - '.github/workflows/devbox-terraform.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/devbox/terraform/**'
+      - 'infra/modules/network/**'
+      - '.github/workflows/devbox-terraform.yml'
+  workflow_dispatch:
+    inputs:
+      allow_destroy:
+        description: 'Apply even if the plan deletes or replaces resources'
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: devbox-terraform
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  terraform:
+    name: Devbox Terraform
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      TF_IN_AUTOMATION: 'true'
+      ROOT: deploy/devbox/terraform
+      APPLY: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+      ALLOW_DESTROY: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_destroy }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Plan
+        run: |
+          set -euo pipefail
+          terraform -chdir="$ROOT" init -input=false -lock-timeout=10m
+          terraform -chdir="$ROOT" validate
+          terraform -chdir="$ROOT" plan -input=false -lock-timeout=10m -out=tfplan
+          {
+            echo "## Devbox Terraform plan"
+            echo
+            echo '```'
+            (cd "$ROOT" && "$GITHUB_WORKSPACE/scripts/sanitize-terraform-plan.sh" tfplan)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Refuse deletes and replacements
+        if: env.ALLOW_DESTROY != 'true'
+        run: |
+          set -euo pipefail
+          destructive=$(terraform -chdir="$ROOT" show -json tfplan \
+            | jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address')
+          if [ -n "$destructive" ]; then
+            echo "::error title=Destructive devbox plan::The plan deletes or replaces: $(echo $destructive)"
+            echo "Dispatch this workflow from main with allow_destroy if the change is intentional." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Apply
+        if: env.APPLY == 'true'
+        run: |
+          set -euo pipefail
+          terraform -chdir="$ROOT" apply -input=false -lock-timeout=10m tfplan
+          {
+            echo "## Devbox environment values"
+            echo
+            echo '```json'
+            terraform -chdir="$ROOT" output -json github_environment_variables
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
