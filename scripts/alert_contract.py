@@ -4,6 +4,9 @@ from pathlib import Path
 import re
 
 POLICIES = {
+    "entitlement_metric": ("billing_entitlement", "billing", "api", "variant", ["each"]),
+    "entitlement_recovery": ("billing_entitlement", "billing", "api", "manual_recovery", ["aggregate"]),
+    "billing_preserved": ("billing_entitlement", "billing", "api", "billing_backlog", ["each"]),
     "compute_instance_cpu": ("host_cpu", "host", "host", "capacity", ["each"]),
     "host_maintenance_events": ("host_maintenance", "host", "host", "maintenance", ["each"]),
     "sandbox_lifecycle_latency": ("lifecycle_latency", "sandbox_lifecycle", "api", "latency", ["create", "resume", "pause", "delete"]),
