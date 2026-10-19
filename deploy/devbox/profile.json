@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "project": "rayai-dev",
+  "zone": "us-central1-a",
+  "region": "us-central1",
+  "resource_name_prefix": "devbox-",
+  "labels": {
+    "managed-by": "superserve-devbox"
+  },
+  "instance": {
+    "machine_type": "n2-standard-8",
+    "enable_nested_virtualization": true,
+    "image_project": "ubuntu-os-cloud",
+    "image_family": "ubuntu-2404-lts-amd64",
+    "network": "superserve-devbox",
+    "subnetwork": "superserve-devbox-usc1",
+    "external_ip": false,
+    "network_tags": ["superserve-devbox"],
+    "service_account": "superserve-devbox-vm@rayai-dev.iam.gserviceaccount.com",
+    "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+    "metadata": {
+      "enable-oslogin": "TRUE",
+      "block-project-ssh-keys": "TRUE"
+    }
+  },
+  "boot_disk": {
+    "type": "pd-balanced",
+    "size_gb": 50,
+    "auto_delete": false
+  },
+  "data_disk": {
+    "name_suffix": "-data",
+    "type": "pd-balanced",
+    "size_gb": 150,
+    "device_name": "devbox-data",
+    "filesystem": "xfs",
+    "mount_path": "/mnt/sandbox-data",
+    "auto_delete": false
+  },
+  "bucket": {
+    "name_prefix": "superserve-devbox-",
+    "location": "us-central1",
+    "storage_class": "STANDARD",
+    "uniform_bucket_level_access": true,
+    "public_access_prevention": "enforced",
+    "soft_delete_retention_seconds": 0
+  }
+}
