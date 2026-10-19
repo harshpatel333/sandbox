@@ -49,6 +49,8 @@ class FakeCloud:
         self.decoys, self.fail_after_create, self.expire_on_script = decoys, fail_after_create, expire_on_script
         self.disks, self.buckets, self.unlabelled = [], [], set()
         self.relabel_after_checkouts = None
+        self.pending_instance = False
+        self.fail_disk_create = False
         self.repo_scripts = list(contract.CREATE_SCRIPTS)
         self.existing = list(existing)
         self.branches = branches if branches is not None else {"main": SANDBOX_SHA, "feature": NEW_SHA}
@@ -88,6 +90,8 @@ class FakeCloud:
             self.unlabelled.discard(args[4])
             return ok()
         if verb == ["compute", "disks", "create"]:
+            if self.fail_disk_create:
+                return fail(1, "quota exceeded")
             self.disks.append(args[4])
             return ok()
         if verb == ["storage", "buckets", "create"]:
@@ -98,12 +102,10 @@ class FakeCloud:
         if verb == ["compute", "instances", "create"]:
             labels = dict(pair.split("=") for pair in arg(args, "--labels").split(","))
             manifest = Path(arg(args, "--metadata-from-file").split("=", 1)[1]).read_text()
-            self.instances[args[4]] = {"name": args[4], "zone": "projects/p/zones/us-central1-a", "labels": labels,
-                                       "metadata": {"items": [{"key": "devbox-manifest", "value": manifest}]},
-                                       "disks": [{"boot": True, "source": f"projects/p/zones/us-central1-a/disks/{args[4]}"},
-                                                 {"source": f"projects/p/zones/us-central1-a/disks/{args[4]}-data"}]}
-            self.disks.append(args[4])
-            self.unlabelled.add(args[4])
+            if self.pending_instance:
+                self.pending_instance = lambda: self.materialize(args[4], labels, manifest)
+                return fail(1, "operation still pending")
+            self.materialize(args[4], labels, manifest)
             return fail(1, "operation timed out") if self.fail_after_create else ok()
         if verb == ["compute", "instances", "describe"]:
             instance = self.instances[args[4]]
@@ -119,6 +121,15 @@ class FakeCloud:
         if verb == ["compute", "ssh", args[3]]:
             return self.ssh(args, args[args.index("--command") + 1], input, ok, fail)
         return ok()
+
+    def materialize(self, name, labels, manifest):
+        disks = [{"boot": True, "source": f"projects/p/zones/us-central1-a/disks/{name}"},
+                 {"source": f"projects/p/zones/us-central1-a/disks/{name}-data"}]
+        self.instances[name] = {"name": name, "zone": "projects/p/zones/us-central1-a", "labels": labels,
+                                "metadata": {"items": [{"key": "devbox-manifest", "value": manifest}]},
+                                "disks": disks}
+        self.disks.append(name)
+        self.unlabelled.add(name)
 
     def ssh(self, args, command, input, ok, fail):
         self.inputs[command] = input
@@ -327,6 +338,25 @@ class CreateTests(WorkflowCase):
         self.assertNotIn("bucket `", summary)
         self.assertFalse([c for c in cloud.commands if any("name=" in a for a in c) and "list" in c
                           and any("devbox-id" in a for a in c)])
+
+    def test_instance_not_yet_visible_leaves_the_backstop_armed(self):
+        attempt = Path(self.directory.name) / "attempt.json"
+        cloud = FakeCloud()
+        cloud.pending_instance = True
+        self.assertEqual(self.create(cloud, DEVBOX_ATTEMPT_FILE=str(attempt)), 1)
+        self.assertFalse(json.loads(attempt.read_text())["reported"])
+        cloud.pending_instance()
+        self.run_with(cloud, workflow.finish_create, self.create_env(DEVBOX_ATTEMPT_FILE=str(attempt)))
+        self.assertEqual(cloud.metadata_writes[-1]["state"], "failed")
+        self.assertTrue(json.loads(attempt.read_text())["reported"])
+
+    def test_failure_before_any_vm_is_requested_is_settled(self):
+        attempt = Path(self.directory.name) / "attempt.json"
+        cloud = FakeCloud()
+        cloud.fail_disk_create = True
+        self.assertEqual(self.create(cloud, DEVBOX_ATTEMPT_FILE=str(attempt)), 1)
+        self.assertTrue(json.loads(attempt.read_text())["reported"])
+        self.assertFalse(cloud.gcloud("compute", "instances", "create"))
 
     def test_interrupted_create_is_marked_failed_by_the_backstop(self):
         attempt = Path(self.directory.name) / "attempt.json"

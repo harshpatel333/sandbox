@@ -483,7 +483,7 @@ def create(env, profile_path=PROFILE_PATH):
     except StepError as error:
         append_summary(env, f"# Devbox `{name}` was not created\n\n{error}")
         raise
-    save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False})
+    save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "instance_started": False})
     try:
         where = [f"--zone={contract.ZONE}", f"--project={contract.PROJECT}"]
         data = profile["data_disk"]
@@ -492,6 +492,7 @@ def create(env, profile_path=PROFILE_PATH):
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
             manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+            save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "instance_started": True})
             run(instance_args(name, profile, labels, manifest_path))
         run(["gcloud", "compute", "disks", "add-labels", box.instance, *where,
              f"--labels={contract.format_labels(labels)}"])
@@ -513,7 +514,7 @@ def create(env, profile_path=PROFILE_PATH):
         manifest = contract.with_state(collect_state(box, manifest), "ready")
         box.record(manifest, devbox_id)
     except (Exception, KeyboardInterrupt) as error:
-        report_create_failure(env, name, devbox_id, error)
+        report_create_failure(env, name, devbox_id, error, load_attempt(env).get("instance_started", True))
         return 1
     save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": True})
 
@@ -587,7 +588,7 @@ def mark_failed(name, devbox_id):
     return True, ""
 
 
-def report_create_failure(env, name, devbox_id, error):
+def report_create_failure(env, name, devbox_id, error, instance_started):
     DEADLINE.start(REPORT_SECONDS)
     try:
         found = discover(name, devbox_id)
@@ -612,18 +613,28 @@ def report_create_failure(env, name, devbox_id, error):
         "Clean up with:",
         "```sh", destroy_command(name), "```",
     ]))
-    save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": marked is not False})
+    # Settled only when a visible VM was marked failed or had already finished,
+    # or no VM was ever requested; a VM that may still appear leaves the attempt
+    # open so the backstop step looks again.
+    settled = (has_instance and marked is not False) or not instance_started
+    save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": settled,
+                       "instance_started": instance_started})
     print(f"::error::Devbox {name} failed: {describe(error)}", file=sys.stderr)
 
 
-def finish_create(env):
+def load_attempt(env):
     path = env.get("DEVBOX_ATTEMPT_FILE")
     if not path or not Path(path).exists():
-        return
-    attempt = json.loads(Path(path).read_text())
-    if not attempt["reported"]:
+        return {}
+    return json.loads(Path(path).read_text())
+
+
+def finish_create(env):
+    attempt = load_attempt(env)
+    if attempt and not attempt["reported"]:
         report_create_failure(env, attempt["name"], attempt["devbox_id"],
-                              StepError("The create run was cancelled or timed out"))
+                              StepError("The create run was cancelled or timed out"),
+                              attempt.get("instance_started", True))
 
 
 def main(argv=None):
