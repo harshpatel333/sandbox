@@ -106,18 +106,16 @@ which `services-up.sh` generates once and keeps on the data disk:
 
 ## Docker on the same host
 
-The local services run in Docker. Docker and VMD share the kernel's netfilter
-tables and stay out of each other's way under these rules:
+The local services run in Docker. Docker stays out of the kernel's netfilter
+tables entirely, so the only `FORWARD` and NAT rules on the box are VMD's:
 
-* Both use the system `iptables` binary, so they share one backend. Docker
-  keeps its default iptables management; never set `"iptables": false`.
-* Docker's `FORWARD` policy `DROP` does not affect guests. VMD appends its own
-  `veth+` ⇄ host-interface `ACCEPT` rules, and Docker's jumps return for
-  non-Docker traffic.
-* Docker address pools stay outside `10.11.0.0/16`, `10.12.0.0/15` and
-  `169.254.0.20/30`. Its defaults (`172.17.0.0/16` and up) already do.
-* Containers never publish the ports VMD or secretsproxy use: `50051`,
+* `/etc/docker/daemon.json` sets `"iptables": false`, `"ip6tables": false`
+  and `"bridge": "none"` before Docker is installed. There is no `docker0`
+  and no Docker chains.
+* Containers use host networking and bind `127.0.0.1` only.
+* Nothing else binds the ports VMD, secretsproxy and the proxy use: `50051`,
   `9090`, `19080`, `19443`, `19090`, `9443`, `8090` and `5008`.
+* No `INPUT` drop policy is configured, so loopback stays open.
 
 ## On-box checks
 
@@ -145,5 +143,5 @@ These need a real box (nested KVM). The single end-to-end smoke covers them:
 * Once the host is active, a template build completes on the box.
 * Rerunning `install-vmd.sh` and `install-proxy.sh` at a different revision
   keeps running and paused sandboxes.
-* `iptables -S FORWARD` shows VMD's `veth+` rules alongside Docker's chains,
-  and guest egress works with Docker running.
+* `iptables -S FORWARD` shows only VMD's `veth+` rules, and no Docker chains.
+  Guest egress works with the services running.
