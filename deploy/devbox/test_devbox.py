@@ -145,10 +145,12 @@ class HostTests(unittest.TestCase):
         env = {"DEVBOX_ARTIFACT_BUCKET": "example-artifacts", "DEVBOX_FIRECRACKER_VERSION": "v0.0.0",
                "DEVBOX_FIRECRACKER_SHA256": "2" * 64, "DEVBOX_KERNEL_OBJECT": "vmlinux-example",
                "DEVBOX_KERNEL_DIGEST": "3" * 64, "DEVBOX_ROOTFS_OBJECT": "base.ext4",
-               "DEVBOX_ROOTFS_DIGEST": "4" * 64}
+               "DEVBOX_ROOTFS_DIGEST": "4" * 64, "DEVBOX_DATA_DISK_DEVICE": "devbox-data"}
         self.assertEqual(devbox_host.pin_drift(manifest, env), [])
-        changed = dict(env, DEVBOX_KERNEL_OBJECT="vmlinux-other", DEVBOX_ROOTFS_DIGEST="5" * 64)
-        self.assertEqual(devbox_host.pin_drift(manifest, changed), ["DEVBOX_KERNEL_OBJECT", "DEVBOX_ROOTFS_DIGEST"])
+        changed = dict(env, DEVBOX_KERNEL_OBJECT="vmlinux-other", DEVBOX_ROOTFS_DIGEST="5" * 64,
+                       DEVBOX_DATA_DISK_DEVICE="other-data")
+        self.assertEqual(devbox_host.pin_drift(manifest, changed),
+                         ["DEVBOX_DATA_DISK_DEVICE", "DEVBOX_KERNEL_OBJECT", "DEVBOX_ROOTFS_DIGEST"])
 
     def test_capacity_reserves_host_memory_and_honours_overrides(self):
         meminfo = "MemTotal:       32873024 kB\nMemFree:  1 kB\n"

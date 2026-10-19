@@ -92,7 +92,7 @@ PY
 check_rerun_pins() {
   [ -s "$DEVBOX_RUNTIME_JSON" ] || return 0
   python3 "$DEVBOX_REPO/deploy/devbox/devbox_host.py" pin-drift --runtime "$DEVBOX_RUNTIME_JSON" \
-    || devbox_die "runtime pins differ from this box's bootstrap; recreate the box to change them"
+    || devbox_die "runtime inputs differ from this box's bootstrap; recreate the box to change them"
 }
 
 verify_vmd_env() {
@@ -203,8 +203,9 @@ install_identity() {
 
 # A devbox is a brand-new cell, so it mints its own secretsproxy CA, written
 # as the daemon's dynamic user exactly as an operator restores a cell's CA.
-# Exactly one file present is never repaired: that is lost trust, not a
-# fresh cell.
+# Only a box that never bootstrapped is a fresh cell: a missing or partial
+# pair on a box that ran is lost trust, which templates and guests still hold
+# the old CA for.
 install_secretsproxy_ca() {
   local dir=/var/lib/secretsproxy crt=0 key=0
   [ -e "$dir/ca.crt" ] && crt=1
@@ -213,6 +214,9 @@ install_secretsproxy_ca() {
     return
   fi
   [ "$crt$key" = 00 ] || devbox_die "only one of $dir/ca.crt and ca.key exists; refusing to replace the cell CA (recreate the box)"
+  if [ -e "$DEVBOX_RUNTIME_JSON" ] || [ -e /var/lib/sandbox/vmd.db ]; then
+    devbox_die "the secretsproxy CA is missing on a box that already bootstrapped; recreate the box"
+  fi
   install -d -m 0755 "$DEVBOX_STATE/bin"
   devbox_build "$DEVBOX_STATE/bin/gen-secretsproxy-ca" ./scripts/gen-secretsproxy-ca
   systemd-run --quiet --wait --collect --unit=secretsproxy-ca-init \

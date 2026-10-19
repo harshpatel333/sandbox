@@ -65,7 +65,8 @@ def install_identity(root, project, instance_id, slot):
 def pin_drift(manifest, env):
     """Requested runtime inputs that differ from what this box was bootstrapped
     with. The fleet bootstrap never replaces installed artifacts or vmd.env,
-    so a changed pin cannot take effect on an existing box."""
+    and the mounted data disk holds the box's sandboxes, so none of these can
+    change on an existing box."""
     artifacts = manifest.get("artifacts") or {}
     recorded = {
         "DEVBOX_ARTIFACT_BUCKET": (artifacts.get("source") or "").removeprefix("gs://").removesuffix("/hostprep/"),
@@ -75,6 +76,7 @@ def pin_drift(manifest, env):
         "DEVBOX_KERNEL_DIGEST": (artifacts.get("kernel") or {}).get("digest"),
         "DEVBOX_ROOTFS_OBJECT": (artifacts.get("rootfs") or {}).get("object"),
         "DEVBOX_ROOTFS_DIGEST": (artifacts.get("rootfs") or {}).get("digest"),
+        "DEVBOX_DATA_DISK_DEVICE": (manifest.get("storage") or {}).get("data_disk_device"),
     }
     return sorted(key for key, value in recorded.items() if value != env.get(key))
 
