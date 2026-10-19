@@ -99,7 +99,9 @@ which `services-up.sh` generates once and keeps on the data disk:
 * **Proxy:** plain HTTP on `127.0.0.1:8090`. Sandbox hosts are
   `http://<port>-<sandbox-id>.sandbox.localhost:8090`, and the data plane is
   `boxd-<sandbox-id>`. `PROXY_PUBLIC_SCHEME=http` keeps preview-link
-  redirects on http. The fleet units are unchanged; drop-ins rebind them to
+  redirects on http. Private preview links rely on browsers keeping the
+  Secure preview cookie on `*.localhost`. Chromium-based browsers and recent
+  Firefox do; Safari may not. The fleet units are unchanged; drop-ins rebind them to
   loopback.
 
 ## Docker on the same host

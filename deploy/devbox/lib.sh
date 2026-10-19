@@ -44,6 +44,7 @@ devbox_load_env() {
   export DEVBOX_ARTIFACT_BUCKET=${DEVBOX_ARTIFACT_BUCKET:-rayai-dev-devbox-hostprep}
   export DEVBOX_DATA_DISK_DEVICE=${DEVBOX_DATA_DISK_DEVICE:-devbox-data}
   export DEVBOX_PROXY_ADDR=${DEVBOX_PROXY_ADDR:-127.0.0.1:8090}
+  [[ "$DEVBOX_PROXY_ADDR" =~ ^127\.0\.0\.1:[0-9]{1,5}$ ]] || devbox_die "DEVBOX_PROXY_ADDR must be a 127.0.0.1 address"
   export DEVBOX_API_URL=${DEVBOX_API_URL:-http://127.0.0.1:8080}
   export DEVBOX_CONSOLE_ORIGIN=${DEVBOX_CONSOLE_ORIGIN:-http://localhost:3000}
 }

@@ -46,7 +46,6 @@ main() {
   devbox_require_bootstrapped
   devbox_instance
   devbox_load_local_secrets SANDBOX_ACCESS_TOKEN_SEED
-  [[ "$DEVBOX_PROXY_ADDR" =~ ^127\.0\.0\.1:[0-9]+$ ]] || devbox_die "DEVBOX_PROXY_ADDR must be a 127.0.0.1 address"
   systemctl is-active --quiet superserve-vmd || devbox_die "VMD is not running; run install-vmd.sh first"
   local revision
   revision=$(devbox_revision)

@@ -27,8 +27,8 @@ This compatibility path retains socket-activated legacy listeners and never chan
   EXPECTED_STANDBY_HOST      optional — require exactly this deployment host
   PEER_PROXY_LISTEN_ADDR     optional — private mTLS listener (auto or private IP:port)
   PEER_PROXY_TARGET_ADDR     optional — loopback target; defaults to 127.0.0.1:5010
-  PROXY_PEERLESS             optional — "1" for a single-host cell with no peers:
-                             no peer routing, listener, or identity to restore
+  PROXY_PEERLESS             optional — "1" only for a single-host cell, which has no
+                             peers: no peer routing, listener, or identity to restore
   PROXY_PUBLIC_SCHEME        optional — "http" or "https" (the proxy's default)
   PROXY_HEALTH_URL           optional — local readiness URL; defaults to the
                              fleet listener, http://127.0.0.1:5007/health

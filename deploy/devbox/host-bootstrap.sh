@@ -40,7 +40,7 @@ PY
   for digest in "$DEVBOX_KERNEL_DIGEST" "$DEVBOX_ROOTFS_DIGEST"; do
     [[ "$digest" =~ ^([0-9a-f]{32}|[0-9a-f]{64})$ ]] || devbox_die "artifact digests must be MD5 or SHA-256: $digest"
   done
-  [[ "$DEVBOX_KERNEL_OBJECT" =~ ^[A-Za-z0-9._-]+$ && "$DEVBOX_ROOTFS_OBJECT" =~ ^[A-Za-z0-9._-]+$ ]] \
+  [[ "$DEVBOX_KERNEL_OBJECT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$DEVBOX_ROOTFS_OBJECT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
     || devbox_die "artifact object names must be plain file names"
 }
 

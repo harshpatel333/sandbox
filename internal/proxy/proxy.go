@@ -183,8 +183,9 @@ func NewHandler(domains []string, resolver Resolver, log zerolog.Logger) *Handle
 }
 
 // WithPublicScheme sets the scheme browsers reach the proxy on. Plain "http"
-// suits only a proxy served on loopback hosts such as *.localhost, where
-// browsers still keep the Secure preview cookie.
+// suits only a proxy served on loopback hosts such as *.localhost, and only
+// in browsers that treat those as secure contexts and so keep the Secure
+// preview cookie (Chromium-based browsers and recent Firefox).
 func (h *Handler) WithPublicScheme(scheme string) *Handler {
 	h.publicScheme = scheme
 	return h

@@ -145,7 +145,7 @@ class HostTests(unittest.TestCase):
             manifest = json.loads(out.read_text())
         self.assertEqual(manifest["schema_version"], 1)
         self.assertEqual(manifest["host"]["host_id"], identity["host_id"])
-        self.assertEqual(manifest["host"]["incarnation_id"], identity["incarnation_id"])
+        self.assertNotIn("incarnation_id", manifest["host"])
         self.assertEqual(manifest["artifacts"]["firecracker"]["version"], "v0.0.0")
         self.assertEqual(manifest["artifacts"]["kernel"]["path"], "/var/lib/sandbox/kernel/vmlinux-example")
         self.assertEqual(manifest["artifacts"]["source"], "gs://example-bucket/hostprep/")

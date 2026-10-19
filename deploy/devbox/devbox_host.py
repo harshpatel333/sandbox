@@ -71,7 +71,6 @@ def runtime_manifest(args, identity):
         "bootstrap_revision": args.revision,
         "host": {
             "host_id": identity["host_id"],
-            "incarnation_id": identity["incarnation_id"],
             "instance": args.instance,
             "instance_id": identity["instance_id"],
             "project": identity["project_id"],
