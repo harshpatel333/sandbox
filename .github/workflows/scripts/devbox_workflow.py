@@ -316,7 +316,6 @@ class Box:
             raise StepError(f"{path} on {self.name} is not a JSON object")
         return value
 
-
     def checkout(self, key, sha):
         self.guard()
         source = f"{contract.BOX_SOURCE_DIR}/{SOURCE_DIRS[key]}"
