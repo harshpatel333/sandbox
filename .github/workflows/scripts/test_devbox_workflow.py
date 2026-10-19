@@ -299,6 +299,7 @@ class CreateTests(WorkflowCase):
         with self.assertRaisesRegex(workflow.StepError, "already in use"):
             self.create(cloud)
         self.assertFalse([c for c in cloud.commands if "create" in c])
+        self.assertIn("already in use", self.summary.read_text())
         self.assertNotIn("devbox-manage.yml", self.summary.read_text())
         self.assertFalse(cloud.gcloud("compute", "instances", "add-metadata"))
 

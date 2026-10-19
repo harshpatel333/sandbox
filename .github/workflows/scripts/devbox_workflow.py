@@ -476,8 +476,12 @@ def create(env, profile_path=PROFILE_PATH):
                                      created_at=created_at, expires_at=expires_at, revisions=revisions)
     box = Box(name)
     # A taken name belongs to another box; it must never reach the failure
-    # path, whose summary lists resources by name and offers to destroy them.
-    ensure_unused(name)
+    # path, whose summary prints a destroy command for the name.
+    try:
+        ensure_unused(name)
+    except StepError as error:
+        append_summary(env, f"# Devbox `{name}` was not created\n\n{error}")
+        raise
     save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False})
     try:
         where = [f"--zone={contract.ZONE}", f"--project={contract.PROJECT}"]
@@ -600,7 +604,8 @@ def report_create_failure(env, name, devbox_id, error):
         f"**Error:** {describe(error)}",
         *([f"**Warning:** {note}"] if note else []),
         "",
-        f"The devbox is **not** ready. Resources{discovery}:",
+        f"The devbox is **not** ready. Resources of this attempt{discovery} (a resource still being created "
+        "may not be listed yet):",
         listing or "- none",
         "",
         "Clean up with:",
