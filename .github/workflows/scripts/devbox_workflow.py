@@ -318,6 +318,10 @@ class Box:
             raise StepError(f"{path} on {self.name} is not a JSON object")
         return value
 
+    def remove(self, path):
+        self.guard()
+        self.ssh("sudo rm -f " + shlex.quote(path))
+
     def checkout(self, key, sha):
         self.guard()
         source = f"{contract.BOX_SOURCE_DIR}/{SOURCE_DIRS[key]}"
@@ -700,6 +704,7 @@ def deploy(env, now=contract.utc_now):
     box = Box(name, zone=instance["zone"])
     manifest = manifest_from(instance)
     devbox_id = contract.check_labels(instance.get("labels"), name, manifest["devbox_id"])
+    box.devbox_id = devbox_id
     if manifest["state"] not in DEPLOYABLE_STATES:
         raise StepError(f"{name} is {manifest['state']}; deploys need one of {', '.join(DEPLOYABLE_STATES)}")
     if not manifest["runtime"]:
@@ -723,13 +728,11 @@ def deploy(env, now=contract.utc_now):
             progress["checked_out"].append(key)
             save()
         box.require_scripts(scripts)
-        box.verify(devbox_id)
         deliver_configuration(box, {**manifest, "revisions": {**manifest["revisions"], **revisions}}, env)
         if "api" in components:
-            box.ssh("sudo rm -f " + shlex.quote(API_DEPLOY_FILE))
+            box.remove(API_DEPLOY_FILE)
         for component in components:
             for script in contract.COMPONENT_SCRIPTS[component]:
-                box.verify(devbox_id)
                 if script == "install-api.sh":
                     progress["api_started"] = True
                     save()

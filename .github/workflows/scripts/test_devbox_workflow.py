@@ -580,6 +580,14 @@ class DeployTests(WorkflowCase):
                        UI_BRANCH="", UI_SHA="", DEVBOX_ATTEMPT_FILE=str(attempt))
         self.run_with(cloud, workflow.finish_deploy, env, now=lambda: self.NOW)
 
+    def test_box_replaced_between_checkouts_gets_no_second_checkout(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.relabel_after_checkouts = 1
+        self.assertEqual(self.deploy(cloud, "all"), 1)
+        self.assertEqual(cloud.checkouts, [NEW_SHA])
+        self.assertEqual(cloud.scripts, [])
+        self.assertFalse([path for path in cloud.box_files if path.endswith(".env")])
+
     def test_failed_box_can_be_redeployed(self):
         cloud = FakeCloud(instances=self.box(state="failed"))
         with self.assertRaisesRegex(workflow.StepError, "components=all"):
