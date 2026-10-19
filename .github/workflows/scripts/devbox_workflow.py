@@ -741,7 +741,7 @@ def conclude_deploy(env, box, manifest, state, devbox_id, components, revisions,
     DEADLINE.stop()
     migrations = "none"
     if progress["api_started"]:
-        migrations = read_migrations(box, revisions["sandbox"]["sha"]) or ("failed" if failure else "none")
+        migrations = read_migrations(box, revisions["sandbox"]["sha"]) or "none"
     recorded = contract.record_deploy(state, at=now(), actor=env["GITHUB_ACTOR"], components=components,
                                       revisions=revisions, migrations=migrations,
                                       result="failed" if failure else "succeeded",

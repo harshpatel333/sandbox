@@ -330,7 +330,8 @@ the actor, components, previous and new commits, the migration result
 Only components whose install finished move in the manifest's `components`,
 and `revisions` moves only for the repositories that were checked out, so a
 deploy that fails partway records exactly what changed. The migration result
-is `failed` only when `install-api.sh` ran and did not report success.
+comes from the report `install-api.sh` writes for the deployed commit
+(`/var/lib/superserve-devbox/api-deploy.json`); without one it is `none`.
 `expires-at` never changes. The run summary shows previous and new commits per
 component, the migration result, service readiness and log access. A failed
 deploy leaves the box in state `failed`, possibly partly upgraded; a later
