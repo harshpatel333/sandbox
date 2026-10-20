@@ -120,6 +120,9 @@ func staffTestPool(t *testing.T) *pgxpool.Pool {
 		t.Fatal(err)
 	}
 	cfg.ConnConfig.Database = database
+	// Dispatch, revoke, regional admission, shared prepare, and the lock observer
+	// must have independent sessions even on small CI runners (default pool: 4).
+	cfg.MaxConns = 8
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -621,6 +624,26 @@ func TestYCStaffAuthorityConcurrency(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	observe := func(t *testing.T, label, query string, args ...any) int {
+		t.Helper()
+		observation, stop := context.WithTimeout(ctx, time.Second)
+		defer stop()
+		for {
+			var value int
+			if err := pool.QueryRow(observation, query, args...).Scan(&value); err != nil {
+				t.Fatalf("%s: %v", label, err)
+			}
+			if value != 0 {
+				return value
+			}
+			select {
+			case <-observation.Done():
+				t.Fatalf("%s: %v", label, observation.Err())
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+
 	t.Run("concurrent manual authority cannot be adopted", func(t *testing.T) {
 		p := create(t)
 		call("prepare-approve", p)
@@ -778,26 +801,7 @@ func TestYCStaffAuthorityConcurrency(t *testing.T) {
 			_, e := h.ycClaimRPC(ctx, "revoke", gin.H{"id": p["id"], "actor_id": actor, "reason": "Synthetic withdrawal", "evidence_reference": "synthetic", "home_region": "use"})
 			revoked <- e
 		}()
-		var revokePID int
-		for {
-			var waiting bool
-			if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT public.yc_claim_rpc%')`).Scan(&waiting); err != nil {
-				t.Fatal(err)
-			}
-			if waiting {
-				if err = pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT public.yc_claim_rpc%' LIMIT 1`).Scan(&revokePID); err != nil {
-					t.Fatal(err)
-				}
-				break
-			}
-			select {
-			case e := <-revoked:
-				t.Fatalf("revocation passed dispatch: %v", e)
-			case <-ctx.Done():
-				t.Fatal(ctx.Err())
-			case <-time.After(time.Millisecond):
-			}
-		}
+		revokePID := observe(t, "revocation waits for dispatch", `SELECT COALESCE((SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT public.yc_claim_rpc%' LIMIT 1),0)`)
 		// Revocation now owns the claim and waits for dispatch's authority.
 		prepared := make(chan struct{})
 		admitted := make(chan error, 1)
@@ -810,30 +814,24 @@ func TestYCStaffAuthorityConcurrency(t *testing.T) {
 			})
 			admitted <- e
 		}()
+		setup, stopSetup := context.WithTimeout(ctx, time.Second)
+		defer stopSetup()
 		select {
 		case <-prepared:
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
+		case err := <-admitted:
+			t.Fatalf("admission ended before shared prepare: %v", err)
+		case <-setup.Done():
+			t.Fatalf("admission did not acquire regional locks: %v", setup.Err())
 		}
-		var admissionPID int
-		for admissionPID == 0 {
-			if err = pool.QueryRow(ctx, `SELECT COALESCE((SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) LIMIT 1),0)`, revokePID).Scan(&admissionPID); err != nil {
-				t.Fatal(err)
-			}
-			if admissionPID == 0 {
-				select {
-				case <-ctx.Done():
-					t.Fatal(ctx.Err())
-				case <-time.After(time.Millisecond):
-				}
-			}
-		}
+		stopSetup()
+		admissionPID := observe(t, "admission waits for revocation", `SELECT COALESCE((SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)) LIMIT 1),0)`, revokePID)
 		// Dispatch needs the account now held by admission, completing the cycle.
 		dispatched := make(chan error, 1)
 		go func() {
 			_, e := pool.Exec(ctx, `SELECT team_id FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, operation.Team)
 			dispatched <- e
 		}()
+		observe(t, "dispatch waits for regional admission", `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT team_id FROM team_billing_account%'`)
 		if err = <-admitted; !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("admission must fail retryably: %v", err)
 		}
@@ -842,20 +840,7 @@ func TestYCStaffAuthorityConcurrency(t *testing.T) {
 		}
 		// Context cancellation must terminate the server statement too. Otherwise
 		// it could finish after the Go caller released its regional fence.
-		for {
-			var ended bool
-			if e := pool.QueryRow(ctx, `SELECT NOT EXISTS(SELECT FROM pg_stat_activity WHERE pid=$1 AND state<>'idle')`, admissionPID).Scan(&ended); e != nil {
-				t.Fatal(e)
-			}
-			if ended {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				t.Fatal(ctx.Err())
-			case <-time.After(time.Millisecond):
-			}
-		}
+		observe(t, "cancelled shared statement terminates", `SELECT CASE WHEN NOT EXISTS(SELECT FROM pg_stat_activity WHERE pid=$1 AND state<>'idle') THEN 1 ELSE 0 END`, admissionPID)
 		response := httptest.NewRecorder()
 		request, _ := gin.CreateTestContext(response)
 		ycClaimError(request, err)
