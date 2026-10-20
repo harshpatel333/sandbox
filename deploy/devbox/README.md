@@ -39,7 +39,13 @@ so they are granted unconditionally; none of them can change an existing
 resource, but listing does return every instance's metadata, so staging
 instance metadata must never hold secrets. IAP forwarding is granted for port
 22 on any VM in the project, including staging hosts; logging in still needs
-OS Login rights that only exist on `devbox-*` VMs.
+OS Login rights, which the workflow identity only holds on `devbox-*` VMs.
+OS Login does not honour the name condition, so the create workflow binds
+`roles/compute.osAdminLogin` for the workflow identity on each new instance
+(its `setIamPolicy` right is itself limited to `devbox-*` VMs). The
+name-conditioned login grant for `engineer_members` has the same limit:
+engineers need a project-level OS Login role, which project owners and editors
+already hold, or a per-instance binding.
 
 Set `engineer_members` (for example `["group:engineers@example.com"]`) to the
 principals who may open tunnels to boxes. The root has its own state prefix
@@ -76,9 +82,7 @@ can be applied by hand from the repository root with
 
 Before the first box, confirm that no organization policy blocks nested
 virtualization (`constraints/compute.disableNestedVirtualization`) or OS Login
-for service accounts in the project. OS Login is expected to honour the
-name-conditioned login grant; check it once on the first box with
-`gcloud compute ssh devbox-<name> --tunnel-through-iap` as an engineer.
+for service accounts in the project.
 
 ### 2. Seed the host artifacts
 

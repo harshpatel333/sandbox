@@ -176,6 +176,9 @@ resource "google_service_account_iam_member" "ci_workload_identity" {
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository_id/${var.github_repository_id}"
 }
 
+# OS Login does not honour the name condition on these grants, so the create
+# workflow also binds roles/compute.osAdminLogin on each new instance itself;
+# getIamPolicy and setIamPolicy below allow that, on devbox instances only.
 resource "google_project_iam_custom_role" "lifecycle" {
   project     = var.project_id
   role_id     = "superserveDevboxLifecycle"
@@ -191,9 +194,11 @@ resource "google_project_iam_custom_role" "lifecycle" {
     "compute.instances.create",
     "compute.instances.delete",
     "compute.instances.get",
+    "compute.instances.getIamPolicy",
     "compute.instances.getSerialPortOutput",
     "compute.instances.osAdminLogin",
     "compute.instances.osLogin",
+    "compute.instances.setIamPolicy",
     "compute.instances.setLabels",
     "compute.instances.setMetadata",
     "compute.instances.setServiceAccount",
