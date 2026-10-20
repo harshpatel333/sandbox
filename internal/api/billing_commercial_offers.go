@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"time"
 
@@ -71,6 +72,10 @@ func (h *Handlers) commercialOfferApply(c *gin.Context, apply bool) {
 	c.Data(200, "application/json", raw)
 }
 func commercialOfferError(c *gin.Context, err error) {
+	if errors.Is(err, errCommercialOfferDisabled) {
+		respondErrorMsg(c, "service_unavailable", err.Error(), 503)
+		return
+	}
 	if errors.Is(err, errCommercialOfferConflict) {
 		respondErrorMsg(c, "conflict", err.Error(), 409)
 		return
@@ -128,6 +133,9 @@ func (h *Handlers) assignCommercialOffer(ctx context.Context, team, actor uuid.U
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
 	} else {
+		if err = commercialOfferEnabled(ctx, tx, team); err != nil {
+			return nil, err
+		}
 		// Match the existing sponsorship/checkout account serialization boundary.
 		// Apply creates the empty row when needed; preflight remains audit-only.
 		if apply {
@@ -137,6 +145,13 @@ func (h *Handlers) assignCommercialOffer(ctx context.Context, team, actor uuid.U
 		}
 		if err = lockCommercialOfferAccount(ctx, tx, team); err != nil && (apply || !errors.Is(err, pgx.ErrNoRows)) {
 			return nil, err
+		}
+		var reserved bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_checkout_attempt WHERE team_id=$1 AND (state IN ('dispatched','customer_observed') OR (state='prepared' AND prepared_until>clock_timestamp())))`, team).Scan(&reserved); err != nil {
+			return nil, err
+		}
+		if reserved {
+			return nil, errCommercialOfferConflict
 		}
 		if err = h.sponsoredLocalPreflight(ctx, tx, team); err != nil {
 			return nil, errCommercialOfferConflict
@@ -263,6 +278,9 @@ func (h *Handlers) materializeCommercialOffer(ctx context.Context, team, assignm
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
+	if err = commercialOfferEnabled(ctx, q, team); err != nil {
+		return err
+	}
 	var approval uuid.UUID
 	var region, company string
 	if err = q.QueryRow(ctx, `SELECT approval_id,home_region,company_identity FROM billing_commercial_offer_assignment WHERE id=$1 AND team_id=$2`, assignment, team).Scan(&approval, &region, &company); err != nil {
@@ -322,4 +340,129 @@ func (h *Handlers) materializeCommercialOffer(ctx context.Context, team, assignm
 func lockCommercialOfferAccount(ctx context.Context, q db.DBTX, team uuid.UUID) error {
 	var locked uuid.UUID
 	return q.QueryRow(ctx, `SELECT team_id FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, team).Scan(&locked)
+}
+
+var errCommercialOfferDisabled = errors.New("commercial offer assignment rollout is disabled")
+
+func commercialOfferEnabled(ctx context.Context, q db.DBTX, team uuid.UUID) error {
+	var enabled bool
+	if err := q.QueryRow(ctx, `SELECT feature_enabled('billing_commercial_offer_assignments_enabled',$1)`, team).Scan(&enabled); err != nil {
+		return err
+	}
+	if !enabled {
+		return errCommercialOfferDisabled
+	}
+	return nil
+}
+
+// Every attempt transition uses the same order as assignment, including the team
+// lock needed by first-account insertion. No transaction spans a provider call.
+func (h *Handlers) withCommercialCheckoutAccount(ctx context.Context, team uuid.UUID, f func(context.Context, pgx.Tx) error) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var id uuid.UUID
+	if err = tx.QueryRow(ctx, `SELECT id FROM team WHERE id=$1 FOR UPDATE`, team).Scan(&id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO team_billing_account(team_id) VALUES($1) ON CONFLICT DO NOTHING`, team); err != nil {
+		return err
+	}
+	if err = lockCommercialOfferAccount(ctx, tx, team); err != nil {
+		return err
+	}
+	if err = f(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (h *Handlers) prepareCommercialCheckout(ctx context.Context, team uuid.UUID) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := h.withCommercialCheckoutAccount(ctx, team, func(ctx context.Context, tx pgx.Tx) error {
+		var assigned bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_offer_assignment WHERE team_id=$1)`, team).Scan(&assigned); err != nil {
+			return err
+		}
+		if assigned {
+			return errCommercialOfferConflict
+		}
+		return tx.QueryRow(ctx, `INSERT INTO billing_commercial_checkout_attempt(team_id) VALUES($1) RETURNING id`, team).Scan(&id)
+	})
+	return id, err
+}
+
+func (h *Handlers) dispatchCommercialCheckout(ctx context.Context, team, attempt uuid.UUID) error {
+	return h.withCommercialCheckoutAccount(ctx, team, func(ctx context.Context, tx pgx.Tx) error {
+		result, err := tx.Exec(ctx, `UPDATE billing_commercial_checkout_attempt SET state='dispatched'
+ WHERE id=$1 AND team_id=$2 AND state='prepared' AND prepared_until>clock_timestamp()
+ AND NOT EXISTS(SELECT 1 FROM billing_commercial_offer_assignment WHERE team_id=$2)`, attempt, team)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() != 1 {
+			return errCommercialOfferConflict
+		}
+		return nil
+	})
+}
+
+func (h *Handlers) finishCommercialCheckout(ctx context.Context, team, attempt uuid.UUID, customer string) error {
+	return h.withCommercialCheckoutAccount(ctx, team, func(ctx context.Context, tx pgx.Tx) error {
+		if customer == "" {
+			// Only a token that never authorized dispatch can be released. A failed
+			// or canceled retry cannot clear an earlier uncertain provider outcome.
+			_, err := tx.Exec(ctx, `UPDATE billing_commercial_checkout_attempt SET state='no_effect' WHERE id=$1 AND team_id=$2 AND state='prepared'`, attempt, team)
+			return err
+		}
+		result, err := tx.Exec(ctx, `UPDATE billing_commercial_checkout_attempt SET state='customer_observed',customer_id=$3 WHERE id=$1 AND team_id=$2 AND state IN ('prepared','dispatched')`, attempt, team, customer)
+		if err != nil {
+			return err
+		}
+		if result.RowsAffected() != 1 {
+			return errCommercialOfferConflict
+		}
+		return nil
+	})
+}
+
+// Ordinary checkout reserves eligibility before authorizing any customer POST.
+// Provisioning an assigned offer must use its separate verified activation path.
+
+func (h *Handlers) ensureCheckoutStripeCustomer(ctx context.Context, team uuid.UUID) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if h.Stripe == nil || h.Pool == nil || h.DB == nil {
+		return "", errors.New("Stripe billing is not configured")
+	}
+	if client, ok := h.Stripe.(*stripeHTTPClient); ok {
+		if client.apiVersion == "" || client.httpClient == nil {
+			return "", errors.New("Stripe client is not configured")
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, client.baseURL+"/v1/customers", nil)
+		if err != nil {
+			return "", err
+		}
+		if req.URL.Host == "" || (req.URL.Scheme != "https" && req.URL.Scheme != "http") {
+			return "", errors.New("Stripe provider URL is not configured")
+		}
+	}
+	attempt, err := h.prepareCommercialCheckout(ctx, team)
+	if err != nil {
+		return "", err
+	}
+	customer, err := h.ensureStripeCustomerBeforeCreate(ctx, team, func() error { return h.dispatchCommercialCheckout(ctx, team, attempt) })
+	if err != nil {
+		cleanupErr := h.finishCommercialCheckout(context.WithoutCancel(ctx), team, attempt, "")
+		return "", errors.Join(err, cleanupErr)
+	}
+	if err = h.finishCommercialCheckout(context.WithoutCancel(ctx), team, attempt, customer); err != nil {
+		return "", err
+	}
+	return customer, nil
 }

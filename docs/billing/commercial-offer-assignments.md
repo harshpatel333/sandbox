@@ -61,3 +61,29 @@ add a separately reviewed authority adapter to this gate. The existing provider
 and grant workers remain responsible for activation, current debt/revocation
 checks, access readiness and issuing each allowance once. Materialized status
 reports historical term capture, not current access authorization.
+
+## Checkout reservation and rollout
+
+Ordinary Pro and legacy checkout reserve a durable attempt before customer
+creation. Assignment and attempt transitions serialize in team/account order.
+A prepared attempt has a one-minute database-clock deadline. Its exact token
+must transition to dispatched before the provider call; expired or released
+tokens cannot dispatch. Only that attempt's proven pre-dispatch failure can
+be marked no-effect. Every unresolved dispatched attempt blocks assignment,
+including when another retry fails harmlessly. A timeout, cancellation, or
+failed local write after dispatch never releases eligibility. Existing provider
+idempotency and checkout recovery remain in use; no database lock spans a
+provider call. Persisted customer observations retain provider history.
+
+An unresolved dispatched attempt requires authoritative reconciliation; there
+is no automatic release based on elapsed time or a generic provider error.
+Retries of ordinary checkout remain available. This change adds no operator
+endpoint for clearing uncertain provider history.
+
+The `billing_commercial_offer_assignments_enabled` feature flag defaults to
+false and gates new assignment/materialization in both services and database
+triggers. Historical replay and status remain readable. Ordinary checkout
+records attempts while the gate is off. Enable it only after every checkout
+writer has the fence, old in-flight requests have drained, and ambiguous
+pre-upgrade provider attempts have been reconciled. No rollout enablement is
+part of this change.

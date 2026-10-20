@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func commercialOfferFixture(t *testing.T) (*Handlers, uuid.UUID, uuid.UUID, CommercialOfferRequest) {
@@ -26,6 +29,9 @@ func commercialOfferFixture(t *testing.T) (*Handlers, uuid.UUID, uuid.UUID, Comm
 	ensureYCTestAuthority(t, h.Pool)
 	h.PromotionAuthPool = h.Pool
 	h.Config = &config.Config{TeamCreationRegion: "use"}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_commercial_offer_assignments_enabled',true)`, team); err != nil {
+		t.Fatal(err)
+	}
 	actor := uuid.New()
 	r := CommercialOfferRequest{Key: uuid.NewString(), OfferKey: "yc_2026", Version: 1, Company: "https://www.ycombinator.com/companies/fixture-" + uuid.NewString(), Region: "use", Reason: "synthetic approval", Reference: "fixture"}
 	if _, err := h.Pool.Exec(t.Context(), `UPDATE team SET home_region='use' WHERE id=$1`, team); err != nil {
@@ -156,6 +162,14 @@ func TestYCCommercialOfferFrozenCalendar(t *testing.T) {
 			exec(`INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_kind,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'yc_2026',$3,$4,$5,$6,'price_annual','subscription',1200000,12,3000000,'scheduled',$3)`, contract, team, anchor, end, customer, subscription)
 			exec(`INSERT INTO billing_contract_entitlement_schedule(team_id,contract_id,month_offset,amount_cents) SELECT $1,$2,n,CASE WHEN n<3 THEN 3000000 ELSE 100000 END FROM generate_series(0,11) n`, team, contract)
 			exec(`INSERT INTO billing_contract_waiver(id,team_id,contract_id,offer_key,offer_version,customer_id,subscription_id,starts_at,ends_at,collectible_base_cents) VALUES($1,$2,$3,'yc_2026',1,$4,$5,$6,$7,0)`, r.ApprovalID, team, contract, customer, subscription, anchor, end)
+			exec(`UPDATE team_feature_flag SET enabled=false WHERE team_id=$1 AND key='billing_commercial_offer_assignments_enabled'`, team)
+			if err := h.materializeCommercialOffer(ctx, team, assignment, contract, "acct_fixture", false); !errors.Is(err, errCommercialOfferDisabled) {
+				t.Fatalf("materialization service bypassed closed gate: %v", err)
+			}
+			if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_commercial_offer_activation(assignment_id,team_id,contract_id,anchor,ends_at,merchant_account,live_mode) VALUES($1,$2,$3,$4,$5,'acct_fixture',false)`, assignment, team, contract, anchor, end); err == nil || !strings.Contains(err.Error(), "assignments are disabled") {
+				t.Fatalf("direct activation bypassed closed gate: %v", err)
+			}
+			exec(`UPDATE team_feature_flag SET enabled=true WHERE team_id=$1 AND key='billing_commercial_offer_assignments_enabled'`, team)
 			if err := h.materializeCommercialOffer(ctx, team, assignment, contract, "acct_fixture", false); err == nil {
 				t.Fatal("pending contract supplied activation authority")
 			}
@@ -241,7 +255,7 @@ func TestYCCommercialOfferHTTPAuthorization(t *testing.T) {
 		}
 	}
 	for _, role := range []string{"anon", "authenticated"} {
-		for _, table := range []string{"billing_commercial_offer_version", "billing_commercial_offer_assignment", "billing_commercial_offer_activation", "billing_commercial_offer_period", "billing_commercial_offer_audit"} {
+		for _, table := range []string{"billing_commercial_offer_version", "billing_commercial_offer_assignment", "billing_commercial_offer_activation", "billing_commercial_offer_period", "billing_commercial_offer_audit", "billing_commercial_checkout_attempt"} {
 			var allowed bool
 			if err := h.Pool.QueryRow(t.Context(), `SELECT has_table_privilege($1,$2,'INSERT') OR has_table_privilege($1,$2,'UPDATE') OR has_table_privilege($1,$2,'SELECT')`, role, table).Scan(&allowed); err != nil || allowed {
 				t.Fatalf("public role has access to %s: %v %v", table, allowed, err)
@@ -269,11 +283,17 @@ func commercialOfferRestrictedPool(t *testing.T, admin *pgxpool.Pool) *pgxpool.P
 		t.Fatal(err)
 	}
 	for _, grant := range []struct{ table, privileges string }{
+		{"feature_flag", "SELECT"},
+		{"team_feature_flag", "SELECT"},
 		{"billing_commercial_offer_version", "SELECT"},
 		{"billing_commercial_offer_assignment", "SELECT,INSERT"},
 		{"billing_commercial_offer_activation", "SELECT,INSERT"},
 		{"billing_commercial_offer_period", "SELECT,INSERT"},
-		{"team_billing_account", "SELECT,UPDATE"},
+		{"team", "SELECT,UPDATE"},
+		{"billing_signup_choice", "SELECT,UPDATE"},
+		{"billing_funding_account", "SELECT,INSERT,UPDATE"},
+		{"billing_commercial_checkout_attempt", "SELECT,INSERT,UPDATE"},
+		{"team_billing_account", "SELECT,INSERT,UPDATE"},
 		{"billing_commercial_contract", "SELECT,UPDATE"},
 		{"billing_yc_operation", "SELECT,UPDATE"},
 		{"billing_contract_waiver", "SELECT"},
@@ -353,4 +373,287 @@ func TestYCCommercialOfferAssignmentWaitsForCheckout(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestYCCommercialOfferCheckoutAttemptStates(t *testing.T) {
+	t.Run("restricted backend can prepare and dispatch", func(t *testing.T) {
+		h, team, _, _ := commercialOfferFixture(t)
+		h.Pool = commercialOfferRestrictedPool(t, h.Pool)
+		id, err := h.prepareCommercialCheckout(t.Context(), team)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = h.dispatchCommercialCheckout(t.Context(), team, id); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("release only undispatched token", func(t *testing.T) {
+		h, team, actor, r := commercialOfferFixture(t)
+		ctx := t.Context()
+		first, err := h.prepareCommercialCheckout(ctx, team)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = h.finishCommercialCheckout(ctx, team, first, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = h.assignCommercialOffer(ctx, team, actor, r, true); err != nil {
+			t.Fatalf("no-effect attempt poisoned eligibility: %v", err)
+		}
+		if err = h.dispatchCommercialCheckout(ctx, team, first); !errors.Is(err, errCommercialOfferConflict) {
+			t.Fatalf("released token dispatched: %v", err)
+		}
+	})
+	t.Run("another retry cannot clear uncertainty", func(t *testing.T) {
+		h, team, actor, r := commercialOfferFixture(t)
+		ctx := t.Context()
+		first, err := h.prepareCommercialCheckout(ctx, team)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = h.dispatchCommercialCheckout(ctx, team, first); err != nil {
+			t.Fatal(err)
+		}
+		second, err := h.prepareCommercialCheckout(ctx, team)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range []uuid.UUID{first, second} {
+			if err = h.finishCommercialCheckout(ctx, team, id, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err = h.assignCommercialOffer(ctx, team, actor, r, true); !errors.Is(err, errCommercialOfferConflict) {
+			t.Fatalf("prior dispatched attempt cleared: %v", err)
+		}
+		var state string
+		if err = h.Pool.QueryRow(ctx, `SELECT state FROM billing_commercial_checkout_attempt WHERE id=$1`, first).Scan(&state); err != nil || state != "dispatched" {
+			t.Fatalf("lost uncertainty: %s %v", state, err)
+		}
+	})
+	t.Run("expired callback cannot pass a winning assignment", func(t *testing.T) {
+		h, team, actor, r := commercialOfferFixture(t)
+		ctx := t.Context()
+		var attempt uuid.UUID
+		if err := h.Pool.QueryRow(ctx, `INSERT INTO billing_commercial_checkout_attempt(team_id,created_at,prepared_until) VALUES($1,clock_timestamp()-interval '2 minutes',clock_timestamp()-interval '1 minute') RETURNING id`, team).Scan(&attempt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.assignCommercialOffer(ctx, team, actor, r, true); err != nil {
+			t.Fatal(err)
+		}
+		var posts atomic.Int32
+		commercialCheckoutProvider(t, h, func(w http.ResponseWriter, r *http.Request) { posts.Add(1); fmt.Fprint(w, `{"id":"cus_example"}`) })
+		_, err := h.ensureStripeCustomerBeforeCreate(ctx, team, func() error { return h.dispatchCommercialCheckout(ctx, team, attempt) })
+		if !errors.Is(err, errCommercialOfferConflict) || posts.Load() != 0 {
+			t.Fatalf("stale callback reached provider: posts=%d err=%v", posts.Load(), err)
+		}
+	})
+	t.Run("cleanup racing dispatch", func(t *testing.T) {
+		h, team, actor, r := commercialOfferFixture(t)
+		ctx := t.Context()
+		id, err := h.prepareCommercialCheckout(ctx, team)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := make(chan error, 1)
+		go func() { result <- h.dispatchCommercialCheckout(ctx, team, id) }()
+		if err = h.finishCommercialCheckout(ctx, team, id, ""); err != nil {
+			t.Fatal(err)
+		}
+		dispatchErr := <-result
+		_, assignErr := h.assignCommercialOffer(ctx, team, actor, r, true)
+		if dispatchErr == nil && !errors.Is(assignErr, errCommercialOfferConflict) {
+			t.Fatalf("dispatch winner lost reservation: %v", assignErr)
+		}
+		if errors.Is(dispatchErr, errCommercialOfferConflict) && assignErr != nil {
+			t.Fatalf("no-effect winner retained reservation: %v", assignErr)
+		}
+		if dispatchErr != nil && !errors.Is(dispatchErr, errCommercialOfferConflict) {
+			t.Fatal(dispatchErr)
+		}
+	})
+}
+
+func commercialCheckoutProvider(t *testing.T, h *Handlers, handler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	h.Stripe = &stripeHTTPClient{baseURL: srv.URL, secretKey: "sk_test_example", apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+	return srv
+}
+
+func TestYCCommercialOfferCheckoutProviderFence(t *testing.T) {
+	t.Run("assignment prevents provider creation", func(t *testing.T) {
+		h, team, actor, r := commercialOfferFixture(t)
+		ctx := t.Context()
+		if _, err := h.assignCommercialOffer(ctx, team, actor, r, true); err != nil {
+			t.Fatal(err)
+		}
+		var posts atomic.Int32
+		commercialCheckoutProvider(t, h, func(w http.ResponseWriter, r *http.Request) { posts.Add(1); fmt.Fprint(w, `{"id":"cus_example"}`) })
+		if _, err := h.ensureCheckoutStripeCustomer(ctx, team); !errors.Is(err, errCommercialOfferConflict) || posts.Load() != 0 {
+			t.Fatalf("assigned team reached provider: posts=%d err=%v", posts.Load(), err)
+		}
+	})
+	t.Run("provider request holds durable eligibility reservation", func(t *testing.T) {
+		h, team, actor, r := commercialOfferFixture(t)
+		ctx := t.Context()
+		entered, release := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		customer := "cus_" + team.String()
+		commercialCheckoutProvider(t, h, func(w http.ResponseWriter, r *http.Request) {
+			close(entered)
+			<-release
+			fmt.Fprintf(w, `{"id":%q}`, customer)
+		})
+		t.Cleanup(func() { once.Do(func() { close(release) }) })
+		result := make(chan error, 1)
+		go func() { _, err := h.ensureCheckoutStripeCustomer(ctx, team); result <- err }()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("provider not reached")
+		}
+		if _, err := h.assignCommercialOffer(ctx, team, actor, r, true); !errors.Is(err, errCommercialOfferConflict) {
+			t.Fatalf("in-flight provider attempt allowed assignment: %v", err)
+		}
+		once.Do(func() { close(release) })
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+		if got, err := h.ensureCheckoutStripeCustomer(ctx, team); err != nil || got != customer {
+			t.Fatalf("existing-customer replay failed: %s %v", got, err)
+		}
+		var pending int
+		if err := h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_commercial_checkout_attempt WHERE team_id=$1 AND state<>'customer_observed'`, team).Scan(&pending); err != nil || pending != 0 {
+			t.Fatalf("existing customer remained pending: %d %v", pending, err)
+		}
+	})
+	t.Run("lost response preserves uncertainty and idempotency", func(t *testing.T) {
+		h, team, actor, r := commercialOfferFixture(t)
+		ctx := t.Context()
+		var calls atomic.Int32
+		customer := "cus_" + team.String()
+		commercialCheckoutProvider(t, h, func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Idempotency-Key") != customerCreationIdempotencyKey(team) {
+				t.Error("changed customer idempotency")
+			}
+			if calls.Add(1) == 1 {
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				conn.Close()
+				return
+			}
+			fmt.Fprintf(w, `{"id":%q}`, customer)
+		})
+		if _, err := h.ensureCheckoutStripeCustomer(ctx, team); err == nil {
+			t.Fatal("lost response accepted")
+		}
+		if _, err := h.assignCommercialOffer(ctx, team, actor, r, true); !errors.Is(err, errCommercialOfferConflict) {
+			t.Fatalf("lost response released eligibility: %v", err)
+		}
+		if got, err := h.ensureCheckoutStripeCustomer(ctx, team); err != nil || got != customer {
+			t.Fatalf("ordinary retry blocked: %s %v", got, err)
+		}
+		var count int
+		if err := h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_commercial_checkout_attempt WHERE team_id=$1 AND state='dispatched'`, team).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("prior uncertainty erased: %d %v", count, err)
+		}
+	})
+}
+
+func TestYCCommercialOfferRolloutGate(t *testing.T) {
+	h, team, actor, r := commercialOfferFixture(t)
+	ctx := t.Context()
+	if _, err := h.Pool.Exec(ctx, `DELETE FROM team_feature_flag WHERE team_id=$1 AND key='billing_commercial_offer_assignments_enabled'`, team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.assignCommercialOffer(ctx, team, actor, r, true); !errors.Is(err, errCommercialOfferDisabled) {
+		t.Fatalf("default-closed service admitted assignment: %v", err)
+	}
+	// Checkout remains usable while assignment rollout is closed.
+	id, err := h.prepareCommercialCheckout(ctx, team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = h.finishCommercialCheckout(ctx, team, id, ""); err != nil {
+		t.Fatal(err)
+	}
+	source, sourceTeam, sourceActor, sourceRequest := commercialOfferFixture(t)
+	if _, err = source.assignCommercialOffer(ctx, sourceTeam, sourceActor, sourceRequest, true); err != nil {
+		t.Fatal(err)
+	}
+	_, err = h.Pool.Exec(ctx, `INSERT INTO billing_commercial_offer_assignment(team_id,approval_id,company_identity,home_region,offer_key,offer_version,idempotency_key,rate_card_key,rate_ids,pricing_at,request,assigned_by,reason,reference,resource_rates)
+ SELECT $1,$2,company_identity,home_region,offer_key,offer_version,idempotency_key,rate_card_key,rate_ids,pricing_at,request,assigned_by,reason,reference,resource_rates FROM billing_commercial_offer_assignment WHERE team_id=$3`, team, r.ApprovalID, sourceTeam)
+	if err == nil || !strings.Contains(err.Error(), "assignments are disabled") {
+		t.Fatalf("direct insert bypassed rollout gate: %v", err)
+	}
+}
+
+func TestYCCommercialOfferCheckoutFailureBoundaries(t *testing.T) {
+	t.Run("read failure before dispatch releases only preparation", func(t *testing.T) {
+		h, team, actor, r := commercialOfferFixture(t)
+		ctx := t.Context()
+		var calls atomic.Int32
+		commercialCheckoutProvider(t, h, func(w http.ResponseWriter, r *http.Request) { calls.Add(1); fmt.Fprint(w, `{"id":"cus_example"}`) })
+		closed, err := pgxpool.NewWithConfig(ctx, h.Pool.Config().Copy())
+		if err != nil {
+			t.Fatal(err)
+		}
+		closed.Close()
+		original := h.DB
+		h.DB = db.New(closed)
+		if _, err = h.ensureCheckoutStripeCustomer(ctx, team); err == nil {
+			t.Fatal("failed fixture read accepted")
+		}
+		h.DB = original
+		if calls.Load() != 0 {
+			t.Fatal("provider called despite pre-dispatch read failure")
+		}
+		var state string
+		if err = h.Pool.QueryRow(ctx, `SELECT state FROM billing_commercial_checkout_attempt WHERE team_id=$1`, team).Scan(&state); err != nil || state != "no_effect" {
+			t.Fatalf("proven no-effect failure retained reservation: %s %v", state, err)
+		}
+		if _, err = h.assignCommercialOffer(ctx, team, actor, r, true); err != nil {
+			t.Fatalf("no-effect failure prohibited new assignment: %v", err)
+		}
+	})
+	t.Run("customer success with local failure remains uncertain", func(t *testing.T) {
+		h, team, actor, r := commercialOfferFixture(t)
+		ctx := t.Context()
+		name := pgx.Identifier{"offer_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")}.Sanitize()
+		if _, err := h.Pool.Exec(ctx, "ALTER TABLE team_billing_account ADD CONSTRAINT "+name+" CHECK (team_id<>'"+team.String()+"'::uuid OR stripe_customer_id IS NULL)"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if _, err := h.Pool.Exec(context.Background(), "ALTER TABLE team_billing_account DROP CONSTRAINT IF EXISTS "+name); err != nil {
+				t.Error(err)
+			}
+		})
+		var calls atomic.Int32
+		commercialCheckoutProvider(t, h, func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			fmt.Fprintf(w, `{"id":%q}`, "cus_"+team.String())
+		})
+		if _, err := h.ensureCheckoutStripeCustomer(ctx, team); err == nil || calls.Load() != 1 {
+			t.Fatalf("persistence fault not exercised: calls=%d err=%v", calls.Load(), err)
+		}
+		var state string
+		if err := h.Pool.QueryRow(ctx, `SELECT state FROM billing_commercial_checkout_attempt WHERE team_id=$1`, team).Scan(&state); err != nil || state != "dispatched" {
+			t.Fatalf("lost provider success evidence: %s %v", state, err)
+		}
+		if _, err := h.assignCommercialOffer(ctx, team, actor, r, true); !errors.Is(err, errCommercialOfferConflict) {
+			t.Fatalf("local failure released assignment: %v", err)
+		}
+		if _, err := h.Pool.Exec(ctx, "ALTER TABLE team_billing_account DROP CONSTRAINT "+name); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.ensureCheckoutStripeCustomer(ctx, team); err != nil {
+			t.Fatalf("ordinary recovery blocked: %v", err)
+		}
+	})
 }

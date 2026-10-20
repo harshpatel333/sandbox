@@ -344,6 +344,16 @@ type BackupWalk struct {
 	StartedAt time.Time `json:"started_at"`
 }
 
+type BillingCommercialCheckoutAttempt struct {
+	ID            uuid.UUID          `json:"id"`
+	TeamID        uuid.UUID          `json:"team_id"`
+	State         string             `json:"state"`
+	CreatedAt     time.Time          `json:"created_at"`
+	PreparedUntil time.Time          `json:"prepared_until"`
+	DispatchedAt  pgtype.Timestamptz `json:"dispatched_at"`
+	CustomerID    *string            `json:"customer_id"`
+}
+
 type BillingCommercialContract struct {
 	ID                     uuid.UUID          `json:"id"`
 	TeamID                 uuid.UUID          `json:"team_id"`

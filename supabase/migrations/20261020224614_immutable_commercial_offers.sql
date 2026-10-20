@@ -28,6 +28,27 @@ VALUES ('yc_2026',1,'payg','pro','usd',12,1200000,12,true,'eligible_credit_or_ve
  ARRAY[3000000,3000000,3000000,100000,100000,100000,100000,100000,100000,100000,100000,100000]),
  ('pro_annual',1,'payg','pro','usd',12,1200000,12,false,'verified_payment','pro_annual','usage_allowance',array_fill(100000::bigint,ARRAY[12]));
 
+INSERT INTO feature_flag(key,enabled,description)
+VALUES ('billing_commercial_offer_assignments_enabled',false,'Admit commercial offer assignments after checkout writer rollout and reconciliation.')
+ON CONFLICT(key) DO NOTHING;
+
+CREATE TABLE billing_commercial_checkout_attempt (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    team_id uuid NOT NULL REFERENCES team(id),
+    state text NOT NULL DEFAULT 'prepared' CHECK (state IN ('prepared','dispatched','no_effect','customer_observed')),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    prepared_until timestamptz NOT NULL DEFAULT clock_timestamp()+interval '1 minute',
+    dispatched_at timestamptz,
+    customer_id text,
+    CHECK (prepared_until > created_at),
+    CHECK ((state='customer_observed') = (customer_id IS NOT NULL)),
+    CHECK (state NOT IN ('prepared','no_effect') OR dispatched_at IS NULL),
+    CHECK (state<>'dispatched' OR dispatched_at IS NOT NULL)
+);
+CREATE INDEX commercial_checkout_attempt_team ON billing_commercial_checkout_attempt(team_id,state);
+ALTER TABLE billing_commercial_checkout_attempt ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON billing_commercial_checkout_attempt FROM PUBLIC;
+
 CREATE TABLE billing_commercial_offer_assignment (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     team_id uuid NOT NULL UNIQUE REFERENCES team(id),
@@ -95,6 +116,14 @@ CREATE FUNCTION billing_commercial_offer_assignment_guard() RETURNS trigger LANG
 DECLARE v billing_commercial_offer_version; region text;
 BEGIN
     SELECT home_region INTO STRICT region FROM team WHERE id=NEW.team_id FOR UPDATE;
+    PERFORM 1 FROM team_billing_account WHERE team_id=NEW.team_id FOR UPDATE;
+    IF NOT feature_enabled('billing_commercial_offer_assignments_enabled',NEW.team_id) THEN
+        RAISE EXCEPTION 'commercial offer assignments are disabled';
+    END IF;
+    IF EXISTS(SELECT 1 FROM billing_commercial_checkout_attempt WHERE team_id=NEW.team_id
+       AND (state IN ('dispatched','customer_observed') OR (state='prepared' AND prepared_until>clock_timestamp()))) THEN
+        RAISE EXCEPTION 'ordinary checkout attempt reserves this team';
+    END IF;
     SELECT * INTO STRICT v FROM billing_commercial_offer_version WHERE offer_key=NEW.offer_key AND version=NEW.offer_version;
     IF NEW.home_region <> region OR NEW.offer_key <> 'yc_2026'
        OR NEW.rate_card_key <> v.rate_card_key THEN
@@ -126,6 +155,9 @@ FOR EACH ROW EXECUTE FUNCTION billing_commercial_offer_period_guard();
 CREATE FUNCTION billing_commercial_offer_activation_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE a billing_commercial_offer_assignment; v billing_commercial_offer_version; c billing_commercial_contract; billing_anchor timestamptz; resource_terms jsonb;
 BEGIN
+    IF NOT feature_enabled('billing_commercial_offer_assignments_enabled',NEW.team_id) THEN
+        RAISE EXCEPTION 'commercial offer assignments are disabled';
+    END IF;
     SELECT * INTO STRICT a FROM billing_commercial_offer_assignment WHERE id=NEW.assignment_id AND team_id=NEW.team_id;
     SELECT * INTO STRICT v FROM billing_commercial_offer_version WHERE offer_key=a.offer_key AND version=a.offer_version;
     PERFORM 1 FROM team_billing_account WHERE team_id=NEW.team_id FOR SHARE;
@@ -240,5 +272,58 @@ DO $$ DECLARE t text; BEGIN
             EXECUTE format('GRANT SELECT,INSERT ON %I TO service_role',t);
             EXECUTE format('CREATE POLICY commercial_offer_backend ON %I TO service_role USING(true) WITH CHECK(true)',t);
         END LOOP;
+    END IF;
+END $$;
+
+-- Prepared leases can expire; dispatch evidence never expires or downgrades.
+CREATE FUNCTION billing_commercial_checkout_attempt_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP='DELETE' THEN RAISE EXCEPTION 'checkout attempt history is immutable'; END IF;
+    PERFORM 1 FROM team WHERE id=NEW.team_id FOR UPDATE;
+    PERFORM 1 FROM team_billing_account WHERE team_id=NEW.team_id FOR UPDATE;
+    IF TG_OP='INSERT' THEN
+        IF NEW.state<>'prepared' OR NEW.dispatched_at IS NOT NULL OR NEW.customer_id IS NOT NULL
+           OR NEW.created_at>clock_timestamp() OR NEW.prepared_until>clock_timestamp()+interval '1 minute' THEN
+            RAISE EXCEPTION 'invalid prepared checkout attempt';
+        END IF;
+    ELSE
+        IF (NEW.id,NEW.team_id,NEW.created_at,NEW.prepared_until) IS DISTINCT FROM
+           (OLD.id,OLD.team_id,OLD.created_at,OLD.prepared_until) THEN
+            RAISE EXCEPTION 'checkout attempt identity and deadline are immutable';
+        END IF;
+        IF NOT ((OLD.state='prepared' AND NEW.state IN ('dispatched','no_effect','customer_observed'))
+             OR (OLD.state='dispatched' AND NEW.state='customer_observed')) THEN
+            RAISE EXCEPTION 'invalid checkout attempt transition';
+        END IF;
+        IF NEW.state='dispatched' THEN
+            IF OLD.prepared_until<=clock_timestamp() THEN RAISE EXCEPTION 'checkout preparation expired'; END IF;
+            NEW.dispatched_at := clock_timestamp();
+        ELSIF NEW.dispatched_at IS DISTINCT FROM OLD.dispatched_at THEN
+            RAISE EXCEPTION 'checkout dispatch evidence is immutable';
+        END IF;
+    END IF;
+    IF NEW.state IN ('prepared','dispatched') AND EXISTS(
+        SELECT 1 FROM billing_commercial_offer_assignment WHERE team_id=NEW.team_id) THEN
+        RAISE EXCEPTION 'commercial offer assignment reserves this team';
+    END IF;
+    IF NEW.state='customer_observed' AND NOT EXISTS(
+        SELECT 1 FROM team_billing_account WHERE team_id=NEW.team_id AND stripe_customer_id=NEW.customer_id) THEN
+        RAISE EXCEPTION 'checkout customer observation requires persisted identity';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER commercial_checkout_attempt_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_commercial_checkout_attempt
+FOR EACH ROW EXECUTE FUNCTION billing_commercial_checkout_attempt_guard();
+REVOKE ALL ON FUNCTION billing_commercial_checkout_attempt_guard() FROM PUBLIC;
+DO $$ DECLARE r text; BEGIN
+    FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+        IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
+            EXECUTE format('REVOKE ALL ON billing_commercial_checkout_attempt FROM %I',r);
+            EXECUTE format('REVOKE ALL ON FUNCTION billing_commercial_checkout_attempt_guard() FROM %I',r);
+        END IF;
+    END LOOP;
+    IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+        GRANT SELECT,INSERT,UPDATE ON billing_commercial_checkout_attempt TO service_role;
+        CREATE POLICY commercial_checkout_backend ON billing_commercial_checkout_attempt TO service_role USING(true) WITH CHECK(true);
     END IF;
 END $$;
