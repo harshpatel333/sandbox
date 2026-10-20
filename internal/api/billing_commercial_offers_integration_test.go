@@ -3,9 +3,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"github.com/gin-gonic/gin"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,7 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/config"
 )
 
@@ -133,9 +136,10 @@ func TestYCCommercialOfferFrozenCalendar(t *testing.T) {
 			if err := h.Pool.QueryRow(ctx, `SELECT id FROM billing_commercial_offer_assignment WHERE team_id=$1`, team).Scan(&assignment); err != nil {
 				t.Fatal(err)
 			}
+			adminPool := h.Pool
 			exec := func(q string, args ...any) {
 				t.Helper()
-				if _, err := h.Pool.Exec(ctx, q, args...); err != nil {
+				if _, err := adminPool.Exec(ctx, q, args...); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -162,6 +166,11 @@ func TestYCCommercialOfferFrozenCalendar(t *testing.T) {
 			if err := h.materializeCommercialOffer(ctx, team, assignment, contract, "acct_fixture", true); err == nil {
 				t.Fatal("wrong provider mode accepted")
 			}
+			// Exercise first materialization and concurrent retries with the backend's
+			// restricted new-table grants, including the database trigger chain.
+			restricted := *h
+			restricted.Pool = commercialOfferRestrictedPool(t, h.Pool)
+			h = &restricted
 			results := make(chan error, 4)
 			for range 4 {
 				go func() {
@@ -239,4 +248,55 @@ func TestYCCommercialOfferHTTPAuthorization(t *testing.T) {
 			}
 		}
 	}
+}
+
+// Use a unique, narrowly granted synthetic role so the test cannot accidentally
+// pass because its fixture connection owns the tables. Cleanup removes its ACLs
+// and policies; no application role or default privileges are changed.
+func commercialOfferRestrictedPool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	ctx := t.Context()
+	role := pgx.Identifier{"offer_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE ROLE "+role+" NOLOGIN"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP OWNED BY "+role+"; DROP ROLE "+role); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := admin.Exec(ctx, "GRANT USAGE ON SCHEMA public TO "+role+"; GRANT EXECUTE ON FUNCTION billing_anniversary_boundary(timestamptz,integer) TO "+role); err != nil {
+		t.Fatal(err)
+	}
+	for _, grant := range []struct{ table, privileges string }{
+		{"billing_commercial_offer_version", "SELECT"},
+		{"billing_commercial_offer_assignment", "SELECT,INSERT"},
+		{"billing_commercial_offer_activation", "SELECT,INSERT"},
+		{"billing_commercial_offer_period", "SELECT,INSERT"},
+		{"team_billing_account", "SELECT,UPDATE"},
+		{"billing_commercial_contract", "SELECT,UPDATE"},
+		{"billing_yc_operation", "SELECT,UPDATE"},
+		{"billing_contract_waiver", "SELECT"},
+		{"billing_contract_entitlement_schedule", "SELECT"},
+	} {
+		table := pgx.Identifier{grant.table}.Sanitize()
+		if _, err := admin.Exec(ctx, "GRANT "+grant.privileges+" ON "+table+" TO "+role+"; CREATE POLICY "+role+" ON "+table+" TO "+role+" USING(true) WITH CHECK(true)"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := admin.Config().Copy()
+	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, "SET ROLE "+role)
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	var canUpdate bool
+	if err = pool.QueryRow(ctx, `SELECT has_table_privilege(current_user,'billing_commercial_offer_assignment','UPDATE')`).Scan(&canUpdate); err != nil || canUpdate {
+		t.Fatalf("fixture permits assignment updates: %v %v", canUpdate, err)
+	}
+	return pool
 }

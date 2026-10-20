@@ -275,8 +275,7 @@ func (h *Handlers) materializeCommercialOffer(ctx context.Context, team, assignm
 	}
 	defer tx.Rollback(ctx)
 	q = tx
-	var locked uuid.UUID
-	if err = q.QueryRow(ctx, `SELECT id FROM billing_commercial_offer_assignment WHERE id=$1 AND team_id=$2 FOR UPDATE`, assignment, team).Scan(&locked); err != nil {
+	if err = lockCommercialOfferAccount(ctx, q, team); err != nil {
 		return err
 	}
 	// A concurrent materializer may have committed while this call acquired locks.
@@ -306,4 +305,11 @@ func (h *Handlers) materializeCommercialOffer(ctx context.Context, team, assignm
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// Use the existing mutable billing account as the serialization point. Row locks
+// require UPDATE privilege, which immutable assignment tables deliberately lack.
+func lockCommercialOfferAccount(ctx context.Context, q db.DBTX, team uuid.UUID) error {
+	var locked uuid.UUID
+	return q.QueryRow(ctx, `SELECT team_id FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, team).Scan(&locked)
 }
