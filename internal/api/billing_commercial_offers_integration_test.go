@@ -376,6 +376,36 @@ func TestYCCommercialOfferAssignmentWaitsForCheckout(t *testing.T) {
 }
 
 func TestYCCommercialOfferCheckoutAttemptStates(t *testing.T) {
+	t.Run("expired preparation cannot adopt an assigned customer", func(t *testing.T) {
+		h, team, actor, r := commercialOfferFixture(t)
+		ctx := t.Context()
+		var attempt uuid.UUID
+		if err := h.Pool.QueryRow(ctx, `INSERT INTO billing_commercial_checkout_attempt(team_id,created_at,prepared_until) VALUES($1,clock_timestamp()-interval '2 minutes',clock_timestamp()-interval '1 minute') RETURNING id`, team).Scan(&attempt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.assignCommercialOffer(ctx, team, actor, r, true); err != nil {
+			t.Fatal(err)
+		}
+		customer := "cus_" + team.String()
+		// Simulate the assigned-offer provisioner persisting its own customer.
+		if _, err := h.Pool.Exec(ctx, `UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team, customer); err != nil {
+			t.Fatal(err)
+		}
+		got, err := h.ensureStripeCustomerBeforeCreate(ctx, team, func() error {
+			t.Error("existing customer attempted creation")
+			return errors.New("unexpected dispatch")
+		})
+		if err != nil || got != customer {
+			t.Fatalf("existing customer not observed: %s %v", got, err)
+		}
+		if err = h.finishCommercialCheckout(ctx, team, attempt, got); !errors.Is(err, errCommercialOfferConflict) {
+			t.Fatalf("stale ordinary checkout adopted assigned customer: %v", err)
+		}
+		if _, err = h.Pool.Exec(ctx, `UPDATE billing_commercial_checkout_attempt SET state='customer_observed',customer_id=$2 WHERE id=$1`, attempt, customer); err == nil {
+			t.Fatal("direct observation bypassed assignment fence")
+		}
+	})
+
 	t.Run("restricted backend can prepare and dispatch", func(t *testing.T) {
 		h, team, _, _ := commercialOfferFixture(t)
 		h.Pool = commercialOfferRestrictedPool(t, h.Pool)

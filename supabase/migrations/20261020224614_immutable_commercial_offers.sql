@@ -302,7 +302,7 @@ BEGIN
             RAISE EXCEPTION 'checkout dispatch evidence is immutable';
         END IF;
     END IF;
-    IF NEW.state IN ('prepared','dispatched') AND EXISTS(
+    IF NEW.state IN ('prepared','dispatched','customer_observed') AND EXISTS(
         SELECT 1 FROM billing_commercial_offer_assignment WHERE team_id=NEW.team_id) THEN
         RAISE EXCEPTION 'commercial offer assignment reserves this team';
     END IF;

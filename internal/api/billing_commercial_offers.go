@@ -419,6 +419,13 @@ func (h *Handlers) finishCommercialCheckout(ctx context.Context, team, attempt u
 			_, err := tx.Exec(ctx, `UPDATE billing_commercial_checkout_attempt SET state='no_effect' WHERE id=$1 AND team_id=$2 AND state='prepared'`, attempt, team)
 			return err
 		}
+		var assigned bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_offer_assignment WHERE team_id=$1)`, team).Scan(&assigned); err != nil {
+			return err
+		}
+		if assigned {
+			return errCommercialOfferConflict
+		}
 		result, err := tx.Exec(ctx, `UPDATE billing_commercial_checkout_attempt SET state='customer_observed',customer_id=$3 WHERE id=$1 AND team_id=$2 AND state IN ('prepared','dispatched')`, attempt, team, customer)
 		if err != nil {
 			return err
