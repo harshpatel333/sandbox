@@ -91,6 +91,7 @@ jobs:
         env:
           DEVBOX_ATTEMPT_FILE: ${{ runner.temp }}/devbox-attempt.json
           DEVBOX_CI_SERVICE_ACCOUNT: ${{ vars.DEVBOX_GCP_SERVICE_ACCOUNT }}
+          DEVBOX_ENGINEER_MEMBERS: ${{ vars.DEVBOX_GCP_ENGINEER_MEMBERS }}
           NAME: ${{ needs.prepare.outputs.name }}
           OWNER: ${{ needs.prepare.outputs.owner }}
           LIFETIME_HOURS: ${{ needs.prepare.outputs.lifetime_hours }}

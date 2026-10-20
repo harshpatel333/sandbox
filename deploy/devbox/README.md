@@ -256,10 +256,12 @@ It then:
 1. creates the data disk `devbox-<name>-data`, the VM `devbox-<name>` (boot
    disk of the same name) from `profile.json`, and the bucket
    `superserve-devbox-<devbox-id>`, all labelled `managed-by`,
-   `devbox-name`, `devbox-id`, `owner` and `expires-at`, then grants the
-   workflow identity OS Login (`roles/compute.osAdminLogin`) on that VM only,
+   `devbox-name`, `devbox-id`, `owner` and `expires-at`. It then grants, on
+   that VM only, OS Login to the workflow identity (`roles/compute.osAdminLogin`,
    because OS Login doesn't honour the name-prefix condition on its project
-   role;
+   role) and to the members in `DEVBOX_GCP_ENGINEER_MEMBERS`
+   (`roles/compute.osLogin`). If that variable is empty, the run warns that no
+   engineer can reach the box. These grants go away when the VM is destroyed;
 2. writes the manifest (state `creating`) to the VM's `devbox-manifest`
    metadata key as part of creating the VM, so even a failed box can be found
    and cleaned up;
