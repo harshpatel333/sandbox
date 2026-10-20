@@ -231,3 +231,88 @@ mounted at `/mnt/sandbox-data`, OS Login, the devbox network tag and VM identity
 private bucket with uniform access, public access prevention and no soft
 delete retention. Its names, zone, region, network tag and VM identity must match the Terraform
 IAM conditions and firewall; `test_profile.py` checks that.
+
+## Create a devbox
+
+Run **Devbox Create** (`.github/workflows/devbox-create.yml`) from `main`:
+
+```sh
+gh workflow run devbox-create.yml --repo superserve-ai/sandbox --ref main \
+  -f sandbox_branch=main -f ui_branch=main -f lifetime_hours=24
+```
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `sandbox_branch` | `main` | Branch of `superserve-ai/sandbox` to build VMD, proxy and API from |
+| `ui_branch` | `main` | Branch of `superserve-ai/superserve` to build the console from |
+| `name` | generated | 2-40 lowercase letters, digits or hyphens, starting with a letter. Blank generates `<owner>-dev-<6 hex>` from your GitHub login. A name already in use is refused |
+| `lifetime_hours` | `24` | 1 to 168. The box is deleted when it expires; lifetimes cannot be extended |
+
+Each branch is resolved once to an exact commit, and every later step uses
+that commit. Before taking any cloud action, the workflow checks the profile
+and that the selected sandbox commit contains every box script it will run.
+It then:
+
+1. creates the data disk `devbox-<name>-data`, the VM `devbox-<name>` (boot
+   disk of the same name) from `profile.json`, and the bucket
+   `superserve-devbox-<devbox-id>`, all labelled `managed-by`,
+   `devbox-name`, `devbox-id`, `owner` and `expires-at`;
+2. writes the manifest (state `creating`) to the VM's `devbox-manifest`
+   metadata key as part of creating the VM, so even a failed box can be found
+   and cleaned up;
+3. waits for SSH over IAP, checks out both commits on the box under
+   `/opt/superserve-devbox/src/{sandbox,superserve}`, and writes
+   `/etc/superserve-devbox/devbox.env` and, over SSH stdin,
+   `/etc/superserve-devbox/secrets.env` (mode 0600). Each `devbox`
+   environment secret `DEVBOX_SECRET_<NAME>` becomes `<NAME>` in
+   `secrets.env`, and each variable `DEVBOX_CONFIG_<NAME>` becomes `<NAME>` in
+   `devbox.env`. The workflow refuses to run if any value it forwards is unset;
+4. runs, as root on the box and from the checked-out sandbox commit,
+   `host-bootstrap.sh`, `services-up.sh`, `install-api.sh`,
+   `install-vmd.sh`, `install-proxy.sh`, `seed-base.sh` and `install-ui.sh`
+   (VMD needs the database and API on a fresh host), logging each to
+   `/var/log/superserve-devbox/<script>.log`;
+5. merges `/var/lib/superserve-devbox/runtime.json` and `services.json`
+   into the manifest, sets state `ready`, and copies the manifest to
+   `/etc/superserve-devbox/manifest.json`.
+
+The run summary shows the name, zone, owner, expiry, commits, the manifest,
+the port-forwarding command, log access and the destroy command. To use a
+box, run the forwarding command and keep it open:
+
+```sh
+gcloud compute ssh devbox-<name> --zone=us-central1-a --project=rayai-dev \
+  --tunnel-through-iap -- -N -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 \
+  -L 54321:127.0.0.1:54321 -L 8025:127.0.0.1:8025 -L 8090:127.0.0.1:8090
+```
+
+Then open the console at http://localhost:3000 and Mailpit at
+http://localhost:8025. The API is on 8080, the auth/data gateway on 54321 and
+the sandbox proxy on 8090 (sandbox hosts are `*.sandbox.localhost:8090`).
+
+If any step fails, times out or is cancelled, the run fails, sets state
+`failed` on the VM when it exists, and lists every resource of the attempt it
+finds by `devbox-id` label or name. A failed box is never reported
+as ready; destroy it and create a new one.
+
+## Workflow safety
+
+- Create, deploy and destroy for one box share the concurrency group
+  `devbox-<name>` with `queue: max`, so they run one at a time in the order
+  they were started and none is cancelled for another. Each
+  re-reads the box's labels before writing and stops if its `devbox-id`
+  changed.
+- The workflows refuse to run from any ref but `main`; the `devbox`
+  environment and its Workload Identity Federation provider enforce the same.
+- The runner only resolves branches, provisions, labels, writes metadata and
+  connects over IAP SSH. Code from the selected branches is checked out and
+  built on the box, never on the runner, and the box's service account has no
+  project permissions beyond object access in devbox buckets.
+
+### Verified only on a real box
+
+The unit tests (`.github/workflows/scripts/test_devbox_*.py`) cover naming,
+lifetime bounds, branch handling, labels, the manifest and the order of cloud
+calls with `gcloud` mocked. IAP
+reachability, OS Login, on-box checkouts and the box scripts themselves are
+exercised by the end-to-end smoke run.
