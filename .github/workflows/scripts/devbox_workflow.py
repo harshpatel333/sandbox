@@ -832,7 +832,7 @@ def deploy_summary(manifest, before, components, deployed, migrations, failure):
         if component in deployed:
             new = f"`{current['sha'][:12]}` (`{current['branch']}`)"
         elif current["sha"] == contract.UNKNOWN_SHA:
-            new = "unknown (install interrupted)"
+            new = "unknown (install interrupted; redeploy with components=all)"
         else:
             new = "not deployed" if component in components else "unchanged"
         rows.append(f"| {component} | `{previous['sha'][:12]}` (`{previous['branch']}`) | {new} |")

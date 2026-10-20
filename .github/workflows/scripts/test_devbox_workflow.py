@@ -535,7 +535,7 @@ class DeployTests(WorkflowCase):
         self.assertEqual(final["revisions"]["ui"], {"branch": "feature", "sha": NEW_SHA})
         self.assertEqual(final["deploys"][-1]["migrations"], "applied")
         summary = self.summary.read_text()
-        self.assertIn("| api | `" + SANDBOX_SHA[:12] + "` (`main`) | unknown (install interrupted) |", summary)
+        self.assertIn("| api | `" + SANDBOX_SHA[:12] + "` (`main`) | unknown (install interrupted; redeploy with components=all) |", summary)
         self.assertIn("| ui | `" + UI_SHA[:12] + "` (`main`) | not deployed |", summary)
         self.assertIn("Services (before this deploy)", summary)
 
