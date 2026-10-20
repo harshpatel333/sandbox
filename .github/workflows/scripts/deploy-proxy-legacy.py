@@ -3,7 +3,9 @@
 configured label, in parallel.
 
 Env vars:
-  GCP_PROJECT                required — project containing vmd hosts
+  GCP_PROJECT                required for fleet deploys — project containing vmd hosts
+  DEPLOY_TRANSPORT           optional — "local" deploys onto this machine, named by
+                             DEPLOY_INSTANCE and DEPLOY_ZONE (see host_transport.py)
   GCP_REGION                 required — restrict discovery to this region
   EXPECTED_STANDBY_HOST      optional — exact identity from select-deploy-target.sh
   VMD_LABEL                  required — gcloud instances list label filter
@@ -25,6 +27,11 @@ This compatibility path retains socket-activated legacy listeners and never chan
   EXPECTED_STANDBY_HOST      optional — require exactly this deployment host
   PEER_PROXY_LISTEN_ADDR     optional — private mTLS listener (auto or private IP:port)
   PEER_PROXY_TARGET_ADDR     optional — loopback target; defaults to 127.0.0.1:5010
+  PROXY_PEERLESS             optional — "1" only for a single-host cell, which has no
+                             peers: no peer routing, listener, or identity to restore
+  PROXY_PUBLIC_SCHEME        optional — "http" or "https" (the proxy's default)
+  PROXY_HEALTH_URL           optional — local readiness URL; defaults to the
+                             fleet listener, http://127.0.0.1:5007/health
   Peer identity and certificate paths are supplied by host bootstrap.
 """
 
@@ -36,9 +43,16 @@ import sys
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from host_transport import local_instance, scp_command, ssh_command
+
 
 def main() -> int:
-    project = os.environ["GCP_PROJECT"]
+    try:
+        local = local_instance(os.environ)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    project = os.environ.get("GCP_PROJECT", "") if local else os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
     if not region.strip():
         print("ERROR: GCP_REGION is required; refusing unscoped deployment", file=sys.stderr)
@@ -133,28 +147,48 @@ def main() -> int:
     if sentry_dsn and not re.fullmatch(r"https://[A-Za-z0-9@./:_\-]+", sentry_dsn):
         print("ERROR: SENTRY_DSN must be a https:// URL or empty", file=sys.stderr)
         return 1
-
-    result = subprocess.run(
-        [
-            "gcloud", "compute", "instances", "list",
-            f"--project={project}",
-            f"--filter=labels.{label}" + ("" if expected_standby else " AND status=RUNNING"),
-            "--format=csv[no-heading](name,zone,status)" if expected_standby else "--format=csv[no-heading](name,zone)",
-        ],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"ERROR: gcloud instance discovery failed (exit {result.returncode})", file=sys.stderr)
-        if result.stderr:
-            print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+    public_scheme = os.environ.get("PROXY_PUBLIC_SCHEME", "")
+    if public_scheme not in ("", "http", "https"):
+        print('ERROR: PROXY_PUBLIC_SCHEME must be empty, "http", or "https"', file=sys.stderr)
+        return 1
+    health_url = os.environ.get("PROXY_HEALTH_URL", "") or "http://127.0.0.1:5007/health"
+    if not re.fullmatch(r"http://(127\.0\.0\.1|localhost):[0-9]{1,5}/[A-Za-z0-9/_.-]*", health_url):
+        print("ERROR: PROXY_HEALTH_URL must be a loopback http:// URL", file=sys.stderr)
+        return 1
+    # Without peers there is no identity to bootstrap and no legacy peer
+    # settings to restore, so a fresh host needs no prior proxy.env.
+    peerless = os.environ.get("PROXY_PEERLESS", "") or "0"
+    if peerless not in ("0", "1"):
+        print("ERROR: PROXY_PEERLESS must be 0 or 1", file=sys.stderr)
+        return 1
+    if peerless == "1" and (peer_routing == "1" or peer_listen or peer_identity_hosts):
+        print("ERROR: PROXY_PEERLESS excludes peer routing, a peer listener, and peer identity hosts", file=sys.stderr)
         return 1
 
-    instances = [
-        {"name": r[0], "zone": r[1], "status": r[2] if len(r) > 2 else ""}
-        for line in result.stdout.strip().splitlines()
-        if line.strip()
-        for r in [line.strip().split(",")]
-    ]
+    if local:
+        instances = [dict(local, status="RUNNING")]
+    else:
+        result = subprocess.run(
+            [
+                "gcloud", "compute", "instances", "list",
+                f"--project={project}",
+                f"--filter=labels.{label}" + ("" if expected_standby else " AND status=RUNNING"),
+                "--format=csv[no-heading](name,zone,status)" if expected_standby else "--format=csv[no-heading](name,zone)",
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"ERROR: gcloud instance discovery failed (exit {result.returncode})", file=sys.stderr)
+            if result.stderr:
+                print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+            return 1
+
+        instances = [
+            {"name": r[0], "zone": r[1], "status": r[2] if len(r) > 2 else ""}
+            for line in result.stdout.strip().splitlines()
+            if line.strip()
+            for r in [line.strip().split(",")]
+        ]
 
     # A misplaced standby must not become an optional staging absence.
     if expected_standby and any(
@@ -199,7 +233,7 @@ def main() -> int:
     # ssh-keygen; the loser fails with "already exists". Create it up front,
     # locally, so no single host's reachability gates the others.
     key = os.path.expanduser("~/.ssh/google_compute_engine")
-    if not os.path.exists(key):
+    if not local and not os.path.exists(key):
         os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
         subprocess.run(["ssh-keygen", "-q", "-t", "rsa", "-N", "", "-f", key], check=True)
 
@@ -214,14 +248,8 @@ def main() -> int:
             ("deploy/proxy.service", "/tmp/proxy.service"),
             ("deploy/proxy.socket", "/tmp/proxy.socket"),
         ]:
-            subprocess.run(
-                [
-                    "gcloud", "compute", "scp", src, f"{name}:{dst}",
-                    f"--zone={zone}", f"--project={project}",
-                    "--quiet", "--tunnel-through-iap",
-                ],
-                check=True, capture_output=True,
-            )
+            subprocess.run(scp_command(os.environ, project, name, zone, src, dst),
+                           check=True, capture_output=True)
         print(f"[{tag}] proxy uploaded")
 
         deploy_script = textwrap.dedent(f"""
@@ -253,7 +281,7 @@ def main() -> int:
             elif [ "{int(name in peer_identity_hosts)}" -eq 1 ]; then
                 echo 'ERROR: host requires infrastructure identity bootstrap' >&2
                 exit 1
-            elif ! sudo test -s /etc/sandbox/proxy.env; then
+            elif [ "{peerless}" -eq 0 ] && ! sudo test -s /etc/sandbox/proxy.env; then
                 # Legacy peer identity lives in proxy.env. A rebuilt host must
                 # restore it or bootstrap before deployment can preserve mTLS.
                 echo 'ERROR: restore the legacy proxy.env or bootstrap host identity before deployment' >&2
@@ -389,6 +417,7 @@ def main() -> int:
             PEER_ROUTING_ENABLED={peer_routing}
             HOST_ID=${{host_id:-{name}}}
             HOST_REGION={host_region}{otel_env_lines}
+            PROXY_PUBLIC_SCHEME={public_scheme}
             PROXYENV
             if [ -z "$peer_identity" ]; then
                 sudo sed -i '/^PEER_PROXY_/d' /etc/sandbox/proxy.env
@@ -423,7 +452,7 @@ def main() -> int:
                 sudo journalctl -u proxy --no-pager -n 40 >&2 || true
                 exit 1
             fi
-            curl --fail --silent --show-error --max-time 10 http://127.0.0.1:5007/health > /dev/null
+            curl --fail --silent --show-error --max-time 10 {health_url} > /dev/null
             [ "$(systemctl show -p InvocationID --value {service})" = "$vmd_invocation" ]
         """)
         # Heredoc terminators must begin at column zero in the generated shell.
@@ -432,15 +461,8 @@ def main() -> int:
         deploy_script = ("sudo install -d -m 0755 /var/lib/proxy-rollout && "
                          "sudo flock -n /var/lib/proxy-rollout/lock bash -c " + shlex.quote(deploy_script))
 
-        r = subprocess.run(
-            [
-                "gcloud", "compute", "ssh", name,
-                f"--zone={zone}", f"--project={project}",
-                "--quiet", "--tunnel-through-iap",
-                "--command", deploy_script,
-            ],
-            capture_output=True, text=True,
-        )
+        r = subprocess.run(ssh_command(os.environ, project, name, zone, deploy_script),
+                           capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(
                 f"proxy not healthy\n"

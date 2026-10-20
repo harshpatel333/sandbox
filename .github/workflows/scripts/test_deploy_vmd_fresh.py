@@ -204,7 +204,7 @@ journalctl() { :; }
             self.assertNotIn('restart-secretsproxy', result.stdout)
 
     def test_preflight_precedes_bundle_upload_and_remote_mutations(self):
-        self.assertLess(SOURCE.index('runtime input preflight")'), SOURCE.index('"compute", "scp"'))
+        self.assertLess(SOURCE.index('runtime input preflight")'), SOURCE.index('scp_command('))
         self.assertLess(SOURCE.index('inject_script = input_preflight +'), SOURCE.index('sudo install -d'))
 
     def test_blank_vmd_env_requires_explicit_kernel_selection(self):
