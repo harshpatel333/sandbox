@@ -187,6 +187,8 @@ module "api" {
   cpu_idle = false
 
   env = {
+    BILLING_USAGE_ENTITLEMENTS_ENABLED = "true"
+
     YC_CONSOLE_URL                = var.yc_claim_console_url
     YC_EMAIL_FROM                 = var.yc_claim_email_from
     YC_EXISTING_EXCEPTION_USER_ID = var.yc_existing_exception_user_id
