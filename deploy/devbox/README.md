@@ -27,8 +27,9 @@ The workflows cannot create a box until they are complete.
 - the VM identity `superserve-devbox-vm`, which has no project roles. It has
   object access in buckets named `superserve-devbox-*` (shared by all boxes)
   and read-only access to the hostprep bucket below;
-- a reCAPTCHA Enterprise score key that allows `localhost` and an API key
-  restricted to the reCAPTCHA Enterprise API.
+- a reCAPTCHA Enterprise score key without domain checks (boxes are only
+  reached through local port forwarding; it is a development key) and an API
+  key restricted to the reCAPTCHA Enterprise API.
 
 The project also runs staging, so the workflow identity's rights to modify,
 SSH into or delete anything are conditioned on resource names: VMs and disks
@@ -160,7 +161,7 @@ Secrets:
 
 | Secret | Value |
 | --- | --- |
-| `DEVBOX_SECRET_RECAPTCHA_API_KEY` | `gcloud services api-keys get-key-string projects/rayai-dev/locations/global/keys/superserve-devbox-recaptcha` |
+| `DEVBOX_SECRET_RECAPTCHA_API_KEY` | `gcloud services api-keys get-key-string projects/rayai-dev/locations/global/keys/superserve-devbox-recaptcha --format='value(keyString)'` (only the `AIza…` string, with no `keyString:` prefix or trailing space) |
 | `DEVBOX_SECRET_STRIPE_SECRET_KEY` | devbox Stripe sandbox secret key (step 4) |
 
 The console repository `superserve-ai/superserve` is public, so the box
