@@ -300,3 +300,57 @@ func commercialOfferRestrictedPool(t *testing.T, admin *pgxpool.Pool) *pgxpool.P
 	}
 	return pool
 }
+
+func TestYCCommercialOfferAssignmentWaitsForCheckout(t *testing.T) {
+	for _, apply := range []bool{false, true} {
+		t.Run(map[bool]string{false: "preflight", true: "apply"}[apply], func(t *testing.T) {
+			h, team, actor, r := commercialOfferFixture(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if _, err := h.Pool.Exec(ctx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team); err != nil {
+				t.Fatal(err)
+			}
+			checkout, err := h.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer checkout.Rollback(context.Background())
+			var pid int
+			if err = checkout.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			// Model the account write made by checkout while its transaction is open.
+			if _, err = checkout.Exec(ctx, `UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team, "cus_"+team.String()); err != nil {
+				t.Fatal(err)
+			}
+			result := make(chan error, 1)
+			go func() { _, err := h.assignCommercialOffer(ctx, team, actor, r, apply); result <- err }()
+			// Observe the actual lock wait rather than relying on a timing-only assertion.
+			for {
+				select {
+				case err = <-result:
+					t.Fatalf("assignment did not wait for checkout: %v", err)
+				default:
+				}
+				var waiting bool
+				if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err = checkout.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err = <-result; !errors.Is(err, errCommercialOfferConflict) {
+				t.Fatalf("committed checkout not rejected: %v", err)
+			}
+			var count int
+			if err = h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_commercial_offer_assignment WHERE team_id=$1`, team).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("checkout race assigned offer: count=%d err=%v", count, err)
+			}
+		})
+	}
+}

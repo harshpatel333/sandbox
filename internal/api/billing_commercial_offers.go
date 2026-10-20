@@ -128,6 +128,16 @@ func (h *Handlers) assignCommercialOffer(ctx context.Context, team, actor uuid.U
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
 	} else {
+		// Match the existing sponsorship/checkout account serialization boundary.
+		// Apply creates the empty row when needed; preflight remains audit-only.
+		if apply {
+			if _, err = tx.Exec(ctx, `INSERT INTO team_billing_account(team_id) VALUES($1) ON CONFLICT DO NOTHING`, team); err != nil {
+				return nil, err
+			}
+		}
+		if err = lockCommercialOfferAccount(ctx, tx, team); err != nil && (apply || !errors.Is(err, pgx.ErrNoRows)) {
+			return nil, err
+		}
 		if err = h.sponsoredLocalPreflight(ctx, tx, team); err != nil {
 			return nil, errCommercialOfferConflict
 		}
