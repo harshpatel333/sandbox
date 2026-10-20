@@ -509,6 +509,10 @@ def create(env, profile_path=PROFILE_PATH):
     revisions = {key: contract.revision(env[f"{key.upper()}_BRANCH"], env[f"{key.upper()}_SHA"])
                  for key in ("sandbox", "ui")}
     profile = load_profile(profile_path)
+    ci_account = env.get("DEVBOX_CI_SERVICE_ACCOUNT", "")
+    if not re.fullmatch(r"[a-z][a-z0-9-]*@[a-z0-9.-]+\.iam\.gserviceaccount\.com", ci_account):
+        raise StepError("DEVBOX_CI_SERVICE_ACCOUNT must be the workflow's service account email")
+    engineers = engineer_members(env.get("DEVBOX_ENGINEER_MEMBERS", ""))
     devbox_id = contract.new_devbox_id()
     created_at = contract.utc_now()
     expires_at = contract.expiry(created_at, lifetime)
@@ -545,6 +549,15 @@ def create(env, profile_path=PROFILE_PATH):
              f"--default-storage-class={profile['bucket']['storage_class']}",
              "--uniform-bucket-level-access", "--public-access-prevention", "--soft-delete-duration=0"])
         run(["gcloud", "storage", "buckets", "update", bucket, "--update-labels=" + contract.format_labels(labels)])
+        # OS Login does not honour the name-prefix condition on the workflow's
+        # project role, so it and the engineers get unconditioned login grants
+        # on this VM only.
+        run(["gcloud", "compute", "instances", "add-iam-policy-binding", box.instance, *where,
+             f"--member=serviceAccount:{ci_account}", "--role=roles/compute.osAdminLogin",
+             "--condition=None", "--quiet"])
+        for member in engineers:
+            run(["gcloud", "compute", "instances", "add-iam-policy-binding", box.instance, *where,
+                 f"--member={member}", "--role=roles/compute.osAdminLogin", "--condition=None", "--quiet"])
 
         box.wait_for_ssh()
         box.devbox_id = devbox_id
@@ -575,6 +588,16 @@ def create(env, profile_path=PROFILE_PATH):
         manifest_details(manifest),
     ]))
     return 0
+
+
+def engineer_members(value):
+    members = [member.strip() for member in value.split(",") if member.strip()]
+    for member in members:
+        if not re.fullmatch(r"(user|group|serviceAccount|domain):[A-Za-z0-9._%+@-]+", member):
+            raise StepError(f"DEVBOX_ENGINEER_MEMBERS entry {member!r} is not an IAM member like group:team@example.com")
+    if not members:
+        print("::warning::DEVBOX_ENGINEER_MEMBERS is empty, so no engineer can reach this box over IAP")
+    return members
 
 
 def save_attempt(env, attempt):

@@ -275,8 +275,10 @@ class PrepareTests(WorkflowCase):
 
 class CreateTests(WorkflowCase):
     def create_env(self, **values):
-        return self.env(NAME="my-box", OWNER="awille-ai", LIFETIME_HOURS="24", SANDBOX_BRANCH="main",
-                        SANDBOX_SHA=SANDBOX_SHA, UI_BRANCH="main", UI_SHA=UI_SHA, **values)
+        return self.env(**{"NAME": "my-box", "OWNER": "awille-ai", "LIFETIME_HOURS": "24", "SANDBOX_BRANCH": "main",
+                           "DEVBOX_CI_SERVICE_ACCOUNT": "devbox-ci@example-project.iam.gserviceaccount.com",
+                           "DEVBOX_ENGINEER_MEMBERS": "group:engineers@example.com, user:someone@example.com",
+                           "SANDBOX_SHA": SANDBOX_SHA, "UI_BRANCH": "main", "UI_SHA": UI_SHA, **values})
 
     def create(self, cloud, **values):
         return self.run_with(cloud, workflow.create, self.create_env(**values), profile_path=self.profile)
@@ -312,6 +314,16 @@ class CreateTests(WorkflowCase):
         self.assertEqual(cloud.scripts, list(contract.CREATE_SCRIPTS))
         for args in cloud.gcloud("compute", "ssh"):
             self.assertIn("--tunnel-through-iap", args)
+        binding = cloud.gcloud("compute", "instances", "add-iam-policy-binding")
+        self.assertEqual(len(binding), 3)
+        engineer_bindings = [(arg(b, "--member"), arg(b, "--role")) for b in binding[1:]]
+        self.assertEqual(engineer_bindings, [("group:engineers@example.com", "roles/compute.osAdminLogin"),
+                                             ("user:someone@example.com", "roles/compute.osAdminLogin")])
+        self.assertTrue(all("--condition=None" in b for b in binding))
+        for flag in ("devbox-my-box", "--member=serviceAccount:devbox-ci@example-project.iam.gserviceaccount.com",
+                     "--role=roles/compute.osAdminLogin", "--condition=None"):
+            self.assertIn(flag, binding[0])
+        self.assertLess(cloud.commands.index(binding[0]), cloud.commands.index(cloud.gcloud("compute", "ssh")[0]))
         final = cloud.metadata_writes[-1]
         self.assertEqual(final["state"], "ready")
         self.assertEqual(final["runtime"], {"firecracker": "1.10.1"})
@@ -340,11 +352,19 @@ class CreateTests(WorkflowCase):
 
     def test_bad_configuration_fails_before_provisioning(self):
         for values in ({"DEVBOX_SECRET_STRIPE_SECRET_KEY": ""}, {"DEVBOX_SECRET_STRIPE_SECRET_KEY": "sk_test\n"},
-                       {"DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG": '{\n  "cpu": 1\n}'}, {"DEVBOX_CONFIG_DEVBOX_ID": "x"}):
+                       {"DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG": '{\n  "cpu": 1\n}'}, {"DEVBOX_CONFIG_DEVBOX_ID": "x"},
+                       {"DEVBOX_CI_SERVICE_ACCOUNT": ""}, {"DEVBOX_CI_SERVICE_ACCOUNT": "user:someone@example.com"},
+                       {"DEVBOX_ENGINEER_MEMBERS": "engineers@example.com"},
+                       {"DEVBOX_ENGINEER_MEMBERS": "group:a@example.com,allUsers"}):
             cloud = FakeCloud()
             with self.subTest(values=values), self.assertRaises(workflow.StepError):
                 self.create(cloud, **values)
             self.assertEqual(cloud.commands, [])
+
+    def test_no_engineer_members_still_creates_with_a_warning(self):
+        cloud = FakeCloud()
+        self.assertEqual(self.create(cloud, DEVBOX_ENGINEER_MEMBERS=""), 0)
+        self.assertEqual(len(cloud.gcloud("compute", "instances", "add-iam-policy-binding")), 1)
 
     def test_name_collision_is_refused_without_offering_cleanup(self):
         cloud = FakeCloud(existing=["my-box"])
