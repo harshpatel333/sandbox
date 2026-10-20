@@ -149,6 +149,7 @@ Variables:
 | `DEVBOX_GCP_ENGINEER_MEMBERS` | the Terraform `engineer_members`, comma-separated (for example `group:engineers@example.com`); each new box grants them OS Login with sudo. Left empty, boxes are created with a warning and only the workflow identity can log in |
 | `DEVBOX_CONFIG_RECAPTCHA_SITE_KEY` | reCAPTCHA key ID |
 | `DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID` | devbox project ID |
+| `DEVBOX_CONFIG_RECAPTCHA_SCORE_THRESHOLD` | optional: minimum reCAPTCHA score the console accepts, `0.0` to `1.0`. Unset keeps the console default; `0.0` accepts any valid token that carries a score, for when a fresh key scores new browser profiles low. Values outside that range are ignored |
 | `DEVBOX_CONFIG_STRIPE_API_VERSION` | `2026-05-27.dahlia`, the version staging pins |
 | `DEVBOX_CONFIG_STRIPE_CHECKOUT_PRICE_IDS` | devbox sandbox usage price IDs (step 4) |
 | `DEVBOX_CONFIG_STRIPE_PRO_MONTHLY_PRICE_ID` | devbox sandbox Pro monthly price ID (step 4) |
@@ -285,7 +286,8 @@ It then:
    `/etc/superserve-devbox/secrets.env` (mode 0600). Each `devbox`
    environment secret `DEVBOX_SECRET_<NAME>` becomes `<NAME>` in
    `secrets.env`, and each variable `DEVBOX_CONFIG_<NAME>` becomes `<NAME>` in
-   `devbox.env`. The workflow refuses to run if any value it forwards is unset;
+   `devbox.env`. The workflow refuses to run if any value it forwards is unset,
+   except optional ones such as `RECAPTCHA_SCORE_THRESHOLD`;
 4. runs, as root on the box and from the checked-out sandbox commit,
    `host-bootstrap.sh`, `services-up.sh`, `install-api.sh`,
    `install-vmd.sh`, `install-proxy.sh`, `seed-base.sh` and `install-ui.sh`

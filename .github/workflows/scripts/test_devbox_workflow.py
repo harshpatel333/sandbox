@@ -361,6 +361,17 @@ class CreateTests(WorkflowCase):
                 self.create(cloud, **values)
             self.assertEqual(cloud.commands, [])
 
+    def test_optional_configuration_is_written_only_when_set(self):
+        for value, expected in (("", None), ("0.0", "RECAPTCHA_SCORE_THRESHOLD=0.0\n")):
+            cloud = FakeCloud()
+            with self.subTest(value=value):
+                self.create(cloud, DEVBOX_CONFIG_RECAPTCHA_SCORE_THRESHOLD=value)
+                devbox_env = cloud.box_files["/etc/superserve-devbox/devbox.env"]
+                if expected:
+                    self.assertIn(expected, devbox_env)
+                else:
+                    self.assertNotIn("RECAPTCHA_SCORE_THRESHOLD", devbox_env)
+
     def test_no_engineer_members_still_creates_with_a_warning(self):
         cloud = FakeCloud()
         self.assertEqual(self.create(cloud, DEVBOX_ENGINEER_MEMBERS=""), 0)
