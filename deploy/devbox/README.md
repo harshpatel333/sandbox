@@ -161,7 +161,7 @@ Secrets:
 
 | Secret | Value |
 | --- | --- |
-| `DEVBOX_SECRET_RECAPTCHA_API_KEY` | `gcloud services api-keys get-key-string projects/rayai-dev/locations/global/keys/superserve-devbox-recaptcha` |
+| `DEVBOX_SECRET_RECAPTCHA_API_KEY` | `gcloud services api-keys get-key-string projects/rayai-dev/locations/global/keys/superserve-devbox-recaptcha --format='value(keyString)'` (only the `AIza…` string, with no `keyString:` prefix or trailing space) |
 | `DEVBOX_SECRET_STRIPE_SECRET_KEY` | devbox Stripe sandbox secret key (step 4) |
 
 The console repository `superserve-ai/superserve` is public, so the box
