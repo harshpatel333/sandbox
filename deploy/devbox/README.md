@@ -148,6 +148,7 @@ Variables:
 | `DEVBOX_GCP_ENGINEER_MEMBERS` | the Terraform `engineer_members`, comma-separated (for example `group:engineers@example.com`); each new box grants them OS Login with sudo. Left empty, boxes are created with a warning and only the workflow identity can log in |
 | `DEVBOX_CONFIG_RECAPTCHA_SITE_KEY` | reCAPTCHA key ID |
 | `DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID` | devbox project ID |
+| `DEVBOX_CONFIG_RECAPTCHA_SCORE_THRESHOLD` | minimum reCAPTCHA score the console accepts, `0.0` to `1.0`; `0.0` accepts every valid token, since a fresh key scores new browser profiles low |
 | `DEVBOX_CONFIG_STRIPE_API_VERSION` | `2026-05-27.dahlia`, the version staging pins |
 | `DEVBOX_CONFIG_STRIPE_CHECKOUT_PRICE_IDS` | devbox sandbox usage price IDs (step 4) |
 | `DEVBOX_CONFIG_STRIPE_PRO_MONTHLY_PRICE_ID` | devbox sandbox Pro monthly price ID (step 4) |
