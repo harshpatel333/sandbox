@@ -233,6 +233,7 @@ DO $$ DECLARE role_name text; BEGIN
 END $$;
 DO $$ DECLARE t text; BEGIN
     IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+        REVOKE ALL ON billing_commercial_offer_version,billing_commercial_offer_assignment,billing_commercial_offer_activation,billing_commercial_offer_period,billing_commercial_offer_audit FROM service_role;
         GRANT SELECT ON billing_commercial_offer_version TO service_role;
         CREATE POLICY commercial_offer_catalog_read ON billing_commercial_offer_version TO service_role USING(true);
         FOREACH t IN ARRAY ARRAY['billing_commercial_offer_assignment','billing_commercial_offer_activation','billing_commercial_offer_period','billing_commercial_offer_audit'] LOOP

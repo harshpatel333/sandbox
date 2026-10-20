@@ -34,7 +34,7 @@ func commercialOfferFixture(t *testing.T) (*Handlers, uuid.UUID, uuid.UUID, Comm
 	return h, team, actor, r
 }
 
-func TestCommercialOfferAssignmentAuthorityAndRetry(t *testing.T) {
+func TestYCCommercialOfferAssignmentAuthorityAndRetry(t *testing.T) {
 	h, team, actor, r := commercialOfferFixture(t)
 	ctx := t.Context()
 	// The authority RPC returns company OR team matches. Neither alone authorizes another binding.
@@ -118,7 +118,7 @@ func TestCommercialOfferAssignmentAuthorityAndRetry(t *testing.T) {
 
 }
 
-func TestCommercialOfferFrozenCalendar(t *testing.T) {
+func TestYCCommercialOfferFrozenCalendar(t *testing.T) {
 	for _, anchor := range []time.Time{time.Date(time.Now().UTC().Year(), 1, 31, 12, 34, 56, 0, time.UTC), time.Date(time.Now().UTC().Year(), 2, 28, 23, 59, 59, 0, time.UTC)} {
 		if anchor.After(time.Now().UTC()) {
 			anchor = anchor.AddDate(-1, 0, 0)
@@ -212,7 +212,7 @@ func TestCommercialOfferFrozenCalendar(t *testing.T) {
 	}
 }
 
-func TestCommercialOfferHTTPAuthorization(t *testing.T) {
+func TestYCCommercialOfferHTTPAuthorization(t *testing.T) {
 	h, team, _, _ := commercialOfferFixture(t)
 	for _, provider := range []string{"google", "email"} {
 		actor := uuid.New()
