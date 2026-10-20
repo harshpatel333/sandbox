@@ -28,8 +28,8 @@ The workflows cannot create a box until they are complete.
   object access in buckets named `superserve-devbox-*` (shared by all boxes)
   and read-only access to the hostprep bucket below;
 - a reCAPTCHA Enterprise score key without domain checks (boxes are only
-  reached through local port forwarding; it is a development key) and an API key
-  restricted to the reCAPTCHA Enterprise API.
+  reached through local port forwarding; it is a development key) and an API
+  key restricted to the reCAPTCHA Enterprise API.
 
 The project also runs staging, so the workflow identity's rights to modify,
 SSH into or delete anything are conditioned on resource names: VMs and disks

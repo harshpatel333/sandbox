@@ -348,7 +348,7 @@ resource "google_project_iam_member" "box_bucket_objects" {
 
 resource "google_recaptcha_enterprise_key" "devbox" {
   project      = var.project_id
-  display_name = "superserve-devbox-localhost"
+  display_name = "superserve-devbox"
   labels       = local.labels
 
   # Boxes are only reached through local port forwarding, so the key is not
