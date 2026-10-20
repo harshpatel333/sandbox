@@ -348,13 +348,14 @@ resource "google_project_iam_member" "box_bucket_objects" {
 
 resource "google_recaptcha_enterprise_key" "devbox" {
   project      = var.project_id
-  display_name = "superserve-devbox-localhost"
+  display_name = "superserve-devbox"
   labels       = local.labels
 
+  # Boxes are only reached through local port forwarding, so the key is not
+  # bound to a domain; it is a development key with no production use.
   web_settings {
     integration_type  = "SCORE"
-    allow_all_domains = false
-    allowed_domains   = ["localhost"]
+    allow_all_domains = true
   }
 
   depends_on = [google_project_service.required]
