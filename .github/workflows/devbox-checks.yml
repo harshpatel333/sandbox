@@ -12,6 +12,7 @@ on:
       - 'scripts/provision_devbox_stripe.py'
       - 'scripts/test_provision_devbox_stripe.py'
       - 'scripts/provision_storage_stripe.py'
+      - 'scripts/migrate_database.py'
       - 'supabase/migrations/**'
       - 'internal/api/billing_pro_checkout.go'
   push:
@@ -23,6 +24,7 @@ on:
       - 'scripts/provision_devbox_stripe.py'
       - 'scripts/test_provision_devbox_stripe.py'
       - 'scripts/provision_storage_stripe.py'
+      - 'scripts/migrate_database.py'
       - 'supabase/migrations/**'
       - 'internal/api/billing_pro_checkout.go'
 
