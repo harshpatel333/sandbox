@@ -37,9 +37,8 @@ SOURCE_DIRS = {"sandbox": "sandbox", "ui": "superserve"}
 PROFILE_PATH = Path(__file__).resolve().parents[3] / "deploy" / "devbox" / "profile.json"
 SECRET_PREFIX = "DEVBOX_SECRET_"
 CONFIG_PREFIX = "DEVBOX_CONFIG_"
-# Tuning knobs the product defaults when absent; an empty value is left out of
-# devbox.env instead of failing the run like every other forwarded value.
-OPTIONAL_CONFIG = frozenset({"RECAPTCHA_SCORE_THRESHOLD"})
+# Forwarded only when set; every other forwarded value is required.
+OPTIONAL_VALUES = ("RECAPTCHA_SCORE_THRESHOLD",)
 DEPLOYABLE_STATES = ("ready", "failed")
 LOG_DIR = "/var/log/superserve-devbox"
 API_DEPLOY_FILE = contract.BOX_STATE_DIR + "/api-deploy.json"
@@ -249,9 +248,9 @@ def env_file(values):
     return "".join(line + "\n" for line in lines)
 
 
-def prefixed(env, prefix, kind, optional=frozenset()):
+def prefixed(env, prefix, kind):
     values = {key[len(prefix):]: value for key, value in env.items() if key.startswith(prefix)}
-    values = {key: value for key, value in values.items() if value or key not in optional}
+    values = {key: value for key, value in values.items() if value or key not in OPTIONAL_VALUES}
     empty = sorted(key for key, value in values.items() if not value)
     if empty:
         raise StepError(f"devbox environment {kind} not configured: {', '.join(empty)}")
@@ -418,7 +417,7 @@ def box_config(manifest, env):
         "DEVBOX_SANDBOX_SHA": manifest["revisions"]["sandbox"]["sha"],
         "DEVBOX_UI_SHA": manifest["revisions"]["ui"]["sha"],
     }
-    extra = prefixed(env, CONFIG_PREFIX, "variables", optional=OPTIONAL_CONFIG)
+    extra = prefixed(env, CONFIG_PREFIX, "variables")
     clash = sorted(set(extra) & set(values))
     if clash:
         raise StepError(f"devbox environment variables may not override {', '.join(clash)}")
