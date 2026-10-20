@@ -41,14 +41,18 @@ instance metadata must never hold secrets. IAP forwarding is granted for port
 22 on any VM in the project, including staging hosts; logging in still needs
 OS Login rights, which the workflow identity only holds on `devbox-*` VMs.
 OS Login does not honour the name condition, so the create workflow binds
-`roles/compute.osAdminLogin` for the workflow identity on each new instance
-(its `setIamPolicy` right is itself limited to `devbox-*` VMs). The
-name-conditioned login grant for `engineer_members` has the same limit:
-engineers need a project-level OS Login role, which project owners and editors
-already hold, or a per-instance binding.
+login per instance right after creating the VM (its `setIamPolicy` right is
+itself limited to `devbox-*` VMs): `roles/compute.osAdminLogin` for the
+workflow identity and `roles/compute.osLogin` for the members in
+`DEVBOX_GCP_ENGINEER_MEMBERS`. These bindings live on the VM and go away when
+it is destroyed.
 
-Set `engineer_members` (for example `["group:engineers@example.com"]`) to the
-principals who may open tunnels to boxes. The root has its own state prefix
+Set `engineer_members` in `terraform.tfvars` (for example
+`["group:engineers@example.com"]`) to the principals who may reach boxes; it
+grants them IAP tunnelling on port 22 and use of the box identity, which OS
+Login on these VMs requires. Put the same members in the
+`DEVBOX_GCP_ENGINEER_MEMBERS` environment variable (step 3), from which each
+new box grants them login. The root has its own state prefix
 (`devbox/us-central1`) and lives outside `infra/`, so no staging or production
 deploy workflow runs on it. Instead, the Devbox Terraform workflow
 (`.github/workflows/devbox-terraform.yml`) plans it on every pull request that
@@ -140,6 +144,7 @@ Variables:
 | `DEVBOX_GCP_PROJECT` | devbox project ID |
 | `DEVBOX_GCP_WORKLOAD_IDENTITY` | full provider name, `projects/<number>/locations/global/workloadIdentityPools/superserve-devbox-github/providers/github` |
 | `DEVBOX_GCP_SERVICE_ACCOUNT` | `superserve-devbox-ci@<project>.iam.gserviceaccount.com` |
+| `DEVBOX_GCP_ENGINEER_MEMBERS` | the Terraform `engineer_members`, comma-separated (for example `group:engineers@example.com`); each new box grants them OS Login. Left empty, boxes are created with a warning and only the workflow identity can log in |
 | `DEVBOX_CONFIG_RECAPTCHA_SITE_KEY` | reCAPTCHA key ID |
 | `DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID` | devbox project ID |
 | `DEVBOX_CONFIG_STRIPE_API_VERSION` | `2026-05-27.dahlia`, the version staging pins |
