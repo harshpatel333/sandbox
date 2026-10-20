@@ -90,15 +90,20 @@ storage rights, only the staging Terraform identity can write it, through the
 Devbox Hostprep Seed workflow.
 
 Dispatch Devbox Hostprep Seed (`.github/workflows/devbox-hostprep.yml`) from
-`main` once, preferably while no VMD deploy is running. It copies the guest kernel and
-base rootfs from staging Host 1 over IAP SSH, only reading the host. The
-kernel is never modified and must match the SHA-256 recorded in the
-[Host 2 identity runbook](../host2-identity-runbook.md), or the job stops.
-VMD deploys that change boxd re-inject it into the host's `base.ext4`, so its
-digest may legitimately differ from the runbook's `7494f228...`; any staging
-copy works because each box injects the boxd of its selected revision. The
-job stops if the rootfs changes during the copy, uploads both files and shows
-the rootfs digest in its summary.
+`main` once, preferably while no VMD deploy is running. It copies the guest
+kernel and base rootfs from staging Host 1 (the `host` input's default) over
+IAP SSH, only reading the host: no staging bucket holds an established copy of
+these files, so Host 1's files are the source, as the
+[Host 2 identity runbook](../host2-identity-runbook.md) also directs. The
+kernel is never modified and must match the SHA-256 recorded there, or the job
+stops. The rootfs is rewritten with the current boxd by every VMD deploy that
+changes boxd, so the copy includes that boxd and its digest can differ from
+the runbook's; a box's own VMD install replaces boxd anyway. The job reads each
+file once on the host, hashing exactly the bytes it sends, and accepts the
+copy only if the open file was not written during that read (a deploy
+renaming a new rootfs into place is fine) and the received bytes match the
+digest and size. It tries up to three times, then uploads both files and
+shows the rootfs digest in its summary.
 
 Boxes verify both files against SHA-256 pins after download; the host
 bootstrap keeps them as `DEVBOX_KERNEL_DIGEST` and `DEVBOX_ROOTFS_DIGEST` in
