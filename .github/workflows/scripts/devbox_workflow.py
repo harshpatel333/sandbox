@@ -489,8 +489,8 @@ def access_section(name):
         "### Access",
         f"Forward {ports} to localhost:",
         "```sh", contract.forwarding_command(name), "```",
-        "Shell and box script logs (engineer logins have no sudo; the system journal needs OS Login admin):",
-        "```sh", ssh, f"{ssh} -- 'tail -n 200 -f {LOG_DIR}/*.log'", "```",
+        "Shell and logs:",
+        "```sh", ssh, f"{ssh} -- 'sudo tail -n 200 -f {LOG_DIR}/*.log'", f"{ssh} -- sudo journalctl -f", "```",
         "Destroy:",
         "```sh", destroy_command(name), "```",
     ])
@@ -550,13 +550,14 @@ def create(env, profile_path=PROFILE_PATH):
              "--uniform-bucket-level-access", "--public-access-prevention", "--soft-delete-duration=0"])
         run(["gcloud", "storage", "buckets", "update", bucket, "--update-labels=" + contract.format_labels(labels)])
         # OS Login does not honour the name-prefix condition on the workflow's
-        # project role, so it gets an unconditioned login grant on this VM only.
+        # project role, so it and the engineers get unconditioned login grants
+        # on this VM only.
         run(["gcloud", "compute", "instances", "add-iam-policy-binding", box.instance, *where,
              f"--member=serviceAccount:{ci_account}", "--role=roles/compute.osAdminLogin",
              "--condition=None", "--quiet"])
         for member in engineers:
             run(["gcloud", "compute", "instances", "add-iam-policy-binding", box.instance, *where,
-                 f"--member={member}", "--role=roles/compute.osLogin", "--condition=None", "--quiet"])
+                 f"--member={member}", "--role=roles/compute.osAdminLogin", "--condition=None", "--quiet"])
 
         box.wait_for_ssh()
         box.devbox_id = devbox_id

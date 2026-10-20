@@ -257,16 +257,14 @@ It then:
    disk of the same name) from `profile.json`, and the bucket
    `superserve-devbox-<devbox-id>`, all labelled `managed-by`,
    `devbox-name`, `devbox-id`, `owner` and `expires-at`. It then grants, on
-   that VM only, OS Login to the workflow identity (`roles/compute.osAdminLogin`,
-   because OS Login doesn't honour the name-prefix condition on its project
-   role) and to the members in `DEVBOX_GCP_ENGINEER_MEMBERS`
-   (`roles/compute.osLogin`). If that variable is empty, the run warns that no
-   engineer can reach the box. These grants go away when the VM is destroyed.
-   Keep `DEVBOX_GCP_ENGINEER_MEMBERS` the same as Terraform's
-   `engineer_members`: Terraform grants the IAP tunnel, and this grants the
-   login, so a member in only one of them can't connect. Engineers get a shell
-   without sudo, and can read the box script logs in
-   `/var/log/superserve-devbox/`;
+   that VM only, OS Login with sudo (`roles/compute.osAdminLogin`) to the
+   workflow identity, because OS Login doesn't honour the name-prefix condition
+   on its project role, and to the members in `DEVBOX_GCP_ENGINEER_MEMBERS`, so
+   they can read logs and restart services on their own box. If that variable
+   is empty, the run warns that no engineer can reach the box. These grants go
+   away when the VM is destroyed. Keep `DEVBOX_GCP_ENGINEER_MEMBERS` the same as
+   Terraform's `engineer_members`: Terraform grants the IAP tunnel, and this
+   grants the login, so a member in only one of them can't connect;
 2. writes the manifest (state `creating`) to the VM's `devbox-manifest`
    metadata key as part of creating the VM, so even a failed box can be found
    and cleaned up;

@@ -317,8 +317,8 @@ class CreateTests(WorkflowCase):
         binding = cloud.gcloud("compute", "instances", "add-iam-policy-binding")
         self.assertEqual(len(binding), 3)
         engineer_bindings = [(arg(b, "--member"), arg(b, "--role")) for b in binding[1:]]
-        self.assertEqual(engineer_bindings, [("group:engineers@example.com", "roles/compute.osLogin"),
-                                             ("user:someone@example.com", "roles/compute.osLogin")])
+        self.assertEqual(engineer_bindings, [("group:engineers@example.com", "roles/compute.osAdminLogin"),
+                                             ("user:someone@example.com", "roles/compute.osAdminLogin")])
         self.assertTrue(all("--condition=None" in b for b in binding))
         for flag in ("devbox-my-box", "--member=serviceAccount:devbox-ci@example-project.iam.gserviceaccount.com",
                      "--role=roles/compute.osAdminLogin", "--condition=None"):
