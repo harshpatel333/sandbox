@@ -16,7 +16,7 @@ services:
   # passwords with DDL that it would otherwise write to the journal.
   db:
     <<: *service
-    image: supabase/postgres:17.11.0.002
+    image: supabase/postgres:17.6.1.178
     command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql-devbox/pg_hba.conf -c listen_addresses=127.0.0.1 -c log_statement=none
     environment:
       PGPORT: "54322"

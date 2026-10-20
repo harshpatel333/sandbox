@@ -371,7 +371,7 @@ resource "google_apikeys_key" "recaptcha" {
 
 # Verified guest kernel and base rootfs that boxes fetch at bootstrap. Its name
 # deliberately falls outside bucket_name_prefix, so neither the box's object
-# grant nor box destroy can match it; operators upload, boxes only read.
+# grant nor box destroy can match it; only the seeder writes, boxes only read.
 resource "google_storage_bucket" "hostprep" {
   project                     = var.project_id
   name                        = var.hostprep_bucket
@@ -396,4 +396,10 @@ resource "google_storage_bucket_iam_member" "box_hostprep_read" {
   bucket = google_storage_bucket.hostprep.name
   role   = "roles/storage.objectViewer"
   member = local.box_member
+}
+
+resource "google_storage_bucket_iam_member" "hostprep_seeder" {
+  bucket = google_storage_bucket.hostprep.name
+  role   = "roles/storage.objectAdmin"
+  member = var.hostprep_seeder
 }
