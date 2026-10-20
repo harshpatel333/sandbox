@@ -285,7 +285,8 @@ It then:
    `/etc/superserve-devbox/secrets.env` (mode 0600). Each `devbox`
    environment secret `DEVBOX_SECRET_<NAME>` becomes `<NAME>` in
    `secrets.env`, and each variable `DEVBOX_CONFIG_<NAME>` becomes `<NAME>` in
-   `devbox.env`. The workflow refuses to run if any value it forwards is unset;
+   `devbox.env`. The workflow refuses to run if any value it forwards is unset,
+   except optional ones such as `RECAPTCHA_SCORE_THRESHOLD`;
 4. runs, as root on the box and from the checked-out sandbox commit,
    `host-bootstrap.sh`, `services-up.sh`, `install-api.sh`,
    `install-vmd.sh`, `install-proxy.sh`, `seed-base.sh` and `install-ui.sh`
