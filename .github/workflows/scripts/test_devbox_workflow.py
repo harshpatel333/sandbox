@@ -1,5 +1,6 @@
-"""Exercise the devbox create workflow against a mocked gcloud."""
+"""Exercise the devbox create and deploy workflows against a mocked gcloud."""
 
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -43,18 +44,22 @@ SECRETS = {"DEVBOX_SECRET_STRIPE_SECRET_KEY": "sk_test_example", "DEVBOX_SECRET_
 class FakeCloud:
     """Stands in for gcloud, git ls-remote and the box behind IAP SSH."""
 
-    def __init__(self, *, existing=(), branches=None, fail_script=None, instances=None, relabel_after=None,
-                 decoys=(), fail_after_create=False, expire_on_script=None):
+    def __init__(self, *, existing=(), branches=None, fail_script=None, migrations="applied", instances=None,
+                 relabel_after=None, decoys=(), fail_after_create=False, expire_on_script=None):
         self.commands, self.inputs = [], {}
         self.decoys, self.fail_after_create, self.expire_on_script = decoys, fail_after_create, expire_on_script
+        self.deployed_sha = NEW_SHA
         self.disks, self.buckets, self.unlabelled = [], [], set()
         self.relabel_after_checkouts = None
         self.pending_instance = False
         self.fail_disk_create = False
+        self.box_missing = set()
+        self.heads, self.drop_after_checkout = {"sandbox": SANDBOX_SHA, "superserve": UI_SHA}, False
+        self.heads_unreadable = False
         self.repo_scripts = list(contract.CREATE_SCRIPTS)
         self.existing = list(existing)
         self.branches = branches if branches is not None else {"main": SANDBOX_SHA, "feature": NEW_SHA}
-        self.fail_script = fail_script
+        self.fail_script, self.migrations = fail_script, migrations
         self.instances = instances or {}
         self.metadata_writes, self.box_files, self.scripts, self.checkouts = [], {}, [], []
         self.relabel_after = relabel_after
@@ -139,15 +144,32 @@ class FakeCloud:
         if target and input is not None and "cat >" in unquote(command):
             self.box_files[target.group(1)] = input
             return ok()
+        if command.startswith("for script in"):
+            missing = [script for script in self.box_missing if script in command]
+            return fail(1, f"missing {missing[0]}") if missing else ok()
+        if "rev-parse HEAD 2>/dev/null" in command:
+            if self.heads_unreadable:
+                return fail(255, "Connection timed out")
+            return ok(self.heads.get(shlex.split(command)[3].rsplit("/", 1)[-1], "") + "\n")
         if "git -C" in unquote(command):
-            self.checkouts.append(re.search(r"checkout -q --force --detach ([0-9a-f]{40})", unquote(command)).group(1))
+            sha = re.search(r"checkout -q --force --detach ([0-9a-f]{40})", unquote(command)).group(1)
+            self.checkouts.append(sha)
+            self.heads[re.search(r"src/(\w+)", unquote(command)).group(1)] = sha
+            if self.drop_after_checkout:
+                return fail(255, "Connection closed by remote host")
             return ok()
         script = re.search(r"deploy/devbox/([a-z-]+\.sh)'? 2>&1", unquote(command))
         if script:
             self.scripts.append(script.group(1))
             if script.group(1) == self.expire_on_script:
                 workflow.DEADLINE.end = 0
+            if script.group(1) == "install-api.sh" and self.migrations is not None:
+                self.box_files[workflow.API_DEPLOY_FILE] = json.dumps(
+                    {"sha": self.deployed_sha, "migrations": self.migrations, "applied": []})
             return fail() if script.group(1) == self.fail_script else ok()
+        if command.startswith("sudo rm -f"):
+            self.box_files.pop(workflow.API_DEPLOY_FILE, None)
+            return ok()
         if command.startswith("sudo cat"):
             path = shlex.split(command)[2]
             if path.endswith("runtime.json"):
@@ -234,6 +256,22 @@ class PrepareTests(WorkflowCase):
                        {"GITHUB_REF": "refs/heads/feature"}):
             with self.subTest(values=values), self.assertRaises((workflow.StepError, contract.ContractError)):
                 self.run_with(FakeCloud(), workflow.prepare_create, self.env(**values), profile_path=self.profile)
+
+    def test_prepare_deploy_resolves_only_used_repositories(self):
+        cloud = FakeCloud()
+        self.run_with(cloud, workflow.prepare_deploy, self.env(INPUT_NAME="my-box", INPUT_COMPONENTS="ui",
+                                                            INPUT_SANDBOX_BRANCH="missing", INPUT_UI_BRANCH="feature"))
+        outputs = self.outputs()
+        self.assertEqual(outputs["components"], "ui")
+        self.assertEqual((outputs["ui_branch"], outputs["ui_sha"]), ("feature", NEW_SHA))
+        self.assertEqual(outputs["sandbox_sha"], "")
+        with self.assertRaises(contract.ContractError):
+            self.run_with(FakeCloud(), workflow.prepare_deploy, self.env(INPUT_NAME="my-box", INPUT_COMPONENTS="db"))
+        cloud = FakeCloud()
+        cloud.repo_scripts.remove("install-ui.sh")
+        with self.assertRaisesRegex(workflow.StepError, "install-ui.sh"):
+            self.run_with(cloud, workflow.prepare_deploy, self.env(INPUT_NAME="my-box", INPUT_COMPONENTS="all"))
+
 
 class CreateTests(WorkflowCase):
     def create_env(self, **values):
@@ -418,6 +456,226 @@ class CreateTests(WorkflowCase):
             with self.subTest(profile=profile), self.assertRaises(workflow.StepError):
                 self.create(cloud)
             self.assertEqual(cloud.commands, [])
+
+
+class DeployTests(WorkflowCase):
+    NOW = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
+
+    def box(self, state="ready", expires_hours=24, runtime=None):
+        created = datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc)
+        manifest = contract.new_manifest(
+            name="my-box", devbox_id="3f9c0a1b2c4d", owner="awille-ai", actor="awille-ai", created_at=created,
+            expires_at=contract.expiry(created, expires_hours),
+            revisions={"sandbox": {"branch": "main", "sha": SANDBOX_SHA}, "ui": {"branch": "main", "sha": UI_SHA}})
+        manifest = {**contract.with_state(manifest, state),
+                    "runtime": {"firecracker": "1.10.1"} if runtime is None else runtime}
+        labels = contract.labels("my-box", "3f9c0a1b2c4d", "awille-ai", contract.parse_iso(manifest["expires_at"]))
+        return {"devbox-my-box": {"name": "devbox-my-box", "zone": "projects/p/zones/us-central1-a", "labels": labels,
+                           "metadata": {"items": [{"key": "devbox-manifest", "value": json.dumps(manifest)}]}}}
+
+    def deploy(self, cloud, components="all", **values):
+        env = self.env(**{"NAME": "my-box", "COMPONENTS": components, "SANDBOX_BRANCH": "feature",
+                          "SANDBOX_SHA": NEW_SHA, "UI_BRANCH": "main", "UI_SHA": UI_SHA,
+                          "GITHUB_ACTOR": "someone", **values})
+        return self.run_with(cloud, workflow.deploy, env, now=lambda: self.NOW)
+
+    def test_all_components_upgrade_in_contract_order(self):
+        cloud = FakeCloud(instances=self.box())
+        self.assertEqual(self.deploy(cloud), 0)
+        listing = cloud.gcloud("compute", "instances", "list")[0]
+        self.assertIn("--filter=labels.managed-by=superserve-devbox AND labels.devbox-name=my-box", listing)
+        self.assertEqual(cloud.scripts, ["install-vmd.sh", "install-proxy.sh", "services-up.sh",
+                                         "install-api.sh", "install-ui.sh"])
+        self.assertEqual(cloud.checkouts, [NEW_SHA, UI_SHA])
+        self.assertEqual([m["state"] for m in cloud.metadata_writes], ["deploying", "ready"])
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["expires_at"], "2026-10-21T15:00:00Z")
+        self.assertEqual(final["revisions"]["sandbox"], {"branch": "feature", "sha": NEW_SHA})
+        self.assertEqual(final["deploys"], [{
+            "at": "2026-10-20T18:00:00Z", "actor": "someone", "components": ["vmd", "proxy", "api", "ui"],
+            "from": {"sandbox": SANDBOX_SHA, "ui": UI_SHA}, "to": {"sandbox": NEW_SHA, "ui": UI_SHA},
+            "migrations": "applied", "result": "succeeded"}])
+        self.assertEqual(final["components"]["api"], {"branch": "feature", "sha": NEW_SHA})
+        self.assertFalse(cloud.gcloud("compute", "instances", "add-labels"))
+        summary = self.summary.read_text()
+        self.assertIn(f"| api | `{SANDBOX_SHA[:12]}` (`main`) | `{NEW_SHA[:12]}` (`feature`) |", summary)
+        self.assertIn("**Migrations:** applied", summary)
+
+    def test_ui_only_deploy_leaves_sandbox_checkout_alone(self):
+        cloud = FakeCloud(instances=self.box())
+        self.assertEqual(self.deploy(cloud, "ui", SANDBOX_BRANCH="", SANDBOX_SHA="", UI_BRANCH="feature",
+                                     UI_SHA=NEW_SHA), 0)
+        self.assertEqual(cloud.scripts, ["install-ui.sh"])
+        self.assertEqual(cloud.checkouts, [NEW_SHA])
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["revisions"]["sandbox"], {"branch": "main", "sha": SANDBOX_SHA})
+        self.assertEqual(final["components"]["vmd"], {"branch": "main", "sha": SANDBOX_SHA})
+        self.assertEqual(final["components"]["ui"], {"branch": "feature", "sha": NEW_SHA})
+        self.assertEqual(final["deploys"][0]["migrations"], "none")
+        self.assertIn(f"| vmd | `{SANDBOX_SHA[:12]}` (`main`) | unchanged |", self.summary.read_text())
+
+    def test_failed_migration_stops_and_is_recorded(self):
+        cloud = FakeCloud(instances=self.box(), fail_script="install-api.sh", migrations="failed")
+        self.assertEqual(self.deploy(cloud, "api,ui"), 1)
+        self.assertEqual(cloud.scripts, ["services-up.sh", "install-api.sh"])
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["state"], "failed")
+        self.assertEqual(final["deploys"][-1]["migrations"], "failed")
+        self.assertEqual(final["deploys"][-1]["result"], "failed")
+        self.assertIn("**Migrations:** failed", self.summary.read_text())
+
+    def test_partial_failure_moves_only_finished_components(self):
+        cloud = FakeCloud(instances=self.box(), fail_script="install-api.sh", migrations="applied")
+        self.assertEqual(self.deploy(cloud, "vmd,api,ui", UI_BRANCH="feature", UI_SHA=NEW_SHA), 1)
+        self.assertEqual(cloud.scripts, ["install-vmd.sh", "services-up.sh", "install-api.sh"])
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["components"]["vmd"], {"branch": "feature", "sha": NEW_SHA})
+        self.assertEqual(final["components"]["api"], {"branch": "feature", "sha": "unknown"})
+        self.assertEqual(final["components"]["ui"], {"branch": "main", "sha": UI_SHA})
+        self.assertEqual(final["revisions"]["ui"], {"branch": "feature", "sha": NEW_SHA})
+        self.assertEqual(final["deploys"][-1]["migrations"], "applied")
+        summary = self.summary.read_text()
+        self.assertIn("| api | `" + SANDBOX_SHA[:12] + "` (`main`) | unknown (install interrupted; redeploy with components=all) |", summary)
+        self.assertIn("| ui | `" + UI_SHA[:12] + "` (`main`) | not deployed |", summary)
+        self.assertIn("Services (before this deploy)", summary)
+
+    def test_api_install_without_a_readable_report_is_unknown(self):
+        cloud = FakeCloud(instances=self.box(), fail_script="install-api.sh", migrations=None)
+        self.assertEqual(self.deploy(cloud, "api"), 1)
+        self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["migrations"], "unknown")
+
+    def test_migration_report_for_another_revision_is_ignored(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.deployed_sha = SANDBOX_SHA
+        self.assertEqual(self.deploy(cloud, "api"), 0)
+        self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["migrations"], "unknown")
+
+    def test_stale_migration_marker_is_not_reported(self):
+        cloud = FakeCloud(instances=self.box(), fail_script="services-up.sh")
+        cloud.box_files[workflow.API_DEPLOY_FILE] = json.dumps({"sha": NEW_SHA, "migrations": "applied"})
+        self.assertEqual(self.deploy(cloud, "api"), 1)
+        self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["migrations"], "none")
+
+    def test_refuses_busy_expired_or_missing_boxes(self):
+        for instances, message in ((self.box(state="creating"), "creating"),
+                                   (self.box(state="failed", runtime={}), "never finished"),
+                                   (self.box(state="destroying"), "destroying"),
+                                   (self.box(expires_hours=1), "expired"),
+                                   ({}, "No devbox")):
+            with self.subTest(message=message):
+                cloud = FakeCloud(instances=instances)
+                with self.assertRaisesRegex((workflow.StepError, contract.ContractError), message):
+                    self.deploy(cloud)
+                self.assertEqual(cloud.metadata_writes, [])
+                self.assertEqual(cloud.scripts, [])
+
+    def test_interrupted_deploy_is_concluded_by_the_backstop(self):
+        attempt = Path(self.directory.name) / "attempt.json"
+        cloud = FakeCloud(instances=self.box())
+        self.assertEqual(self.deploy(cloud, "vmd", DEVBOX_ATTEMPT_FILE=str(attempt)), 0)
+        writes = len(cloud.metadata_writes)
+        self.deploy_backstop(cloud, attempt)
+        self.assertEqual(len(cloud.metadata_writes), writes)
+
+        cloud = FakeCloud(instances=self.box(state="deploying"))
+        attempt.write_text(json.dumps({"name": "my-box", "devbox_id": "3f9c0a1b2c4d", "reported": False,
+                                       "progress": {"checked_out": ["sandbox"], "deployed": [],
+                                                    "api_started": False}}))
+        self.deploy_backstop(cloud, attempt)
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["state"], "failed")
+        self.assertEqual(final["deploys"][-1]["result"], "failed")
+        self.assertEqual(final["deploys"][-1]["components"], ["vmd"])
+        self.assertEqual(final["components"]["vmd"], {"branch": "main", "sha": SANDBOX_SHA})
+        self.assertEqual(final["revisions"]["sandbox"], {"branch": "feature", "sha": NEW_SHA})
+        self.assertIn("cancelled or timed out", self.summary.read_text())
+
+    def deploy_backstop(self, cloud, attempt):
+        env = self.env(NAME="my-box", COMPONENTS="vmd", SANDBOX_BRANCH="feature", SANDBOX_SHA=NEW_SHA,
+                       UI_BRANCH="", UI_SHA="", DEVBOX_ATTEMPT_FILE=str(attempt))
+        self.run_with(cloud, workflow.finish_deploy, env, now=lambda: self.NOW)
+
+    def test_box_replaced_between_checkouts_gets_no_second_checkout(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.relabel_after_checkouts = 1
+        self.assertEqual(self.deploy(cloud, "all"), 1)
+        self.assertEqual(cloud.checkouts, [NEW_SHA])
+        self.assertEqual(cloud.scripts, [])
+        self.assertFalse([path for path in cloud.box_files if path.endswith(".env")])
+
+    def test_ui_only_deploy_checks_the_box_scripts_before_changing_anything(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.box_missing = {"install-ui.sh"}
+        with self.assertRaisesRegex(workflow.StepError, "install-ui.sh"):
+            self.deploy(cloud, "ui", SANDBOX_BRANCH="", SANDBOX_SHA="", UI_BRANCH="feature", UI_SHA=NEW_SHA)
+        self.assertEqual(cloud.metadata_writes, [])
+        self.assertEqual(cloud.checkouts, [])
+
+    def test_bad_configuration_is_refused_before_the_box_changes(self):
+        cloud = FakeCloud(instances=self.box())
+        with self.assertRaisesRegex(workflow.StepError, "newline"):
+            self.deploy(cloud, "vmd", DEVBOX_SECRET_STRIPE_SECRET_KEY="sk_test\n")
+        self.assertEqual(cloud.metadata_writes, [])
+        self.assertEqual(cloud.checkouts, [])
+
+    def test_checkout_that_finished_before_a_dropped_connection_is_recorded(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.drop_after_checkout = True
+        self.assertEqual(self.deploy(cloud, "vmd"), 1)
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["state"], "failed")
+        self.assertEqual(final["revisions"]["sandbox"], {"branch": "feature", "sha": NEW_SHA})
+        self.assertEqual(final["components"]["vmd"], {"branch": "main", "sha": SANDBOX_SHA})
+
+    def test_unreadable_checkout_after_a_failure_is_flagged_unconfirmed(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.drop_after_checkout = True
+        cloud.heads_unreadable = True
+        self.assertEqual(self.deploy(cloud, "vmd"), 1)
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["revisions"]["sandbox"], {"branch": "main", "sha": SANDBOX_SHA, "unconfirmed": True})
+        self.assertEqual(final["components"]["vmd"], {"branch": "main", "sha": SANDBOX_SHA})
+
+    def test_full_deploy_after_an_unknown_install_settles_the_box(self):
+        cloud = FakeCloud(instances=self.box(), fail_script="install-vmd.sh")
+        self.assertEqual(self.deploy(cloud, "vmd"), 1)
+        failed = cloud.metadata_writes[-1]
+        self.assertEqual(failed["components"]["vmd"], {"branch": "feature", "sha": "unknown"})
+        cloud.fail_script = None
+        self.assertEqual(self.deploy(cloud, "all"), 0)
+        settled = cloud.metadata_writes[-1]
+        self.assertEqual(settled["state"], "ready")
+        self.assertEqual(settled["components"]["vmd"], {"branch": "feature", "sha": NEW_SHA})
+        self.assertNotIn("unconfirmed", settled["revisions"]["sandbox"])
+
+    def test_install_in_flight_survives_for_the_backstop(self):
+        attempt = Path(self.directory.name) / "attempt.json"
+        cloud = FakeCloud(instances=self.box(), fail_script="install-vmd.sh")
+        original = cloud.ssh
+
+        def killed(args, command, input, ok, fail):
+            if re.search(r"install-vmd\.sh'? 2>&1", unquote(command)):
+                raise KeyboardInterrupt
+            return original(args, command, input, ok, fail)
+
+        cloud.ssh = killed
+        with self.assertRaises(KeyboardInterrupt):
+            with patch.object(workflow, "conclude_deploy", side_effect=KeyboardInterrupt):
+                self.deploy(cloud, "vmd", DEVBOX_ATTEMPT_FILE=str(attempt))
+        saved = json.loads(attempt.read_text())
+        self.assertEqual(saved["progress"]["in_flight"], "vmd")
+        cloud.ssh = original
+        self.deploy_backstop(cloud, attempt)
+        self.assertEqual(cloud.metadata_writes[-1]["components"]["vmd"], {"branch": "feature", "sha": "unknown"})
+
+    def test_failed_box_can_be_redeployed(self):
+        cloud = FakeCloud(instances=self.box(state="failed"))
+        with self.assertRaisesRegex(workflow.StepError, "components=all"):
+            self.deploy(cloud, "ui")
+        self.assertEqual(cloud.metadata_writes, [])
+        self.assertEqual(self.deploy(cloud, "all"), 0)
+        self.assertEqual(cloud.metadata_writes[-1]["state"], "ready")
+        self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["result"], "succeeded")
 
 
 if __name__ == "__main__":
