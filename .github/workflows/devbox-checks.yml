@@ -1,28 +1,35 @@
 name: Devbox Checks
 
 # Devbox changes stay off every deploy trigger path, so their checks live here
-# rather than in ci.yml.
+# rather than in ci.yml. The devbox renders the fleet host bootstrap and reuses
+# the host identity installer, so changes to those run these checks too.
 on:
   pull_request:
     branches: [main]
     paths:
       - 'deploy/devbox/**'
+      - 'deploy/host-bootstrap/**'
+      - 'deploy/install-host-identity.py'
       - '.github/workflows/scripts/devbox*'
       - '.github/workflows/devbox-checks.yml'
       - 'scripts/provision_devbox_stripe.py'
       - 'scripts/test_provision_devbox_stripe.py'
       - 'scripts/provision_storage_stripe.py'
+      - 'scripts/migrate_database.py'
       - 'supabase/migrations/**'
       - 'internal/api/billing_pro_checkout.go'
   push:
     branches: [main]
     paths:
       - 'deploy/devbox/**'
+      - 'deploy/host-bootstrap/**'
+      - 'deploy/install-host-identity.py'
       - '.github/workflows/scripts/devbox*'
       - '.github/workflows/devbox-checks.yml'
       - 'scripts/provision_devbox_stripe.py'
       - 'scripts/test_provision_devbox_stripe.py'
       - 'scripts/provision_storage_stripe.py'
+      - 'scripts/migrate_database.py'
       - 'supabase/migrations/**'
       - 'internal/api/billing_pro_checkout.go'
 
@@ -46,5 +53,11 @@ jobs:
       - name: Run profile tests
         run: python3 -m unittest discover -s deploy/devbox -p 'test_*.py'
 
+      - name: Run services tests
+        run: python3 -m unittest discover -s deploy/devbox/services -p 'test_*.py'
+
       - name: Run Stripe catalog bootstrap tests
         run: python3 -m unittest discover -s scripts -p 'test_provision_devbox_stripe.py'
+
+      - name: Check devbox shell scripts
+        run: find deploy/devbox -name '*.sh' -print0 | xargs -0 -r shellcheck -x -P SCRIPTDIR

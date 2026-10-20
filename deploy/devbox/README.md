@@ -27,8 +27,9 @@ The workflows cannot create a box until they are complete.
 - the VM identity `superserve-devbox-vm`, which has no project roles. It has
   object access in buckets named `superserve-devbox-*` (shared by all boxes)
   and read-only access to the hostprep bucket below;
-- a reCAPTCHA Enterprise score key that allows `localhost` and an API key
-  restricted to the reCAPTCHA Enterprise API.
+- a reCAPTCHA Enterprise score key without domain checks (boxes are only
+  reached through local port forwarding; it is a development key) and an API
+  key restricted to the reCAPTCHA Enterprise API.
 
 The project also runs staging, so the workflow identity's rights to modify,
 SSH into or delete anything are conditioned on resource names: VMs and disks
@@ -39,77 +40,88 @@ so they are granted unconditionally; none of them can change an existing
 resource, but listing does return every instance's metadata, so staging
 instance metadata must never hold secrets. IAP forwarding is granted for port
 22 on any VM in the project, including staging hosts; logging in still needs
-OS Login rights that only exist on `devbox-*` VMs.
+OS Login rights, which the workflow identity only holds on `devbox-*` VMs.
+OS Login does not honour the name condition (for the federated workflow
+identity it checks the instance by numeric ID), so the create workflow binds
+login per instance right after creating the VM (its `setIamPolicy` right is
+itself limited to `devbox-*` VMs): `roles/compute.osAdminLogin`, which
+includes sudo, for the workflow identity and for the members in
+`DEVBOX_GCP_ENGINEER_MEMBERS`. These bindings live on the VM and go away when
+it is destroyed; a box created before this has none and must be recreated.
 
-Set `engineer_members` (for example `["group:engineers@example.com"]`) to the
-principals who may open tunnels to boxes, then plan and review:
+Set `engineer_members` in `terraform.tfvars` (for example
+`["group:engineers@example.com"]`) to the principals who may reach boxes; it
+grants them IAP tunnelling on port 22 and use of the box identity, which OS
+Login on these VMs requires. Put the same members in the
+`DEVBOX_GCP_ENGINEER_MEMBERS` environment variable (step 3), from which each
+new box grants them login. The root has its own state prefix
+(`devbox/us-central1`) and lives outside `infra/`, so no staging or production
+deploy workflow runs on it. Instead, the Devbox Terraform workflow
+(`.github/workflows/devbox-terraform.yml`) plans it on every pull request that
+changes it and applies it when the change merges to `main`. It runs as the
+staging Terraform identity, `superserve-github-actions`. An apply whose plan
+would delete or replace anything stops; if that is intentional, dispatch the
+workflow from `main` with `allow_destroy`.
+
+Once, before the first apply, grant the staging Terraform identity the roles
+for the resource types only this root manages:
 
 ```sh
-terraform -chdir=deploy/devbox/terraform init
-terraform -chdir=deploy/devbox/terraform plan -out=tfplan
+for role in roles/iam.workloadIdentityPoolAdmin roles/recaptchaenterprise.admin roles/serviceusage.apiKeysAdmin; do
+  gcloud projects add-iam-policy-binding rayai-dev --condition=None \
+    --member=serviceAccount:superserve-github-actions@rayai-dev.iam.gserviceaccount.com --role="$role"
+done
 ```
 
-The plan must only create resources; it has its own state prefix
-(`devbox/us-central1`) and touches nothing in the staging or production roots.
-Apply the saved plan from the same root:
+Everything else it needs it already holds. The staging root uses its rights
+over service accounts, custom roles, project IAM, firewall rules, buckets,
+API enablement and the state bucket, and `roles/compute.networkAdmin` covers
+subnet IAM, routers and NAT. If the first apply still fails on a permission,
+grant that one and rerun the workflow. These grants give every workflow that
+runs as the staging Terraform identity, including pull request plans, the
+same reach; that identity can already change project IAM.
 
-```sh
-terraform -chdir=deploy/devbox/terraform apply tfplan
-```
-
-The applier needs project owner (`roles/owner`) on the devbox project and
-object access to the `superserve-terraform-state` bucket. The root lives
-outside `infra/` so that no deploy workflow ever runs on it; it is only ever
-applied by hand.
+Break glass: with project owner and access to the state bucket, the same root
+can be applied by hand from the repository root with
+`terraform -chdir=deploy/devbox/terraform init`, then `plan -out=tfplan`, then
+`apply tfplan`.
 
 Before the first box, confirm that no organization policy blocks nested
 virtualization (`constraints/compute.disableNestedVirtualization`) or OS Login
-for service accounts in the project. OS Login is expected to honour the
-name-conditioned login grant; check it once on the first box with
-`gcloud compute ssh devbox-<name> --tunnel-through-iap` as an engineer.
+for service accounts in the project.
 
 ### 2. Seed the host artifacts
 
 Terraform also creates `gs://rayai-dev-devbox-hostprep`, which boxes read the
 guest kernel and base rootfs from at bootstrap. Its name is deliberately
 outside `superserve-devbox-*`, so box destroy and the box's object grant never
-match it. Boxes have read-only access and the workflow identity has none;
-only an operator uploads.
+match it. Boxes can only read it. Apart from principals with project-wide
+storage rights, only the staging Terraform identity can write it, through the
+Devbox Hostprep Seed workflow.
 
-Copy the guest kernel and base rootfs from staging Host 1 once, while no VMD
-deploy is running. The kernel is never modified and must match the SHA-256
-recorded in the [Host 2 identity runbook](../host2-identity-runbook.md);
-stop if it does not. VMD deploys that change boxd re-inject it into the
-host's `base.ext4`, so its digest may legitimately differ from the runbook's
-`7494f228...`; any staging copy works because each box injects the boxd of its
-selected revision. The commands below check that the rootfs did not change
-during the copy and print its digest.
-
-```sh
-set -euo pipefail
-work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
-ssh1() { gcloud compute ssh superserve-vmd-staging --project=rayai-dev --zone=us-central1-a --tunnel-through-iap --quiet --command="set -eu; $1" -- -T; }
-before=$(ssh1 'sudo sha256sum /var/lib/sandbox/rootfs/base.ext4' | cut -d' ' -f1)
-ssh1 'sudo cat /var/lib/sandbox/kernel/vmlinux-4.14-fuse' > "$work/vmlinux-4.14-fuse"
-ssh1 'sudo cat /var/lib/sandbox/rootfs/base.ext4' > "$work/base.ext4"
-(cd "$work" && sha256sum -c <<'HASHES'
-3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761  vmlinux-4.14-fuse
-HASHES
-)
-rootfs=$(sha256sum "$work/base.ext4" | cut -d' ' -f1)
-[ "$rootfs" = "$before" ] || { echo "base.ext4 changed during the copy; rerun" >&2; exit 1; }
-gcloud storage cp "$work/vmlinux-4.14-fuse" "$work/base.ext4" gs://rayai-dev-devbox-hostprep/hostprep/
-echo "base.ext4 sha256: $rootfs"
-```
+Dispatch Devbox Hostprep Seed (`.github/workflows/devbox-hostprep.yml`) from
+`main` once, preferably while no VMD deploy is running. It copies the guest
+kernel and base rootfs from staging Host 1 (the `host` input's default) over
+IAP SSH, only reading the host: no staging bucket holds an established copy of
+these files, so Host 1's files are the source, as the
+[Host 2 identity runbook](../host2-identity-runbook.md) also directs. The
+kernel is never modified and must match the SHA-256 recorded there, or the job
+stops. The rootfs is rewritten with the current boxd by every VMD deploy that
+changes boxd, so the copy includes that boxd and its digest can differ from
+the runbook's; a box's own VMD install replaces boxd anyway. The job reads each
+file once on the host, hashing exactly the bytes it sends, and accepts the
+copy only if the open file was not written during that read (a deploy
+renaming a new rootfs into place is fine) and the received bytes match the
+digest and size. It tries up to three times, then uploads both files and
+shows the rootfs digest in its summary.
 
 Boxes verify both files against SHA-256 pins after download; the host
 bootstrap keeps them as `DEVBOX_KERNEL_DIGEST` and `DEVBOX_ROOTFS_DIGEST` in
 `deploy/devbox/runtime-pins.env`, added together with the box scripts. If the
-printed rootfs digest differs from that pin, update the pin to it; boxes created before the new pin reaches `main` fail
-verification and should be recreated afterwards. The upload overwrites any
-earlier copy so the bucket always holds the digest just printed; the bucket
-keeps object versions, so an overwritten copy can be recovered.
+summary's rootfs digest differs from that pin, update the pin to it; boxes
+created before the new pin reaches `main` fail verification and should be
+recreated afterwards. Each run overwrites the earlier copy; the bucket keeps
+object versions, so an overwritten copy can be recovered.
 
 ### 3. Create the `devbox` GitHub environment
 
@@ -134,6 +146,7 @@ Variables:
 | `DEVBOX_GCP_PROJECT` | devbox project ID |
 | `DEVBOX_GCP_WORKLOAD_IDENTITY` | full provider name, `projects/<number>/locations/global/workloadIdentityPools/superserve-devbox-github/providers/github` |
 | `DEVBOX_GCP_SERVICE_ACCOUNT` | `superserve-devbox-ci@<project>.iam.gserviceaccount.com` |
+| `DEVBOX_GCP_ENGINEER_MEMBERS` | the Terraform `engineer_members`, comma-separated (for example `group:engineers@example.com`); each new box grants them OS Login with sudo. Left empty, boxes are created with a warning and only the workflow identity can log in |
 | `DEVBOX_CONFIG_RECAPTCHA_SITE_KEY` | reCAPTCHA key ID |
 | `DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID` | devbox project ID |
 | `DEVBOX_CONFIG_STRIPE_API_VERSION` | `2026-05-27.dahlia`, the version staging pins |
@@ -142,14 +155,13 @@ Variables:
 | `DEVBOX_CONFIG_STRIPE_PRO_ANNUAL_PRICE_ID` | devbox sandbox Pro annual price ID (step 4) |
 | `DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG` | resource-to-meter-and-price mapping JSON (step 4) |
 
-The first five come from
-`terraform -chdir=deploy/devbox/terraform output github_environment_variables`.
+The first five are in the Devbox Terraform apply's job summary.
 
 Secrets:
 
 | Secret | Value |
 | --- | --- |
-| `DEVBOX_SECRET_RECAPTCHA_API_KEY` | `terraform -chdir=deploy/devbox/terraform output -raw recaptcha_api_key` |
+| `DEVBOX_SECRET_RECAPTCHA_API_KEY` | `gcloud services api-keys get-key-string projects/rayai-dev/locations/global/keys/superserve-devbox-recaptcha --format='value(keyString)'` (only the `AIza…` string, with no `keyString:` prefix or trailing space) |
 | `DEVBOX_SECRET_STRIPE_SECRET_KEY` | devbox Stripe sandbox secret key (step 4) |
 
 The console repository `superserve-ai/superserve` is public, so the box
@@ -230,3 +242,146 @@ mounted at `/mnt/sandbox-data`, OS Login, the devbox network tag and VM identity
 private bucket with uniform access, public access prevention and no soft
 delete retention. Its names, zone, region, network tag and VM identity must match the Terraform
 IAM conditions and firewall; `test_profile.py` checks that.
+
+## Create a devbox
+
+Run **Devbox Create** (`.github/workflows/devbox-create.yml`) from `main`:
+
+```sh
+gh workflow run devbox-create.yml --repo superserve-ai/sandbox --ref main \
+  -f sandbox_branch=main -f ui_branch=main -f lifetime_hours=24
+```
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `sandbox_branch` | `main` | Branch of `superserve-ai/sandbox` to build VMD, proxy and API from |
+| `ui_branch` | `main` | Branch of `superserve-ai/superserve` to build the console from |
+| `name` | generated | 2-40 lowercase letters, digits or hyphens, starting with a letter. Blank generates `<owner>-dev-<6 hex>` from your GitHub login. A name already in use is refused |
+| `lifetime_hours` | `24` | 1 to 168. The box is deleted when it expires; lifetimes cannot be extended |
+
+Each branch is resolved once to an exact commit, and every later step uses
+that commit. Before taking any cloud action, the workflow checks the profile
+and that the selected sandbox commit contains every box script it will run.
+It then:
+
+1. creates the data disk `devbox-<name>-data`, the VM `devbox-<name>` (boot
+   disk of the same name) from `profile.json`, and the bucket
+   `superserve-devbox-<devbox-id>`, all labelled `managed-by`,
+   `devbox-name`, `devbox-id`, `owner` and `expires-at`. It then grants, on
+   that VM only, OS Login with sudo (`roles/compute.osAdminLogin`) to the
+   workflow identity, because OS Login doesn't honour the name-prefix condition
+   on its project role, and to every member of `DEVBOX_GCP_ENGINEER_MEMBERS`,
+   so engineers can read logs and restart services on any devbox. If that variable
+   is empty, the run warns that no engineer can reach the box. These grants go
+   away when the VM is destroyed. Keep `DEVBOX_GCP_ENGINEER_MEMBERS` the same as
+   Terraform's `engineer_members`: Terraform grants the IAP tunnel, and this
+   grants the login, so a member in only one of them can't connect;
+2. writes the manifest (state `creating`) to the VM's `devbox-manifest`
+   metadata key as part of creating the VM, so even a failed box can be found
+   and cleaned up;
+3. waits for SSH over IAP, checks out both commits on the box under
+   `/opt/superserve-devbox/src/{sandbox,superserve}`, and writes
+   `/etc/superserve-devbox/devbox.env` and, over SSH stdin,
+   `/etc/superserve-devbox/secrets.env` (mode 0600). Each `devbox`
+   environment secret `DEVBOX_SECRET_<NAME>` becomes `<NAME>` in
+   `secrets.env`, and each variable `DEVBOX_CONFIG_<NAME>` becomes `<NAME>` in
+   `devbox.env`. The workflow refuses to run if any value it forwards is unset;
+4. runs, as root on the box and from the checked-out sandbox commit,
+   `host-bootstrap.sh`, `services-up.sh`, `install-api.sh`,
+   `install-vmd.sh`, `install-proxy.sh`, `seed-base.sh` and `install-ui.sh`
+   (VMD needs the database and API on a fresh host), logging each to
+   `/var/log/superserve-devbox/<script>.log`;
+5. merges `/var/lib/superserve-devbox/runtime.json` and `services.json`
+   into the manifest, sets state `ready`, and copies the manifest to
+   `/etc/superserve-devbox/manifest.json`.
+
+The run summary shows the name, zone, owner, expiry, commits, the manifest,
+the port-forwarding command, log access and the destroy command. To use a
+box, run the forwarding command and keep it open:
+
+```sh
+gcloud compute ssh devbox-<name> --zone=us-central1-a --project=rayai-dev \
+  --tunnel-through-iap -- -N -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 \
+  -L 54321:127.0.0.1:54321 -L 8025:127.0.0.1:8025 -L 8090:127.0.0.1:8090
+```
+
+Then open the console at http://localhost:3000 and Mailpit at
+http://localhost:8025. The API is on 8080, the auth/data gateway on 54321 and
+the sandbox proxy on 8090 (sandbox hosts are `*.sandbox.localhost:8090`).
+
+If any step fails, times out or is cancelled, the run fails, sets state
+`failed` on the VM when it exists, and lists every resource of the attempt it
+finds by `devbox-id` label or name. A failed box is never reported
+as ready; destroy it and create a new one.
+
+## Deploy to a devbox
+
+Run **Devbox Deploy** (`.github/workflows/devbox-deploy.yml`) from `main` to
+move an existing box to other revisions, for example to test an upgrade from
+`main` to a branch:
+
+```sh
+gh workflow run devbox-deploy.yml --repo superserve-ai/sandbox --ref main \
+  -f name=<name> -f sandbox_branch=my-feature -f components=all
+```
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `name` | required | The devbox name (without the `devbox-` prefix) |
+| `sandbox_branch` | `main` | Used when `vmd`, `proxy` or `api` is selected |
+| `ui_branch` | `main` | Used when `ui` is selected |
+| `components` | `all` | `all`, or a comma-separated subset of `vmd`, `proxy`, `api`, `ui` |
+
+The box is found by its labels, not by name prefix, and must be `ready` or
+`failed`, have finished its first install, and not be expired. The workflow
+sets state `deploying`, checks out the new commit of each repository the
+selected components are built from, and reruns the same box scripts the
+create workflow uses, in the production upgrade order: `install-vmd.sh`,
+`install-proxy.sh`, `services-up.sh` and `install-api.sh` (both for `api`),
+then `install-ui.sh`. `install-api.sh` applies pending
+database migrations forward to the existing database; a failing migration
+stops the deploy. There is no rollback or downgrade: deploy a fixed revision
+instead. Existing sandboxes and data are kept.
+
+Each deploy, successful or not, is appended to the manifest's `deploys` with
+the actor, the requested components, the previous record (`from`) and the
+targeted commits (`to`), the migration result
+(`applied`, `none`, `failed` or `unknown`) and the outcome (`succeeded` or `failed`).
+Only components whose install finished move in the manifest's `components`,
+and `revisions` moves only for checkouts confirmed at the new commit, so a
+deploy that fails partway never records progress it can't confirm. After a
+failure the workflow reads the box's checkouts once: a checkout it can't read
+keeps its previous revision marked `unconfirmed`, and the component whose
+install was running when the deploy stopped is recorded with SHA `unknown`. The migration result
+comes from the report `install-api.sh` writes for the deployed commit
+(`/var/lib/superserve-devbox/api-deploy.json`). It is `none` when `install-api.sh`
+didn't run, and `unknown` when it ran but left no readable report for that
+commit, for example when the run was cancelled mid-migration.
+`expires-at` never changes. The run summary shows previous and new commits per
+component, the migration result, service readiness and log access. A failed
+deploy leaves the box in state `failed`, possibly partly upgraded. Recover it
+with `components=all` and the branches it should run, which reinstalls
+everything and returns it to `ready`; a partial deploy to a failed box is
+refused. `seed-base.sh` is not rerun.
+
+## Workflow safety
+
+- Create, deploy and destroy for one box share the concurrency group
+  `devbox-<name>` with `queue: max`, so they run one at a time in the order
+  they were started and none is cancelled for another. Each
+  re-reads the box's labels before writing and stops if its `devbox-id`
+  changed.
+- The workflows refuse to run from any ref but `main`; the `devbox`
+  environment and its Workload Identity Federation provider enforce the same.
+- The runner only resolves branches, provisions, labels, writes metadata and
+  connects over IAP SSH. Code from the selected branches is checked out and
+  built on the box, never on the runner, and the box's service account has no
+  project permissions beyond object access in devbox buckets.
+
+### Verified only on a real box
+
+The unit tests (`.github/workflows/scripts/test_devbox_*.py`) cover naming,
+lifetime bounds, branch handling, labels, the manifest and the order of cloud
+calls with `gcloud` mocked. IAP
+reachability, OS Login, on-box checkouts and the box scripts themselves are
+exercised by the end-to-end smoke run.

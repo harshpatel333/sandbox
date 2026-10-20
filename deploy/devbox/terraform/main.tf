@@ -176,6 +176,9 @@ resource "google_service_account_iam_member" "ci_workload_identity" {
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository_id/${var.github_repository_id}"
 }
 
+# OS Login does not honour the name condition on these grants, so the create
+# workflow also binds roles/compute.osAdminLogin on each new instance itself;
+# getIamPolicy and setIamPolicy below allow that, on devbox instances only.
 resource "google_project_iam_custom_role" "lifecycle" {
   project     = var.project_id
   role_id     = "superserveDevboxLifecycle"
@@ -191,9 +194,11 @@ resource "google_project_iam_custom_role" "lifecycle" {
     "compute.instances.create",
     "compute.instances.delete",
     "compute.instances.get",
+    "compute.instances.getIamPolicy",
     "compute.instances.getSerialPortOutput",
     "compute.instances.osAdminLogin",
     "compute.instances.osLogin",
+    "compute.instances.setIamPolicy",
     "compute.instances.setLabels",
     "compute.instances.setMetadata",
     "compute.instances.setServiceAccount",
@@ -343,13 +348,14 @@ resource "google_project_iam_member" "box_bucket_objects" {
 
 resource "google_recaptcha_enterprise_key" "devbox" {
   project      = var.project_id
-  display_name = "superserve-devbox-localhost"
+  display_name = "superserve-devbox"
   labels       = local.labels
 
+  # Boxes are only reached through local port forwarding, so the key is not
+  # bound to a domain; it is a development key with no production use.
   web_settings {
     integration_type  = "SCORE"
-    allow_all_domains = false
-    allowed_domains   = ["localhost"]
+    allow_all_domains = true
   }
 
   depends_on = [google_project_service.required]
@@ -371,7 +377,7 @@ resource "google_apikeys_key" "recaptcha" {
 
 # Verified guest kernel and base rootfs that boxes fetch at bootstrap. Its name
 # deliberately falls outside bucket_name_prefix, so neither the box's object
-# grant nor box destroy can match it; operators upload, boxes only read.
+# grant nor box destroy can match it; only the seeder writes, boxes only read.
 resource "google_storage_bucket" "hostprep" {
   project                     = var.project_id
   name                        = var.hostprep_bucket
@@ -396,4 +402,10 @@ resource "google_storage_bucket_iam_member" "box_hostprep_read" {
   bucket = google_storage_bucket.hostprep.name
   role   = "roles/storage.objectViewer"
   member = local.box_member
+}
+
+resource "google_storage_bucket_iam_member" "hostprep_seeder" {
+  bucket = google_storage_bucket.hostprep.name
+  role   = "roles/storage.objectAdmin"
+  member = var.hostprep_seeder
 }
