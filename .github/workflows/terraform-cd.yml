@@ -27,7 +27,33 @@ env:
   TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
 
 jobs:
+  release-scope:
+    name: Classify the one-time East issuance enablement
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      east_usage_only: ${{ steps.scope.outputs.east_usage_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect the separately approved East-only release
+        id: scope
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/east_usage_entitlements_release.py landing \
+            --before "$BEFORE" --after "$AFTER" >> "$GITHUB_OUTPUT"
+      - name: Hold automatic rollout for the East-only release
+        if: steps.scope.outputs.east_usage_only == 'true'
+        run: echo 'East issuance source landed. All automatic applies and image deployments are held for separate plan approval.' >> "$GITHUB_STEP_SUMMARY"
+
   wait-for-migrations:
+    needs: [release-scope]
+    if: needs.release-scope.outputs.east_usage_only == 'false'
     uses: ./.github/workflows/deployment-migrations.yml
     permissions:
       contents: read
@@ -493,6 +519,9 @@ jobs:
   # against that cell.
   production-us-east4-infra:
     name: Apply production/us-east4
+    # Clear only after the separately approved flag apply and runtime verification.
+    # Default closed also protects later pushes during the enablement window.
+    if: vars.EAST_USAGE_ENTITLEMENTS_APPLIED == 'true'
     runs-on: ubuntu-latest
     environment: production
     needs: [staging-us-central1-api, production-us-central1-bootstrap]
