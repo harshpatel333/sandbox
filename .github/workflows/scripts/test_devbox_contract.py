@@ -216,10 +216,13 @@ class ManifestTests(unittest.TestCase):
         target = {"sandbox": {"branch": "feature", "sha": SHA_C}}
         after = contract.record_deploy(manifest(), at=at, actor="x", components=["vmd", "api"], revisions=target,
                                        migrations="unknown", result="failed", checked_out=[], deployed=[],
-                                       unconfirmed=["sandbox"], in_flight="vmd")
+                                       unconfirmed=["sandbox"])
         self.assertEqual(after["revisions"]["sandbox"], {"branch": "main", "sha": SHA_A, "unconfirmed": True})
-        self.assertEqual(after["components"]["vmd"], {"branch": "feature", "sha": "unknown"})
-        self.assertEqual(after["components"]["api"], {"branch": "main", "sha": SHA_A})
+        running = contract.record_deploy(manifest(), at=at, actor="x", components=["vmd", "api"], revisions=target,
+                                         migrations="unknown", result="failed", checked_out=["sandbox"],
+                                         deployed=[], in_flight="vmd")
+        self.assertEqual(running["components"]["vmd"], {"branch": "feature", "sha": "unknown"})
+        self.assertEqual(running["components"]["api"], {"branch": "main", "sha": SHA_A})
         for overrides in ({"result": "succeeded", "checked_out": ["sandbox"], "deployed": ["vmd", "api"]},
                           {"checked_out": ["sandbox"]}, {"in_flight": "ui"}):
             arguments = {"at": at, "actor": "x", "components": ["vmd", "api"], "revisions": target,

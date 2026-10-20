@@ -346,8 +346,10 @@ def record_deploy(manifest, *, at, actor, components, revisions, migrations, res
     unconfirmed = set(unconfirmed)
     if unconfirmed & checked_out or not unconfirmed <= repositories:
         raise ContractError("Unconfirmed repositories must be targeted and not confirmed checked out")
-    if in_flight is not None and (in_flight not in components or in_flight in deployed):
-        raise ContractError(f"In-flight component {in_flight!r} must be targeted and not deployed")
+    if in_flight is not None and (in_flight not in components or in_flight in deployed
+                                  or COMPONENT_REPOSITORIES[in_flight] not in checked_out):
+        raise ContractError(f"In-flight component {in_flight!r} must be targeted, not deployed, "
+                            "and built from a checked-out repository")
     if result == "succeeded" and (checked_out != repositories or deployed != set(components)
                                   or unconfirmed or in_flight is not None):
         raise ContractError("A succeeded deploy must have checked out and deployed everything it targeted")

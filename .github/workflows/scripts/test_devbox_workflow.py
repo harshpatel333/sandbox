@@ -648,6 +648,26 @@ class DeployTests(WorkflowCase):
         self.assertEqual(settled["components"]["vmd"], {"branch": "feature", "sha": NEW_SHA})
         self.assertNotIn("unconfirmed", settled["revisions"]["sandbox"])
 
+    def test_install_in_flight_survives_for_the_backstop(self):
+        attempt = Path(self.directory.name) / "attempt.json"
+        cloud = FakeCloud(instances=self.box(), fail_script="install-vmd.sh")
+        original = cloud.ssh
+
+        def killed(args, command, input, ok, fail):
+            if re.search(r"install-vmd\.sh'? 2>&1", unquote(command)):
+                raise KeyboardInterrupt
+            return original(args, command, input, ok, fail)
+
+        cloud.ssh = killed
+        with self.assertRaises(KeyboardInterrupt):
+            with patch.object(workflow, "conclude_deploy", side_effect=KeyboardInterrupt):
+                self.deploy(cloud, "vmd", DEVBOX_ATTEMPT_FILE=str(attempt))
+        saved = json.loads(attempt.read_text())
+        self.assertEqual(saved["progress"]["in_flight"], "vmd")
+        cloud.ssh = original
+        self.deploy_backstop(cloud, attempt)
+        self.assertEqual(cloud.metadata_writes[-1]["components"]["vmd"], {"branch": "feature", "sha": "unknown"})
+
     def test_failed_box_can_be_redeployed(self):
         cloud = FakeCloud(instances=self.box(state="failed"))
         with self.assertRaisesRegex(workflow.StepError, "components=all"):

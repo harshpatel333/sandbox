@@ -325,7 +325,8 @@ stops the deploy. There is no rollback or downgrade: deploy a fixed revision
 instead. Existing sandboxes and data are kept.
 
 Each deploy, successful or not, is appended to the manifest's `deploys` with
-the actor, components, previous and new commits, the migration result
+the actor, the requested components, the previous record (`from`) and the
+targeted commits (`to`), the migration result
 (`applied`, `none`, `failed` or `unknown`) and the outcome (`succeeded` or `failed`).
 Only components whose install finished move in the manifest's `components`,
 and `revisions` moves only for checkouts confirmed at the new commit, so a
