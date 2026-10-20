@@ -51,6 +51,72 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
         with patch.object(regional, "verify_connection_identity"), contextlib.redirect_stdout(io.StringIO()):
             regional.migrate("use4", "push", self.url, root=root, cli=cli_test.CLI)
 
+    def apply_approvals(self, execute=True):
+        return shared.apply(self.conn, "use4", self.revision, shared.approval_source(), execute, "approvals")
+
+    def test_approval_requires_claims_and_preserves_receipts(self):
+        self.assertEqual(self.apply_approvals(False)["state"], "pending")
+        with self.assertRaisesRegex(shared.SharedMigrationError, "claims_migration_required"):
+            self.apply_approvals()
+        self.apply()
+        with self.assertRaisesRegex(shared.SharedMigrationError, "claims_migration_required"):
+            self.apply_approvals()
+        self.apply_claims()
+        before = self.history()
+        prior = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
+        self.assertEqual(self.apply_approvals(False)["state"], "pending")
+        self.assertEqual(self.apply_approvals()["state"], "applied")
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m WHERE version<>'{shared.APPROVAL_VERSION}' ORDER BY version"), prior)
+        receipt = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
+        self.assertEqual(self.apply_approvals()["state"], "applied")
+        self.assertEqual(self.apply_claims(False)["state"], "applied")
+        self.assertEqual(self.apply(False)["state"], "applied")
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version"), receipt)
+
+    def test_approval_failure_and_drift_preserve_history(self):
+        self.apply()
+        self.apply_claims()
+        prior = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
+        with patch.object(shared, "approval_catalog", side_effect=shared.SharedMigrationError("injected_snapshot_failure")):
+            with self.assertRaisesRegex(shared.SharedMigrationError, "injected_snapshot_failure"):
+                self.apply_approvals()
+        self.assertFalse(shared.approval_objects_present(self.conn))
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version"), prior)
+        self.apply_approvals()
+        for sql in (
+            "ALTER TABLE public.yc_claim ADD COLUMN unexpected text",
+            "ALTER TABLE public.yc_claim ALTER COLUMN acceptance_required SET DEFAULT true",
+            "DROP INDEX public.yc_claim_approval_mail_pending",
+            "ALTER FUNCTION public.yc_claim_view(public.yc_claim) VOLATILE",
+            "ALTER FUNCTION public.yc_claim_rpc(text,jsonb) STABLE",
+        ):
+            with self.conn.transaction(force_rollback=True):
+                self.conn.execute(sql)
+                with self.assertRaisesRegex(shared.SharedMigrationError, "catalog_mismatch"):
+                    self.apply_approvals()
+        with self.conn.transaction(force_rollback=True):
+            self.conn.execute("GRANT SELECT (approved_email) ON public.yc_claim_approval_mail TO service_role")
+            with self.assertRaisesRegex(shared.SharedMigrationError, "approval_table_privileges"):
+                self.apply_approvals()
+        self.assertEqual(self.apply_approvals(False)["state"], "applied")
+
+    def test_approval_source_grants_and_unrecorded_schema(self):
+        self.apply()
+        self.apply_claims()
+        with self.assertRaisesRegex(shared.SharedMigrationError, "source_hash_mismatch"):
+            shared.apply(self.conn, "use4", self.revision, shared.approval_source() + "\n", True, "approvals")
+        with self.conn.transaction(force_rollback=True):
+            self.conn.execute(shared.approval_execution(shared.approval_source()))
+            with self.assertRaisesRegex(shared.SharedMigrationError, "catalog_mismatch|schema_without_shared_history"):
+                self.apply_approvals()
+        self.sql("ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public "
+                 "GRANT ALL ON TABLES TO anon,authenticated,service_role,promotion_evidence_proxy; "
+                 "ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public "
+                 "GRANT ALL ON FUNCTIONS TO anon,authenticated,service_role,promotion_evidence_proxy;")
+        self.apply_approvals()
+        shared.verify_approval_permissions(self.conn)
+
     def test_apply_retry_and_regional_deployment_preserve_history(self):
         self.regional_push()
         before = self.history()

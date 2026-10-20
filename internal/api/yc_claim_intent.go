@@ -15,6 +15,10 @@ import (
 // A timeout never removes either fence; an audited rejection can release local
 // plan selection only after the shared authority has been revoked.
 func (h *Handlers) ycBindWithIntent(ctx context.Context, op string, p gin.H) (json.RawMessage, error) {
+	return h.ycBindWithIntentRPC(ctx, op, p, h.ycClaimRPC)
+}
+
+func (h *Handlers) ycBindWithIntentRPC(ctx context.Context, op string, p gin.H, rpc func(context.Context, string, any) (json.RawMessage, error)) (json.RawMessage, error) {
 	team := p["team_id"]
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
@@ -53,7 +57,7 @@ func (h *Handlers) ycBindWithIntent(ctx context.Context, op string, p gin.H) (js
 	if op == "approve" {
 		prepare = "prepare-approve"
 	}
-	out, err := h.ycClaimRPC(ctx, prepare, p)
+	out, err := rpc(ctx, prepare, p)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +87,7 @@ func (h *Handlers) ycBindWithIntent(ctx context.Context, op string, p gin.H) (js
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return h.ycClaimRPC(ctx, op, p)
+	return rpc(ctx, op, p)
 }
 
 // Wait for an admission transaction even if its intent row is not visible yet.

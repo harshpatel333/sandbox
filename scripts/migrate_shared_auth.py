@@ -48,6 +48,13 @@ FROM anon,authenticated,service_role,promotion_evidence_proxy;
 """
 
 
+APPROVAL_VERSION = "20261020224623"
+APPROVAL_NAME = "yc_staff_claim_approval_notification"
+APPROVAL_HASH = "bc797a0dd6098d6166f1cbb402d77fb6c8eb925210492fbf1214944f07ea133b"
+APPROVAL_TABLES = ("public.yc_claim_approval_mail", "public.yc_staff_claim_request")
+APPROVAL_FUNCTIONS = ("public.yc_staff_claim_rpc(text,jsonb)", "public.yc_claim_approval_mail_rpc(text,jsonb)")
+
+
 class SharedMigrationError(Exception):
     pass
 
@@ -78,6 +85,72 @@ def claim_execution(sql):
     return sql[len(prefix):-len("COMMIT;\n")] + CLAIM_ACL_SQL
 
 
+def approval_source(root=ROOT):
+    data = (root / "supabase/shared-auth-migrations" / f"{APPROVAL_VERSION}_{APPROVAL_NAME}.sql").read_bytes()
+    require(hashlib.sha256(data).hexdigest() == APPROVAL_HASH, "source_hash_mismatch")
+    return data.decode("utf-8")
+
+
+def approval_execution(sql):
+    require(hashlib.sha256(sql.encode()).hexdigest() == APPROVAL_HASH, "source_hash_mismatch")
+    prefix = "-- Shared Auth only. Staff eligibility remains separate from customer acceptance.\nBEGIN;\n"
+    require(sql.startswith(prefix) and sql.endswith("COMMIT;\n"), "approval_transaction_wrapper_mismatch")
+    return sql[len(prefix):-len("COMMIT;\n")]
+
+
+def approval_objects_present(conn):
+    return conn.execute("""SELECT
+        EXISTS(SELECT FROM unnest(%s::text[]) t WHERE to_regclass(t) IS NOT NULL)
+        OR EXISTS(SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+                  WHERE n.nspname='public' AND p.proname=ANY(%s))
+        OR EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass('public.yc_claim')
+                  AND attname='acceptance_required' AND NOT attisdropped)""",
+        (list(APPROVAL_TABLES), [f.split('.')[1].split('(')[0] for f in APPROVAL_FUNCTIONS])).fetchone()[0]
+
+
+def approval_catalog(conn):
+    return {
+        "claims": claim_catalog(conn),
+        "tables": {table: catalog(conn, table, APPROVAL_FUNCTIONS if i == 0 else ())
+                   for i, table in enumerate(APPROVAL_TABLES)},
+        "indexes": conn.execute("""SELECT jsonb_agg(pg_get_indexdef(i.indexrelid) ORDER BY c.relname)
+            FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+            WHERE i.indrelid=ANY(SELECT to_regclass(t) FROM unnest(%s::text[]) t)""",
+            (list(APPROVAL_TABLES),)).fetchone()[0],
+    }
+
+
+def verify_approval_permissions(conn):
+    verify_claim_permissions(conn)
+    for table in APPROVAL_TABLES:
+        require(conn.execute("SELECT relkind='r' AND relrowsecurity AND relowner='postgres'::regrole "
+                             "FROM pg_class WHERE oid=%s::regclass", (table,)).fetchone()[0],
+                "approval_table_security_mismatch")
+        for role in ROLES:
+            require(not conn.execute("SELECT has_table_privilege(%s,%s,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
+                                     "OR has_any_column_privilege(%s,%s,'SELECT,INSERT,UPDATE,REFERENCES')",
+                                     (role, table, role, table)).fetchone()[0], "approval_table_privileges_mismatch")
+    for function in APPROVAL_FUNCTIONS:
+        for role in ROLES:
+            allowed = conn.execute("SELECT has_function_privilege(%s,%s,'EXECUTE')", (role, function)).fetchone()[0]
+            require(allowed == (role == "promotion_evidence_proxy"), "approval_rpc_privileges_mismatch")
+
+
+def predecessor_claim_catalog(conn, recorded):
+    # Preserve the original receipt while allowing only this migration's two
+    # deliberate replacements. The approval receipt verifies the full new view
+    # and column, including all other claim definitions and privileges.
+    current = claim_catalog(conn)
+    table = current["tables"]["public.yc_claim"]
+    table["columns"] = [column for column in table["columns"] if column[0] != "acceptance_required"]
+    prior_functions = recorded["tables"]["public.yc_claim"]["functions"]
+    for function in table["functions"]:
+        if function[0] == "yc_claim_view(yc_claim)":
+            old = next(f for f in prior_functions if f[0] == function[0])
+            function[1] = old[1]
+    return current
+
+
 def ordinary_history(conn):
     return conn.execute("SELECT version,name,statements FROM supabase_migrations.schema_migrations ORDER BY version").fetchall()
 
@@ -93,7 +166,7 @@ def prerequisites(conn, target):
     require(conn.execute("SELECT count(*) FROM pg_roles WHERE rolname=ANY(%s)", (list(ROLES),)).fetchone()[0] == len(ROLES),
             "required_roles_missing")
     rows = ordinary_history(conn)
-    require(not any(row[0] in (VERSION, CLAIM_VERSION) for row in rows), "shared_version_in_regional_history")
+    require(not any(row[0] in (VERSION, CLAIM_VERSION, APPROVAL_VERSION) for row in rows), "shared_version_in_regional_history")
     aggregate = [row for row in rows if row[0] == regional.VERSION]
     if target == "use4":
         require(len(aggregate) == 1 and aggregate[0][1] == regional.NAME
@@ -218,39 +291,45 @@ def ledger_exists(conn):
 def inspect(conn, sql, migration="authority"):
     authority_sql = sql if migration == "authority" else source()
     claim_sql = sql if migration == "claims" else claim_source()
+    approval_sql = sql if migration == "approvals" else approval_source()
     definitions = {
         VERSION: (NAME, authority_sql, authority_sql + ACL_SQL, SOURCE_HASH, objects_present, verify_permissions, catalog),
         CLAIM_VERSION: (CLAIM_NAME, claim_sql, claim_execution(claim_sql), CLAIM_HASH,
                         claim_objects_present, verify_claim_permissions, claim_catalog),
+        APPROVAL_VERSION: (APPROVAL_NAME, approval_sql, approval_execution(approval_sql), APPROVAL_HASH,
+                           approval_objects_present, verify_approval_permissions, approval_catalog),
     }
     if not ledger_exists(conn):
-        require(not objects_present(conn) and not claim_objects_present(conn), "schema_without_shared_history")
+        require(not objects_present(conn) and not claim_objects_present(conn) and not approval_objects_present(conn), "schema_without_shared_history")
         return "pending"
     rows = conn.execute(f"SELECT version,name,source_sql,applied_sql,source_sha256,catalog,revision FROM {LEDGER} ORDER BY version").fetchall()
     versions = {row[0] for row in rows}
     require(len(versions) == len(rows) and versions <= definitions.keys(), "unknown_shared_history")
     require(CLAIM_VERSION not in versions or VERSION in versions, "claim_authority_history_missing")
+    require(APPROVAL_VERSION not in versions or CLAIM_VERSION in versions, "approval_claim_history_missing")
     for version, name, stored_sql, applied_sql, stored_hash, stored_catalog, revision in rows:
         expected_name, original, executed, expected_hash, present, permissions, snapshot = definitions[version]
         require(name == expected_name and stored_sql == original and applied_sql == executed and stored_hash == expected_hash
                 and re.fullmatch(r"[a-f0-9]{40}", revision), "shared_history_mismatch")
         require(present(conn), "shared_schema_missing")
         permissions(conn)
-        require(snapshot(conn) == stored_catalog, "shared_catalog_mismatch")
+        actual = predecessor_claim_catalog(conn, stored_catalog) if version == CLAIM_VERSION and APPROVAL_VERSION in versions else snapshot(conn)
+        require(actual == stored_catalog, "shared_catalog_mismatch")
     for version, definition in definitions.items():
         if version not in versions:
             require(not definition[4](conn), "schema_without_shared_history")
-    selected = VERSION if migration == "authority" else CLAIM_VERSION
+    selected = {"authority": VERSION, "claims": CLAIM_VERSION, "approvals": APPROVAL_VERSION}[migration]
     return "applied" if selected in versions else "pending"
 
 
 def apply(conn, target, revision, sql, execute=False, migration="authority"):
     require(target in ("staging", "use4"), "unsupported_auth_target")
     require(re.fullmatch(r"[a-f0-9]{40}", revision), "invalid_revision")
-    require(migration in ("authority", "claims"), "unsupported_shared_migration")
+    require(migration in ("authority", "claims", "approvals"), "unsupported_shared_migration")
     version, name, expected_hash, executed_sql, permissions, snapshot = (
         (VERSION, NAME, SOURCE_HASH, sql + ACL_SQL, verify_permissions, catalog) if migration == "authority" else
-        (CLAIM_VERSION, CLAIM_NAME, CLAIM_HASH, claim_execution(sql), verify_claim_permissions, claim_catalog))
+        (CLAIM_VERSION, CLAIM_NAME, CLAIM_HASH, claim_execution(sql), verify_claim_permissions, claim_catalog) if migration == "claims" else
+        (APPROVAL_VERSION, APPROVAL_NAME, APPROVAL_HASH, approval_execution(sql), verify_approval_permissions, approval_catalog))
     require(hashlib.sha256(sql.encode()).hexdigest() == expected_hash, "source_hash_mismatch")
     with conn.transaction():
         if execute:
@@ -262,6 +341,8 @@ def apply(conn, target, revision, sql, execute=False, migration="authority"):
         if execute and state == "pending":
             if migration == "claims":
                 require(inspect(conn, source()) == "applied", "authority_migration_required")
+            if migration == "approvals":
+                require(inspect(conn, claim_source(), "claims") == "applied", "claims_migration_required")
             if not ledger_exists(conn):
                 conn.execute("""
                     CREATE SCHEMA shared_auth_migrations AUTHORIZATION postgres;
@@ -286,7 +367,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=("staging", "use4"))
     parser.add_argument("action", choices=("inspect", "apply"))
-    parser.add_argument("--migration", choices=("authority", "claims"), default="authority")
+    parser.add_argument("--migration", choices=("authority", "claims", "approvals"), default="authority")
     parser.add_argument("--revision", required=True)
     parser.add_argument("--runtime-project", required=True,
                         help="Previously verified runtime authority project, not an inferred environment label")
@@ -297,7 +378,7 @@ def main():
                 "source_revision_mismatch")
         url = regional.migration_connection_url(os.environ.get("DATABASE_URL", ""), args.target)
         with psycopg.connect(url, autocommit=True, connect_timeout=10, options=OPTIONS, sslmode="require") as conn:
-            sql = source() if args.migration == "authority" else claim_source()
+            sql = {"authority": source, "claims": claim_source, "approvals": approval_source}[args.migration]()
             result = apply(conn, args.target, args.revision, sql, args.action == "apply", args.migration)
         print(json.dumps(result, sort_keys=True))
     except Exception as error:
