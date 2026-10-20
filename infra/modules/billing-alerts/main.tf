@@ -52,7 +52,7 @@ locals {
       duration = "60s"
       severity = "CRITICAL"
       failure  = "missing_telemetry"
-      detail   = "No sampler progress for five minutes in ${check.cell}, sustained for another minute to tolerate startup/export delay. Includes absent, never-seen and frozen counters. Both success and error count as progress; errors have their own policy. Check the process and collector before interpreting backlog counts. Coverage liveness must be disarmed when issuance is intentionally disabled."
+      detail   = "No sampler progress in ${check.cell}. A never-seen counter can alert after one minute; the five-minute lookback is not startup grace. Previously observed counters alert after progress ages out of the lookback plus the one-minute hold. Includes absent and frozen counters. Both success and error count as progress; errors have their own policy. Check the process and collector before interpreting backlog counts. Coverage liveness must be disarmed when issuance is intentionally disabled."
     }
   })
   # The API currently uses zerolog ConsoleWriter on stderr. Accept structured
