@@ -256,7 +256,10 @@ It then:
 1. creates the data disk `devbox-<name>-data`, the VM `devbox-<name>` (boot
    disk of the same name) from `profile.json`, and the bucket
    `superserve-devbox-<devbox-id>`, all labelled `managed-by`,
-   `devbox-name`, `devbox-id`, `owner` and `expires-at`;
+   `devbox-name`, `devbox-id`, `owner` and `expires-at`, then grants the
+   workflow identity OS Login (`roles/compute.osAdminLogin`) on that VM only,
+   because OS Login doesn't honour the name-prefix condition on its project
+   role;
 2. writes the manifest (state `creating`) to the VM's `devbox-manifest`
    metadata key as part of creating the VM, so even a failed box can be found
    and cleaned up;

@@ -509,6 +509,9 @@ def create(env, profile_path=PROFILE_PATH):
     revisions = {key: contract.revision(env[f"{key.upper()}_BRANCH"], env[f"{key.upper()}_SHA"])
                  for key in ("sandbox", "ui")}
     profile = load_profile(profile_path)
+    ci_account = env.get("DEVBOX_CI_SERVICE_ACCOUNT", "")
+    if not re.fullmatch(r"[a-z][a-z0-9-]*@[a-z0-9.-]+\.iam\.gserviceaccount\.com", ci_account):
+        raise StepError("DEVBOX_CI_SERVICE_ACCOUNT must be the workflow's service account email")
     devbox_id = contract.new_devbox_id()
     created_at = contract.utc_now()
     expires_at = contract.expiry(created_at, lifetime)
@@ -545,6 +548,11 @@ def create(env, profile_path=PROFILE_PATH):
              f"--default-storage-class={profile['bucket']['storage_class']}",
              "--uniform-bucket-level-access", "--public-access-prevention", "--soft-delete-duration=0"])
         run(["gcloud", "storage", "buckets", "update", bucket, "--update-labels=" + contract.format_labels(labels)])
+        # OS Login does not honour the name-prefix condition on the workflow's
+        # project role, so it gets an unconditioned login grant on this VM only.
+        run(["gcloud", "compute", "instances", "add-iam-policy-binding", box.instance, *where,
+             f"--member=serviceAccount:{ci_account}", "--role=roles/compute.osAdminLogin",
+             "--condition=None", "--quiet"])
 
         box.wait_for_ssh()
         box.devbox_id = devbox_id
