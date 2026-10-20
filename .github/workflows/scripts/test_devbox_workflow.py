@@ -54,6 +54,7 @@ class FakeCloud:
         self.pending_instance = False
         self.fail_disk_create = False
         self.box_missing = set()
+        self.heads, self.drop_after_checkout = {}, False
         self.repo_scripts = list(contract.CREATE_SCRIPTS)
         self.existing = list(existing)
         self.branches = branches if branches is not None else {"main": SANDBOX_SHA, "feature": NEW_SHA}
@@ -145,8 +146,14 @@ class FakeCloud:
         if command.startswith("for script in"):
             missing = [script for script in self.box_missing if script in command]
             return fail(1, f"missing {missing[0]}") if missing else ok()
+        if "rev-parse HEAD 2>/dev/null" in command:
+            return ok(self.heads.get(shlex.split(command)[3].rsplit("/", 1)[-1], "") + "\n")
         if "git -C" in unquote(command):
-            self.checkouts.append(re.search(r"checkout -q --force --detach ([0-9a-f]{40})", unquote(command)).group(1))
+            sha = re.search(r"checkout -q --force --detach ([0-9a-f]{40})", unquote(command)).group(1)
+            self.checkouts.append(sha)
+            self.heads[re.search(r"src/(\w+)", unquote(command)).group(1)] = sha
+            if self.drop_after_checkout:
+                return fail(255, "Connection closed by remote host")
             return ok()
         script = re.search(r"deploy/devbox/([a-z-]+\.sh)'? 2>&1", unquote(command))
         if script:
@@ -606,6 +613,15 @@ class DeployTests(WorkflowCase):
             self.deploy(cloud, "vmd", DEVBOX_SECRET_STRIPE_SECRET_KEY="sk_test\n")
         self.assertEqual(cloud.metadata_writes, [])
         self.assertEqual(cloud.checkouts, [])
+
+    def test_checkout_that_finished_before_a_dropped_connection_is_recorded(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.drop_after_checkout = True
+        self.assertEqual(self.deploy(cloud, "vmd"), 1)
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["state"], "failed")
+        self.assertEqual(final["revisions"]["sandbox"], {"branch": "feature", "sha": NEW_SHA})
+        self.assertEqual(final["components"]["vmd"], {"branch": "main", "sha": SANDBOX_SHA})
 
     def test_failed_box_can_be_redeployed(self):
         cloud = FakeCloud(instances=self.box(state="failed"))

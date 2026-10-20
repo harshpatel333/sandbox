@@ -322,6 +322,11 @@ class Box:
         self.guard()
         self.ssh("sudo rm -f " + shlex.quote(path))
 
+    def head(self, key):
+        source = f"{contract.BOX_SOURCE_DIR}/{SOURCE_DIRS[key]}"
+        result = self.ssh(f"sudo git -C {shlex.quote(source)} rev-parse HEAD 2>/dev/null || true", timeout=60)
+        return result.stdout.strip()
+
     def checkout(self, key, sha):
         self.guard()
         source = f"{contract.BOX_SOURCE_DIR}/{SOURCE_DIRS[key]}"
@@ -749,6 +754,17 @@ def deploy(env, now=contract.utc_now):
 
 def conclude_deploy(env, box, manifest, state, devbox_id, components, revisions, progress, failure, now):
     DEADLINE.report()
+    if failure is not None:
+        # A dropped connection can hide a checkout that finished on the box;
+        # record what the box actually has. Installers stay unmoved when their
+        # outcome is unknown, and a failed box is only recovered by a full deploy.
+        for key in revisions:
+            if key not in progress["checked_out"]:
+                try:
+                    if box.head(key) == revisions[key]["sha"]:
+                        progress["checked_out"].append(key)
+                except Exception:
+                    pass
     migrations = "none"
     if progress["api_started"]:
         # install-api.sh ran, so without a readable report for this revision the
