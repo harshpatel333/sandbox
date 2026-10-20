@@ -489,8 +489,8 @@ def access_section(name):
         "### Access",
         f"Forward {ports} to localhost:",
         "```sh", contract.forwarding_command(name), "```",
-        "Shell and logs:",
-        "```sh", ssh, f"{ssh} -- 'sudo tail -n 200 -f {LOG_DIR}/*.log'", f"{ssh} -- sudo journalctl -f", "```",
+        "Shell and box script logs (engineer logins have no sudo; the system journal needs OS Login admin):",
+        "```sh", ssh, f"{ssh} -- 'tail -n 200 -f {LOG_DIR}/*.log'", "```",
         "Destroy:",
         "```sh", destroy_command(name), "```",
     ])

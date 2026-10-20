@@ -261,7 +261,12 @@ It then:
    because OS Login doesn't honour the name-prefix condition on its project
    role) and to the members in `DEVBOX_GCP_ENGINEER_MEMBERS`
    (`roles/compute.osLogin`). If that variable is empty, the run warns that no
-   engineer can reach the box. These grants go away when the VM is destroyed;
+   engineer can reach the box. These grants go away when the VM is destroyed.
+   Keep `DEVBOX_GCP_ENGINEER_MEMBERS` the same as Terraform's
+   `engineer_members`: Terraform grants the IAP tunnel, and this grants the
+   login, so a member in only one of them can't connect. Engineers get a shell
+   without sudo, and can read the box script logs in
+   `/var/log/superserve-devbox/`;
 2. writes the manifest (state `creating`) to the VM's `devbox-manifest`
    metadata key as part of creating the VM, so even a failed box can be found
    and cleaned up;
