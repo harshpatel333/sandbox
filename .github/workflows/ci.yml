@@ -45,11 +45,11 @@ jobs:
       - name: Run storage catalog provisioning tests
         run: python3 -m unittest discover -s scripts -p 'test_provision_storage_stripe.py'
 
-      - name: Run devbox services tests
-        run: python3 -m unittest discover -s deploy/devbox/services -p 'test_*.py'
-
       - name: Run host identity provisioning tests
         run: python3 -m unittest discover -v -s deploy -p 'test_host_identity.py'
+
+      - name: Run devbox script tests
+        run: python3 -m unittest discover -s deploy/devbox -p 'test_*.py'
 
       - name: Run peer identity bootstrap tests
         run: |

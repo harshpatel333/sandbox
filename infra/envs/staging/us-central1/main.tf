@@ -160,6 +160,21 @@ module "iam" {
       role    = "roles/iam.roleAdmin"
       members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
     }
+    # Temporary: the first devbox Terraform apply (.github/workflows/devbox-terraform.yml)
+    # runs as this account and creates the devbox workload identity pool, reCAPTCHA key
+    # and API key. Reduce these to their viewer roles once that apply has run.
+    cd_devbox_workload_identity_pool_admin = {
+      role    = "roles/iam.workloadIdentityPoolAdmin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    cd_devbox_recaptcha_admin = {
+      role    = "roles/recaptchaenterprise.admin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    cd_devbox_api_keys_admin = {
+      role    = "roles/serviceusage.apiKeysAdmin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
     grafana_monitoring_viewer = {
       role = "roles/monitoring.viewer"
       members = [
@@ -203,29 +218,30 @@ module "api" {
   service_account_email = google_service_account.controlplane_runtime.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
   env = {
-    YC_CONSOLE_URL                = var.yc_claim_console_url
-    YC_EMAIL_FROM                 = var.yc_claim_email_from
-    YC_EXISTING_EXCEPTION_USER_ID = var.yc_existing_exception_user_id
-    YC_EXISTING_EXCEPTION_TEAM_ID = var.yc_existing_exception_team_id
-    COMPUTE_RESTRICTIONS_SOURCE   = "database"
-    API_PORT                      = "8080"
-    TEAM_CREATION_REGION          = "use"
-    TEAM_CREATION_PUBLIC_KEYS     = var.team_creation_public_keys
-    EDGE_PROXY_DOMAIN             = "staging-sandbox.superserve.ai"
-    OTEL_ENVIRONMENT              = local.environment
-    OTEL_EXPORTER_OTLP_ENDPOINT   = local.staging_otlp_endpoint
-    OTEL_EXPORT_INTERVAL          = "15s"
-    OTEL_METRICS_ENABLED          = "true"
-    OTEL_SERVICE_NAME             = "sandbox-controlplane"
-    SUPABASE_URL                  = var.supabase_url
-    TEMPLATE_BUILD_REGION         = local.region
-    BACKUP_BUCKET                 = "superserve-artifact-backup-staging-usc1"
-    DEFAULT_HOST_ID               = var.build_host_id
-    VMD_GRPC_ADDRESS              = format("%s:50051", module.sandbox_host_b.internal_ip)
-    STRIPE_API_BASE_URL           = "https://api.stripe.com"
-    STRIPE_CHECKOUT_PRICE_IDS     = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
-    STRIPE_PRO_MONTHLY_PRICE_ID   = "price_1UQiJZQ9Sm5V6nX8dRNQ5ob5"
-    STRIPE_PRO_ANNUAL_PRICE_ID    = "price_1UQiJjQ9Sm5V6nX8toQIgOzz"
+    BILLING_USAGE_ENTITLEMENTS_ENABLED = "true"
+    YC_CONSOLE_URL                     = var.yc_claim_console_url
+    YC_EMAIL_FROM                      = var.yc_claim_email_from
+    YC_EXISTING_EXCEPTION_USER_ID      = var.yc_existing_exception_user_id
+    YC_EXISTING_EXCEPTION_TEAM_ID      = var.yc_existing_exception_team_id
+    COMPUTE_RESTRICTIONS_SOURCE        = "database"
+    API_PORT                           = "8080"
+    TEAM_CREATION_REGION               = "use"
+    TEAM_CREATION_PUBLIC_KEYS          = var.team_creation_public_keys
+    EDGE_PROXY_DOMAIN                  = "staging-sandbox.superserve.ai"
+    OTEL_ENVIRONMENT                   = local.environment
+    OTEL_EXPORTER_OTLP_ENDPOINT        = local.staging_otlp_endpoint
+    OTEL_EXPORT_INTERVAL               = "15s"
+    OTEL_METRICS_ENABLED               = "true"
+    OTEL_SERVICE_NAME                  = "sandbox-controlplane"
+    SUPABASE_URL                       = var.supabase_url
+    TEMPLATE_BUILD_REGION              = local.region
+    BACKUP_BUCKET                      = "superserve-artifact-backup-staging-usc1"
+    DEFAULT_HOST_ID                    = var.build_host_id
+    VMD_GRPC_ADDRESS                   = format("%s:50051", module.sandbox_host_b.internal_ip)
+    STRIPE_API_BASE_URL                = "https://api.stripe.com"
+    STRIPE_CHECKOUT_PRICE_IDS          = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
+    STRIPE_PRO_MONTHLY_PRICE_ID        = "price_1UQiJZQ9Sm5V6nX8dRNQ5ob5"
+    STRIPE_PRO_ANNUAL_PRICE_ID         = "price_1UQiJjQ9Sm5V6nX8toQIgOzz"
     BILLING_RESOURCE_CONFIG = jsonencode([
       {
         resource_key         = "vcpu"

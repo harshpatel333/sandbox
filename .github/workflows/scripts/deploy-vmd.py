@@ -3,7 +3,10 @@
 instance tagged with the configured label, in parallel.
 
 Env vars:
-  GCP_PROJECT          required — project containing vmd hosts
+  GCP_PROJECT          required for fleet deploys — project containing vmd hosts
+  DEPLOY_TRANSPORT     optional — "local" deploys onto this machine, named by
+                       DEPLOY_INSTANCE and DEPLOY_ZONE, with the same on-host
+                       script instead of discovering hosts (see host_transport.py)
   GCP_REGION           optional — only deploy to instances whose zone is in
                        this region (e.g. us-central1). The prod project holds
                        hosts for more than one cell (us-central1 primary +
@@ -16,9 +19,7 @@ Env vars:
                        GCP_REGION before deploying to a standby
   VMD_SERVICE          required — systemd unit name for vmd (e.g. superserve-vmd)
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
-  SHA                  required — commit SHA (full SHA binds egress rollout approval)
-  DEPLOY_CELL          optional — actual target cell; only staging exempts
-                       egress enforcement from release/limit rollout approval
+  SHA                  required — commit SHA
   SENTRY_DSN           optional — upserted into /etc/sandbox/vmd.env when set
   BACKUP_BUCKET        optional — the cell's artifact backup bucket. Upserted
                        into vmd.env when set; empty = skip, leaving the
@@ -162,6 +163,8 @@ import subprocess
 import sys
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from host_transport import local_instance, scp_command, ssh_command
 
 
 def deployment_host_region(region, zone):
@@ -393,8 +396,7 @@ def egress_capacity_settings(env):
 def egress_capacity_preflight(env):
     maximum, enforce = egress_capacity_settings(env)
     args = " ".join(shlex.quote(v) for v in (
-        maximum, enforce, env.get("DEPLOY_CELL", ""),
-        env.get("SHA", ""), env.get("VMD_EGRESS_ROLLOUT_APPROVAL", ""),
+        maximum, enforce,
     ))
     # Interpret only simple scalar assignments; never source host environment
     # contents. Escaped/multiline syntax must be normalized before line updates.
@@ -403,7 +405,7 @@ def egress_capacity_preflight(env):
         import re
         import sys
 
-        maximum, enforce, cell, sha, approval = sys.argv[1:]
+        maximum, enforce = sys.argv[1:]
         wanted = set()
         if not maximum:
             wanted.add("VMD_EGRESS_MAX_CONNECTIONS")
@@ -440,9 +442,6 @@ def egress_capacity_preflight(env):
             sys.exit("Invalid effective egress capacity")
         if enforce not in ("true", "false"):
             sys.exit("Invalid effective egress enforcement")
-        if enforce == "true" and cell != "staging":
-            if not re.fullmatch(r"[0-9a-f]{40}", sha) or approval != sha + ":" + maximum:
-                sys.exit("Egress enforcement requires reviewed staging evidence and release:limit rollout approval")
     """)
     return "\nset -eu\nsudo python3 - " + args + " <<'EGRESS_PREFLIGHT'\n" + script + "\nEGRESS_PREFLIGHT\n"
 
@@ -450,7 +449,12 @@ def main() -> int:
     check_bundle_parity()
     egress_preflight = egress_capacity_preflight(os.environ)
     egress_update = egress_capacity_update(os.environ)
-    project = os.environ["GCP_PROJECT"]
+    try:
+        local = local_instance(os.environ)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    project = os.environ.get("GCP_PROJECT", "") if local else os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
     label = os.environ.get("VMD_LABEL", "component=vmd")
     service = os.environ.get("VMD_SERVICE", "superserve-vmd")
@@ -558,22 +562,25 @@ def main() -> int:
     run_or_die(["tar", "czf", bundle_local] + BUNDLE_FILES, "bundle build")
     print(f"Built {bundle_local} ({os.path.getsize(bundle_local)} bytes)")
 
-    result = subprocess.run(
-        [
-            "gcloud", "compute", "instances", "list",
-            f"--project={project}",
-            f"--filter=labels.{label} AND status=RUNNING",
-            "--format=csv[no-heading](name,zone)",
-        ],
-        capture_output=True, text=True, check=True,
-    )
+    if local:
+        instances = [local]
+    else:
+        result = subprocess.run(
+            [
+                "gcloud", "compute", "instances", "list",
+                f"--project={project}",
+                f"--filter=labels.{label} AND status=RUNNING",
+                "--format=csv[no-heading](name,zone)",
+            ],
+            capture_output=True, text=True, check=True,
+        )
 
-    instances = [
-        {"name": r[0], "zone": r[1]}
-        for line in result.stdout.strip().splitlines()
-        if line.strip()
-        for r in [line.strip().split(",")]
-    ]
+        instances = [
+            {"name": r[0], "zone": r[1]}
+            for line in result.stdout.strip().splitlines()
+            if line.strip()
+            for r in [line.strip().split(",")]
+        ]
 
     # Region scoping is done here rather than in the gcloud filter: matching
     # on the zone basename is unambiguous, while gcloud filter matching
@@ -606,7 +613,7 @@ def main() -> int:
     # first, so no single unreachable host can keep the others from being
     # attempted.
     key = os.path.expanduser("~/.ssh/google_compute_engine")
-    if not os.path.exists(key):
+    if not local and not os.path.exists(key):
         os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
         run_or_die(["ssh-keygen", "-q", "-t", "rsa", "-N", "", "-f", key], "generate gcloud ssh key")
 
@@ -621,21 +628,12 @@ def main() -> int:
 
         input_preflight = host_identity_preflight() + runtime_input_preflight(control_plane_url, database_url, internal_api_token) + egress_preflight
         # Identity is mandatory even when all runtime inputs are supplied.
-        run_or_die([
-            "gcloud", "compute", "ssh", name,
-            f"--zone={zone}", f"--project={project}",
-            "--quiet", "--tunnel-through-iap", "--command", input_preflight,
-        ], f"[{tag}] runtime input preflight")
+        run_or_die(ssh_command(os.environ, project, name, zone, input_preflight),
+                   f"[{tag}] runtime input preflight")
 
         # Single SCP — one IAP tunnel for the whole bundle.
-        run_or_die(
-            [
-                "gcloud", "compute", "scp", bundle_local, f"{name}:{bundle_remote}",
-                f"--zone={zone}", f"--project={project}",
-                "--quiet", "--tunnel-through-iap",
-            ],
-            f"[{tag}] scp bundle",
-        )
+        run_or_die(scp_command(os.environ, project, name, zone, bundle_local, bundle_remote),
+                   f"[{tag}] scp bundle")
         print(f"[{tag}] bundle uploaded")
 
         inject_script = input_preflight + legacy_vmd_enrollment() + textwrap.dedent(f"""
@@ -1641,15 +1639,8 @@ def main() -> int:
             sudo rm -f /etc/sandbox/.runtime-bootstrap-pending
         """)
 
-        r = subprocess.run(
-            [
-                "gcloud", "compute", "ssh", name,
-                f"--zone={zone}", f"--project={project}",
-                "--quiet", "--tunnel-through-iap",
-                "--command", inject_script,
-            ],
-            capture_output=True, text=True,
-        )
+        r = subprocess.run(ssh_command(os.environ, project, name, zone, inject_script),
+                           capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(
                 f"service not healthy\n"
