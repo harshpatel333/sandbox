@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/ycclaims"
 )
 
@@ -309,6 +310,45 @@ func TestYCStaffDatabasePermissionsAndTransactions(t *testing.T) {
 	if approved["state"] != "bound" || approved["acceptance_required"] != true || approved["billing_contract_id"] != nil {
 		t.Fatalf("approval accepted or provisioned: %v", approved)
 	}
+	team := p["team_id"].(uuid.UUID)
+	approvalInput := ycApproval{ClaimID: p["id"].(string), CompanyIdentity: approved["company_identity"].(string), Region: "use", SignupEmail: approved["submitted_email"].(string), FounderEmail: "founder@example.test"}
+	blocked := func(err error) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "requires customer acceptance") {
+			t.Fatalf("acceptance gate: %v", err)
+		}
+	}
+	blocked(h.ycAuthorityPreflight(ctx, team, approvalInput))
+	_, gateErr := h.ycClaimApproval(ctx, team, approvalInput)
+	blocked(gateErr)
+	approvalInput.ClaimID = ""
+	_, gateErr = h.reserveYCAuthority(ctx, team, writer, approvalInput)
+	blocked(gateErr)
+	operation := ycOperation{Team: team, ID: uuid.MustParse(approved["approval_id"].(string)), Request: approvalInput}
+	blocked(h.verifyYCAuthority(ctx, operation))
+	release, gateErr := h.lockYCAuthority(ctx, operation)
+	if release != nil {
+		release()
+	}
+	blocked(gateErr)
+	// Old binaries call these signatures without any Go acceptance preflight.
+	_, gateErr = pool.Exec(ctx, `SELECT public.reserve_yc_activation_authority($1,$2,'use',$3,'operator','synthetic',NULL)`, approvalInput.CompanyIdentity, team, writer)
+	blocked(gateErr)
+	var oldDispatchAllowed bool
+	if err := pool.QueryRow(ctx, `SELECT public.lock_yc_activation_authority($1,$2,'use')`, operation.ID, team).Scan(&oldDispatchAllowed); err != nil || oldDispatchAllowed {
+		t.Fatalf("old dispatch bypassed acceptance: %t %v", oldDispatchAllowed, err)
+	}
+	pending := must("activation-pending", gin.H{})
+	for _, row := range pending["claims"].([]any) {
+		if row.(map[string]any)["id"] == p["id"] {
+			t.Fatal("unaccepted claim entered legacy handoff")
+		}
+	}
+	legacyTeam := uuid.New()
+	legacyInput := ycApproval{CompanyIdentity: "https://www.ycombinator.com/companies/" + uuid.NewString(), Region: "use", Evidence: "synthetic"}
+	if _, err := h.reserveYCAuthority(ctx, legacyTeam, writer, legacyInput); err != nil {
+		t.Fatalf("historical operator path broken: %v", err)
+	}
 	if approved["confirmation_status"] == "confirmed" {
 		t.Fatal("approval forged confirmation")
 	}
@@ -410,6 +450,20 @@ func TestYCStaffDatabasePermissionsAndTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var unavailable ycMailJob
+	json.Unmarshal(raw, &unavailable)
+	if unavailable.ClaimID != uuid.Nil {
+		t.Fatal("ambiguous crashed submission automatically retried")
+	}
+	status := rpc("operator-get", gin.H{"id": q["id"]})
+	if status["approval_notification"].(map[string]any)["status"] != "delivery_unknown" {
+		t.Fatal("crash ambiguity hidden")
+	}
+	must("retry-approval-email", gin.H{"id": q["id"], "actor_id": writer, "request_id": uuid.New(), "expected_revision": status["revision"], "reason": "Confirmed resend with operator", "evidence_reference": "synthetic-review", "home_region": "use"})
+	raw, err = h.ycApprovalMailRPC(ctx, "lease", gin.H{"lease_id": lease2})
+	if err != nil {
+		t.Fatal(err)
+	}
 	var recovered ycMailJob
 	json.Unmarshal(raw, &recovered)
 	if recovered.MessageID != job.MessageID || recovered.ClaimID == uuid.Nil {
@@ -426,17 +480,442 @@ func TestYCStaffDatabasePermissionsAndTransactions(t *testing.T) {
 	if n != 1 {
 		t.Fatal("stale ack reset delivery")
 	}
+	unknownClaim := create()
+	must("prepare-approve", unknownClaim)
+	must("approve", unknownClaim)
+	sender.unknown = true
+	if found, err := h.deliverYCApprovalMail(ctx, sender, "https://console.example.test", "hello@example.test"); !found || err == nil {
+		t.Fatal("ambiguous SMTP submission not surfaced")
+	}
+	if found, err := h.deliverYCApprovalMail(ctx, sender, "https://console.example.test", "hello@example.test"); found || err != nil {
+		t.Fatal("ambiguous SMTP submission automatically retried")
+	}
+	unknownResult := rpc("operator-get", gin.H{"id": unknownClaim["id"]})
+	if unknownResult["approval_notification"].(map[string]any)["status"] != "delivery_unknown" || unknownResult["state"] != "bound" {
+		t.Fatal("unknown delivery lost approval or status")
+	}
+	lostAck := create()
+	must("prepare-approve", lostAck)
+	must("approve", lostAck)
+	exec(`CREATE FUNCTION fail_approval_ack() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.sent_at IS NOT NULL THEN RAISE EXCEPTION 'synthetic lost ack'; END IF; RETURN NEW; END $$;
+ CREATE TRIGGER fail_approval_ack BEFORE UPDATE ON yc_claim_approval_mail FOR EACH ROW EXECUTE FUNCTION fail_approval_ack();`)
+	sender.unknown = false
+	if found, err := h.deliverYCApprovalMail(ctx, sender, "https://console.example.test", "hello@example.test"); !found || err == nil {
+		t.Fatal("lost successful delivery acknowledgement not surfaced")
+	}
+	exec("DROP TRIGGER fail_approval_ack ON yc_claim_approval_mail")
+	exec("UPDATE yc_claim_approval_mail SET lease_until=now()-interval '1 second' WHERE claim_id=$1", lostAck["id"])
+	if found, err := h.deliverYCApprovalMail(ctx, sender, "https://console.example.test", "hello@example.test"); found || err != nil {
+		t.Fatal("lost acknowledgement automatically resent")
+	}
+	rejected := create()
+	must("prepare-approve", rejected)
+	must("approve", rejected)
+	sender.rejected = true
+	if found, err := h.deliverYCApprovalMail(ctx, sender, "https://console.example.test", "hello@example.test"); !found || err == nil {
+		t.Fatal("permanent rejection not surfaced")
+	}
+	rejection := rpc("operator-get", gin.H{"id": rejected["id"]})["approval_notification"].(map[string]any)
+	if rejection["attempts"] != float64(1) || rejection["status"] != "delivery_failed" {
+		t.Fatalf("permanent rejection fabricated attempts: %v", rejection)
+	}
+	if found, err := h.deliverYCApprovalMail(ctx, sender, "https://console.example.test", "hello@example.test"); found || err != nil {
+		t.Fatal("permanent rejection automatically retried")
+	}
+	sender.rejected = false
+	exhausted := create()
+	must("prepare-approve", exhausted)
+	must("approve", exhausted)
+	exec("UPDATE yc_claim_approval_mail SET attempts=8,created_at=now()-interval '31 minutes' WHERE claim_id=$1", exhausted["id"])
+	exec("UPDATE auth.users SET email='changed@example.test' WHERE id=$1", exhausted["user_id"])
+	exec("UPDATE yc_claim_approval_mail SET created_at=now()-interval '31 minutes' WHERE claim_id=$1", unknownClaim["id"])
+	// Cancelled rows and accepted deliveries are old too, but must not count.
+	exec("UPDATE yc_claim_approval_mail SET created_at=now()-interval '31 minutes' WHERE claim_id IN ($1,$2)", p["id"], q["id"])
+	recent := create()
+	must("prepare-approve", recent)
+	must("approve", recent)
+	metric := &staffBacklogRecorder{Recorder: telemetry.NewNoopRecorder()}
+	previous := currentTelemetryRecorder()
+	SetTelemetryRecorder(metric)
+	t.Cleanup(func() { SetTelemetryRecorder(previous) })
+	if err := h.observeYCApprovalBacklog(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if metric.state != "yc_approval_notification" || metric.count != 2 || metric.age < 30*60 {
+		t.Fatalf("backlog misclassified: %+v", metric)
+	}
+	if err := (&Handlers{}).observeYCApprovalBacklog(ctx); err == nil || metric.count != -1 {
+		t.Fatal("failed observation left a misleading healthy/stale count")
+	}
+}
+
+type staffBacklogRecorder struct {
+	telemetry.Recorder
+	telemetry.NoopBillingRecorder
+	state string
+	count int64
+	age   float64
+}
+
+func (r *staffBacklogRecorder) RecordBillingBacklog(_ context.Context, state string, count int64, age float64) {
+	r.state = state
+	r.count = count
+	r.age = age
 }
 
 type staffMailSender struct {
+	rejected bool
+	unknown  bool
 	fail     bool
 	messages []EmailMessage
 }
 
 func (s *staffMailSender) SendEmail(_ context.Context, m EmailMessage) error {
 	s.messages = append(s.messages, m)
+	if s.rejected {
+		return &rejectedEmailError{err: errors.New("synthetic permanent rejection")}
+	}
+	if s.unknown {
+		return &unknownEmailOutcomeError{err: errors.New("synthetic ambiguous delivery")}
+	}
 	if s.fail {
 		return errors.New("synthetic delivery failure")
 	}
 	return nil
+}
+
+// Exercise shared SQL signatures used by older binaries, with separate sessions
+// for admission, authority ownership, and dispatch.
+func TestYCStaffAuthorityConcurrency(t *testing.T) {
+	pool := staffTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	h := &Handlers{Pool: pool, PromotionAuthPool: pool}
+	actor := uuid.New()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	create := func(t *testing.T) gin.H {
+		t.Helper()
+		email := uuid.NewString() + "@example.test"
+		raw, err := h.ycClaimRPC(ctx, "submit", gin.H{"submitted_email": email, "founder_email": "founder@example.test", "company_identity": "https://www.ycombinator.com/companies/" + uuid.NewString(), "evidence": gin.H{"verified": true}, "verification_reference": ycclaims.Hash(email), "state": "manual_review", "reason": "email_mismatch"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c map[string]any
+		if err = json.Unmarshal(raw, &c); err != nil {
+			t.Fatal(err)
+		}
+		user, team := uuid.New(), uuid.New()
+		exec("INSERT INTO auth.users(id,email,email_confirmed_at,created_at) VALUES($1,$2,now(),clock_timestamp())", user, email)
+		exec("INSERT INTO team VALUES($1,clock_timestamp(),'use')", team)
+		exec("INSERT INTO billing_signup_choice VALUES($1,'selecting',NULL)", team)
+		return gin.H{"id": c["id"], "company_identity": c["company_identity"], "user_id": user, "team_id": team, "home_region": "use", "actor_id": actor, "request_id": uuid.New(), "expected_revision": 0, "reason": "Synthetic review", "evidence_reference": "synthetic", "team_created_at": time.Now().Add(time.Second), "team_eligible": true}
+	}
+	call := func(op string, p gin.H) {
+		t.Helper()
+		if _, err := h.ycStaffRPC(ctx, op, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("concurrent manual authority cannot be adopted", func(t *testing.T) {
+		p := create(t)
+		call("prepare-approve", p)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err = tx.Exec(ctx, `SELECT public.reserve_yc_activation_authority($1,$2,'use',$3,'operator','synthetic',NULL)`, p["company_identity"], p["team_id"], actor); err != nil {
+			t.Fatal(err)
+		}
+		var ownerPID int
+		if err = tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&ownerPID); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { _, e := h.ycStaffRPC(ctx, "approve", p); done <- e }()
+		// Wait for the staff transaction's INSERT conflict, not an arbitrary delay.
+		for {
+			var blocked bool
+			if err = pool.QueryRow(ctx, "SELECT EXISTS(SELECT FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))", ownerPID).Scan(&blocked); err != nil {
+				t.Fatal(err)
+			}
+			if blocked {
+				break
+			}
+			select {
+			case e := <-done:
+				t.Fatalf("approval did not wait for reservation: %v", e)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-time.After(time.Millisecond):
+			}
+		}
+		if err = tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err = <-done; err == nil || !strings.Contains(err.Error(), "manual recovery") {
+			t.Fatalf("adopted concurrent manual authority: %v", err)
+		}
+		var unchanged bool
+		if err = pool.QueryRow(ctx, `SELECT state='manual_review' AND NOT acceptance_required AND approval_id IS NULL AND NOT EXISTS(SELECT FROM yc_claim_approval_mail WHERE claim_id=c.id) FROM yc_claim c WHERE id=$1`, p["id"]).Scan(&unchanged); err != nil || !unchanged {
+			t.Fatalf("partial staff approval: %t %v", unchanged, err)
+		}
+		// Already-visible manual authority is rejected as well.
+		if _, err = h.ycStaffRPC(ctx, "approve", p); err == nil {
+			t.Fatal("adopted prior manual authority")
+		}
+	})
+	t.Run("uncommitted approval cannot dispatch and committed approval blocks old callers", func(t *testing.T) {
+		p := create(t)
+		call("prepare-approve", p)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		var raw []byte
+		if err = tx.QueryRow(ctx, `SELECT public.yc_staff_claim_rpc('approve',$1::jsonb)`, p).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var c map[string]any
+		json.Unmarshal(raw, &c)
+		var allowed bool
+		if err = pool.QueryRow(ctx, `SELECT public.lock_yc_activation_authority($1,$2,'use')`, c["approval_id"], p["team_id"]).Scan(&allowed); err != nil || allowed {
+			t.Fatalf("uncommitted dispatch: %t %v", allowed, err)
+		}
+		if err = tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err = pool.QueryRow(ctx, `SELECT public.lock_yc_activation_authority($1,$2,'use')`, c["approval_id"], p["team_id"]).Scan(&allowed); err != nil || allowed {
+			t.Fatalf("committed unaccepted dispatch: %t %v", allowed, err)
+		}
+		if _, err = pool.Exec(ctx, `SELECT public.reserve_yc_activation_authority($1,$2,'use',$3,'operator','synthetic',NULL)`, p["company_identity"], p["team_id"], actor); err == nil {
+			t.Fatal("old reservation bypassed acceptance")
+		}
+	})
+	t.Run("legacy admission retry completes while dispatch owns authority", func(t *testing.T) {
+		p := create(t)
+		raw, err := h.ycBindWithIntent(ctx, "approve", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c map[string]any
+		json.Unmarshal(raw, &c)
+		operation := ycOperation{Team: p["team_id"].(uuid.UUID), ID: uuid.MustParse(c["approval_id"].(string)), Request: ycApproval{Region: "use", CompanyIdentity: p["company_identity"].(string)}}
+		release, err := h.lockYCAuthority(ctx, operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { release() }()
+		retryCtx, stop := context.WithTimeout(ctx, time.Second)
+		defer stop()
+		if _, err = h.ycBindWithIntent(retryCtx, "approve", p); err != nil {
+			t.Fatalf("dispatch/admission lock inversion: %v", err)
+		}
+		// Regional work can proceed once admission released its account lock.
+		regional, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer regional.Rollback(ctx)
+		if _, err = regional.Exec(ctx, `SELECT team_id FROM team_billing_account WHERE team_id=$1 FOR UPDATE NOWAIT`, operation.Team); err != nil {
+			t.Fatal(err)
+		}
+		// Revocation must wait for dispatch, then deny every subsequent dispatch.
+		revocation := make(chan error, 1)
+		go func() {
+			_, e := h.ycClaimRPC(ctx, "revoke", gin.H{"id": p["id"], "actor_id": actor, "reason": "Synthetic withdrawal", "evidence_reference": "synthetic", "home_region": "use"})
+			revocation <- e
+		}()
+		for {
+			var waiting bool
+			if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT public.yc_claim_rpc%')`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+			if waiting {
+				break
+			}
+			select {
+			case e := <-revocation:
+				t.Fatalf("revocation bypassed dispatch: %v", e)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-time.After(time.Millisecond):
+			}
+		}
+		regional.Rollback(ctx)
+		release()
+		release = func() {}
+		if err = <-revocation; err != nil {
+			t.Fatal(err)
+		}
+		var allowed bool
+		if err = pool.QueryRow(ctx, `SELECT public.lock_yc_activation_authority($1,$2,'use')`, operation.ID, operation.Team).Scan(&allowed); err != nil || allowed {
+			t.Fatalf("revoked dispatch: %t %v", allowed, err)
+		}
+	})
+	t.Run("admission breaks three party wait and revoke wins retry", func(t *testing.T) {
+		p := create(t)
+		raw, err := h.ycBindWithIntent(ctx, "approve", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c map[string]any
+		json.Unmarshal(raw, &c)
+		operation := ycOperation{Team: p["team_id"].(uuid.UUID), ID: uuid.MustParse(c["approval_id"].(string)), Request: ycApproval{Region: "use", CompanyIdentity: p["company_identity"].(string)}}
+		release, err := h.lockYCAuthority(ctx, operation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { release() }()
+		revoked := make(chan error, 1)
+		go func() {
+			_, e := h.ycClaimRPC(ctx, "revoke", gin.H{"id": p["id"], "actor_id": actor, "reason": "Synthetic withdrawal", "evidence_reference": "synthetic", "home_region": "use"})
+			revoked <- e
+		}()
+		var revokePID int
+		for {
+			var waiting bool
+			if err = pool.QueryRow(ctx, `SELECT EXISTS(SELECT FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT public.yc_claim_rpc%')`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+			if waiting {
+				if err = pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT public.yc_claim_rpc%' LIMIT 1`).Scan(&revokePID); err != nil {
+					t.Fatal(err)
+				}
+				break
+			}
+			select {
+			case e := <-revoked:
+				t.Fatalf("revocation passed dispatch: %v", e)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-time.After(time.Millisecond):
+			}
+		}
+		// Revocation now owns the claim and waits for dispatch's authority.
+		prepared := make(chan struct{})
+		admitted := make(chan error, 1)
+		calls := 0
+		go func() {
+			_, e := h.ycBindWithIntentRPC(ctx, "approve", p, func(callCtx context.Context, op string, payload any) (json.RawMessage, error) {
+				calls++
+				close(prepared) // reached only after acquiring the regional account
+				return h.ycClaimRPC(callCtx, op, payload)
+			})
+			admitted <- e
+		}()
+		select {
+		case <-prepared:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		var admissionPID int
+		for admissionPID == 0 {
+			if err = pool.QueryRow(ctx, `SELECT COALESCE((SELECT pid FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)) LIMIT 1),0)`, revokePID).Scan(&admissionPID); err != nil {
+				t.Fatal(err)
+			}
+			if admissionPID == 0 {
+				select {
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				case <-time.After(time.Millisecond):
+				}
+			}
+		}
+		// Dispatch needs the account now held by admission, completing the cycle.
+		dispatched := make(chan error, 1)
+		go func() {
+			_, e := pool.Exec(ctx, `SELECT team_id FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, operation.Team)
+			dispatched <- e
+		}()
+		if err = <-admitted; !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("admission must fail retryably: %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("timeout proceeded to final approval: %d calls", calls)
+		}
+		// Context cancellation must terminate the server statement too. Otherwise
+		// it could finish after the Go caller released its regional fence.
+		for {
+			var ended bool
+			if e := pool.QueryRow(ctx, `SELECT NOT EXISTS(SELECT FROM pg_stat_activity WHERE pid=$1 AND state<>'idle')`, admissionPID).Scan(&ended); e != nil {
+				t.Fatal(e)
+			}
+			if ended {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-time.After(time.Millisecond):
+			}
+		}
+		response := httptest.NewRecorder()
+		request, _ := gin.CreateTestContext(response)
+		ycClaimError(request, err)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("contention was not retryable: %d", response.Code)
+		}
+		if err = <-dispatched; err != nil {
+			t.Fatalf("admission retained regional lock: %v", err)
+		}
+		release()
+		release = func() {}
+		if err = <-revoked; err != nil {
+			t.Fatal(err)
+		}
+		// The retry reaches persisted revoked state; it cannot revive authority.
+		if _, err = h.ycBindWithIntent(ctx, "approve", p); err == nil || !strings.Contains(err.Error(), "operator recovery") {
+			t.Fatalf("retry defeated revocation: %v", err)
+		}
+		var valid bool
+		if err = pool.QueryRow(ctx, `SELECT public.lock_yc_activation_authority($1,$2,'use')`, operation.ID, operation.Team).Scan(&valid); err != nil || valid {
+			t.Fatalf("revoked dispatch: %t %v", valid, err)
+		}
+		var contracts int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM billing_commercial_contract WHERE team_id=$1`, operation.Team).Scan(&contracts); err != nil || contracts != 0 {
+			t.Fatalf("admission provisioned billing: %d %v", contracts, err)
+		}
+	})
+
+	t.Run("lost prepare response preserves intent and reconciles on retry", func(t *testing.T) {
+		p := create(t)
+		calls := 0
+		_, err := h.ycBindWithIntentRPC(ctx, "approve", p, func(callCtx context.Context, op string, payload any) (json.RawMessage, error) {
+			calls++
+			if _, e := h.ycStaffRPC(callCtx, op, payload); e != nil {
+				return nil, e
+			}
+			return nil, context.DeadlineExceeded // shared commit succeeded; response lost
+		})
+		if !errors.Is(err, context.DeadlineExceeded) || calls != 1 {
+			t.Fatalf("lost response advanced approval: %d %v", calls, err)
+		}
+		var preserved bool
+		if err = pool.QueryRow(ctx, `SELECT intent_team_id=$2 AND intent_user_id=$3 AND approval_id IS NULL AND state='manual_review' FROM yc_claim WHERE id=$1`, p["id"], p["team_id"], p["user_id"]).Scan(&preserved); err != nil || !preserved {
+			t.Fatalf("shared prepare lost: %t %v", preserved, err)
+		}
+		var count int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM yc_claim_team_intent WHERE team_id=$1`, p["team_id"]).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("regional transaction leaked: %d %v", count, err)
+		}
+		for range 2 {
+			if _, err = h.ycBindWithIntentRPC(ctx, "approve", p, h.ycStaffRPC); err != nil {
+				t.Fatalf("reconcile retry: %v", err)
+			}
+		}
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM yc_claim_decision WHERE claim_id=$1 AND decision='operator'`, p["id"]).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("duplicated decision: %d %v", count, err)
+		}
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM yc_claim_approval_mail WHERE claim_id=$1`, p["id"]).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("duplicated notification: %d %v", count, err)
+		}
+	})
+
 }

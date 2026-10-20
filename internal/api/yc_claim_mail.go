@@ -47,6 +47,7 @@ func (h *Handlers) StartYCClaimMail(ctx context.Context) {
 	if h.PromotionAuthPool == nil {
 		return
 	}
+	h.startYCApprovalMonitoring(ctx)
 	origin, err := ycConsoleOrigin()
 	sender, from := h.EmailTransport.Sender(os.Getenv("YC_EMAIL_API_KEY")), os.Getenv("YC_EMAIL_FROM")
 	if err != nil || sender == nil || from == "" {

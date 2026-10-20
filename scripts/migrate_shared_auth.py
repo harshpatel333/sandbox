@@ -50,7 +50,7 @@ FROM anon,authenticated,service_role,promotion_evidence_proxy;
 
 APPROVAL_VERSION = "20261020224623"
 APPROVAL_NAME = "yc_staff_claim_approval_notification"
-APPROVAL_HASH = "bc797a0dd6098d6166f1cbb402d77fb6c8eb925210492fbf1214944f07ea133b"
+APPROVAL_HASH = "fde8a73b8f6aeb1bff110727119cb44c111ede55eb354490a0fb8dddb9a1e114"
 APPROVAL_TABLES = ("public.yc_claim_approval_mail", "public.yc_staff_claim_request")
 APPROVAL_FUNCTIONS = ("public.yc_staff_claim_rpc(text,jsonb)", "public.yc_claim_approval_mail_rpc(text,jsonb)")
 
@@ -111,6 +111,7 @@ def approval_objects_present(conn):
 def approval_catalog(conn):
     return {
         "claims": claim_catalog(conn),
+        "authority": catalog(conn),
         "tables": {table: catalog(conn, table, APPROVAL_FUNCTIONS if i == 0 else ())
                    for i, table in enumerate(APPROVAL_TABLES)},
         "indexes": conn.execute("""SELECT jsonb_agg(pg_get_indexdef(i.indexrelid) ORDER BY c.relname)
@@ -148,6 +149,18 @@ def predecessor_claim_catalog(conn, recorded):
         if function[0] == "yc_claim_view(yc_claim)":
             old = next(f for f in prior_functions if f[0] == function[0])
             function[1] = old[1]
+    return current
+
+
+def predecessor_authority_catalog(conn, recorded):
+    # Only these two function bodies change; attributes and ACLs still match the
+    # original receipt. The approval receipt independently pins both new bodies.
+    current = catalog(conn)
+    replaced = {"reserve_yc_activation_authority(text,uuid,text,uuid,text,text,uuid)",
+                "lock_yc_activation_authority(uuid,uuid,text)"}
+    for function in current["functions"]:
+        if function[0] in replaced:
+            function[1] = next(f[1] for f in recorded["functions"] if f[0] == function[0])
     return current
 
 
@@ -313,7 +326,12 @@ def inspect(conn, sql, migration="authority"):
                 and re.fullmatch(r"[a-f0-9]{40}", revision), "shared_history_mismatch")
         require(present(conn), "shared_schema_missing")
         permissions(conn)
-        actual = predecessor_claim_catalog(conn, stored_catalog) if version == CLAIM_VERSION and APPROVAL_VERSION in versions else snapshot(conn)
+        if APPROVAL_VERSION in versions and version == CLAIM_VERSION:
+            actual = predecessor_claim_catalog(conn, stored_catalog)
+        elif APPROVAL_VERSION in versions and version == VERSION:
+            actual = predecessor_authority_catalog(conn, stored_catalog)
+        else:
+            actual = snapshot(conn)
         require(actual == stored_catalog, "shared_catalog_mismatch")
     for version, definition in definitions.items():
         if version not in versions:

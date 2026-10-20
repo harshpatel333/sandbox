@@ -24,7 +24,11 @@ func (h *Handlers) ycBindWithIntentRPC(ctx context.Context, op string, p gin.H, 
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanup)
+	}()
 	var created time.Time
 	if err = tx.QueryRow(ctx, "SELECT created_at FROM public.team WHERE id=$1 FOR UPDATE", team).Scan(&created); err != nil {
 		return nil, err
@@ -57,7 +61,12 @@ func (h *Handlers) ycBindWithIntentRPC(ctx context.Context, op string, p gin.H, 
 	if op == "approve" {
 		prepare = "prepare-approve"
 	}
-	out, err := rpc(ctx, prepare, p)
+	// Admission holds regional locks while preparing the shared claim. Bound
+	// this wait so revoke (claim -> authority) and dispatch (authority ->
+	// regional) cannot form a cross-database cycle until the request deadline.
+	prepareCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	out, err := rpc(prepareCtx, prepare, p)
+	cancel()
 	if err != nil {
 		return nil, err
 	}

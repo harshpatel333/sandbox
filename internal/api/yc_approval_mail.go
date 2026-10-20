@@ -48,7 +48,13 @@ func (h *Handlers) deliverYCApprovalMail(ctx context.Context, sender EmailSender
 		return false, nil
 	}
 	deliveryErr := sendYCApprovalMail(ctx, sender, origin, from, j)
-	_, ackErr := h.ycApprovalMailRPC(ctx, "finish", map[string]any{"id": j.ClaimID, "message_id": j.MessageID, "lease_id": lease, "success": deliveryErr == nil})
+	var unknown *unknownEmailOutcomeError
+	var rejected *rejectedEmailError
+	// A fresh bounded acknowledgement context survives the send timeout. If it
+	// also fails, the pre-dispatch unknown state requires an audited retry.
+	ackctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	_, ackErr := h.ycApprovalMailRPC(ackctx, "finish", map[string]any{"id": j.ClaimID, "message_id": j.MessageID, "lease_id": lease, "success": deliveryErr == nil, "unknown": errors.As(deliveryErr, &unknown), "rejected": errors.As(deliveryErr, &rejected)})
 	return true, errors.Join(deliveryErr, ackErr)
 }
 
@@ -73,6 +79,44 @@ func (h *Handlers) startYCApprovalMail(ctx context.Context, sender EmailSender, 
 				if !found {
 					break
 				}
+			}
+		}
+	}()
+}
+
+// A negative count means the latest observation failed, never a healthy zero.
+func (h *Handlers) observeYCApprovalBacklog(ctx context.Context) error {
+	raw, err := h.ycApprovalMailRPC(ctx, "backlog", map[string]any{})
+	var sample struct {
+		Count  int64   `json:"count"`
+		Oldest float64 `json:"oldest_seconds"`
+	}
+	if err == nil {
+		err = json.Unmarshal(raw, &sample)
+	}
+	if err != nil {
+		currentBillingRecorder().RecordBillingBacklog(ctx, "yc_approval_notification", -1, 0)
+		return err
+	}
+	currentBillingRecorder().RecordBillingBacklog(ctx, "yc_approval_notification", sample.Count, sample.Oldest)
+	return nil
+}
+
+func (h *Handlers) startYCApprovalMonitoring(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			sample, cancel := context.WithTimeout(ctx, 3*time.Second)
+			err := h.observeYCApprovalBacklog(sample)
+			cancel()
+			if err != nil {
+				log.Warn().Msg("YC approval notification backlog observation unavailable")
 			}
 		}
 	}()

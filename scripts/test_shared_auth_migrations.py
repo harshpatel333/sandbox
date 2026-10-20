@@ -90,6 +90,9 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
             "DROP INDEX public.yc_claim_approval_mail_pending",
             "ALTER FUNCTION public.yc_claim_view(public.yc_claim) VOLATILE",
             "ALTER FUNCTION public.yc_claim_rpc(text,jsonb) STABLE",
+            "CREATE OR REPLACE FUNCTION public.lock_yc_activation_authority(p_approval uuid,p_team uuid,p_region text) RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $$ BEGIN RETURN true; END $$",
+            "ALTER FUNCTION public.reserve_yc_activation_authority(text,uuid,text,uuid,text,text,uuid) STABLE",
+            "ALTER FUNCTION public.revoke_yc_activation_authority(uuid,uuid,uuid) STABLE",
         ):
             with self.conn.transaction(force_rollback=True):
                 self.conn.execute(sql)
@@ -98,6 +101,10 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
         with self.conn.transaction(force_rollback=True):
             self.conn.execute("GRANT SELECT (approved_email) ON public.yc_claim_approval_mail TO service_role")
             with self.assertRaisesRegex(shared.SharedMigrationError, "approval_table_privileges"):
+                self.apply_approvals()
+        with self.conn.transaction(force_rollback=True):
+            self.conn.execute("GRANT EXECUTE ON FUNCTION public.lock_yc_activation_authority(uuid,uuid,text) TO authenticated")
+            with self.assertRaisesRegex(shared.SharedMigrationError, "privileges_mismatch"):
                 self.apply_approvals()
         self.assertEqual(self.apply_approvals(False)["state"], "applied")
 
