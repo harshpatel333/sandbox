@@ -42,25 +42,37 @@ instance metadata must never hold secrets. IAP forwarding is granted for port
 OS Login rights that only exist on `devbox-*` VMs.
 
 Set `engineer_members` (for example `["group:engineers@example.com"]`) to the
-principals who may open tunnels to boxes, then plan and review:
+principals who may open tunnels to boxes. The root has its own state prefix
+(`devbox/us-central1`) and lives outside `infra/`, so no staging or production
+deploy workflow runs on it. Instead, the Devbox Terraform workflow
+(`.github/workflows/devbox-terraform.yml`) plans it on every pull request that
+changes it and applies it when the change merges to `main`. It runs as the
+staging Terraform identity, `superserve-github-actions`. An apply whose plan
+would delete or replace anything stops; if that is intentional, dispatch the
+workflow from `main` with `allow_destroy`.
+
+Once, before the first apply, grant the staging Terraform identity the roles
+for the resource types only this root manages:
 
 ```sh
-terraform -chdir=deploy/devbox/terraform init
-terraform -chdir=deploy/devbox/terraform plan -out=tfplan
+for role in roles/iam.workloadIdentityPoolAdmin roles/recaptchaenterprise.admin roles/serviceusage.apiKeysAdmin; do
+  gcloud projects add-iam-policy-binding rayai-dev --condition=None \
+    --member=serviceAccount:superserve-github-actions@rayai-dev.iam.gserviceaccount.com --role="$role"
+done
 ```
 
-The plan must only create resources; it has its own state prefix
-(`devbox/us-central1`) and touches nothing in the staging or production roots.
-Apply the saved plan from the same root:
+Everything else it needs it already holds. The staging root uses its rights
+over service accounts, custom roles, project IAM, firewall rules, buckets,
+API enablement and the state bucket, and `roles/compute.networkAdmin` covers
+subnet IAM, routers and NAT. If the first apply still fails on a permission,
+grant that one and rerun the workflow. These grants give every workflow that
+runs as the staging Terraform identity, including pull request plans, the
+same reach; that identity can already change project IAM.
 
-```sh
-terraform -chdir=deploy/devbox/terraform apply tfplan
-```
-
-The applier needs project owner (`roles/owner`) on the devbox project and
-object access to the `superserve-terraform-state` bucket. The root lives
-outside `infra/` so that no deploy workflow ever runs on it; it is only ever
-applied by hand.
+Break glass: with project owner and access to the state bucket, the same root
+can be applied by hand from the repository root with
+`terraform -chdir=deploy/devbox/terraform init`, then `plan -out=tfplan`, then
+`apply tfplan`.
 
 Before the first box, confirm that no organization policy blocks nested
 virtualization (`constraints/compute.disableNestedVirtualization`) or OS Login
@@ -73,43 +85,28 @@ name-conditioned login grant; check it once on the first box with
 Terraform also creates `gs://rayai-dev-devbox-hostprep`, which boxes read the
 guest kernel and base rootfs from at bootstrap. Its name is deliberately
 outside `superserve-devbox-*`, so box destroy and the box's object grant never
-match it. Boxes have read-only access and the workflow identity has none;
-only an operator uploads.
+match it. Boxes can only read it. Apart from principals with project-wide
+storage rights, only the staging Terraform identity can write it, through the
+Devbox Hostprep Seed workflow.
 
-Copy the guest kernel and base rootfs from staging Host 1 once, while no VMD
-deploy is running. The kernel is never modified and must match the SHA-256
-recorded in the [Host 2 identity runbook](../host2-identity-runbook.md);
-stop if it does not. VMD deploys that change boxd re-inject it into the
-host's `base.ext4`, so its digest may legitimately differ from the runbook's
-`7494f228...`; any staging copy works because each box injects the boxd of its
-selected revision. The commands below check that the rootfs did not change
-during the copy and print its digest.
-
-```sh
-set -euo pipefail
-work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
-ssh1() { gcloud compute ssh superserve-vmd-staging --project=rayai-dev --zone=us-central1-a --tunnel-through-iap --quiet --command="set -eu; $1" -- -T; }
-before=$(ssh1 'sudo sha256sum /var/lib/sandbox/rootfs/base.ext4' | cut -d' ' -f1)
-ssh1 'sudo cat /var/lib/sandbox/kernel/vmlinux-4.14-fuse' > "$work/vmlinux-4.14-fuse"
-ssh1 'sudo cat /var/lib/sandbox/rootfs/base.ext4' > "$work/base.ext4"
-(cd "$work" && sha256sum -c <<'HASHES'
-3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761  vmlinux-4.14-fuse
-HASHES
-)
-rootfs=$(sha256sum "$work/base.ext4" | cut -d' ' -f1)
-[ "$rootfs" = "$before" ] || { echo "base.ext4 changed during the copy; rerun" >&2; exit 1; }
-gcloud storage cp "$work/vmlinux-4.14-fuse" "$work/base.ext4" gs://rayai-dev-devbox-hostprep/hostprep/
-echo "base.ext4 sha256: $rootfs"
-```
+Dispatch Devbox Hostprep Seed (`.github/workflows/devbox-hostprep.yml`) from
+`main` once, preferably while no VMD deploy is running. It copies the guest kernel and
+base rootfs from staging Host 1 over IAP SSH, only reading the host. The
+kernel is never modified and must match the SHA-256 recorded in the
+[Host 2 identity runbook](../host2-identity-runbook.md), or the job stops.
+VMD deploys that change boxd re-inject it into the host's `base.ext4`, so its
+digest may legitimately differ from the runbook's `7494f228...`; any staging
+copy works because each box injects the boxd of its selected revision. The
+job stops if the rootfs changes during the copy, uploads both files and shows
+the rootfs digest in its summary.
 
 Boxes verify both files against SHA-256 pins after download; the host
 bootstrap keeps them as `DEVBOX_KERNEL_DIGEST` and `DEVBOX_ROOTFS_DIGEST` in
 `deploy/devbox/runtime-pins.env`, added together with the box scripts. If the
-printed rootfs digest differs from that pin, update the pin to it; boxes created before the new pin reaches `main` fail
-verification and should be recreated afterwards. The upload overwrites any
-earlier copy so the bucket always holds the digest just printed; the bucket
-keeps object versions, so an overwritten copy can be recovered.
+summary's rootfs digest differs from that pin, update the pin to it; boxes
+created before the new pin reaches `main` fail verification and should be
+recreated afterwards. Each run overwrites the earlier copy; the bucket keeps
+object versions, so an overwritten copy can be recovered.
 
 ### 3. Create the `devbox` GitHub environment
 
@@ -142,14 +139,13 @@ Variables:
 | `DEVBOX_CONFIG_STRIPE_PRO_ANNUAL_PRICE_ID` | devbox sandbox Pro annual price ID (step 4) |
 | `DEVBOX_CONFIG_BILLING_RESOURCE_CONFIG` | resource-to-meter-and-price mapping JSON (step 4) |
 
-The first five come from
-`terraform -chdir=deploy/devbox/terraform output github_environment_variables`.
+The first five are in the Devbox Terraform apply's job summary.
 
 Secrets:
 
 | Secret | Value |
 | --- | --- |
-| `DEVBOX_SECRET_RECAPTCHA_API_KEY` | `terraform -chdir=deploy/devbox/terraform output -raw recaptcha_api_key` |
+| `DEVBOX_SECRET_RECAPTCHA_API_KEY` | `gcloud services api-keys get-key-string projects/rayai-dev/locations/global/keys/superserve-devbox-recaptcha` |
 | `DEVBOX_SECRET_STRIPE_SECRET_KEY` | devbox Stripe sandbox secret key (step 4) |
 
 The console repository `superserve-ai/superserve` is public, so the box

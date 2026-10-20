@@ -1,0 +1,66 @@
+name: Devbox Hostprep Seed
+
+# Copies the guest kernel and base rootfs from a staging host into the devbox
+# hostprep bucket. The staging host is only read; the kernel must match its
+# pinned digest, and the rootfs must not change while it is copied.
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: 'Staging host to copy from'
+        required: true
+        default: superserve-vmd-staging
+        type: string
+
+concurrency:
+  group: devbox-hostprep
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  seed:
+    name: Seed hostprep artifacts
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: staging
+    env:
+      HOST: ${{ inputs.host }}
+      BUCKET: gs://rayai-dev-devbox-hostprep/hostprep
+      KERNEL_SHA256: 3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Copy and verify
+        run: |
+          set -euo pipefail
+          [[ "$HOST" =~ ^superserve-vmd-staging(-[0-9]+)?$ ]] || { echo "::error::Not a staging host: $HOST"; exit 1; }
+          work=$(mktemp -d)
+          ssh_host() {
+            gcloud compute ssh "$HOST" --project=rayai-dev --zone=us-central1-a \
+              --tunnel-through-iap --quiet --command="set -eu; $1" -- -T
+          }
+          before=$(ssh_host 'sudo sha256sum /var/lib/sandbox/rootfs/base.ext4' | cut -d' ' -f1)
+          ssh_host 'sudo cat /var/lib/sandbox/kernel/vmlinux-4.14-fuse' > "$work/vmlinux-4.14-fuse"
+          ssh_host 'sudo cat /var/lib/sandbox/rootfs/base.ext4' > "$work/base.ext4"
+          echo "$KERNEL_SHA256  $work/vmlinux-4.14-fuse" | sha256sum -c -
+          rootfs=$(sha256sum "$work/base.ext4" | cut -d' ' -f1)
+          [ "$rootfs" = "$before" ] || { echo "::error::base.ext4 changed during the copy; rerun"; exit 1; }
+          gcloud storage cp "$work/vmlinux-4.14-fuse" "$work/base.ext4" "$BUCKET/"
+          {
+            echo "## Devbox hostprep seeded from $HOST"
+            echo
+            echo "- vmlinux-4.14-fuse: \`$KERNEL_SHA256\`"
+            echo "- base.ext4: \`$rootfs\`"
+            echo
+            echo "If base.ext4 differs from DEVBOX_ROOTFS_DIGEST in deploy/devbox/runtime-pins.env, update that pin."
+          } >> "$GITHUB_STEP_SUMMARY"
