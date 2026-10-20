@@ -724,7 +724,7 @@ def deploy(env, now=contract.utc_now):
         # The scripts then come from the box's current sandbox checkout, which
         # prepare could not see; check them before anything on the box changes.
         box.require_scripts(scripts)
-    progress = {"checked_out": [], "deployed": [], "api_started": False}
+    progress = {"checked_out": [], "deployed": [], "api_started": False, "in_flight": None}
     save = lambda: save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "progress": progress})
     save()
     state, failure = manifest, None
@@ -739,12 +739,15 @@ def deploy(env, now=contract.utc_now):
         if "api" in components:
             box.remove(API_DEPLOY_FILE)
         for component in components:
+            progress["in_flight"] = component
+            save()
             for script in contract.COMPONENT_SCRIPTS[component]:
                 if script == "install-api.sh":
                     progress["api_started"] = True
                     save()
                 box.run_script(script)
             progress["deployed"].append(component)
+            progress["in_flight"] = None
             save()
         state = collect_state(box, manifest)
     except (Exception, KeyboardInterrupt) as error:
@@ -754,17 +757,23 @@ def deploy(env, now=contract.utc_now):
 
 def conclude_deploy(env, box, manifest, state, devbox_id, components, revisions, progress, failure, now):
     DEADLINE.report()
+    unconfirmed = []
     if failure is not None:
-        # A dropped connection can hide a checkout that finished on the box;
-        # record what the box actually has. Installers stay unmoved when their
-        # outcome is unknown, and a failed box is only recovered by a full deploy.
+        # A dropped connection can hide a checkout that finished on the box, so
+        # record what one read of the box shows, and never a revision it can't
+        # confirm. The installer that was running gets an unknown SHA; the box
+        # stays failed until a full deploy settles it.
         for key in revisions:
-            if key not in progress["checked_out"]:
-                try:
-                    if box.head(key) == revisions[key]["sha"]:
-                        progress["checked_out"].append(key)
-                except Exception:
-                    pass
+            if key in progress["checked_out"]:
+                continue
+            try:
+                head = box.head(key)
+            except Exception:
+                head = ""
+            if head == revisions[key]["sha"]:
+                progress["checked_out"].append(key)
+            elif head != manifest["revisions"][key]["sha"]:
+                unconfirmed.append(key)
     migrations = "none"
     if progress["api_started"]:
         # install-api.sh ran, so without a readable report for this revision the
@@ -773,7 +782,9 @@ def conclude_deploy(env, box, manifest, state, devbox_id, components, revisions,
     recorded = contract.record_deploy(state, at=now(), actor=env["GITHUB_ACTOR"], components=components,
                                       revisions=revisions, migrations=migrations,
                                       result="failed" if failure else "succeeded",
-                                      checked_out=progress["checked_out"], deployed=progress["deployed"])
+                                      checked_out=progress["checked_out"], deployed=progress["deployed"],
+                                      unconfirmed=unconfirmed,
+                                      in_flight=progress.get("in_flight") if failure is not None else None)
     reported = True
     try:
         box.record(recorded, devbox_id)
@@ -820,6 +831,8 @@ def deploy_summary(manifest, before, components, deployed, migrations, failure):
         previous, current = before["components"][component], manifest["components"][component]
         if component in deployed:
             new = f"`{current['sha'][:12]}` (`{current['branch']}`)"
+        elif current["sha"] == contract.UNKNOWN_SHA:
+            new = "unknown (install interrupted)"
         else:
             new = "not deployed" if component in components else "unchanged"
         rows.append(f"| {component} | `{previous['sha'][:12]}` (`{previous['branch']}`) | {new} |")

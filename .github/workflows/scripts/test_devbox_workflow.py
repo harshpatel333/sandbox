@@ -54,7 +54,8 @@ class FakeCloud:
         self.pending_instance = False
         self.fail_disk_create = False
         self.box_missing = set()
-        self.heads, self.drop_after_checkout = {}, False
+        self.heads, self.drop_after_checkout = {"sandbox": SANDBOX_SHA, "superserve": UI_SHA}, False
+        self.heads_unreadable = False
         self.repo_scripts = list(contract.CREATE_SCRIPTS)
         self.existing = list(existing)
         self.branches = branches if branches is not None else {"main": SANDBOX_SHA, "feature": NEW_SHA}
@@ -147,6 +148,8 @@ class FakeCloud:
             missing = [script for script in self.box_missing if script in command]
             return fail(1, f"missing {missing[0]}") if missing else ok()
         if "rev-parse HEAD 2>/dev/null" in command:
+            if self.heads_unreadable:
+                return fail(255, "Connection timed out")
             return ok(self.heads.get(shlex.split(command)[3].rsplit("/", 1)[-1], "") + "\n")
         if "git -C" in unquote(command):
             sha = re.search(r"checkout -q --force --detach ([0-9a-f]{40})", unquote(command)).group(1)
@@ -527,12 +530,13 @@ class DeployTests(WorkflowCase):
         self.assertEqual(cloud.scripts, ["install-vmd.sh", "services-up.sh", "install-api.sh"])
         final = cloud.metadata_writes[-1]
         self.assertEqual(final["components"]["vmd"], {"branch": "feature", "sha": NEW_SHA})
-        self.assertEqual(final["components"]["api"], {"branch": "main", "sha": SANDBOX_SHA})
+        self.assertEqual(final["components"]["api"], {"branch": "feature", "sha": "unknown"})
         self.assertEqual(final["components"]["ui"], {"branch": "main", "sha": UI_SHA})
         self.assertEqual(final["revisions"]["ui"], {"branch": "feature", "sha": NEW_SHA})
         self.assertEqual(final["deploys"][-1]["migrations"], "applied")
         summary = self.summary.read_text()
-        self.assertIn("| api | `" + SANDBOX_SHA[:12] + "` (`main`) | not deployed |", summary)
+        self.assertIn("| api | `" + SANDBOX_SHA[:12] + "` (`main`) | unknown (install interrupted) |", summary)
+        self.assertIn("| ui | `" + UI_SHA[:12] + "` (`main`) | not deployed |", summary)
         self.assertIn("Services (before this deploy)", summary)
 
     def test_api_install_without_a_readable_report_is_unknown(self):
@@ -622,6 +626,27 @@ class DeployTests(WorkflowCase):
         self.assertEqual(final["state"], "failed")
         self.assertEqual(final["revisions"]["sandbox"], {"branch": "feature", "sha": NEW_SHA})
         self.assertEqual(final["components"]["vmd"], {"branch": "main", "sha": SANDBOX_SHA})
+
+    def test_unreadable_checkout_after_a_failure_is_flagged_unconfirmed(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.drop_after_checkout = True
+        cloud.heads_unreadable = True
+        self.assertEqual(self.deploy(cloud, "vmd"), 1)
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["revisions"]["sandbox"], {"branch": "main", "sha": SANDBOX_SHA, "unconfirmed": True})
+        self.assertEqual(final["components"]["vmd"], {"branch": "main", "sha": SANDBOX_SHA})
+
+    def test_full_deploy_after_an_unknown_install_settles_the_box(self):
+        cloud = FakeCloud(instances=self.box(), fail_script="install-vmd.sh")
+        self.assertEqual(self.deploy(cloud, "vmd"), 1)
+        failed = cloud.metadata_writes[-1]
+        self.assertEqual(failed["components"]["vmd"], {"branch": "feature", "sha": "unknown"})
+        cloud.fail_script = None
+        self.assertEqual(self.deploy(cloud, "all"), 0)
+        settled = cloud.metadata_writes[-1]
+        self.assertEqual(settled["state"], "ready")
+        self.assertEqual(settled["components"]["vmd"], {"branch": "feature", "sha": NEW_SHA})
+        self.assertNotIn("unconfirmed", settled["revisions"]["sandbox"])
 
     def test_failed_box_can_be_redeployed(self):
         cloud = FakeCloud(instances=self.box(state="failed"))

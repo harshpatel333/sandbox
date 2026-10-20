@@ -328,8 +328,11 @@ Each deploy, successful or not, is appended to the manifest's `deploys` with
 the actor, components, previous and new commits, the migration result
 (`applied`, `none`, `failed` or `unknown`) and the outcome (`succeeded` or `failed`).
 Only components whose install finished move in the manifest's `components`,
-and `revisions` moves only for the repositories that were checked out, so a
-deploy that fails partway records exactly what changed. The migration result
+and `revisions` moves only for checkouts confirmed at the new commit, so a
+deploy that fails partway never records progress it can't confirm. After a
+failure the workflow reads the box's checkouts once: a checkout it can't read
+keeps its previous revision marked `unconfirmed`, and the component whose
+install was running when the deploy stopped is recorded with SHA `unknown`. The migration result
 comes from the report `install-api.sh` writes for the deployed commit
 (`/var/lib/superserve-devbox/api-deploy.json`). It is `none` when `install-api.sh`
 didn't run, and `unknown` when it ran but left no readable report for that

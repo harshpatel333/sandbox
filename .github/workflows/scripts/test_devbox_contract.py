@@ -211,6 +211,26 @@ class ManifestTests(unittest.TestCase):
                                        checked_out=["sandbox"], deployed=[])
         self.assertEqual(after["deploys"][-1]["migrations"], "unknown")
 
+    def test_unconfirmed_and_in_flight_progress_is_recorded_without_a_sha(self):
+        at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
+        target = {"sandbox": {"branch": "feature", "sha": SHA_C}}
+        after = contract.record_deploy(manifest(), at=at, actor="x", components=["vmd", "api"], revisions=target,
+                                       migrations="unknown", result="failed", checked_out=[], deployed=[],
+                                       unconfirmed=["sandbox"], in_flight="vmd")
+        self.assertEqual(after["revisions"]["sandbox"], {"branch": "main", "sha": SHA_A, "unconfirmed": True})
+        self.assertEqual(after["components"]["vmd"], {"branch": "feature", "sha": "unknown"})
+        self.assertEqual(after["components"]["api"], {"branch": "main", "sha": SHA_A})
+        for overrides in ({"result": "succeeded", "checked_out": ["sandbox"], "deployed": ["vmd", "api"]},
+                          {"checked_out": ["sandbox"]}, {"in_flight": "ui"}):
+            arguments = {"at": at, "actor": "x", "components": ["vmd", "api"], "revisions": target,
+                         "migrations": "none", "result": "failed", "checked_out": [], "deployed": [],
+                         "unconfirmed": ["sandbox"], "in_flight": "vmd", **overrides}
+            with self.subTest(overrides=overrides), self.assertRaises(contract.ContractError):
+                contract.record_deploy(manifest(), **arguments)
+        with self.assertRaises(contract.ContractError):
+            contract.validate_manifest({**manifest(), "revisions": {**manifest()["revisions"],
+                                        "ui": {"branch": "main", "sha": SHA_B, "unconfirmed": "maybe"}}})
+
     def test_record_deploy_rejects_unknown_outcomes_and_mismatched_revisions(self):
         at = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
         sandbox = {"sandbox": {"branch": "main", "sha": SHA_C}}
