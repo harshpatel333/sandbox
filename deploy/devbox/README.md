@@ -40,12 +40,13 @@ resource, but listing does return every instance's metadata, so staging
 instance metadata must never hold secrets. IAP forwarding is granted for port
 22 on any VM in the project, including staging hosts; logging in still needs
 OS Login rights, which the workflow identity only holds on `devbox-*` VMs.
-OS Login does not honour the name condition, so the create workflow binds
+OS Login does not honour the name condition (for the federated workflow
+identity it checks the instance by numeric ID), so the create workflow binds
 login per instance right after creating the VM (its `setIamPolicy` right is
 itself limited to `devbox-*` VMs): `roles/compute.osAdminLogin` for the
 workflow identity and `roles/compute.osLogin` for the members in
 `DEVBOX_GCP_ENGINEER_MEMBERS`. These bindings live on the VM and go away when
-it is destroyed.
+it is destroyed; a box created before this has none and must be recreated.
 
 Set `engineer_members` in `terraform.tfvars` (for example
 `["group:engineers@example.com"]`) to the principals who may reach boxes; it
