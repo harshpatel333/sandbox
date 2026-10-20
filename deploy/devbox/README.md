@@ -43,8 +43,8 @@ OS Login rights, which the workflow identity only holds on `devbox-*` VMs.
 OS Login does not honour the name condition (for the federated workflow
 identity it checks the instance by numeric ID), so the create workflow binds
 login per instance right after creating the VM (its `setIamPolicy` right is
-itself limited to `devbox-*` VMs): `roles/compute.osAdminLogin` for the
-workflow identity and `roles/compute.osLogin` for the members in
+itself limited to `devbox-*` VMs): `roles/compute.osAdminLogin`, which
+includes sudo, for the workflow identity and for the members in
 `DEVBOX_GCP_ENGINEER_MEMBERS`. These bindings live on the VM and go away when
 it is destroyed; a box created before this has none and must be recreated.
 
@@ -145,7 +145,7 @@ Variables:
 | `DEVBOX_GCP_PROJECT` | devbox project ID |
 | `DEVBOX_GCP_WORKLOAD_IDENTITY` | full provider name, `projects/<number>/locations/global/workloadIdentityPools/superserve-devbox-github/providers/github` |
 | `DEVBOX_GCP_SERVICE_ACCOUNT` | `superserve-devbox-ci@<project>.iam.gserviceaccount.com` |
-| `DEVBOX_GCP_ENGINEER_MEMBERS` | the Terraform `engineer_members`, comma-separated (for example `group:engineers@example.com`); each new box grants them OS Login. Left empty, boxes are created with a warning and only the workflow identity can log in |
+| `DEVBOX_GCP_ENGINEER_MEMBERS` | the Terraform `engineer_members`, comma-separated (for example `group:engineers@example.com`); each new box grants them OS Login with sudo. Left empty, boxes are created with a warning and only the workflow identity can log in |
 | `DEVBOX_CONFIG_RECAPTCHA_SITE_KEY` | reCAPTCHA key ID |
 | `DEVBOX_CONFIG_RECAPTCHA_PROJECT_ID` | devbox project ID |
 | `DEVBOX_CONFIG_STRIPE_API_VERSION` | `2026-05-27.dahlia`, the version staging pins |
