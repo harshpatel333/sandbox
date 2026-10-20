@@ -259,8 +259,8 @@ It then:
    `devbox-name`, `devbox-id`, `owner` and `expires-at`. It then grants, on
    that VM only, OS Login with sudo (`roles/compute.osAdminLogin`) to the
    workflow identity, because OS Login doesn't honour the name-prefix condition
-   on its project role, and to the members in `DEVBOX_GCP_ENGINEER_MEMBERS`, so
-   they can read logs and restart services on their own box. If that variable
+   on its project role, and to every member of `DEVBOX_GCP_ENGINEER_MEMBERS`,
+   so engineers can read logs and restart services on any devbox. If that variable
    is empty, the run warns that no engineer can reach the box. These grants go
    away when the VM is destroyed. Keep `DEVBOX_GCP_ENGINEER_MEMBERS` the same as
    Terraform's `engineer_members`: Terraform grants the IAP tunnel, and this
