@@ -46,5 +46,8 @@ jobs:
       - name: Run profile tests
         run: python3 -m unittest discover -s deploy/devbox -p 'test_*.py'
 
+      - name: Run services tests
+        run: python3 -m unittest discover -s deploy/devbox/services -p 'test_*.py'
+
       - name: Run Stripe catalog bootstrap tests
         run: python3 -m unittest discover -s scripts -p 'test_provision_devbox_stripe.py'
