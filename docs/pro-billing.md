@@ -251,10 +251,18 @@ incident labels.
 
 The independent backlog sampler runs even with issuance disabled. Coverage
 sampler liveness is configured with each cell's `coverage_checks_enabled`.
-It starts false while issuance is disabled. In the separate issuance rollout,
-arm it for every enabled cell and verify recent counter progress; disarm it
-when deliberately disabling issuance. This monitoring input never changes
-issuance itself. The three metric failure policies and recovery log policy
+The production configuration arms East for its coordinated activation and
+leaves West disarmed until its separate issuance rollout. Deploy the East
+monitoring with that activation sequence, before an enabled revision starts
+background workers; traffic cutover is not the activation boundary. Verify
+recent coverage-counter progress afterward. A never-seen sampler can alert after the first minute of evaluation; the
+five-minute lookback does not provide a startup grace period. Coordinate
+activation promptly after arming monitoring. Previously observed counters
+can alert after their last progress ages out of the lookback plus the
+one-minute hold.
+Disarm coverage liveness when deliberately disabling issuance. Staging
+coverage liveness remains a separate follow-up. This monitoring input never
+changes issuance itself. The three metric failure policies and recovery log policy
 remain enabled before rollout. Error series need not exist before their first
 failure: validate selectors using descriptors and staging/fixture evidence,
 then verify live observations after enablement. Normal issuance still targets
@@ -292,8 +300,8 @@ with its extra five-minute delay removed. There must be no policy replacement
 or deletion. Preserve the existing billing notification route rather than
 substituting the general infrastructure channel. Staging uses its own channel.
 
-Before adoption, stop external management of these policy IDs in Struct and
-confirm it will not recreate or overwrite them. Removing `struct_managed`
+Before adoption, stop external management of these policy IDs and
+confirm it will not recreate or overwrite them. Removing external-management
 labels in Terraform alone does not prove the external controller has stopped.
 Do not remove broad telemetry IAM permissions to solve this local ownership
 handoff. Unrelated unmanaged policies belong to their owning rollout.

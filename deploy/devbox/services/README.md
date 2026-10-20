@@ -10,7 +10,7 @@ accept `--dry-run` to validate configuration without changing anything.
 
 | Service | Image or source | Listens on |
 | --- | --- | --- |
-| Postgres | `supabase/postgres:17.11.0.002` | 127.0.0.1:54322 |
+| Postgres | `supabase/postgres:17.6.1.178` | 127.0.0.1:54322 |
 | Auth (GoTrue) | `supabase/gotrue:v2.197.0` | 127.0.0.1:54324, via gateway |
 | Data API (PostgREST) | `postgrest/postgrest:v16.4` | 127.0.0.1:54325, via gateway |
 | Gateway (`/auth/v1`, `/rest/v1`) | `caddy:2.10.2-alpine` | 127.0.0.1:54321 |
@@ -18,8 +18,9 @@ accept `--dry-run` to validate configuration without changing anything.
 | `stripe listen` | `stripe/stripe-cli:v1.31.0` | outbound only |
 | API and background jobs | `cmd/controlplane` built from the checkout | 127.0.0.1:8080 |
 
-The images match the service versions pinned by Supabase CLI 2.119.0, the CLI
-the deployment migrations use. Containers share the host network and bind
+Postgres runs the production server version (17.6). The other images match the
+service versions pinned by Supabase CLI 2.119.0, the CLI the deployment
+migrations use. Containers share the host network and bind
 loopback only; Docker runs with `iptables`, `ip6tables` and the default bridge
 disabled, so it never changes the forwarding and firewall rules VMD relies on.
 `services.json` records each image's digest.

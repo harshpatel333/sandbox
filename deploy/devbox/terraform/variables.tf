@@ -73,3 +73,8 @@ variable "hostprep_bucket" {
   description = "Read-only bucket holding the verified guest kernel and base rootfs for box bootstrap."
   type        = string
 }
+
+variable "hostprep_seeder" {
+  description = "Principal that seeds the hostprep bucket from a staging host."
+  type        = string
+}

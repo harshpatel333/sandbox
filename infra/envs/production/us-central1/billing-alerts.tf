@@ -9,10 +9,11 @@ module "billing_alerts" {
   notification_channel_ids = ["projects/${local.project_id}/notificationChannels/17044408421759047225"]
   cells = {
     east = {
-      metric_location         = "us-east4-c"
-      cloud_run_service       = "superserve-api-use4"
-      cloud_run_region        = "us-east4"
-      coverage_checks_enabled = false
+      metric_location   = "us-east4-c"
+      cloud_run_service = "superserve-api-use4"
+      cloud_run_region  = "us-east4"
+      # Deploy with the East activation sequence, before enabled workers start.
+      coverage_checks_enabled = true
     }
     west = {
       metric_location         = "us-west2-a"
