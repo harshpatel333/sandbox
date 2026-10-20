@@ -160,6 +160,21 @@ module "iam" {
       role    = "roles/iam.roleAdmin"
       members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
     }
+    # Temporary: the first devbox Terraform apply (.github/workflows/devbox-terraform.yml)
+    # runs as this account and creates the devbox workload identity pool, reCAPTCHA key
+    # and API key. Reduce these to their viewer roles once that apply has run.
+    cd_devbox_workload_identity_pool_admin = {
+      role    = "roles/iam.workloadIdentityPoolAdmin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    cd_devbox_recaptcha_admin = {
+      role    = "roles/recaptchaenterprise.admin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    cd_devbox_api_keys_admin = {
+      role    = "roles/serviceusage.apiKeysAdmin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
     grafana_monitoring_viewer = {
       role = "roles/monitoring.viewer"
       members = [
