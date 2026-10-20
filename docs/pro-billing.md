@@ -223,3 +223,82 @@ issuance. If a plan cannot drain, keep collection held and deploy a forward fix;
 do not delete frozen plans, grants, or requests to make an older binary proceed.
 The database deliberately rejects older Pro overdue observations as new credit
 authority. Existing issued grants and legacy invoice plans remain readable.
+
+## Entitlement alert response
+
+Six additive production policies are owned by `deploy/billing-alerts/terraform`,
+using the production state bucket's `production/billing-alerts` prefix and
+default workspace. This dedicated root covers East and West API cells and is
+applied only through the manually dispatched Billing Alert Rollout workflow.
+Merging its source does not apply it. Staging is unchanged.
+
+Five existing billing policies retain their current ownership and routing.
+The existing paid-missing alert retains its five-minute sustained-condition
+requirement after the application grace. Its five-minute maximum-alignment
+window is aggregation, not another fixed five-minute delay. The additive root
+must not create a second paid-missing policy. Future adoption must preserve
+these six resources in their dedicated state or explicitly migrate ownership;
+never declare a second copy in a regional root.
+
+The metric resource's `location` comes from the receiving collector, currently
+`us-east4-c` and `us-west2-a` in production.
+It is not the Cloud Run region. Queries restrict the project and
+`sandbox-controlplane` job and take the maximum of replicated backlog gauges.
+Customer and contract identifiers stay in diagnostic logs, never metric or
+incident labels.
+
+| Signal | Timing and meaning | Response |
+| --- | --- | --- |
+| Paid missing (existing policy) | Nonzero backlog after the application's 15-minute threshold, with the existing five-minute sustained-condition requirement | Identify affected current entitlements; check eligibility and frozen request evidence. |
+| Debt unknown | Warning on any nonzero count; a subset of paid missing | Restore fresh debt observation. Unknown debt does not prove nonpayment or authorize a grant. |
+| Sampler errors | Critical on any coverage/backlog error increase over five minutes | Check database and worker errors; the policy clears after errors leave the window. |
+| Sampler stopped | One-minute hold after no progress; never-seen counters can alert after one minute, while previously progressing counters must first age out of the five-minute lookback | Inspect API/collector health and export delays. Absent or frozen counters are not healthy zeroes. |
+| Operator recovery | Critical on the first matching ERROR; one incident for all customers, replicas and cells | Inspect all matching logs, pending grants and collection holds. |
+
+The independent backlog sampler runs even with issuance disabled. Coverage
+sampler liveness is configured with each cell's `coverage_checks_enabled`.
+The production configuration arms East for its coordinated activation and
+leaves West disarmed until its separate issuance rollout. Deploy the East
+monitoring with that activation sequence, before an enabled revision starts
+background workers; traffic cutover is not the activation boundary. Verify
+recent coverage-counter progress afterward. A never-seen sampler can alert
+after the first minute of evaluation; the five-minute lookback does not provide a startup grace period. Coordinate
+activation promptly after arming monitoring. Previously observed counters
+can alert after their last progress ages out of the lookback plus the
+one-minute hold.
+Disarm coverage liveness when deliberately disabling issuance. Staging
+coverage liveness remains a separate follow-up. This monitoring input never
+changes issuance itself. The new observation-error, debt-unknown and recovery
+log policies remain enabled before rollout. Error series need not exist before their first
+failure: validate selectors using descriptors and staging/fixture evidence,
+then verify live observations after enablement. Normal issuance still targets
+one minute; escalation thresholds are not the normal service target.
+
+The recovery selector covers the API's current console `ERR` lines in
+`textPayload` as well as structured JSON `ERROR` entries, scoped to the expected
+Cloud Run services and regions. The recovery policy extracts no labels, so 100
+customer events within five minutes produce one incident and one initial
+notification. Subsequent matching events can notify again no sooner than five minutes later; there is no initial
+five-minute delay, including near-expiry events. Cloud Monitoring limits direct
+log policies to 20 notifications per day. Treat a notification as a prompt to
+inspect *all* affected contracts; it is not a queue of individual customers.
+The paid-missing and debt-unknown policies overlap deliberately and remain
+separately identifiable. A log incident auto-closes after 24 hours of silence;
+metric predicates clear on healthy samples. Neither notification closure nor
+missing telemetry proves billing recovery.
+
+Before declaring a billing incident resolved, verify the intended current
+period has its confirmed grant and correct provider evidence, or record the
+explicit manual remediation for a missed period. Inspect
+`billing_entitlement_work`, `billing_usage_entitlement`, and
+`billing_entitlement_withheld` as described above. Retain the frozen request
+identity after a potentially successful write; reconcile the original grant
+instead of issuing a replacement. Keep invoice collection held until the
+expected allowance and invoice settlement are correct. Never automatically
+extend an expired grant or roll it into a new period.
+
+
+After coordinated deployment, record all six policy IDs, enabled states,
+selectors, cell scope and notification route; verify the five existing policies
+remain unchanged. Observe East coverage-counter progress before completing the
+issuance rollout. No synthetic notification delivery is required.
