@@ -51,6 +51,8 @@ def validate_plan(plan, project, service):
         raise ValueError("Deferred changes are not permitted")
     mutations = []
     for resource in plan.get("resource_changes", []):
+        if resource.get("previous_address") or resource["change"].get("importing"):
+            raise ValueError("State moves and imports require separate review")
         actions = resource["change"]["actions"]
         if actions == ["no-op"]:
             continue

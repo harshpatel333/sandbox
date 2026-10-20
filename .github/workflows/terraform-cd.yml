@@ -519,6 +519,9 @@ jobs:
   # against that cell.
   production-us-east4-infra:
     name: Apply production/us-east4
+    # Clear only after the separately approved flag apply and runtime verification.
+    # Default closed also protects later pushes during the enablement window.
+    if: vars.EAST_USAGE_ENTITLEMENTS_APPLIED == 'true'
     runs-on: ubuntu-latest
     environment: production
     needs: [staging-us-central1-api, production-us-central1-bootstrap]

@@ -1,6 +1,7 @@
 import copy
 import importlib.util
 from pathlib import Path
+import re
 import unittest
 
 
@@ -69,6 +70,23 @@ class ReleasePlanTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 self.validate(value)
 
+    def test_rejects_state_imports_and_moves_even_without_resource_mutations(self):
+        for actions in (["no-op"], ["read"], ["update"]):
+            for kind in ("import", "move"):
+                value = plan()
+                extra = {"address": "module.other.resource", "mode": "managed", "change": {"actions": actions}}
+                if kind == "import":
+                    extra["change"]["importing"] = {"id": "example"}
+                else:
+                    extra["previous_address"] = "module.previous.resource"
+                value["resource_changes"].append(extra)
+                with self.subTest(actions=actions, kind=kind), self.assertRaises(ValueError):
+                    self.validate(value)
+        value = plan()
+        value["resource_changes"][0]["previous_address"] = "module.old_api.service"
+        with self.assertRaises(ValueError):
+            self.validate(value)
+
     def test_rejects_missing_duplicate_or_nonliteral_flag(self):
         for case in ("missing", "duplicate", "false", "secret"):
             value = plan()
@@ -106,6 +124,38 @@ class SourceLandingTests(unittest.TestCase):
     def test_unrelated_later_deploy_keeps_normal_pipeline(self):
         self.assertFalse(release.source_landing(self.after(), self.after(), {"infra/other.tf"}))
         self.assertFalse(release.source_landing(self.after(), self.after().replace('"preserve"', '"changed"'), {release.ROOT_FILE}))
+
+
+class WorkflowBoundaryTests(unittest.TestCase):
+    def test_pending_enablement_holds_only_east_on_later_pushes(self):
+        # Check the actual dependency graph: a skipped East gate must not strand
+        # the independent West/central chain or leave an East deployment bypass.
+        text = (PATH.parents[1] / ".github/workflows/terraform-cd.yml").read_text()
+        blocks = dict(re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", text.split("jobs:\n", 1)[1], re.M | re.S))
+        self.assertIn("if: vars.EAST_USAGE_ENTITLEMENTS_APPLIED == 'true'", blocks["production-us-east4-infra"])
+        self.assertIn("if: needs.release-scope.outputs.east_usage_only == 'false'", blocks["wait-for-migrations"])
+        dependencies = {}
+        for name, block in blocks.items():
+            match = re.search(r"^    needs: \[([^]]*)\]", block, re.M)
+            dependencies[name] = [x.strip() for x in match.group(1).split(",")] if match else []
+        def skipped(initial):
+            result = set(initial)
+            while True:
+                new = result | {name for name, needs in dependencies.items() if set(needs) & result}
+                if new == result:
+                    return result
+                result = new
+        initial_hold = skipped({"wait-for-migrations"})
+        self.assertEqual(initial_hold, set(blocks) - {"release-scope"})
+        later_hold = skipped({"production-us-east4-infra"})
+        self.assertEqual(later_hold, {"production-us-east4-infra", "production-us-east4-api"})
+
+    def test_image_only_updates_do_not_replace_runtime_environment(self):
+        text = (PATH.parents[1] / ".github/workflows/deploy-api.yml").read_text()
+        commands = re.findall(r"gcloud run services update (?:[^\n]*\\\n)*[^\n]*", text)
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertNotRegex(command, r"--(?:set|update|remove|clear)-env-vars|--env-vars-file|--(?:set|remove|clear)-secrets")
 
 
 if __name__ == "__main__":
