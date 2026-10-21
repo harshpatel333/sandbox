@@ -223,12 +223,31 @@ func TestProviderPairRevokedPendingWorkIsNotPlatformFailure(t *testing.T) {
 	if err = f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_entitlement_withheld WHERE contract_id=$1 AND platform_failure_at IS NOT NULL`, f.b.ContractID).Scan(&failures); err != nil || failures != 0 || f.posts.Load() != 0 {
 		t.Fatal("revocation fabricated platform delivery failure", failures, err)
 	}
+	plan := billing.InvoiceClosePlan{InvoiceEnd: end.Unix()}
+	if err = f.h.prepareInvoiceCredits(t.Context(), billing.ExportPeriod{TeamID: f.b.Identity.TeamID, Start: start, End: end}, invoiceAccount{Customer: f.b.CustomerID, Subscription: f.b.UsageSubscriptionID, Price: f.b.Terms.Rounding.PriceID, Pair: &f.b}, "in_closing", &plan, f.h.Stripe.(*stripeHTTPClient)); err != nil {
+		t.Fatal("revoked pending allowance blocked invoice closure", err)
+	}
+}
+
+func TestProviderPairRevocationKeepsUncertainInvoiceBlocked(t *testing.T) {
+	f := newPairWorkerFixture(t)
+	f.lost.Store(true)
+	if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.b.ContractID); err == nil {
+		t.Fatal("expected lost grant response")
+	}
+	f.revoke(t)
+	start, end := f.b.Anchor, annualBoundary(f.b.Anchor, 1)
+	plan := billing.InvoiceClosePlan{InvoiceEnd: end.Unix()}
+	err := f.h.prepareInvoiceCredits(t.Context(), billing.ExportPeriod{TeamID: f.b.Identity.TeamID, Start: start, End: end}, invoiceAccount{Customer: f.b.CustomerID, Subscription: f.b.UsageSubscriptionID, Price: f.b.Terms.Rounding.PriceID, Pair: &f.b}, "in_closing", &plan, f.h.Stripe.(*stripeHTTPClient))
+	if err == nil || !strings.Contains(err.Error(), "unresolved") {
+		t.Fatal("revocation hid uncertain grant during invoice closure", err)
+	}
 }
 
 func configurePairWorkerProvider(t *testing.T, wf *pairWorkerFixture, f *pairFixture) {
 	f.serve = func(w http.ResponseWriter, req *http.Request) bool {
 		w.Header().Set("Content-Type", "application/json")
-		if req.URL.Path == "/v1/invoices" {
+		if req.URL.Path == "/v1/invoices" || req.URL.Path == "/v1/billing/credit_balance_transactions" {
 			fmt.Fprint(w, `{"data":[]}`)
 			return true
 		}
