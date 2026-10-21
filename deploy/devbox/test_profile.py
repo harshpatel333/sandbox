@@ -15,6 +15,7 @@ class TerraformAgreementTest(unittest.TestCase):
     def test_names_match_the_iam_conditions(self):
         self.assertEqual(PROFILE["resource_name_prefix"], TFVARS["resource_name_prefix"])
         self.assertEqual(PROFILE["bucket"]["name_prefix"], TFVARS["bucket_name_prefix"])
+        self.assertEqual(PROFILE["zones"], ZONES)
         self.assertIn(PROFILE["zone"], ZONES)
         self.assertEqual(PROFILE["project"], TFVARS["project_id"])
 
