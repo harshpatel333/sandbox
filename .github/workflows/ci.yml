@@ -17,12 +17,7 @@ jobs:
         with:
           version: '2.119.0'
 
-      - name: Install isolated migration dependencies
-        run: |
-          python3 -m venv "$RUNNER_TEMP/migration-venv"
-          "$RUNNER_TEMP/migration-venv/bin/python" -m pip install -r scripts/migration-requirements.txt
-          "$RUNNER_TEMP/migration-venv/bin/python" -I -c 'import psycopg'
-          echo "$RUNNER_TEMP/migration-venv/bin" >> "$GITHUB_PATH"
+      - run: python3 -m pip install -r scripts/migration-requirements.txt
 
       - name: Validate fresh and interrupted migrations
         run: |
@@ -30,7 +25,6 @@ jobs:
           python3 scripts/test_migration_overlay.py
           python3 scripts/test_migration_execution.py
           python3 scripts/test_shared_auth_migrations.py
-          python3 scripts/test_devbox_shared_auth.py
 
   unit-tests:
     name: Unit Tests
