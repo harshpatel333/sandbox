@@ -10,7 +10,11 @@ health remains successful.
 ## Compatibility before preparation
 
 Release the acceptance-aware migration inspector before preparing any shared
-database. It recognizes the exact optional acceptance receipt and its permitted
+database: [recognition-only compatibility PR #771](https://github.com/superserve-ai/sandbox/pull/771),
+source `9b2be50116e9c4e8209898dc3cd7672e059b6711`. Record its actual merge/release
+revision and verify the deployed executor retains that implementation before
+preparation; the PR's existence alone does not prove release. It recognizes the
+exact optional acceptance receipt and its permitted
 predecessor catalog changes, while retaining all previous receipt checks. The initial
 compatibility release does not expose acceptance apply through the CLI or add it
 to the general deployment prerequisite. The pinned SQL file is the reference
