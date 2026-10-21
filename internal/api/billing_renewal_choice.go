@@ -57,6 +57,7 @@ type renewalChoiceRequest struct {
 }
 
 type renewalChoiceOperation struct {
+	Steps        []renewalChoiceStep  `json:"steps,omitempty"`
 	ID           uuid.UUID            `json:"operation_id"`
 	Request      renewalChoiceRequest `json:"request"`
 	Actor        uuid.UUID            `json:"actor_id"`
@@ -356,6 +357,9 @@ func (s *renewalChoiceService) reconcile(ctx context.Context, k renewalChoiceKey
 	}
 	if s.Provider == nil || !validRenewalKey(k) {
 		return errRenewalDisabled
+	}
+	if p, ok := s.Provider.(renewalChoiceStagedProvider); ok {
+		return s.reconcileSteps(ctx, k, p)
 	}
 	var op *renewalChoiceOperation
 	err := s.Store.Transact(ctx, k, func(tx renewalChoiceTransaction) error {

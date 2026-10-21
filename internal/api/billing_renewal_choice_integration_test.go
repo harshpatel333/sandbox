@@ -269,3 +269,28 @@ func TestRenewalChoiceHTTPCurrentPermissionAndReplay(t *testing.T) {
 		t.Fatal("revoked replay", out.Code, out.Body.String())
 	}
 }
+
+func TestRenewalChoicePostgresStagedRestart(t *testing.T) {
+	s, a, pool := newRenewalPostgresFixture(t)
+	submitRenewal(t, s, a, "free")
+	p := &fixtureRenewalSteps{fixtureRenewalProvider: &fixtureRenewalProvider{}, loseCreate: true, observed: true, now: func() renewalChoiceProof { return renewalChoiceProof{VerifiedAt: time.Now().UTC()} }}
+	s.Provider = p
+	for range 2 {
+		if err := s.reconcile(t.Context(), a.key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restart := &renewalChoiceService{Enabled: true, Store: postgresRenewalChoiceStore{Pool: pool}, Authority: a, Provider: p}
+	for range 3 {
+		if err := restart.reconcile(t.Context(), a.key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	j, err := restart.status(t.Context(), a.key, a.actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.calls.Load() != 2 || j.Confirmed.Request.Choice != "free" || len(j.Confirmed.Steps) != 2 || j.Confirmed.Steps[0].Request.Kind != "create_schedule" || j.Confirmed.Steps[1].Request.Kind != "update_schedule" {
+		t.Fatal("restart lost stage identity", j)
+	}
+}
