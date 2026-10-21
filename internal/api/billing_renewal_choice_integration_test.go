@@ -3,8 +3,16 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"github.com/gin-gonic/gin"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -20,7 +28,11 @@ import (
 // does not stand in for production authority, catalog or payment guard adapters.
 func newRenewalPostgresFixture(t *testing.T) (*renewalChoiceService, *fixtureRenewalAuthority, *pgxpool.Pool) {
 	t.Helper()
-	cfg, err := pgxpool.ParseConfig(os.Getenv("RENEWAL_JOURNAL_TEST_DSN"))
+	dsn := os.Getenv("RENEWAL_JOURNAL_TEST_DSN")
+	if dsn == "" {
+		t.Skip("dedicated renewal journal database not configured")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,5 +197,75 @@ func TestRenewalChoiceMonthlyPublicationRejectsConflictingVersion(t *testing.T) 
 	var amount int64
 	if err = pool.QueryRow(t.Context(), `SELECT charge_amount_cents FROM billing_commercial_offer_version`).Scan(&amount); err != nil || amount != 1 {
 		t.Fatal(amount, err)
+	}
+}
+
+func TestRenewalChoiceHTTPCurrentPermissionAndReplay(t *testing.T) {
+	s, a, pool := newRenewalPostgresFixture(t)
+	_, err := pool.Exec(t.Context(), `CREATE TABLE roles(id uuid,scope_type text); CREATE TABLE permissions(id uuid,name text); CREATE TABLE role_permissions(role_id uuid,permission_id uuid); CREATE TABLE team_memberships(team_id uuid,user_id uuid,status text); CREATE TABLE user_role_assignments(user_id uuid,team_id uuid,role_id uuid,scope_type text,revoked_at timestamptz)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, read, write := uuid.New(), uuid.New(), uuid.New()
+	for _, entry := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO roles VALUES($1,'team')`, []any{role}},
+		{`INSERT INTO permissions VALUES($1,'billing:read'),($2,'billing:write')`, []any{read, write}},
+		{`INSERT INTO role_permissions VALUES($1,$2),($1,$3)`, []any{role, read, write}},
+		{`INSERT INTO team_memberships VALUES($1,$2,'active')`, []any{a.key.Team, a.actor}},
+		{`INSERT INTO user_role_assignments VALUES($1,$2,$3,'team',NULL)`, []any{a.actor, a.key.Team, role}},
+	} {
+		if _, err = pool.Exec(t.Context(), entry.sql, entry.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pub, key, _ := ed25519.GenerateKey(rand.Reader)
+	t.Setenv("PROMOTION_ACCOUNT_PUBLIC_KEY", base64.StdEncoding.EncodeToString(pub))
+	h := &Handlers{Pool: pool, RenewalChoices: s}
+	r := gin.New()
+	statusPath := "/internal/yc/account/renewals/status"
+	submitPath := "/internal/yc/account/renewals/submit"
+	r.POST(statusPath, YCRenewalAuth("status"), h.RenewalChoiceStatus)
+	r.POST(submitPath, YCRenewalAuth("submit"), h.SubmitRenewalChoice)
+	send := func(path string, body []byte, actor uuid.UUID) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+		req.Header.Set("X-YC-Renewal-Assertion", renewalHTTPAssertion(t, key, actor, path, string(body), func(c *renewalChoiceClaims) {
+			if path == submitPath {
+				c.Operation = "submit"
+			}
+		}))
+		out := httptest.NewRecorder()
+		r.ServeHTTP(out, req)
+		return out
+	}
+	statusBody, _ := json.Marshal(map[string]any{"team_id": a.key.Team, "assignment_id": a.key.Assignment})
+	if out := send(statusPath, statusBody, a.actor); out.Code != 200 {
+		t.Fatal(out.Code, out.Body.String())
+	}
+	req := struct {
+		renewalChoiceKey
+		renewalChoiceRequest
+	}{a.key, renewalChoiceRequest{Acceptance: a.authority.Acceptance, ID: uuid.New(), Choice: "free", ApprovalRevision: a.authority.Revision, ChoiceRevision: 1}}
+	body, _ := json.Marshal(req)
+	for range 2 {
+		out := send(submitPath, body, a.actor)
+		if out.Code != 200 {
+			t.Fatal(out.Code, out.Body.String())
+		}
+	}
+	if out := send(statusPath, statusBody, uuid.New()); out.Code != 403 {
+		t.Fatal("cross actor", out.Code, out.Body.String())
+	}
+	if _, err = pool.Exec(t.Context(), `UPDATE user_role_assignments SET revoked_at=now()`); err != nil {
+		t.Fatal(err)
+	}
+	if out := send(statusPath, statusBody, a.actor); out.Code != 403 {
+		t.Fatal("stale read authority", out.Code, out.Body.String())
+	}
+	if out := send(submitPath, body, a.actor); out.Code != 403 {
+		t.Fatal("revoked replay", out.Code, out.Body.String())
 	}
 }

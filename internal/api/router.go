@@ -139,6 +139,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	ycConsole.POST("/claims", h.ListYCClaims)
 	ycConsole.POST("/bind", h.BindYCClaim)
 	ycConsole.POST("/status", h.YCClaimBillingStatus)
+	r.POST("/internal/yc/account/renewals/status", TeamCreationPrivacy(), YCRenewalAuth("status"), h.RenewalChoiceStatus)
+	r.POST("/internal/yc/account/renewals/submit", TeamCreationPrivacy(), YCRenewalAuth("submit"), h.SubmitRenewalChoice)
 	ycStaff := r.Group("/internal/yc/staff", TeamCreationPrivacy(), YCStaffAuth())
 	ycStaff.GET("/claims", h.ListStaffYCClaims)
 	ycStaff.GET("/claims/:claim_id", h.GetStaffYCClaim)

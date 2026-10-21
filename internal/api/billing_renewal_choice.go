@@ -151,7 +151,7 @@ type renewalChoiceService struct {
 }
 
 func (s *renewalChoiceService) available() error {
-	if !s.Enabled || s.Store == nil || s.Authority == nil {
+	if s == nil || !s.Enabled || s.Store == nil || s.Authority == nil {
 		return errRenewalDisabled
 	}
 	return nil
@@ -202,7 +202,7 @@ func validateRenewalProof(k renewalChoiceKey, op renewalChoiceOperation, p renew
 	if p.Operation != op.ID || !p.Boundary.Equal(k.Boundary) || p.BindingHash != renewalHash(op.Binding) || p.TermsHash != renewalHash(op.Terms) || p.VerifiedAt.IsZero() || p.VerifiedAt.After(now) || json.Unmarshal(p.Evidence, &evidence) != nil || len(evidence) == 0 {
 		return errRenewalConflict
 	}
-	if p.Timing != "boundary_history" && !(p.Timing == "future_configuration" && now.Before(k.Boundary)) {
+	if (p.Timing == "boundary_history" && p.VerifiedAt.Before(k.Boundary)) || (p.Timing != "boundary_history" && !(p.Timing == "future_configuration" && now.Before(k.Boundary))) {
 		return errRenewalConflict
 	}
 	if p.Outcome != "confirmed" && p.Outcome != "no_effect" {
@@ -370,6 +370,7 @@ func (s *renewalChoiceService) reconcile(ctx context.Context, k renewalChoiceKey
 	}
 	var proof renewalChoiceProof
 	var providerErr error
+	directResult := false
 	if op.State == "prepared" {
 		dispatched := false
 		err = s.Authority.Guard(ctx, k, op.Actor, func() error {
@@ -399,6 +400,7 @@ func (s *renewalChoiceService) reconcile(ctx context.Context, k renewalChoiceKey
 			}
 			if dispatched {
 				proof, providerErr = s.Provider.Dispatch(ctx, k, *op)
+				directResult = true
 			}
 			return nil
 		})
@@ -418,7 +420,10 @@ func (s *renewalChoiceService) reconcile(ctx context.Context, k renewalChoiceKey
 		if current.State != "dispatched" && current.State != "outcome_unknown" {
 			return nil
 		}
-		if providerErr != nil || validateRenewalProof(k, *current, proof, tx.Now()) != nil {
+		// Absence observed concurrently or after a lost response cannot prove that
+		// an in-flight write will not arrive. Only a direct terminal rejection may
+		// release the generation fence; observation can confirm but never reject.
+		if providerErr != nil || (proof.Outcome == "no_effect" && !directResult) || validateRenewalProof(k, *current, proof, tx.Now()) != nil {
 			current.State = "outcome_unknown"
 			return tx.Save("provider_outcome_unknown")
 		}
@@ -470,6 +475,9 @@ func (s *renewalChoiceService) reconcileSuccessor(ctx context.Context, k renewal
 			return err
 		}
 		if observeErr != nil || proof.Outcome != "confirmed" || proof.Timing != "boundary_history" || validateRenewalProof(k, *j.Confirmed, proof, tx.Now()) != nil {
+			if j.SuccessorState == "active" || j.SuccessorState == "free" {
+				return errRenewalPending
+			}
 			j.SuccessorState = "review_required"
 			return tx.Save("boundary_verification_required")
 		}

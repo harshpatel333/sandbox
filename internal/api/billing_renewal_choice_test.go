@@ -534,3 +534,80 @@ func TestRenewalChoiceCustomerProjectionPreservesPinnedTermsAndHidesEvidence(t *
 		}
 	}
 }
+
+func TestRenewalChoiceNoEffectObservationCannotReleaseInflightFence(t *testing.T) {
+	s, store, a := newRenewalFixture(t)
+	submitRenewal(t, s, a, "free")
+	entered, release := make(chan struct{}), make(chan struct{})
+	s.Provider = &fixtureRenewalProvider{dispatch: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+		close(entered)
+		<-release
+		return fixtureRenewalProof(k, op, store.now), nil
+	}, observe: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+		p := fixtureRenewalProof(k, op, store.now)
+		p.Outcome = "no_effect"
+		return p, nil
+	}}
+	done := make(chan error, 1)
+	go func() { done <- s.reconcile(t.Context(), a.key) }()
+	<-entered
+	if err := s.reconcile(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	j, _ := s.status(t.Context(), a.key, a.actor)
+	if j.Requested.State != "outcome_unknown" {
+		t.Fatal(j)
+	}
+	_, err := s.submit(t.Context(), a.key, a.actor, renewalChoiceRequest{ID: uuid.New(), Choice: "annual", Acceptance: a.authority.Acceptance, ApprovalRevision: 7, ChoiceRevision: j.Revision})
+	if !errors.Is(err, errRenewalPending) {
+		t.Fatal(err)
+	}
+	close(release)
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+	j, _ = s.status(t.Context(), a.key, a.actor)
+	if j.Confirmed.Request.Choice != "free" {
+		t.Fatal(j)
+	}
+}
+
+func TestRenewalChoiceLaterReadFailurePreservesCompletedSuccessor(t *testing.T) {
+	s, store, a := newRenewalFixture(t)
+	store.now = a.key.Boundary
+	s.Provider = &fixtureRenewalProvider{observe: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+		return fixtureRenewalProof(k, op, store.now), nil
+	}}
+	s.Successors = &fixtureRenewalSuccessor{state: "active"}
+	if err := s.reconcileSuccessor(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	s.Provider = &fixtureRenewalProvider{observe: func(renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error) {
+		return renewalChoiceProof{}, errors.New("temporary unavailable")
+	}}
+	if err := s.reconcileSuccessor(t.Context(), a.key); !errors.Is(err, errRenewalPending) {
+		t.Fatal(err)
+	}
+	j, _ := s.status(t.Context(), a.key, a.actor)
+	if j.SuccessorState != "active" {
+		t.Fatal(j)
+	}
+}
+
+func TestRenewalChoiceRejectsPreBoundaryHistoryTimestamp(t *testing.T) {
+	s, store, a := newRenewalFixture(t)
+	store.now = a.key.Boundary.Add(time.Hour)
+	s.Provider = &fixtureRenewalProvider{observe: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+		p := fixtureRenewalProof(k, op, store.now)
+		p.VerifiedAt = k.Boundary.Add(-time.Second)
+		return p, nil
+	}}
+	successor := &fixtureRenewalSuccessor{state: "active"}
+	s.Successors = successor
+	if err := s.reconcileSuccessor(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	if successor.calls != 0 {
+		t.Fatal("pre-boundary proof adopted")
+	}
+}
