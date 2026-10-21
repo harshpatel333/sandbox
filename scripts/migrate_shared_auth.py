@@ -56,7 +56,7 @@ APPROVAL_FUNCTIONS = ("public.yc_staff_claim_rpc(text,jsonb)", "public.yc_claim_
 
 ACCEPTANCE_VERSION = "20261021135531"
 ACCEPTANCE_NAME = "yc_offer_acceptance_authority"
-ACCEPTANCE_HASH = "2c1ecb84f54bbb3c0d9234e40a487cc302a5d4a8e3beaaffa65b339dd8dffe4e"
+ACCEPTANCE_HASH = "42555db4a841210177944aabf7a14e1311b0e5febbbbe6a080d8babdc47ceba3"
 ACCEPTANCE_TABLES = ("public.yc_offer_acceptance_authority", "public.yc_preferred_identity_review",
     "public.yc_financial_serialization", "public.yc_financial_authorization", "public.yc_financial_invalidation")
 ACCEPTANCE_WRITER_TRIGGERS = {

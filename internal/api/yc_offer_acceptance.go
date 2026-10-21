@@ -230,11 +230,22 @@ func (s *YCOfferAcceptanceService) WithGuard(ctx context.Context, r YCAcceptance
 	return s.withGuard(ctx, r, "guard", f)
 }
 
+// WithSuccessorGuard checks the current requesting administrator while retaining
+// the original accepted identity as shared authority. Like WithGuard, its callback
+// is network-only; it does not authorize a regional financial commit.
+func (s *YCOfferAcceptanceService) WithSuccessorGuard(ctx context.Context, r YCAcceptanceRecord, requester uuid.UUID, f func(context.Context) error) error {
+	return s.withGuardForActor(ctx, r, "guard", requester, f)
+}
+
 func (s *YCOfferAcceptanceService) withGuard(ctx context.Context, r YCAcceptanceRecord, op string, f func(context.Context) error) error {
-	if !s.available() || r.AcceptedAt == nil || r.RequestID == nil || r.HomeRegion != s.Region {
+	return s.withGuardForActor(ctx, r, op, r.UserID, f)
+}
+
+func (s *YCOfferAcceptanceService) withGuardForActor(ctx context.Context, r YCAcceptanceRecord, op string, actor uuid.UUID, f func(context.Context) error) error {
+	if !s.available() || actor == uuid.Nil || f == nil || r.AcceptedAt == nil || r.RequestID == nil || r.HomeRegion != s.Region {
 		return errYCAcceptanceUnavailable
 	}
-	if err := s.Authorize(ctx, r.UserID, r.TeamID); err != nil {
+	if err := s.Authorize(ctx, actor, r.TeamID); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)

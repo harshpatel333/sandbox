@@ -6,10 +6,11 @@ API version and stable idempotency key before dispatch. An uncertain request is
 recovered by reading the original provider evidence; it is never automatically
 posted again, including after provider idempotency retention expires.
 
-This is an integration foundation. No production acceptance, provider, activation
-or readiness adapter is registered. The API startup hook returns without database
-access when any adapter is missing. Local tests use synthetic authority and
-provider adapters and do not establish provider or runtime readiness.
+The composed startup registers acceptance, provider, financial activation and
+readiness adapters when shared authority and provider configuration are available.
+Admission still requires the existing team rollout and permission checks. Shared
+revocation delivery continues independently of provider configuration and new
+admission flags. Local synthetic tests do not establish deployed readiness.
 
 ## Adapter contract
 
@@ -106,9 +107,10 @@ acknowledgement must follow that readback. Missing operations still receive a
 permanent tombstone; replay cannot reopen it. Provider history recovery never
 clears financial revocation. Existing ledgers and grant history remain intact.
 
-The shared invalidation consumer, commercial activation and runtime registration
-remain integration prerequisites. Tests of the regional fence do not establish
-end-to-end shared invalidation delivery or deployed access revocation.
+The shared invalidation consumer commits regional fencing and commercial
+revocation before acknowledging delivery. Initial and successor materialization
+share the same financial commit boundary. Deployed behavior still requires
+verification with the exact source, schema, configuration and fixture binding.
 
 The background worker observes pending dispatch count and oldest age at most once
 per minute, logging an operator-recovery warning after fifteen minutes. Deployment
