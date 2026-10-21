@@ -45,7 +45,10 @@ class Box:
 
     @property
     def instance(self):
-        return next(iter(self.of('instance')), None)
+        """The instance the box lives on: a fallback attempt in an earlier zone can leave another one behind."""
+        return max(self.of('instance'), default=None, key=lambda i: (
+            bool(i.manifest) and i.manifest.get('zone') == i.zone and i.manifest.get('state') != 'creating',
+            _created(i.created) or 0))
 
     @property
     def primary(self):
@@ -81,7 +84,7 @@ class Box:
     def unhandled(self):
         known = {(r['type'], r['name'], r.get('zone')) for zone in contract.DEVBOX_ZONES
                  for r in contract.resources(self.name, self.devbox_id, zone)}
-        recorded = self.instance.recorded if self.instance else []
+        recorded = [r for i in self.of('instance') for r in i.recorded]
         return [f'{r.get("type")} {r.get("name")}' if isinstance(r, dict) else str(r) for r in recorded
                 if not isinstance(r, dict) or (r.get('type'), r.get('name'), r.get('zone')) not in known]
 
@@ -256,6 +259,8 @@ def _unadoptable(resource, group):
     foreign = [u for u in resource.users if u not in links]
     if foreign:
         return f'unlabelled and attached to {", ".join(map(_last, foreign))}'
+    if resource.kind != 'bucket' and resource.zone not in {r.zone for r in group if not r.adopted}:
+        return 'unlabelled and in a zone where the devbox that would claim it has no labelled resource'
     created = _created(resource.created)
     born = [t for t in (_created(r.created) for r in group if not r.adopted) if t is not None]
     if created is None or not born:
@@ -475,15 +480,14 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
         if error:
             raise SystemExit(f'Could not label unlabelled {resource.kind} {resource.name} of {name} ({devbox_id}) '
                              f'before deleting; nothing was deleted, rerun to retry: {error}')
-    instance = box.instance
-    if instance and box.manifest is not None:
+    for marked in [i for i in box.of('instance') if i.manifest is not None]:
         try:
-            error = cloud.set_metadata(instance.name, instance.zone, contract.MANIFEST_METADATA_KEY,
-                                       json.dumps(contract.with_state(box.manifest, 'destroying')))
+            error = cloud.set_metadata(marked.name, marked.zone, contract.MANIFEST_METADATA_KEY,
+                                       json.dumps(contract.with_state(marked.manifest, 'destroying')))
         except contract.ContractError as invalid:
             error = str(invalid)
         if error:
-            print(f'::warning::Could not mark {name} as destroying: {error}')
+            print(f'::warning::Could not mark {name} in {marked.zone} as destroying: {error}')
     instances = box.of('instance')
     failures = [cloud.delete_instance(i.name, i.zone) for i in instances]
     failures += [_delete(cloud, r, instances) for r in box.resources if r.kind != 'instance']

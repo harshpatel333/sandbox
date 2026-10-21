@@ -88,7 +88,8 @@ class FakeCloud:
         if ('label', resource.name) in self.fail:
             return f'{resource.name}: permission denied'
         for item in self.disks_ + self.buckets_:
-            if item['name'] == resource.name:
+            if item['name'] == resource.name and (resource.kind == 'bucket'
+                                                  or item['zone'].rsplit('/', 1)[-1] == resource.zone):
                 item['labels'] = {**item['labels'], **labels}
         return None
 
@@ -355,13 +356,14 @@ class UnlabelledResourceTest(unittest.TestCase):
         inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
         self.assertEqual((cloud.instances_, cloud.disks_, cloud.buckets_), ([], [], []))
 
-    def test_detached_unlabelled_boot_disk_claimed_by_two_identities_is_refused(self):
+    def test_detached_unlabelled_boot_disk_goes_to_the_identity_with_labelled_resources_in_its_zone(self):
         cloud = FakeCloud()
         cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', vm=False, disks=False)
         cloud.add_box('alice-dev-a7f3c9', '5b6c7d8e9f0a', vm=False, unlabelled=('boot',))
         found, ignored = boxes(cloud)
-        self.assertFalse(any(r.adopted for b in found for r in b.resources))
-        self.assertIn('claimed by 2 devboxes', ignored[0][1])
+        self.assertEqual(ignored, [])
+        self.assertEqual([(b.devbox_id, any(r.adopted for r in b.resources)) for b in found],
+                         [('3f9c0a1b2c4d', False), ('5b6c7d8e9f0a', True)])
 
     def test_unlabelled_leftovers_are_labelled_first_so_a_failed_delete_stays_findable(self):
         cloud = FakeCloud()
@@ -547,6 +549,55 @@ class ZoneTest(unittest.TestCase):
             [('instance', instance, z) for z in (first, final)] + [('disk', d, z) for d in (boot, data)
                                                                    for z in (first, final)]))
         self.assertEqual((cloud.instances_, cloud.disks_, cloud.buckets_), ([], [], []))
+
+    def leftover_vm_and_real_box(self):
+        first, final = contract.DEVBOX_ZONES[0], contract.DEVBOX_ZONES[2]
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', zone=first, bucket=False)
+        leftover = json.loads(cloud.instances_[0]['metadata']['items'][0]['value'])
+        leftover['state'] = 'creating'
+        cloud.instances_[0]['metadata']['items'][0]['value'] = json.dumps(leftover)
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', zone=final)
+        cloud.instances_[1]['creationTimestamp'] = '2027-01-15T06:20:00.000-00:00'
+        return cloud, first, final
+
+    def test_box_lives_on_the_instance_its_manifest_names(self):
+        for order in (1, -1):
+            with self.subTest(order=order):
+                cloud, _, final = self.leftover_vm_and_real_box()
+                cloud.instances_ = cloud.instances_[::order]
+                [box], _ = boxes(cloud)
+                self.assertEqual(box.instance.zone, final)
+                self.assertIn(contract.forwarding_command('alice-dev-a7f3c9', final), inv.render([box], [], NOW))
+                inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+                self.assertEqual(sum(1 for c in cloud.calls if c[0] == 'metadata'), 2)
+
+    def test_resources_recorded_on_any_instance_are_checked(self):
+        cloud, _, _ = self.leftover_vm_and_real_box()
+        leftover = json.loads(cloud.instances_[0]['metadata']['items'][0]['value'])
+        leftover['resources'].append({'type': 'disk', 'name': 'devbox-alice-dev-a7f3c9-scratch',
+                                      'zone': contract.DEVBOX_ZONES[0]})
+        cloud.instances_[0]['metadata']['items'][0]['value'] = json.dumps(leftover)
+        [box], _ = boxes(cloud)
+        self.assertEqual(box.instance.zone, contract.DEVBOX_ZONES[2])
+        with self.assertRaises(SystemExit) as stop:
+            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertIn('devbox-alice-dev-a7f3c9-scratch', stop.exception.code)
+        self.assertEqual(cloud.calls, [])
+
+    def test_unlabelled_boot_disk_in_a_zone_the_box_never_used_is_not_adopted(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        stray = gce('alice-dev-a7f3c9')[1]
+        other = contract.DEVBOX_ZONES[1]
+        cloud.disks_.append({'name': stray, 'zone': f'projects/{PROJECT}/zones/{other}', 'creationTimestamp': CREATED,
+                             'labels': {}, 'selfLink': link('disks', stray, zone=other), 'users': []})
+        [box], ignored = boxes(cloud)
+        self.assertNotIn(other, box.zones)
+        self.assertIn('no labelled resource', ignored[0][1])
+        with self.assertRaises(SystemExit):
+            inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        self.assertEqual(cloud.calls, [])
 
     def test_target_binds_every_zone_of_the_box(self):
         cloud = FakeCloud()
