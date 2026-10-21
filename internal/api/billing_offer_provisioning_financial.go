@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/authz"
 	"github.com/superserve-ai/sandbox/internal/billing/provisioning"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // ReadProviderPairFinancialAuthority is a current read, never a substitute for
@@ -56,6 +57,7 @@ type offerProvisioningAuthority struct {
 	admission          *YCAcceptedProvisioningAdmission
 	client             *stripeHTTPClient
 	successorRequester func(context.Context, pgx.Tx, ContractProviderBinding) (uuid.UUID, error)
+	dispatchesResolved func(context.Context, db.DBTX, ContractProviderBinding) error
 }
 
 var _ provisioning.Authority = (*offerProvisioningAuthority)(nil)
@@ -287,5 +289,34 @@ func (a *offerProvisioningAuthority) revokeFinancialDelivery(ctx context.Context
 	if err != nil {
 		return errors.Join(commitErr, err)
 	}
+	if err = a.checkRevocationDispatches(ctx, d, receipt); err != nil {
+		return err
+	}
 	return a.admission.Service.AcknowledgeFinancialInvalidation(ctx, d, receipt.AcknowledgementID, receipt.FenceID)
+}
+
+func (a *offerProvisioningAuthority) checkRevocationDispatches(ctx context.Context, d YCFinancialInvalidation, receipt provisioning.FinancialRevocationReceipt) error {
+	if receipt.Authorization == nil {
+		// A target that never finalized could not admit a paired grant dispatch.
+		return nil
+	}
+	saved := receipt.Authorization
+	if saved.ID != d.AuthorizationID || saved.OperationID != d.OperationID || saved.AcceptanceID != d.AcceptanceID || saved.HomeRegion != d.HomeRegion {
+		return provisioning.ErrConflict
+	}
+	binding, err := loadContractProviderBinding(ctx, a.h.Pool, saved.OperationID)
+	if err != nil {
+		return err
+	}
+	i := binding.Identity
+	if binding.ContractID != saved.OperationID || i.OperationID != saved.OperationID || i.TeamID != saved.Target.TeamID || i.AssignmentID != saved.Target.AssignmentID || i.AcceptanceID != saved.AcceptanceID || i.ApprovalSemanticRevision != saved.ApprovalRevision || i.TermsDigest != saved.TargetTermsDigest {
+		return provisioning.ErrConflict
+	}
+	if a.dispatchesResolved == nil {
+		return provisioning.ErrUnavailable
+	}
+	// The committed permanent tombstone prevents new admissions. Resolution must
+	// be monotone for every previously admitted attempt; repeat this read even
+	// when an earlier delivery already committed regional revocation.
+	return a.dispatchesResolved(ctx, a.h.Pool, binding)
 }

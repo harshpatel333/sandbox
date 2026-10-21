@@ -172,15 +172,30 @@ type FinancialRevocationReceipt struct {
 	InvalidationID    uuid.UUID
 	AcknowledgementID uuid.UUID
 	FenceID           uuid.UUID
+	// Finalized targets also require the adapter to prove that all previously
+	// admitted external dispatches have resolved before acknowledging revocation.
+	Authorization *FinancialAuthorization
 }
 
 // LoadFinancialRevocationReceipt must use the pool after the revocation commit,
 // including after a lost commit response. Only this durable readback may be sent
-// to shared authority as an effective revocation acknowledgement.
+// to shared authority after the adapter has proved external dispatch resolution.
 func LoadFinancialRevocationReceipt(ctx context.Context, q querier, t FinancialTarget, invalidation uuid.UUID) (FinancialRevocationReceipt, error) {
 	var receipt FinancialRevocationReceipt
-	err := q.QueryRow(ctx, `SELECT r.id,r.acknowledgement_id,f.id FROM billing_offer_financial_revocation r
+	var finalized bool
+	var raw json.RawMessage
+	err := q.QueryRow(ctx, `SELECT r.id,r.acknowledgement_id,f.id,f.finalized_at IS NOT NULL,f.authorization_receipt FROM billing_offer_financial_revocation r
  JOIN billing_offer_financial_fence f USING(team_id,assignment_id,phase,target_id)
- WHERE r.id=$1 AND r.team_id=$2 AND r.assignment_id=$3 AND r.phase=$4 AND r.target_id=$5 AND f.revoked_at IS NOT NULL`, invalidation, t.TeamID, t.AssignmentID, t.Phase, t.TargetID).Scan(&receipt.InvalidationID, &receipt.AcknowledgementID, &receipt.FenceID)
-	return receipt, err
+ WHERE r.id=$1 AND r.team_id=$2 AND r.assignment_id=$3 AND r.phase=$4 AND r.target_id=$5 AND f.revoked_at IS NOT NULL`, invalidation, t.TeamID, t.AssignmentID, t.Phase, t.TargetID).Scan(&receipt.InvalidationID, &receipt.AcknowledgementID, &receipt.FenceID, &finalized, &raw)
+	if err != nil {
+		return FinancialRevocationReceipt{}, err
+	}
+	if finalized {
+		var authorization FinancialAuthorization
+		if json.Unmarshal(raw, &authorization) != nil || !authorization.valid() || authorization.Target != t {
+			return FinancialRevocationReceipt{}, ErrConflict
+		}
+		receipt.Authorization = &authorization
+	}
+	return receipt, nil
 }
