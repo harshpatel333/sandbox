@@ -69,6 +69,11 @@ func TestOfferProviderTransportPreservesEverySavedWrite(t *testing.T) {
 				}
 				fmt.Fprint(w, `{"id":"provider_example"}`)
 			})
+			preflight := saved
+			preflight.State, preflight.DispatchedAt = "prepared", nil
+			if err := client.preflightOfferProviderRequest(t.Context(), preflight); err != nil {
+				t.Fatal(err)
+			}
 			if raw, err := client.sendOfferProviderRequest(t.Context(), saved); err != nil || string(raw) != `{"id":"provider_example"}` || writes.Load() != 1 {
 				t.Fatal(string(raw), err, writes.Load())
 			}
@@ -84,7 +89,9 @@ func TestOfferProviderTransportRejectsWrongIdentityBeforeWrite(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := offerWireServer(t, test.account, test.balance, func(http.ResponseWriter, *http.Request) { t.Error("unexpected write") })
-			if _, err := client.sendOfferProviderRequest(t.Context(), savedOfferWireRequest(provisioning.Customer, "/v1/customers")); !errors.Is(err, provisioning.ErrConflict) {
+			saved := savedOfferWireRequest(provisioning.Customer, "/v1/customers")
+			saved.State, saved.DispatchedAt = "prepared", nil
+			if err := client.preflightOfferProviderRequest(t.Context(), saved); !errors.Is(err, provisioning.ErrConflict) {
 				t.Fatal(err)
 			}
 		})
@@ -143,5 +150,46 @@ func TestOfferProviderTransportNeverRepeatsUncertainWrite(t *testing.T) {
 				t.Fatal(err, writes.Load())
 			}
 		})
+	}
+}
+
+func TestOfferProviderPreflightFailureCanRetryBeforeDispatch(t *testing.T) {
+	var reads, writes atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			writes.Add(1)
+			fmt.Fprint(w, `{"id":"cus_example"}`)
+			return
+		}
+		if r.URL.Path == "/v1/account" {
+			if reads.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			fmt.Fprint(w, `{"id":"acct_example"}`)
+			return
+		}
+		fmt.Fprint(w, `{"livemode":false}`)
+	}))
+	defer server.Close()
+	client := &stripeHTTPClient{baseURL: server.URL, secretKey: "fixture-secret", apiVersion: "2026-05-27.dahlia", httpClient: server.Client()}
+	r := savedOfferWireRequest(provisioning.Customer, "/v1/customers")
+	r.State, r.DispatchedAt = "prepared", nil
+	if err := client.preflightOfferProviderRequest(t.Context(), r); err == nil {
+		t.Fatal("expected transient failure")
+	}
+	if writes.Load() != 0 {
+		t.Fatal("preflight wrote provider state")
+	}
+	if err := client.preflightOfferProviderRequest(t.Context(), r); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	r.State, r.DispatchedAt = "dispatched", &now
+	if _, err := client.sendOfferProviderRequest(t.Context(), r); err != nil {
+		t.Fatal(err)
+	}
+	if writes.Load() != 1 {
+		t.Fatal(writes.Load())
 	}
 }

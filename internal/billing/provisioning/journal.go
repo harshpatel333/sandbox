@@ -57,8 +57,8 @@ func controls(o Operation) error {
 	return nil
 }
 
-func (s *Service) guarded(ctx context.Context, o Operation, f func(pgx.Tx) error) error {
-	return s.Authority.WithAcceptedOffer(ctx, o.TeamID, o.AssignmentID, func(tx pgx.Tx, offer AcceptedOffer) error {
+func (s *Service) guarded(ctx context.Context, o Operation, f func(context.Context, pgx.Tx) error) error {
+	return s.Authority.WithAcceptedOffer(ctx, o.TeamID, o.AssignmentID, func(ctx context.Context, tx pgx.Tx, offer AcceptedOffer) error {
 		if err := offer.validate(); err != nil {
 			return err
 		}
@@ -81,7 +81,7 @@ func (s *Service) guarded(ctx context.Context, o Operation, f func(pgx.Tx) error
 		if held {
 			return ErrHeld
 		}
-		return f(tx)
+		return f(ctx, tx)
 	})
 }
 
@@ -124,7 +124,7 @@ func (s *Service) Reconcile(ctx context.Context, team, assignment uuid.UUID) (er
 			if e != nil {
 				return e
 			}
-			err = s.guarded(ctx, o, func(tx pgx.Tx) error {
+			err = s.guarded(ctx, o, func(ctx context.Context, tx pgx.Tx) error {
 				tag, e := tx.Exec(ctx, `INSERT INTO billing_offer_provisioning_request(operation_id,step,idempotency_key,request) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, o.ID, step, key(o.ID, step), raw)
 				if e == nil && tag.RowsAffected() != 1 {
 					return ErrBusy
@@ -138,7 +138,10 @@ func (s *Service) Reconcile(ctx context.Context, team, assignment uuid.UUID) (er
 		}
 		var receipt json.RawMessage
 		if r.State == "prepared" {
-			err = s.guarded(ctx, o, func(tx pgx.Tx) error {
+			if err = s.Provider.Preflight(ctx, r); err != nil {
+				return err
+			}
+			err = s.guarded(ctx, o, func(ctx context.Context, tx pgx.Tx) error {
 				e := tx.QueryRow(ctx, `UPDATE billing_offer_provisioning_request SET state='dispatched',dispatched_at=clock_timestamp() WHERE operation_id=$1 AND step=$2 AND state='prepared' RETURNING dispatched_at`, o.ID, step).Scan(&r.DispatchedAt)
 				if errors.Is(e, pgx.ErrNoRows) {
 					return ErrBusy
@@ -149,7 +152,7 @@ func (s *Service) Reconcile(ctx context.Context, team, assignment uuid.UUID) (er
 				return err
 			}
 			r.State = "dispatched"
-			err = s.Authority.WithDispatchGuard(ctx, team, assignment, func(current AcceptedOffer) error {
+			err = s.Authority.WithDispatchGuard(ctx, team, assignment, func(ctx context.Context, current AcceptedOffer) error {
 				if current.validate() != nil || !sameOffer(current, o.Offer) {
 					return ErrConflict
 				}
@@ -185,7 +188,7 @@ func (s *Service) Reconcile(ctx context.Context, team, assignment uuid.UUID) (er
 	if !object(evidence) {
 		return ErrUnknown
 	}
-	return s.guarded(ctx, o, func(tx pgx.Tx) error {
+	return s.guarded(ctx, o, func(ctx context.Context, tx pgx.Tx) error {
 		// Re-read inside the transaction so a stale verifier cannot authorize a
 		// different operation or finalize twice after a lost commit response.
 		current, e := load(ctx, tx, team, assignment)
