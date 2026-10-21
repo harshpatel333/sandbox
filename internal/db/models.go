@@ -1099,6 +1099,7 @@ type BillingUsageEntitlement struct {
 	CreatedAt                    time.Time          `json:"created_at"`
 	WaiverID                     pgtype.UUID        `json:"waiver_id"`
 	SponsorshipID                pgtype.UUID        `json:"sponsorship_id"`
+	PairedWaiverID               pgtype.UUID        `json:"paired_waiver_id"`
 }
 
 type BillingUsageExport struct {

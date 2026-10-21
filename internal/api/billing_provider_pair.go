@@ -94,6 +94,14 @@ func pairSeal(v VerifiedProviderPair) [32]byte {
 	return sha256.Sum256(b)
 }
 
+func (v VerifiedProviderPair) validateFresh() error {
+	now := time.Now()
+	if v.seal == ([32]byte{}) || v.seal != pairSeal(v) || v.VerifiedAt.After(now) || now.Sub(v.VerifiedAt) > time.Minute {
+		return errors.New("fresh verified provider pair is required")
+	}
+	return v.Input.validate()
+}
+
 func validPairDigest(s string) bool {
 	b, err := hex.DecodeString(s)
 	return err == nil && len(b) == sha256.Size

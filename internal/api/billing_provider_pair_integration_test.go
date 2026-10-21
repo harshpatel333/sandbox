@@ -37,6 +37,7 @@ func TestProviderPairBindingReplayAndIsolation(t *testing.T) {
 	}
 	defer tx.Rollback(t.Context())
 	f := newPairFixture(t)
+	movePairFixture(f, time.Now().UTC().AddDate(-1, 0, 0).Add(-time.Hour).Truncate(time.Second))
 	verified, err := f.client(t).verifyInitialProviderPair(t.Context(), f.p)
 	if err != nil {
 		t.Fatal(err)
@@ -106,8 +107,20 @@ SELECT $1,team_id,assignment_id,acceptance_id,approval_semantic_revision,merchan
 	if err == nil {
 		t.Fatal("successor reinterpreted immutable usage price mapping")
 	}
-	goodPayload, _ := json.Marshal(successor)
-	exec(insertSuccessor, successor.ContractID, successor.StartsAt, successor.EndsAt, goodPayload, contract, successor.Identity.ProviderTermsDigest)
+	// The successor is constructed from actual post-boundary provider state,
+	// then confirmed against the saved predecessor in this transaction.
+	observed := successorPairFixture(f, b, false)
+	observed.ContractID, observed.EndsAt = successor.ContractID, successor.EndsAt
+	verifiedSuccessor, err := f.client(t).verifySuccessorProviderPair(t.Context(), b, observed, f.invoice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ConfirmSuccessorProviderPair(t.Context(), tx, verifiedSuccessor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ConfirmSuccessorProviderPair(t.Context(), tx, verifiedSuccessor); err != nil {
+		t.Fatalf("successor binding replay: %v", err)
+	}
 	a := invoiceAccount{Customer: f.p.CustomerID, Subscription: f.p.UsageSubscriptionID, Base: invoiceBase{Price: "stale_base"}, Price: "ambient_rounding"}
 	paired, err := loadInvoiceProviderPair(t.Context(), tx, f.p.Identity.TeamID, &a)
 	if err != nil || !paired || a.Base.Price != "" || a.Price != f.p.Terms.Rounding.PriceID || a.Pair == nil {

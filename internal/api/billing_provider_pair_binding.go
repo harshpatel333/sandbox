@@ -31,26 +31,29 @@ type ContractProviderBinding struct {
 // authority and performs no provider I/O.
 func ConfirmContractProviderBinding(ctx context.Context, tx pgx.Tx, contract uuid.UUID, verified VerifiedProviderPair) (ContractProviderBinding, error) {
 	var b ContractProviderBinding
-	now := time.Now()
-	if tx == nil || contract == uuid.Nil || verified.seal == ([32]byte{}) || verified.seal != pairSeal(verified) || verified.VerifiedAt.After(now) || now.Sub(verified.VerifiedAt) > time.Minute {
+	if tx == nil || contract == uuid.Nil {
 		return b, errors.New("fresh verified provider pair is required")
 	}
-	p := verified.Input
-	if err := p.validate(); err != nil {
+	if err := verified.validateFresh(); err != nil {
 		return b, err
 	}
+	p := verified.Input
 	end := annualBoundary(p.Anchor, 12)
 	b = ContractProviderBinding{ContractID: contract, Identity: p.Identity, Terms: p.Terms, CustomerID: p.CustomerID, UsageSubscriptionID: p.UsageSubscriptionID, FeeSubscriptionID: p.FeeSubscriptionID, FeeItemID: p.FeeItemID, Anchor: p.Anchor, StartsAt: p.Anchor, EndsAt: &end}
+	return confirmProviderBinding(ctx, tx, b, verified.Evidence, verified.VerifiedAt)
+}
+
+func confirmProviderBinding(ctx context.Context, tx pgx.Tx, b ContractProviderBinding, evidence json.RawMessage, verifiedAt time.Time) (ContractProviderBinding, error) {
 	payload, err := json.Marshal(b)
 	if err != nil {
 		return ContractProviderBinding{}, err
 	}
 	var saved []byte
-	if _, err = tx.Exec(ctx, `SELECT 1 FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, p.Identity.TeamID); err != nil {
+	if _, err = tx.Exec(ctx, `SELECT 1 FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, b.Identity.TeamID); err != nil {
 		return ContractProviderBinding{}, err
 	}
 	var same bool
-	err = tx.QueryRow(ctx, `SELECT binding=$2::jsonb FROM billing_contract_provider_binding WHERE contract_id=$1`, contract, payload).Scan(&same)
+	err = tx.QueryRow(ctx, `SELECT binding=$2::jsonb FROM billing_contract_provider_binding WHERE contract_id=$1`, b.ContractID, payload).Scan(&same)
 	if err == nil {
 		if !same {
 			return ContractProviderBinding{}, errors.New("provider binding replay changed immutable terms")
@@ -61,10 +64,10 @@ func ConfirmContractProviderBinding(ctx context.Context, tx pgx.Tx, contract uui
 		return ContractProviderBinding{}, err
 	}
 	err = tx.QueryRow(ctx, `INSERT INTO billing_contract_provider_binding(contract_id,team_id,assignment_id,acceptance_id,approval_semantic_revision,merchant,live_mode,api_version,terms_digest,provider_terms_digest,customer_id,usage_subscription_id,fee_subscription_id,fee_item_id,anchor,starts_at,ends_at,binding,evidence,verified_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15,$16,$17,$18,$19)
-ON CONFLICT(contract_id) DO NOTHING RETURNING binding`, contract, p.Identity.TeamID, p.Identity.AssignmentID, p.Identity.AcceptanceID, p.Identity.ApprovalSemanticRevision, p.Identity.Merchant, p.Identity.Live, p.Identity.APIVersion, p.Identity.TermsDigest, p.Identity.ProviderTermsDigest, p.CustomerID, p.UsageSubscriptionID, p.FeeSubscriptionID, p.FeeItemID, p.Anchor, end, payload, verified.Evidence, verified.VerifiedAt).Scan(&saved)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+ON CONFLICT(contract_id) DO NOTHING RETURNING binding`, b.ContractID, b.Identity.TeamID, b.Identity.AssignmentID, b.Identity.AcceptanceID, b.Identity.ApprovalSemanticRevision, b.Identity.Merchant, b.Identity.Live, b.Identity.APIVersion, b.Identity.TermsDigest, b.Identity.ProviderTermsDigest, b.CustomerID, b.UsageSubscriptionID, b.FeeSubscriptionID, b.FeeItemID, b.Anchor, b.StartsAt, b.EndsAt, payload, evidence, verifiedAt).Scan(&saved)
 	if errors.Is(err, pgx.ErrNoRows) {
-		err = tx.QueryRow(ctx, `SELECT binding FROM billing_contract_provider_binding WHERE contract_id=$1 AND binding=$2::jsonb`, contract, payload).Scan(&saved)
+		err = tx.QueryRow(ctx, `SELECT binding FROM billing_contract_provider_binding WHERE contract_id=$1 AND binding=$2::jsonb`, b.ContractID, payload).Scan(&saved)
 	}
 	if err != nil {
 		return ContractProviderBinding{}, err
