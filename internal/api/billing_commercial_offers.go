@@ -110,11 +110,20 @@ func (h *Handlers) assignCommercialOffer(ctx context.Context, team, actor uuid.U
 		return nil, err
 	}
 	defer release()
+	return h.assignCommercialOfferRegional(ctx, team, actor, r, apply, nil)
+}
+
+func (h *Handlers) assignCommercialOfferRegional(ctx context.Context, team, actor uuid.UUID, r CommercialOfferRequest, apply bool, accepted *YCAcceptanceRecord) (json.RawMessage, error) {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if accepted != nil {
+		if _, err = tx.Exec(ctx, "SET LOCAL lock_timeout='1s'"); err != nil {
+			return nil, err
+		}
+	}
 	var region string
 	if err = tx.QueryRow(ctx, `SELECT home_region FROM team WHERE id=$1 FOR NO KEY UPDATE`, team).Scan(&region); err != nil {
 		return nil, err
@@ -129,6 +138,11 @@ func (h *Handlers) assignCommercialOffer(ctx context.Context, team, actor uuid.U
 	if err == nil {
 		if !same {
 			return nil, errCommercialOfferConflict
+		}
+		if accepted != nil {
+			if err = verifyAcceptedAssignment(ctx, tx, *accepted, id); err != nil {
+				return nil, err
+			}
 		}
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
@@ -169,8 +183,15 @@ func (h *Handlers) assignCommercialOffer(ctx context.Context, team, actor uuid.U
 		var rates []uuid.UUID
 		var pricingAt time.Time
 		var resourceRates json.RawMessage
-		if err = tx.QueryRow(ctx, commercialOfferPricingSQL, team, r.OfferKey, r.Version).Scan(&card, &rates, &pricingAt, &resourceRates); err != nil {
-			return nil, err
+		if accepted == nil {
+			if err = tx.QueryRow(ctx, commercialOfferPricingSQL, team, r.OfferKey, r.Version).Scan(&card, &rates, &pricingAt, &resourceRates); err != nil {
+				return nil, err
+			}
+		} else {
+			card, rates, pricingAt, resourceRates, err = acceptedOfferPricing(ctx, tx, *accepted)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if len(rates) < 3 {
 			return nil, errCommercialOfferConflict
