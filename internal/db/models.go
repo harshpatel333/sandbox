@@ -931,6 +931,22 @@ type BillingProviderCredit struct {
 	ObservedAt    time.Time `json:"observed_at"`
 }
 
+type BillingProviderPairDispatch struct {
+	ID               uuid.UUID          `json:"id"`
+	EntitlementID    uuid.UUID          `json:"entitlement_id"`
+	ContractID       uuid.UUID          `json:"contract_id"`
+	TeamID           uuid.UUID          `json:"team_id"`
+	Binding          []byte             `json:"binding"`
+	RequestPayload   []byte             `json:"request_payload"`
+	RequestForm      string             `json:"request_form"`
+	IdempotencyKey   string             `json:"idempotency_key"`
+	LegacyUntracked  bool               `json:"legacy_untracked"`
+	AdmittedAt       time.Time          `json:"admitted_at"`
+	SenderFinishedAt pgtype.Timestamptz `json:"sender_finished_at"`
+	ResolvedAt       pgtype.Timestamptz `json:"resolved_at"`
+	GrantID          *string            `json:"grant_id"`
+}
+
 type BillingProviderPairMonthlyPayment struct {
 	PaymentID      uuid.UUID `json:"payment_id"`
 	TeamID         uuid.UUID `json:"team_id"`

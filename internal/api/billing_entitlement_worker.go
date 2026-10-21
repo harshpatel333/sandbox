@@ -633,26 +633,27 @@ func (h *Handlers) dispatchUsageEntitlement(ctx context.Context, c db.BillingCom
 	if pairErr != nil && !errors.Is(pairErr, pgx.ErrNoRows) {
 		return pairErr
 	}
+	var attempt uuid.UUID
 	if pairErr == nil {
-		// Admission is serialized with effective revocation after the final provider
-		// reads. A committed uncertain request remains recoverable as history.
-		if err = h.withProviderPairEntitlementAuthority(ctx, pair, func(ctx context.Context, tx pgx.Tx) error {
-			_, err := h.DB.WithTx(tx).GetReplayableUsageEntitlement(ctx, db.GetReplayableUsageEntitlementParams{TeamID: c.TeamID, EntitlementID: e.ID})
-			return err
-		}); err != nil {
+		attempt, err = h.admitProviderPairDispatch(ctx, pair, e, form.Encode())
+		if err != nil {
 			return err
 		}
 	}
 	var grant entitlementGrant
-	if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey); err != nil {
+	err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey)
+	if attempt != uuid.Nil {
+		if finishErr := h.finishProviderPairDispatch(ctx, attempt); finishErr != nil {
+			return errors.Join(err, finishErr)
+		}
+	}
+	if err != nil {
 		return err
 	}
 	if grant.VoidedAt != 0 {
 		return errors.New("created grant was voided; operator recovery required")
 	}
-	raw, _ := json.Marshal(grant)
-	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})
-	return err
+	return h.confirmEntitlementGrant(ctx, c, e, grant)
 }
 
 func (h *Handlers) entitlementClosingInvoice(ctx context.Context, c db.BillingCommercialContract, start time.Time, client *stripeHTTPClient) error {
@@ -716,9 +717,7 @@ func (h *Handlers) discoverUsageEntitlement(ctx context.Context, c db.BillingCom
 	if grant.VoidedAt != 0 {
 		return errors.New("recovered grant was voided; operator recovery required")
 	}
-	raw, _ := json.Marshal(grant)
-	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})
-	return err
+	return h.confirmEntitlementGrant(ctx, c, e, grant)
 }
 
 // Commit issuance intent only after the exact database-generated request is valid.
