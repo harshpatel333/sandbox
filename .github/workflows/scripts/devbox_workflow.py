@@ -174,8 +174,10 @@ def prepare_create(env, profile_path=PROFILE_PATH):
     sandbox = resolve_branch("sandbox", env.get("INPUT_SANDBOX_BRANCH"))
     ui = resolve_branch("ui", env.get("INPUT_UI_BRANCH"))
     require_scripts_at("sandbox", sandbox["sha"], contract.CREATE_SCRIPTS)
+    zone = (env.get("INPUT_ZONE") or "").strip() or contract.AUTO_ZONE
+    contract.zone_candidates(zone)
     write_outputs(env, {
-        "name": name, "owner": owner, "lifetime_hours": lifetime,
+        "name": name, "owner": owner, "lifetime_hours": lifetime, "zone": zone,
         "sandbox_branch": sandbox["branch"], "sandbox_sha": sandbox["sha"],
         "ui_branch": ui["branch"], "ui_sha": ui["sha"],
     })
@@ -208,7 +210,7 @@ def load_profile(path=PROFILE_PATH):
         expected = {
             "schema_version": (profile.get("schema_version"), 1),
             "project": (profile.get("project"), contract.PROJECT),
-            "zone": (profile.get("zone"), contract.ZONE),
+            "zones": (profile.get("zones"), list(contract.DEVBOX_ZONES)),
             "resource_name_prefix": (profile.get("resource_name_prefix"), contract.RESOURCE_PREFIX),
             "data_disk.name_suffix": (data.get("name_suffix"), contract.DATA_DISK_SUFFIX),
             "data_disk.device_name": (data.get("device_name"), contract.DATA_DISK_DEVICE_NAME),
@@ -261,7 +263,8 @@ def prefixed(env, prefix, kind, optional=frozenset()):
 class Box:
     """One devbox, reached over IAP SSH with the runner's credentials."""
 
-    def __init__(self, name, zone=contract.ZONE, project=contract.PROJECT, devbox_id=None):
+    def __init__(self, name, zone, project=contract.PROJECT, devbox_id=None):
+        contract.validate_zone(zone)
         self.name, self.zone, self.project = name, zone, project
         self.instance = contract.instance_name(name)
         self.where = [f"--zone={zone}", f"--project={project}"]
@@ -455,9 +458,9 @@ def ensure_unused(name, project=contract.PROJECT):
                         "or destroy the existing box first")
 
 
-def instance_args(name, profile, labels, manifest_path):
+def instance_args(name, profile, labels, manifest_path, zone):
     instance, boot, data = profile["instance"], profile["boot_disk"], profile["data_disk"]
-    args = ["gcloud", "compute", "instances", "create", contract.instance_name(name), f"--zone={contract.ZONE}",
+    args = ["gcloud", "compute", "instances", "create", contract.instance_name(name), f"--zone={zone}",
             f"--project={contract.PROJECT}",
             f"--machine-type={instance['machine_type']}",
             f"--image-project={instance['image_project']}", f"--image-family={instance['image_family']}",
@@ -486,13 +489,13 @@ def destroy_command(name):
             f"-f action=destroy-named -f name={name}")
 
 
-def access_section(name):
-    ssh = f"gcloud compute ssh {contract.instance_name(name)} --zone={contract.ZONE} --project={contract.PROJECT} --tunnel-through-iap"
+def access_section(name, zone):
+    ssh = f"gcloud compute ssh {contract.instance_name(name)} --zone={zone} --project={contract.PROJECT} --tunnel-through-iap"
     ports = ", ".join(f"{label} {port}" for label, port in contract.FORWARDED_PORTS)
     return "\n".join([
         "### Access",
         f"Forward {ports} to localhost:",
-        "```sh", contract.forwarding_command(name), "```",
+        "```sh", contract.forwarding_command(name, zone), "```",
         "Shell and logs:",
         "```sh", ssh, f"{ssh} -- 'sudo tail -n 200 -f {LOG_DIR}/*.log'", f"{ssh} -- sudo journalctl -f", "```",
         "Destroy:",
@@ -517,16 +520,19 @@ def create(env, profile_path=PROFILE_PATH):
     if not re.fullmatch(r"[a-z][a-z0-9-]*@[a-z0-9.-]+\.iam\.gserviceaccount\.com", ci_account):
         raise StepError("DEVBOX_CI_SERVICE_ACCOUNT must be the workflow's service account email")
     engineers = engineer_members(env.get("DEVBOX_ENGINEER_MEMBERS", ""))
+    zones = contract.zone_candidates(env.get("ZONE"))
     devbox_id = contract.new_devbox_id()
     created_at = contract.utc_now()
     expires_at = contract.expiry(created_at, lifetime)
     labels = contract.labels(name, devbox_id, owner, expires_at)
-    manifest = contract.new_manifest(name=name, devbox_id=devbox_id, owner=owner, actor=env["GITHUB_ACTOR"],
-                                     created_at=created_at, expires_at=expires_at, revisions=revisions)
+
+    def manifest_in(zone):
+        return contract.new_manifest(name=name, devbox_id=devbox_id, owner=owner, actor=env["GITHUB_ACTOR"],
+                                     created_at=created_at, expires_at=expires_at, revisions=revisions, zone=zone)
+
     # Built before anything exists, so a bad value (empty, multi-line, or
     # overriding a reserved key) is refused with nothing to clean up.
-    files = configuration(manifest, env)
-    box = Box(name)
+    configuration(manifest_in(zones[0]), env)
     # A taken name belongs to another box; it must never reach the failure
     # path, whose summary prints a destroy command for the name.
     try:
@@ -536,15 +542,11 @@ def create(env, profile_path=PROFILE_PATH):
         raise
     save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "instance_started": False})
     try:
-        where = [f"--zone={contract.ZONE}", f"--project={contract.PROJECT}"]
-        data = profile["data_disk"]
-        run(["gcloud", "compute", "disks", "create", contract.data_disk_name(name), *where,
-             f"--size={data['size_gb']}GB", f"--type={data['type']}", f"--labels={contract.format_labels(labels)}"])
-        with tempfile.TemporaryDirectory() as directory:
-            manifest_path = Path(directory) / "manifest.json"
-            manifest_path.write_text(json.dumps(manifest, sort_keys=True))
-            save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "instance_started": True})
-            run(instance_args(name, profile, labels, manifest_path))
+        zone, attempts = place(env, name, devbox_id, profile, labels, zones, manifest_in)
+        manifest = manifest_in(zone)
+        files = configuration(manifest, env)
+        box = Box(name, zone)
+        where = [f"--zone={zone}", f"--project={contract.PROJECT}"]
         run(["gcloud", "compute", "disks", "add-labels", box.instance, *where,
              f"--labels={contract.format_labels(labels)}"])
         bucket = "gs://" + contract.bucket_name(devbox_id)
@@ -574,7 +576,8 @@ def create(env, profile_path=PROFILE_PATH):
         manifest = contract.with_state(collect_state(box, manifest), "ready")
         box.record(manifest, devbox_id)
     except (Exception, KeyboardInterrupt) as error:
-        report_create_failure(env, name, devbox_id, error, load_attempt(env).get("instance_started", True))
+        attempt = load_attempt(env)
+        report_create_failure(env, name, devbox_id, error, attempt.get("instance_started", True), attempt.get("zone"))
         return 1
     save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": True})
 
@@ -582,16 +585,68 @@ def create(env, profile_path=PROFILE_PATH):
         f"# Devbox `{name}` is ready",
         "",
         "| | |", "|--|--|",
-        f"| Name | `{name}` |", f"| Zone | `{contract.ZONE}` |", f"| Owner | `{owner}` |",
+        f"| Name | `{name}` |", f"| Zone | `{zone}`{attempts} |", f"| Owner | `{owner}` |",
         f"| Expires | {manifest['expires_at']} (lifetime {lifetime}h, auto-deleted) |",
         f"| sandbox | `{revisions['sandbox']['branch']}` @ `{revisions['sandbox']['sha']}` |",
         f"| ui | `{revisions['ui']['branch']}` @ `{revisions['ui']['sha']}` |",
         "",
-        access_section(name),
+        access_section(name, zone),
         "",
         manifest_details(manifest),
     ]))
     return 0
+
+
+# GCE reports a zone that can't host the VM or its disks this way; anything
+# else is a real failure and must not be retried in another zone.
+CAPACITY_ERRORS = re.compile(r"ZONE_RESOURCE_POOL_EXHAUSTED|RESOURCE_EXHAUSTED|stockout"
+                             r"|does not have enough resources available", re.IGNORECASE)
+
+
+def place(env, name, devbox_id, profile, labels, zones, manifest_in):
+    data = profile["data_disk"]
+    failures = []
+    for zone in zones:
+        where = [f"--zone={zone}", f"--project={contract.PROJECT}"]
+        save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "instance_started": False,
+                           "zone": zone})
+        try:
+            run(["gcloud", "compute", "disks", "create", contract.data_disk_name(name), *where,
+                 f"--size={data['size_gb']}GB", f"--type={data['type']}",
+                 f"--labels={contract.format_labels(labels)}"])
+            with tempfile.TemporaryDirectory() as directory:
+                manifest_path = Path(directory) / "manifest.json"
+                manifest_path.write_text(json.dumps(manifest_in(zone), sort_keys=True))
+                save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "instance_started": True,
+                                   "zone": zone})
+                run(instance_args(name, profile, labels, manifest_path, zone))
+        except StepError as error:
+            if not CAPACITY_ERRORS.search(str(error)):
+                raise
+            print(f"::warning::{zone} has no capacity for this devbox; removing what this attempt created there")
+            failures.append((zone, error))
+            clean_zone(devbox_id, zone)
+            save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "instance_started": False})
+            continue
+        tried = ", ".join(f"{failed} out of capacity" for failed, _ in failures)
+        return zone, f" (after {tried})" if tried else ""
+    raise StepError("No devbox zone had capacity:\n" + "\n".join(f"- {zone}: {error}" for zone, error in failures))
+
+
+def clean_zone(devbox_id, zone):
+    # Removes only what carries this attempt's devbox-id in this zone, plus the
+    # disks attached to such an instance (its boot disk is not labelled yet).
+    owned = [f"--zones={zone}", f"--project={contract.PROJECT}", f"--filter=labels.devbox-id={devbox_id}",
+             "--format=json"]
+    where = [f"--zone={zone}", f"--project={contract.PROJECT}", "--quiet"]
+    disks = set()
+    for instance in json.loads(run(["gcloud", "compute", "instances", "list", *owned], timeout=120).stdout or "[]"):
+        disks.update((disk.get("source") or "").rsplit("/", 1)[-1] for disk in instance.get("disks") or [])
+        run(["gcloud", "compute", "instances", "delete", instance["name"], *where])
+    disks.update(disk["name"] for disk in json.loads(
+        run(["gcloud", "compute", "disks", "list", *owned], timeout=120).stdout or "[]"))
+    for disk in sorted(disks - {""}):
+        run(["gcloud", "compute", "disks", "delete", disk, *where])
 
 
 def engineer_members(value):
@@ -646,8 +701,8 @@ def discover(name, devbox_id):
     return found
 
 
-def mark_failed(name, devbox_id):
-    box = Box(name)
+def mark_failed(name, devbox_id, zone):
+    box = Box(name, zone)
     try:
         manifest = manifest_from(box.verify(devbox_id))
         if manifest["state"] != "creating":
@@ -658,16 +713,18 @@ def mark_failed(name, devbox_id):
     return True, ""
 
 
-def report_create_failure(env, name, devbox_id, error, instance_started):
+def report_create_failure(env, name, devbox_id, error, instance_started, zone=None):
     DEADLINE.report()
     try:
         found = discover(name, devbox_id)
         discovery = ""
     except Exception as discover_error:
-        found = contract.resources(name, devbox_id)
+        found = [resource for candidate in ([zone] if zone else contract.DEVBOX_ZONES)
+                 for resource in contract.resources(name, devbox_id, candidate) if resource.get("zone")]
+        found.append({"type": "bucket", "name": contract.bucket_name(devbox_id)})
         discovery = f" (could not list them: {describe(discover_error)}; these may exist)"
-    has_instance = any(resource["type"] == "instance" for resource in found)
-    marked, note = mark_failed(name, devbox_id) if has_instance else (None, "")
+    instance = next((resource for resource in found if resource["type"] == "instance"), None)
+    marked, note = (None, "") if instance is None else mark_failed(name, devbox_id, instance["zone"])
     listing = "\n".join(f"- {resource['type']} `{resource['name']}`"
                         + (f" ({resource['zone']})" if resource.get("zone") else "") for resource in found)
     append_summary(env, "\n".join([
@@ -686,9 +743,9 @@ def report_create_failure(env, name, devbox_id, error, instance_started):
     # Settled only when a visible VM was marked failed or had already finished,
     # or no VM was ever requested; a VM that may still appear leaves the attempt
     # open so the backstop step looks again.
-    settled = (has_instance and marked is not False) or not instance_started
+    settled = (instance is not None and marked is not False) or not instance_started
     save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": settled,
-                       "instance_started": instance_started})
+                       "instance_started": instance_started, "zone": zone})
     print(f"::error::Devbox {name} failed: {describe(error)}", file=sys.stderr)
 
 
@@ -704,7 +761,7 @@ def finish_create(env):
     if attempt and not attempt["reported"]:
         report_create_failure(env, attempt["name"], attempt["devbox_id"],
                               StepError("The create run was cancelled or timed out"),
-                              attempt.get("instance_started", True))
+                              attempt.get("instance_started", True), attempt.get("zone"))
 
 
 def find_box(name):
@@ -713,6 +770,7 @@ def find_box(name):
     instances = json.loads(result.stdout or "[]")
     for instance in instances:
         instance["zone"] = (instance.get("zone") or "").rsplit("/", 1)[-1]
+    instances = [instance for instance in instances if instance["zone"] in contract.DEVBOX_ZONES]
     try:
         return contract.select_instance(instances, name)
     except contract.ContractError as error:
@@ -730,8 +788,10 @@ def deploy(env, now=contract.utc_now):
     require_main(env)
     name, components, revisions = deploy_request(env)
     instance = find_box(name)
-    box = Box(name, zone=instance["zone"])
     manifest = manifest_from(instance)
+    if manifest["zone"] != instance["zone"]:
+        raise StepError(f"{name} is in {instance['zone']} but its manifest says {manifest['zone']}; refusing to deploy")
+    box = Box(name, zone=manifest["zone"])
     devbox_id = contract.check_labels(instance.get("labels"), name, manifest["devbox_id"])
     box.devbox_id = devbox_id
     if manifest["state"] not in DEPLOYABLE_STATES:
@@ -877,7 +937,7 @@ def deploy_summary(manifest, before, components, deployed, migrations, failure):
         "**Services (before this deploy):**" if failure else "**Services:**",
         "```json", json.dumps(services, indent=2, sort_keys=True), "```",
         "",
-        access_section(manifest["name"]),
+        access_section(manifest["name"], manifest["zone"]),
         "",
         manifest_details(manifest),
     ])

@@ -260,6 +260,16 @@ gh workflow run devbox-create.yml --repo superserve-ai/sandbox --ref main \
 | `ui_branch` | `main` | Branch of `superserve-ai/superserve` to build the console from |
 | `name` | generated | 2-40 lowercase letters, digits or hyphens, starting with a letter. Blank generates `<owner>-dev-<6 hex>` from your GitHub login. A name already in use is refused |
 | `lifetime_hours` | `24` | 1 to 168. The box is deleted when it expires; lifetimes cannot be extended |
+| `zone` | `auto` | `auto`, or one of `us-central1-a`, `us-central1-b`, `us-central1-c`, `us-central1-f` |
+
+`auto` tries those zones in order. If a zone has no capacity for the VM or a
+disk (a stockout, `ZONE_RESOURCE_POOL_EXHAUSTED` or `RESOURCE_EXHAUSTED`), the
+run deletes what that attempt created there, found by its `devbox-id`, and
+tries the next zone with the same `devbox-id`. Any other error fails the run
+as before. A named zone is the only zone tried. If no zone has capacity, the run
+fails and lists each zone's error. The zone the box ends up in is recorded in
+its manifest and shown in the summary, and deploy and destroy find the box
+there. A name must be unused in every devbox zone.
 
 Each branch is resolved once to an exact commit, and every later step uses
 that commit. Before taking any cloud action, the workflow checks the profile
@@ -303,7 +313,7 @@ the port-forwarding command, log access and the destroy command. To use a
 box, run the forwarding command and keep it open:
 
 ```sh
-gcloud compute ssh devbox-<name> --zone=us-central1-a --project=rayai-dev \
+gcloud compute ssh devbox-<name> --zone=<zone> --project=rayai-dev \
   --tunnel-through-iap -- -N -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 \
   -L 54321:127.0.0.1:54321 -L 8025:127.0.0.1:8025 -L 8090:127.0.0.1:8090
 ```
