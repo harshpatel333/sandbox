@@ -52,8 +52,12 @@ class Box:
         return self.instance or next(r for r in self.resources if not r.adopted)
 
     @property
+    def zones(self):
+        return sorted({r.zone for r in self.resources if r.zone})
+
+    @property
     def zone(self):
-        return next((r.zone for r in self.resources if r.zone), '')
+        return ', '.join(self.zones)
 
     @property
     def owner(self):
@@ -75,7 +79,8 @@ class Box:
 
     @property
     def unhandled(self):
-        known = {(r['type'], r['name'], r.get('zone')) for r in contract.resources(self.name, self.devbox_id)}
+        known = {(r['type'], r['name'], r.get('zone')) for zone in contract.DEVBOX_ZONES
+                 for r in contract.resources(self.name, self.devbox_id, zone)}
         recorded = self.instance.recorded if self.instance else []
         return [f'{r.get("type")} {r.get("name")}' if isinstance(r, dict) else str(r) for r in recorded
                 if not isinstance(r, dict) or (r.get('type'), r.get('name'), r.get('zone')) not in known]
@@ -222,8 +227,8 @@ def _placement(resource, project):
     match = PROJECT_IN_LINK.search(resource.link)
     if not match or match.group(1) != project:
         return f'not in project {project}'
-    if resource.zone != contract.ZONE:
-        return f'not in zone {contract.ZONE}'
+    if resource.zone not in contract.DEVBOX_ZONES:
+        return f'not in a devbox zone ({", ".join(contract.DEVBOX_ZONES)})'
     return None
 
 
@@ -362,7 +367,7 @@ def render(boxes, ignored, now):
         if reachable:
             lines += ['', 'Access (IAP tunnel):', '']
             for box in reachable:
-                lines += [f'`{box.name}`:', '```', contract.forwarding_command(box.name, box.zone), '```']
+                lines += [f'`{box.name}`:', '```', contract.forwarding_command(box.name, box.instance.zone), '```']
     if ignored:
         lines += ['', 'Ignored resources (never destroyed by these workflows):', '']
         lines += [f'- {r.kind} `{r.name}`: {reason}' for r, reason in ignored]
@@ -439,10 +444,10 @@ def _owned_elsewhere(resource, name, devbox_id):
             and (resource.kind, resource.name) in expected(name, other))
 
 
-def _delete(cloud, resource, instance):
+def _delete(cloud, resource, instances):
     if resource.kind == 'bucket':
         return cloud.delete_bucket(resource.name)
-    foreign = [u for u in resource.users if not instance or u != instance.link]
+    foreign = [u for u in resource.users if u not in {i.link for i in instances}]
     if foreign:
         return f'disk {resource.name} is attached to {", ".join(map(_last, foreign))}; not deleted'
     return cloud.delete_disk(resource.name, resource.zone)
@@ -477,8 +482,9 @@ def destroy(cloud, project, name, devbox_id, *, require_expired_at=None):
             error = str(invalid)
         if error:
             print(f'::warning::Could not mark {name} as destroying: {error}')
-    failures = [cloud.delete_instance(instance.name, instance.zone)] if instance else []
-    failures += [_delete(cloud, r, instance) for r in box.resources if r.kind != 'instance']
+    instances = box.of('instance')
+    failures = [cloud.delete_instance(i.name, i.zone) for i in instances]
+    failures += [_delete(cloud, r, instances) for r in box.resources if r.kind != 'instance']
     try:
         remaining, left = find_with_blocked(cloud, project, name, devbox_id)
     except CLOUD_ERRORS as error:
