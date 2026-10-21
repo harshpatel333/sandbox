@@ -217,7 +217,7 @@ module "api" {
   service_name          = "superserve-api"
   service_account_email = google_service_account.controlplane_runtime.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
-  env = {
+  env = merge({
     BILLING_USAGE_ENTITLEMENTS_ENABLED = "true"
     YC_CONSOLE_URL                     = var.yc_claim_console_url
     YC_EMAIL_FROM                      = var.yc_claim_email_from
@@ -279,8 +279,8 @@ module "api" {
     # identity the runtime impersonates to delete from it.
 
     BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
-  }
-  secrets = merge(local.promotion_evidence_secrets, local.yc_claim_secrets, {
+  }, local.qm_team_service_env)
+  secrets = merge(local.promotion_evidence_secrets, local.yc_claim_secrets, local.qm_team_service_secrets, {
     OPERATOR_API_TOKEN = {
       secret = google_secret_manager_secret.operator_api_token.secret_id
     }

@@ -107,3 +107,47 @@ authority. Rotating the dedicated service credential preserves this binding.
 This endpoint provisions infrastructure identity only. Runtime machine-principal
 issuance, deployment readiness and commercial entitlements retain their separate
 validation gates. No production authority or credential is enabled by this change.
+
+### Staging configuration and recovery
+
+The staging root accepts an optional `qm_team_service` object with `namespace`,
+`authority_id`, `home_region`, `credential_secret_id`, and
+`credential_secret_version`. Its default is `null`: no team-service settings or
+credential access are added. The secret ID must use the dedicated
+`qm-team-service-token-` prefix; its version must be a positive numeric version,
+not `latest`. The credential container and version must already exist. Terraform
+only references the version and grants the existing control-plane runtime access;
+it does not create or read token bytes. The worker receives the same dedicated
+credential through its protected secret reference; do not reuse any other
+service token.
+
+Before supplying enabled inputs, reconcile the worker's protected origin,
+namespace and authority UUID and any existing organization mapping. Record the
+configured regional database's exact secret-version target; shared Auth evidence
+alone does not establish this target. Do not infer the native `use`/`usw` region
+from the worker's AWS region. The API image must support this service, but an
+image-only deployment does not install its settings.
+
+The database deployment owner installs the reviewed authority tuple through the
+existing privileged management connection to that verified regional database.
+Use one bounded transaction with serialized authority-table access. Verify the
+schema, enabled immutability triggers and API read-only authority privileges;
+insert only into an empty authority table, accept the exact existing tuple as a
+no-op, and abort on any conflict. Retain a committed, nonsecret readback. Do not
+seed this identity through the common migrations that run on other databases.
+Authority installation does not create an organization mapping or team.
+
+Review the actual configuration plan before applying it. Preserve existing
+settings, runtime identity and unrelated secret grants. After rollout, verify
+serving revision/traffic, secret version, runtime access, and authenticated lookup
+under the pinned authority. A verified absence permits a separately authorized
+idempotent create; a mismatch or tombstone does not. Runtime machine issuance and
+customer retries remain separate lifecycle actions.
+
+For recovery, restore the prior serving revision and reviewed configuration and,
+if needed, remove only the newly added credential grant through its owning
+infrastructure path. Confirm the restored revision still has its required access
+before revoking anything. Never delete or rewrite the immutable authority or
+organization mapping as rollback. A lost installation or create response requires
+an authoritative readback against the same identity before deciding the next
+step; do not switch authorities or blindly retry customer provisioning.
