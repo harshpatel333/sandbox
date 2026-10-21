@@ -67,7 +67,7 @@ class IdentityTest(unittest.TestCase):
             isolated = subprocess.run([sys.executable, "-I", *args], env=env, capture_output=True, text=True)
             self.assertEqual(isolated.returncode, 1)
             # Reaching binding/root validation proves the pinned helpers loaded.
-            self.assertIn('"next_step"', isolated.stdout)
+            self.assertIn('"next_step"', isolated.stdout, isolated.stderr)
             self.assertFalse(marker.exists())
             (scripts / "migrate_shared_auth.py").write_text(poison)
             dirty = subprocess.run([sys.executable, "-I", *args], env=env, capture_output=True, text=True)

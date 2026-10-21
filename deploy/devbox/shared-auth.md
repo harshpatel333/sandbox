@@ -41,19 +41,27 @@ sources must match the candidate binding exactly.
 
 Run from the reviewed tool checkout on the assigned VM as root. Install the
 repository's pinned `scripts/migration-requirements.txt` in an isolated Python
-environment. Supply the existing local **postgres migration** connection in
+environment, and use that exact interpreter for all subsequent commands:
+
+```sh
+python3 -m venv /opt/superserve-devbox/shared-auth-venv
+/opt/superserve-devbox/shared-auth-venv/bin/python -m pip install -r scripts/migration-requirements.txt
+/opt/superserve-devbox/shared-auth-venv/bin/python -I -c 'import psycopg'
+```
+
+Supply the existing local **postgres migration** connection in
 `DATABASE_URL` through the executor's secret environment mechanism; do not use
 the runtime `promotion_evidence_proxy` connection or print either URL. Unset
 libpq service configuration (`PGSERVICE`, `PGSERVICEFILE`, `PGSYSCONFDIR`).
 
 ```sh
-python -I scripts/migrate_devbox_shared_auth.py inspect \
+/opt/superserve-devbox/shared-auth-venv/bin/python -I scripts/migrate_devbox_shared_auth.py inspect \
   --binding /etc/superserve-devbox/shared-auth-binding.json \
   --revision TOOL_COMMIT
-python -I scripts/migrate_devbox_shared_auth.py apply \
+/opt/superserve-devbox/shared-auth-venv/bin/python -I scripts/migrate_devbox_shared_auth.py apply \
   --binding /etc/superserve-devbox/shared-auth-binding.json \
   --revision TOOL_COMMIT
-python -I scripts/migrate_devbox_shared_auth.py inspect \
+/opt/superserve-devbox/shared-auth-venv/bin/python -I scripts/migrate_devbox_shared_auth.py inspect \
   --binding /etc/superserve-devbox/shared-auth-binding.json \
   --revision TOOL_COMMIT
 ```

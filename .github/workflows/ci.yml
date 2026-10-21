@@ -17,7 +17,12 @@ jobs:
         with:
           version: '2.119.0'
 
-      - run: python3 -m pip install -r scripts/migration-requirements.txt
+      - name: Install isolated migration dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/migration-venv"
+          "$RUNNER_TEMP/migration-venv/bin/python" -m pip install -r scripts/migration-requirements.txt
+          "$RUNNER_TEMP/migration-venv/bin/python" -I -c 'import psycopg'
+          echo "$RUNNER_TEMP/migration-venv/bin" >> "$GITHUB_PATH"
 
       - name: Validate fresh and interrupted migrations
         run: |
