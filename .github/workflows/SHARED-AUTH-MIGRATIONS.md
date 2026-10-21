@@ -1,7 +1,7 @@
 # Shared Auth authority migration
 
 API and Terraform control-plane deployments run the existing shared Auth executor
-before regional migrations: `authority`, `claims`, then `approvals`. Staging uses
+before regional migrations: `authority`, `claims`, `approvals`, then `acceptances`. Staging uses
 its isolated authority; both production regions use the primary production
 authority (`use4`). Proxy-only deployments retain their regional prerequisite.
 All executors share the existing `database-migrations` queue. Do not add new shared versions to
@@ -99,3 +99,5 @@ regions use the verified RPC authority. Then perform the
 Local database tests establish atomicity, privilege checks and regional-runner
 compatibility; they do not establish staging card setup, product access, grants or
 overage invoice behavior. Production customer activation remains a separate action.
+
+After approvals, `acceptances` adds immutable customer acceptance and preferred-account review authority. Deployment validates four shared receipts in order (eight database calls on an already-applied path). This migration does not enable provider adapters or automated provisioning. Original receipt snapshots remain unchanged; explicit inspection also audits the new tables and RPCs.
