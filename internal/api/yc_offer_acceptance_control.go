@@ -26,9 +26,10 @@ func (s *YCOfferAcceptanceService) control(ctx context.Context, actor uuid.UUID,
 	}
 	defer rollbackYCAcceptance(ctx, tx)
 	var team, claim uuid.UUID
+	var assignment *uuid.UUID
 	var busy bool
 	var state string
-	err = tx.QueryRow(ctx, `SELECT team_id,claim_id,COALESCE(lease_until>clock_timestamp(),false),state FROM yc_offer_acceptance WHERE id=$1 AND home_region=$2 FOR UPDATE`, in.AcceptanceID, s.Region).Scan(&team, &claim, &busy, &state)
+	err = tx.QueryRow(ctx, `SELECT team_id,claim_id,COALESCE(lease_until>clock_timestamp(),false),state,assignment_id FROM yc_offer_acceptance WHERE id=$1 AND home_region=$2 FOR UPDATE`, in.AcceptanceID, s.Region).Scan(&team, &claim, &busy, &state, &assignment)
 	if err != nil {
 		return err
 	}
@@ -42,6 +43,17 @@ func (s *YCOfferAcceptanceService) control(ctx context.Context, actor uuid.UUID,
 			return nil
 		}
 		return errYCAcceptanceConflict
+	}
+	if assignment != nil {
+		// A lost enqueue response may leave local state behind the durable provider
+		// journal. Once it exists, only the provisioner's audited controls apply.
+		var handedOff bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_offer_provisioning_operation WHERE team_id=$1 AND assignment_id=$2)`, team, *assignment).Scan(&handedOff); err != nil {
+			return err
+		}
+		if handedOff {
+			return errYCAcceptanceConflict
+		}
 	}
 	if busy || state == "offered" || state == "dispatched" || state == "revoked" {
 		return errYCAcceptanceConflict

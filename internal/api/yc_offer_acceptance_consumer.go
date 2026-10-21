@@ -180,6 +180,9 @@ func (h *Handlers) StartYCOfferAcceptance(ctx context.Context) {
 		h.YCOfferAcceptance = service
 	}
 	s := h.YCOfferAcceptance
+	if s.available() && s.Provisioning == nil && h.OfferProvisioning.Available() {
+		s.Provisioning = ycAcceptanceProvisioner{service: h.OfferProvisioning}
+	}
 	if !s.available() || s.Catalog == nil || s.Provisioning == nil {
 		return
 	}
