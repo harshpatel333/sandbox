@@ -1,6 +1,7 @@
 """Exercise the devbox create and deploy workflows against a mocked gcloud."""
 
 from datetime import datetime, timezone
+import io
 import json
 import os
 from pathlib import Path
@@ -54,6 +55,7 @@ class FakeCloud:
         self.disks, self.buckets, self.unlabelled = [], [], set()
         self.disk_zones, self.deleted, self.stockout = {}, [], {}
         self.leak_boot_disk, self.created_at, self.vanished = False, {}, set()
+        self.login_denials, self.ssh_ready, self.denied, self.script_denials = 0, False, [], 0
         self.relabel_after_checkouts = None
         self.pending_instance = False
         self.fail_disk_create = False
@@ -179,8 +181,14 @@ class FakeCloud:
         self.unlabelled.add(name)
 
     def ssh(self, args, command, input, ok, fail):
+        if self.login_denials and command != "true" and self.ssh_ready:
+            self.login_denials -= 1
+            self.denied.append(command)
+            return fail(1, "ERROR: (gcloud.compute.ssh) PERMISSION_DENIED: User does not have "
+                           "compute.instances.osLogin permission.")
         self.inputs[command] = input
         if command == "true":
+            self.ssh_ready = True
             return ok()
         target = re.search(r"mv -f \S+ (/\S+?)'?$", unquote(command))
         if target and input is not None and "cat >" in unquote(command):
@@ -201,6 +209,11 @@ class FakeCloud:
                 return fail(255, "Connection closed by remote host")
             return ok()
         script = re.search(r"deploy/devbox/([a-z-]+\.sh)'? 2>&1", unquote(command))
+        if script and self.script_denials:
+            self.script_denials -= 1
+            self.denied.append(command)
+            return fail(1, "ERROR: (gcloud.compute.ssh) PERMISSION_DENIED: User does not have "
+                           "compute.instances.osLogin permission.")
         if script:
             self.scripts.append(script.group(1))
             if script.group(1) == self.expire_on_script:
@@ -490,6 +503,72 @@ class CreateTests(WorkflowCase):
                                ("resource_exhausted", False), ("QUOTA_EXCEEDED", False)):
             with self.subTest(text=text):
                 self.assertEqual(bool(workflow.CAPACITY_ERRORS.search(text)), capacity)
+
+    def test_os_login_denials_after_the_first_connection_are_waited_out(self):
+        cloud = FakeCloud()
+        cloud.login_denials = 3
+        self.assertEqual(self.create(cloud), 0)
+        self.assertEqual(len(cloud.denied), 3)
+        self.assertEqual(cloud.metadata_writes[-1]["state"], "ready")
+        self.assertEqual(cloud.checkouts, [SANDBOX_SHA, UI_SHA])
+
+    def test_a_denied_script_run_is_retried_not_blamed_on_the_script(self):
+        cloud = FakeCloud()
+        cloud.script_denials = 2
+        self.assertEqual(self.create(cloud), 0)
+        self.assertEqual(cloud.scripts, list(contract.CREATE_SCRIPTS))
+        self.assertEqual(len(cloud.denied), 2)
+
+    def test_error_annotations_cannot_start_workflow_commands(self):
+        with patch("sys.stderr", new=io.StringIO()) as stderr:
+            workflow.annotate("error", "failed: x\n::warning::injected\r\n50%")
+        self.assertEqual(stderr.getvalue(), "::error::failed: x%0A::warning::injected%0D%0A50%25\n")
+        with patch("sys.stdout", new=io.StringIO()) as stdout:
+            workflow.echo("waiting: x\n  ::add-mask::secret\n##[warning]injected")
+        lines = stdout.getvalue().splitlines()
+        token = lines[0].removeprefix("::stop-commands::")
+        self.assertTrue(lines[0].startswith("::stop-commands::") and len(token) == 32)
+        self.assertEqual(lines[-1], f"::{token}::")
+        self.assertNotIn(token, "\n".join(lines[1:-1]))
+
+    def test_script_runs_stream_output_and_keep_only_errors(self):
+        seen = []
+
+        def record(args, **kwargs):
+            seen.append(kwargs)
+            return subprocess.CompletedProcess(args, 0, None, "")
+
+        with patch.object(workflow.subprocess, "run", side_effect=record):
+            workflow.Box("my-box", "us-central1-a").run_script("install-vmd.sh")
+        self.assertIsNone(seen[-1]["stdout"])
+        self.assertEqual(seen[-1]["stderr"], subprocess.PIPE)
+
+    def test_only_os_login_denials_count_as_settling(self):
+        for text, settling in (("PERMISSION_DENIED: User does not have compute.instances.osLogin permission", True),
+                               ("PERMISSION_DENIED: compute.instances.osLoginExternalUser", False),
+                               ("PERMISSION_DENIED: compute.instances.setMetadata", False),
+                               ("Permission denied (publickey).", False),
+                               ("Error while connecting [4047: 'Failed to lookup instance']", False)):
+            with self.subTest(text=text):
+                self.assertEqual(bool(workflow.LOGIN_DENIED.search(text)), settling)
+
+    def test_os_login_settling_is_waited_out_in_a_fallback_zone(self):
+        cloud = FakeCloud()
+        cloud.stockout, cloud.login_denials = {"us-central1-a": "instance"}, 2
+        self.assertEqual(self.create(cloud), 0)
+        self.assertEqual(len(cloud.denied), 2)
+        self.assertEqual(cloud.metadata_writes[-1]["zone"], "us-central1-b")
+
+    def test_os_login_denials_past_the_settling_window_fail(self):
+        cloud = FakeCloud()
+        cloud.login_denials = 100
+        clock = [0.0]
+        with patch.object(workflow.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(workflow.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            self.assertEqual(self.create(cloud), 1)
+        self.assertGreater(len(cloud.denied), workflow.LOGIN_PROPAGATION_SECONDS // workflow.SSH_RETRY_SECONDS - 2)
+        self.assertLessEqual(len(cloud.denied), workflow.LOGIN_PROPAGATION_SECONDS // workflow.SSH_RETRY_SECONDS + 1)
+        self.assertIn("compute.instances.osLogin", self.summary.read_text())
 
     def test_explicit_zone_is_the_only_zone_tried(self):
         cloud = FakeCloud()
@@ -853,6 +932,14 @@ class DeployTests(WorkflowCase):
         with self.assertRaisesRegex(workflow.StepError, "manifest says us-central1-a"):
             self.deploy(cloud, "vmd")
         self.assertEqual(cloud.metadata_writes, [])
+
+    def test_deploy_does_not_wait_out_os_login_denials(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.login_denials, cloud.ssh_ready = 100, True
+        with patch.object(workflow.time, "sleep") as sleep:
+            self.assertEqual(self.deploy(cloud, "vmd"), 1)
+        self.assertTrue(cloud.denied)
+        sleep.assert_not_called()
 
     def test_failed_box_can_be_redeployed(self):
         cloud = FakeCloud(instances=self.box(state="failed"))

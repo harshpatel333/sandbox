@@ -46,6 +46,10 @@ LOG_DIR = "/var/log/superserve-devbox"
 API_DEPLOY_FILE = contract.BOX_STATE_DIR + "/api-deploy.json"
 SSH_ATTEMPTS = 40
 SSH_RETRY_SECONDS = 15
+# A fresh per-instance OS Login grant takes a few minutes to settle and can
+# flap meanwhile: one connection is let in, the next denied.
+LOGIN_PROPAGATION_SECONDS = 7 * 60
+LOGIN_DENIED = re.compile(r"PERMISSION_DENIED.*compute\.instances\.osLogin\b", re.S)
 # Kept below the job's timeout-minutes so a slow step fails here, with the box
 # marked failed, rather than being killed by the runner.
 DEADLINE_SECONDS = 160 * 60
@@ -95,12 +99,35 @@ class Deadline:
 DEADLINE = Deadline()
 
 
+def annotate(kind, message):
+    # Error text can carry box output; escaping keeps every line of it inside
+    # this one annotation instead of letting a line start a workflow command.
+    escaped = str(message).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{kind}::{escaped}", file=sys.stderr)
+
+
+def echo(text):
+    # Text that can carry box output is printed with workflow commands off, so
+    # no line of it (a leading ::, or ##[ anywhere) is run as one.
+    token = secrets.token_hex(16)
+    print(f"::stop-commands::{token}\n{text}\n::{token}::", flush=True)
+
+
 def run(args, *, input=None, capture=True, timeout=600):
+    # capture="stderr" streams stdout (long box scripts) but keeps gcloud's
+    # own errors so a failure can say why.
     timeout = DEADLINE.cap(timeout)
+    streams = {"stdout": subprocess.PIPE if capture is True else None,
+               "stderr": subprocess.PIPE if capture else None}
     try:
-        result = subprocess.run(args, input=input, capture_output=capture, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise StepError(f"{' '.join(args[:4])} timed out after {timeout}s") from None
+        result = subprocess.run(args, input=input, text=True, timeout=timeout, **streams)
+    except subprocess.TimeoutExpired as error:
+        detail = (error.stderr or "").strip() if isinstance(error.stderr, str) else ""
+        raise StepError(f"{' '.join(args[:4])} timed out after {timeout}s"
+                        + (f": {detail}" if detail else "")) from None
+    if capture == "stderr" and result.stderr and not result.returncode:
+        sys.stdout.write(result.stderr)
+        sys.stdout.flush()
     if result.returncode:
         detail = (result.stderr or "").strip() if capture else ""
         raise StepError(f"{' '.join(args[:4])} failed (exit {result.returncode})"
@@ -163,7 +190,7 @@ def append_summary(env, text):
     if path:
         with open(path, "a") as summary:
             summary.write(text.rstrip() + "\n")
-    print(text)
+    echo(text)
 
 
 def prepare_create(env, profile_path=PROFILE_PATH):
@@ -272,16 +299,29 @@ class Box:
         # steps can take many minutes, and a box replaced meanwhile must never be
         # touched under the old identity.
         self.devbox_id = devbox_id
+        self.login_granted = None
 
     def guard(self):
         if self.devbox_id is not None:
             self.verify(self.devbox_id)
 
     def ssh(self, command, *, input=None, capture=True, timeout=600):
-        return run(["gcloud", "compute", "ssh", self.instance, *self.where, "--quiet", "--tunnel-through-iap",
-                    "--ssh-key-expire-after=4h", "--ssh-flag=-o ServerAliveInterval=30",
-                    "--ssh-flag=-o ServerAliveCountMax=6", "--command", command],
-                   input=input, capture=capture, timeout=timeout)
+        while True:
+            try:
+                return run(["gcloud", "compute", "ssh", self.instance, *self.where, "--quiet",
+                            "--tunnel-through-iap", "--ssh-key-expire-after=4h",
+                            "--ssh-flag=-o ServerAliveInterval=30", "--ssh-flag=-o ServerAliveCountMax=6",
+                            "--command", command], input=input, capture=capture, timeout=timeout)
+            except DeadlineExceeded:
+                raise
+            except StepError as error:
+                # A denied login never reaches the box, so retrying can't repeat
+                # the command.
+                if not (self.login_granted is not None and LOGIN_DENIED.search(str(error))
+                        and time.monotonic() - self.login_granted < LOGIN_PROPAGATION_SECONDS):
+                    raise
+                echo(f"waiting for the OS Login grant on {self.name} to settle: {error}")
+                time.sleep(DEADLINE.cap(SSH_RETRY_SECONDS))
 
     def wait_for_ssh(self, attempts=SSH_ATTEMPTS, delay=SSH_RETRY_SECONDS):
         for attempt in range(1, attempts + 1):
@@ -291,7 +331,7 @@ class Box:
             except DeadlineExceeded:
                 raise
             except StepError as error:
-                print(f"waiting for SSH over IAP ({attempt}/{attempts}): {error}")
+                echo(f"waiting for SSH over IAP ({attempt}/{attempts}): {error}")
                 if attempt < attempts:
                     time.sleep(DEADLINE.cap(delay))
         raise StepError(f"{self.name} did not accept SSH over IAP")
@@ -372,7 +412,7 @@ class Box:
         print(f"::group::{script}", flush=True)
         print(f"::stop-commands::{token}", flush=True)
         try:
-            self.ssh("sudo bash -c " + shlex.quote(command), input="", capture=False, timeout=3600)
+            self.ssh("sudo bash -c " + shlex.quote(command), input="", capture="stderr", timeout=3600)
         except StepError as error:
             raise StepError(f"{script} failed on {self.name}; see {log} on the box ({error})") from None
         finally:
@@ -394,7 +434,7 @@ class Box:
                 self.write_file(f"{contract.BOX_CONFIG_DIR}/manifest.json",
                                 json.dumps(manifest, indent=2) + "\n", "0644")
             except StepError as error:
-                print(f"::warning::Could not copy the manifest to {self.name}: {error}")
+                annotate("warning", f"Could not copy the manifest to {self.name}: {error}")
 
 
 def manifest_from(instance):
@@ -564,6 +604,7 @@ def create(env, profile_path=PROFILE_PATH):
         for member in engineers:
             run(["gcloud", "compute", "instances", "add-iam-policy-binding", box.instance, *where,
                  f"--member={member}", "--role=roles/compute.osAdminLogin", "--condition=None", "--quiet"])
+        box.login_granted = time.monotonic()
 
         box.wait_for_ssh()
         box.devbox_id = devbox_id
@@ -778,7 +819,7 @@ def report_create_failure(env, name, devbox_id, error, instance_started, zone=No
     settled = (instance is not None and marked is not False) or not instance_started
     save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": settled,
                        "instance_started": instance_started, "zone": zone})
-    print(f"::error::Devbox {name} failed: {describe(error)}", file=sys.stderr)
+    annotate("error", f"Devbox {name} failed: {describe(error)}")
 
 
 def load_attempt(env):
@@ -912,7 +953,7 @@ def conclude_deploy(env, box, manifest, state, devbox_id, components, revisions,
     save_attempt(env, {"name": box.name, "devbox_id": devbox_id, "reported": reported, "progress": progress})
     append_summary(env, deploy_summary(recorded, manifest, components, progress["deployed"], migrations, failure))
     if failure is not None:
-        print(f"::error::Deploy to {box.name} failed: {describe(failure)}", file=sys.stderr)
+        annotate("error", f"Deploy to {box.name} failed: {describe(failure)}")
         return 1
     return 0
 
@@ -999,7 +1040,7 @@ def main(argv=None):
             DEADLINE.start(DEADLINE_SECONDS)
             return deploy(env)
     except (StepError, contract.ContractError) as error:
-        print(f"::error::{error}", file=sys.stderr)
+        annotate("error", error)
         return 1
     return 0
 
