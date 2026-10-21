@@ -16,6 +16,7 @@ CREATE TABLE billing_contract_provider_binding (
  fee_subscription_id text NOT NULL CHECK(fee_subscription_id LIKE 'sub_%'),
  fee_item_id text NOT NULL CHECK(fee_item_id LIKE 'si_%'),
  anchor timestamptz NOT NULL,
+ fee_anchor timestamptz NOT NULL,
  starts_at timestamptz NOT NULL,
  ends_at timestamptz,
  binding jsonb NOT NULL CHECK(jsonb_typeof(binding)='object'),
@@ -24,6 +25,7 @@ CREATE TABLE billing_contract_provider_binding (
  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  UNIQUE(team_id,contract_id),
  CHECK(usage_subscription_id<>fee_subscription_id),
+ CHECK(isfinite(fee_anchor) AND fee_anchor=date_trunc('second',fee_anchor) AND fee_anchor>=anchor AND fee_anchor<=starts_at),
  CHECK(isfinite(anchor) AND isfinite(starts_at) AND anchor=date_trunc('second',anchor) AND starts_at>=anchor AND (ends_at IS NULL OR isfinite(ends_at) AND ends_at>starts_at))
 );
 CREATE INDEX billing_provider_pair_usage ON billing_contract_provider_binding(team_id,usage_subscription_id,starts_at DESC);
@@ -45,7 +47,8 @@ BEGIN
   OR (c.base_price_id,c.charge_amount_cents,c.charge_interval_months,c.currency)
      IS DISTINCT FROM (t->>'fee_price_id',(t->>'fee_amount_cents')::bigint,(t->>'fee_months')::integer,t->>'currency')
   OR NEW.verified_at>clock_timestamp() OR NEW.verified_at<clock_timestamp()-interval '1 minute'
-  OR NEW.starts_at IS DISTINCT FROM (SELECT period_start FROM billing_entitlement_period(NEW.anchor,NEW.starts_at)) THEN
+  OR NEW.starts_at IS DISTINCT FROM (SELECT period_start FROM billing_entitlement_period(NEW.anchor,NEW.starts_at))
+  OR NEW.starts_at IS DISTINCT FROM (SELECT period_start FROM billing_entitlement_period(NEW.fee_anchor,NEW.starts_at)) THEN
   RAISE EXCEPTION 'provider binding differs from pending commercial terms';
  END IF;
  IF (NEW.binding->>'contract_id')::uuid IS DISTINCT FROM NEW.contract_id
@@ -56,8 +59,8 @@ BEGIN
    'merchant',NEW.merchant,'live',NEW.live_mode,'api_version',NEW.api_version)
   OR (NEW.binding->>'customer_id',NEW.binding->>'usage_subscription_id',NEW.binding->>'fee_subscription_id',NEW.binding->>'fee_item_id')
    IS DISTINCT FROM (NEW.customer_id,NEW.usage_subscription_id,NEW.fee_subscription_id,NEW.fee_item_id)
-  OR ((NEW.binding->>'anchor')::timestamptz,(NEW.binding->>'starts_at')::timestamptz,(NEW.binding->>'ends_at')::timestamptz)
-   IS DISTINCT FROM (NEW.anchor,NEW.starts_at,NEW.ends_at) THEN
+  OR ((NEW.binding->>'anchor')::timestamptz,(NEW.binding->>'fee_anchor')::timestamptz,(NEW.binding->>'starts_at')::timestamptz,(NEW.binding->>'ends_at')::timestamptz)
+   IS DISTINCT FROM (NEW.anchor,NEW.fee_anchor,NEW.starts_at,NEW.ends_at) THEN
   RAISE EXCEPTION 'provider binding projection differs from immutable evidence';
  END IF;
  IF NOT EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=NEW.team_id AND stripe_customer_id=NEW.customer_id
@@ -192,7 +195,7 @@ END $$;
 
 
 CREATE OR REPLACE FUNCTION guard_billing_contract_payment() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE c billing_commercial_contract; m integer; first_month integer;
+DECLARE c billing_commercial_contract; m integer; first_month integer; fee_anchor timestamptz;
 BEGIN
     IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION 'base payment evidence is immutable'; END IF;
     SELECT * INTO STRICT c FROM billing_commercial_contract WHERE team_id = NEW.team_id AND id = NEW.contract_id FOR SHARE;
@@ -206,13 +209,14 @@ BEGIN
     END IF;
     IF c.status = 'ended' OR NEW.service_period_start < c.starts_at OR NEW.paid_at > clock_timestamp()
         OR NEW.verified_at > clock_timestamp() THEN RAISE EXCEPTION 'invalid base payment period or verification time'; END IF;
-    m := (extract(year FROM NEW.service_period_start AT TIME ZONE 'UTC')::integer - extract(year FROM c.entitlement_anchor AT TIME ZONE 'UTC')::integer) * 12
-        + extract(month FROM NEW.service_period_start AT TIME ZONE 'UTC')::integer - extract(month FROM c.entitlement_anchor AT TIME ZONE 'UTC')::integer;
-    first_month := (extract(year FROM c.starts_at AT TIME ZONE 'UTC')::integer - extract(year FROM c.entitlement_anchor AT TIME ZONE 'UTC')::integer) * 12
-        + extract(month FROM c.starts_at AT TIME ZONE 'UTC')::integer - extract(month FROM c.entitlement_anchor AT TIME ZONE 'UTC')::integer;
+    SELECT COALESCE((SELECT b.fee_anchor FROM billing_contract_provider_binding b WHERE b.contract_id=c.id AND b.team_id=c.team_id),c.entitlement_anchor) INTO fee_anchor;
+    m := (extract(year FROM NEW.service_period_start AT TIME ZONE 'UTC')::integer - extract(year FROM fee_anchor AT TIME ZONE 'UTC')::integer) * 12
+        + extract(month FROM NEW.service_period_start AT TIME ZONE 'UTC')::integer - extract(month FROM fee_anchor AT TIME ZONE 'UTC')::integer;
+    first_month := (extract(year FROM c.starts_at AT TIME ZONE 'UTC')::integer - extract(year FROM fee_anchor AT TIME ZONE 'UTC')::integer) * 12
+        + extract(month FROM c.starts_at AT TIME ZONE 'UTC')::integer - extract(month FROM fee_anchor AT TIME ZONE 'UTC')::integer;
     IF (m - first_month) % c.charge_interval_months <> 0
-        OR NEW.service_period_start <> billing_anniversary_boundary(c.entitlement_anchor, m)
-        OR NEW.service_period_end <> billing_anniversary_boundary(c.entitlement_anchor, m + c.charge_interval_months) THEN
+        OR NEW.service_period_start <> billing_anniversary_boundary(fee_anchor, m)
+        OR NEW.service_period_end <> billing_anniversary_boundary(fee_anchor, m + c.charge_interval_months) THEN
         RAISE EXCEPTION 'base payment service period differs from contract cadence';
     END IF;
     RETURN NEW;

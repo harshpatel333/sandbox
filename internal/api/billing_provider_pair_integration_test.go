@@ -91,8 +91,8 @@ VALUES($1,$2,'yc_2026',$3,$4,$5,$6,$7,1200000,12,'metered_usage',100000,'schedul
 	successor.FeeItemID = "si_successor"
 	exec(`INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_kind,entitlement_amount_cents,entitlement_cadence,entitlement_anchor)
 VALUES($1,$2,'pro_annual',$3,$4,$5,$6,$7,1200000,12,'metered_usage',100000,'monthly',$8)`, successor.ContractID, f.p.Identity.TeamID, successor.StartsAt, successor.EndsAt, f.p.CustomerID, f.p.UsageSubscriptionID, f.p.Terms.FeePriceID, f.p.Anchor)
-	insertSuccessor := `INSERT INTO billing_contract_provider_binding(contract_id,team_id,assignment_id,acceptance_id,approval_semantic_revision,merchant,live_mode,api_version,terms_digest,provider_terms_digest,customer_id,usage_subscription_id,fee_subscription_id,fee_item_id,anchor,starts_at,ends_at,binding,evidence,verified_at)
-SELECT $1,team_id,assignment_id,acceptance_id,approval_semantic_revision,merchant,live_mode,api_version,terms_digest,$6,customer_id,usage_subscription_id,fee_subscription_id,'si_successor',anchor,$2,$3,$4,evidence,clock_timestamp() FROM billing_contract_provider_binding WHERE contract_id=$5`
+	insertSuccessor := `INSERT INTO billing_contract_provider_binding(contract_id,team_id,assignment_id,acceptance_id,approval_semantic_revision,merchant,live_mode,api_version,terms_digest,provider_terms_digest,customer_id,usage_subscription_id,fee_subscription_id,fee_item_id,anchor,fee_anchor,starts_at,ends_at,binding,evidence,verified_at)
+SELECT $1,team_id,assignment_id,acceptance_id,approval_semantic_revision,merchant,live_mode,api_version,terms_digest,$6,customer_id,usage_subscription_id,fee_subscription_id,'si_successor',anchor,fee_anchor,$2,$3,$4,evidence,clock_timestamp() FROM billing_contract_provider_binding WHERE contract_id=$5`
 	changedSuccessor := successor
 	changedSuccessor.Terms.Resources = append([]StripeCheckoutResourceTerms{}, successor.Terms.Resources...)
 	changedSuccessor.Terms.Resources[0].PriceID = "price_changed_usage"

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/superserve-ai/sandbox/internal/billing"
 )
 
 func movePairFixture(f *pairFixture, anchor time.Time) {
@@ -24,12 +25,14 @@ func successorPairFixture(f *pairFixture, previous ContractProviderBinding, mont
 	next.ContractID, next.StartsAt, next.EndsAt, next.FeeItemID = uuid.New(), *previous.EndsAt, nil, "si_successor"
 	next.Identity.OperationID = uuid.New()
 	if monthly {
+		next.FeeAnchor = next.StartsAt
 		next.Terms.FeePriceID, next.Terms.FeeAmount, next.Terms.FeeMonths = "price_monthly", 120000, 1
 	}
 	next.Identity.ProviderTermsDigest, _ = next.Terms.Digest()
 	i := &f.fee.Items.Data[0]
 	i.ID, i.Price.ID, i.Price.UnitAmountDecimal = next.FeeItemID, next.Terms.FeePriceID, "1200000"
-	i.Start, i.End = next.StartsAt.Unix(), annualBoundary(next.Anchor, 12+int(next.Terms.FeeMonths)).Unix()
+	feeMonth := (next.StartsAt.Year()-next.FeeAnchor.Year())*12 + int(next.StartsAt.Month()-next.FeeAnchor.Month())
+	i.Start, i.End = next.StartsAt.Unix(), annualBoundary(next.FeeAnchor, feeMonth+int(next.Terms.FeeMonths)).Unix()
 	if monthly {
 		i.Price.Recurring.Interval, i.Price.UnitAmountDecimal = "month", "120000"
 		f.fee.BillingCycleAnchor = next.StartsAt.Unix()
@@ -56,7 +59,7 @@ func TestProviderPairSuccessorUsesActualBoundaryItem(t *testing.T) {
 			f := newPairFixture(t)
 			movePairFixture(f, time.Now().UTC().AddDate(-1, 0, 0).Add(-time.Hour).Truncate(time.Second))
 			end := annualBoundary(f.p.Anchor, 12)
-			previous := ContractProviderBinding{ContractID: uuid.New(), Identity: f.p.Identity, Terms: f.p.Terms, CustomerID: f.p.CustomerID, UsageSubscriptionID: f.p.UsageSubscriptionID, FeeSubscriptionID: f.p.FeeSubscriptionID, FeeItemID: f.p.FeeItemID, Anchor: f.p.Anchor, StartsAt: f.p.Anchor, EndsAt: &end}
+			previous := ContractProviderBinding{ContractID: uuid.New(), Identity: f.p.Identity, Terms: f.p.Terms, CustomerID: f.p.CustomerID, UsageSubscriptionID: f.p.UsageSubscriptionID, FeeSubscriptionID: f.p.FeeSubscriptionID, FeeItemID: f.p.FeeItemID, Anchor: f.p.Anchor, FeeAnchor: f.p.Anchor, StartsAt: f.p.Anchor, EndsAt: &end}
 			next := successorPairFixture(f, previous, monthly)
 			client := f.client(t)
 			v, err := client.verifySuccessorProviderPair(t.Context(), previous, next, f.invoice.ID)
@@ -85,7 +88,7 @@ func TestProviderPairMonthlySuccessorRecoversAfterFirstUnpaidPeriod(t *testing.T
 	now := time.Now().UTC()
 	movePairFixture(f, time.Date(now.Year()-1, now.Month()-1, 1, 0, 0, 0, 0, time.UTC))
 	end := annualBoundary(f.p.Anchor, 12)
-	previous := ContractProviderBinding{ContractID: uuid.New(), Identity: f.p.Identity, Terms: f.p.Terms, CustomerID: f.p.CustomerID, UsageSubscriptionID: f.p.UsageSubscriptionID, FeeSubscriptionID: f.p.FeeSubscriptionID, FeeItemID: f.p.FeeItemID, Anchor: f.p.Anchor, StartsAt: f.p.Anchor, EndsAt: &end}
+	previous := ContractProviderBinding{ContractID: uuid.New(), Identity: f.p.Identity, Terms: f.p.Terms, CustomerID: f.p.CustomerID, UsageSubscriptionID: f.p.UsageSubscriptionID, FeeSubscriptionID: f.p.FeeSubscriptionID, FeeItemID: f.p.FeeItemID, Anchor: f.p.Anchor, FeeAnchor: f.p.Anchor, StartsAt: f.p.Anchor, EndsAt: &end}
 	next := successorPairFixture(f, previous, true)
 	f.fee.Status = "past_due"
 	f.fee.Items.Data[0].Start, f.fee.Items.Data[0].End = annualBoundary(next.Anchor, 13).Unix(), annualBoundary(next.Anchor, 14).Unix()
@@ -103,5 +106,51 @@ func TestProviderPairMonthlySuccessorRecoversAfterFirstUnpaidPeriod(t *testing.T
 	f.invoice.Lines.Data[0].Period.End = f.fee.Items.Data[0].End
 	if _, err := client.verifySuccessorProviderPair(t.Context(), previous, next, f.invoice.ID); err == nil {
 		t.Fatal("later monthly invoice replaced original boundary evidence")
+	}
+}
+
+func TestProviderPairLeapDayMonthlyFeeKeepsSeparateCalendar(t *testing.T) {
+	for _, year := range []int{2024, 2028} {
+		f := newPairFixture(t)
+		movePairFixture(f, time.Date(year, 2, 29, 12, 0, 0, 0, time.UTC))
+		end := annualBoundary(f.p.Anchor, 12)
+		previous := ContractProviderBinding{ContractID: uuid.New(), Identity: f.p.Identity, Terms: f.p.Terms, CustomerID: f.p.CustomerID, UsageSubscriptionID: f.p.UsageSubscriptionID, FeeSubscriptionID: f.p.FeeSubscriptionID, FeeItemID: f.p.FeeItemID, Anchor: f.p.Anchor, FeeAnchor: f.p.Anchor, StartsAt: f.p.Anchor, EndsAt: &end}
+		next := successorPairFixture(f, previous, true)
+		if err := validatePairSuccessorInvoice(next, f.invoice.ID, f.invoice); err != nil {
+			t.Fatalf("year %d: actual boundary invoice rejected: %v", year, err)
+		}
+		if next.Anchor.Day() != 29 || next.FeeAnchor.Day() != 28 || time.Unix(f.invoice.Lines.Data[0].Period.End, 0).UTC().Day() != 28 || annualBoundary(next.Anchor, 13).Day() != 29 {
+			t.Fatal("fee transition changed the original usage calendar")
+		}
+		f.invoice.Status, f.invoice.AmountRemaining, f.invoice.AmountPaid = "paid", 0, next.Terms.FeeAmount
+		f.invoice.StatusTransitions.PaidAt = next.StartsAt.Add(time.Minute).Unix()
+		client := f.client(t)
+		if _, err := client.verifyProviderPairPayment(t.Context(), next, f.invoice.ID); err != nil {
+			t.Fatalf("year %d: exact actual fee cash rejected: %v", year, err)
+		}
+		wrong := next
+		wrong.FeeAnchor = next.Anchor
+		if _, err := client.verifyProviderPairPayment(t.Context(), wrong, f.invoice.ID); err == nil {
+			t.Fatal("cash receipt silently extended to usage-calendar end")
+		}
+		if year == 2024 {
+			// Delayed construction independently verifies current fee and usage
+			// periods while retaining the original boundary invoice as evidence.
+			start, finish, ok := billing.AnniversaryPeriod(next.FeeAnchor, time.Now())
+			if !ok {
+				t.Fatal("fee calendar unavailable")
+			}
+			f.fee.Items.Data[0].Start, f.fee.Items.Data[0].End = start.Unix(), finish.Unix()
+			start, finish, ok = billing.AnniversaryPeriod(next.Anchor, time.Now())
+			if !ok {
+				t.Fatal("usage calendar unavailable")
+			}
+			for i := range f.usage.Items.Data {
+				f.usage.Items.Data[i].Start, f.usage.Items.Data[i].End = start.Unix(), finish.Unix()
+			}
+			if _, err := client.verifySuccessorProviderPair(t.Context(), previous, next, f.invoice.ID); err != nil {
+				t.Fatalf("separate current calendars rejected: %v", err)
+			}
+		}
 	}
 }

@@ -21,6 +21,7 @@ type ContractProviderBinding struct {
 	UsageSubscriptionID string               `json:"usage_subscription_id"`
 	FeeSubscriptionID   string               `json:"fee_subscription_id"`
 	FeeItemID           string               `json:"fee_item_id"`
+	FeeAnchor           time.Time            `json:"fee_anchor"`
 	Anchor              time.Time            `json:"anchor"`
 	StartsAt            time.Time            `json:"starts_at"`
 	EndsAt              *time.Time           `json:"ends_at,omitempty"`
@@ -39,7 +40,7 @@ func ConfirmContractProviderBinding(ctx context.Context, tx pgx.Tx, contract uui
 	}
 	p := verified.Input
 	end := annualBoundary(p.Anchor, 12)
-	b = ContractProviderBinding{ContractID: contract, Identity: p.Identity, Terms: p.Terms, CustomerID: p.CustomerID, UsageSubscriptionID: p.UsageSubscriptionID, FeeSubscriptionID: p.FeeSubscriptionID, FeeItemID: p.FeeItemID, Anchor: p.Anchor, StartsAt: p.Anchor, EndsAt: &end}
+	b = ContractProviderBinding{ContractID: contract, Identity: p.Identity, Terms: p.Terms, CustomerID: p.CustomerID, UsageSubscriptionID: p.UsageSubscriptionID, FeeSubscriptionID: p.FeeSubscriptionID, FeeItemID: p.FeeItemID, Anchor: p.Anchor, FeeAnchor: p.Anchor, StartsAt: p.Anchor, EndsAt: &end}
 	return confirmProviderBinding(ctx, tx, b, verified.Evidence, verified.VerifiedAt)
 }
 
@@ -70,9 +71,9 @@ func confirmProviderBinding(ctx context.Context, tx pgx.Tx, b ContractProviderBi
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return ContractProviderBinding{}, err
 	}
-	err = tx.QueryRow(ctx, `INSERT INTO billing_contract_provider_binding(contract_id,team_id,assignment_id,acceptance_id,approval_semantic_revision,merchant,live_mode,api_version,terms_digest,provider_terms_digest,customer_id,usage_subscription_id,fee_subscription_id,fee_item_id,anchor,starts_at,ends_at,binding,evidence,verified_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
-ON CONFLICT(contract_id) DO NOTHING RETURNING binding`, b.ContractID, b.Identity.TeamID, b.Identity.AssignmentID, b.Identity.AcceptanceID, b.Identity.ApprovalSemanticRevision, b.Identity.Merchant, b.Identity.Live, b.Identity.APIVersion, b.Identity.TermsDigest, b.Identity.ProviderTermsDigest, b.CustomerID, b.UsageSubscriptionID, b.FeeSubscriptionID, b.FeeItemID, b.Anchor, b.StartsAt, b.EndsAt, payload, evidence, verifiedAt).Scan(&saved)
+	err = tx.QueryRow(ctx, `INSERT INTO billing_contract_provider_binding(contract_id,team_id,assignment_id,acceptance_id,approval_semantic_revision,merchant,live_mode,api_version,terms_digest,provider_terms_digest,customer_id,usage_subscription_id,fee_subscription_id,fee_item_id,anchor,fee_anchor,starts_at,ends_at,binding,evidence,verified_at)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+ON CONFLICT(contract_id) DO NOTHING RETURNING binding`, b.ContractID, b.Identity.TeamID, b.Identity.AssignmentID, b.Identity.AcceptanceID, b.Identity.ApprovalSemanticRevision, b.Identity.Merchant, b.Identity.Live, b.Identity.APIVersion, b.Identity.TermsDigest, b.Identity.ProviderTermsDigest, b.CustomerID, b.UsageSubscriptionID, b.FeeSubscriptionID, b.FeeItemID, b.Anchor, b.FeeAnchor, b.StartsAt, b.EndsAt, payload, evidence, verifiedAt).Scan(&saved)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = tx.QueryRow(ctx, `SELECT binding FROM billing_contract_provider_binding WHERE contract_id=$1 AND binding=$2::jsonb`, b.ContractID, payload).Scan(&saved)
 	}
@@ -121,7 +122,7 @@ func (c *stripeHTTPClient) verifyProviderPairPayment(ctx context.Context, b Cont
 		return empty, err
 	}
 	digest, err := b.Terms.Digest()
-	if err != nil || digest != b.Identity.ProviderTermsDigest || b.FeeSubscriptionID == "" || b.FeeSubscriptionID == b.UsageSubscriptionID || b.FeeItemID == "" || b.CustomerID == "" || b.Anchor.IsZero() || b.StartsAt.Before(b.Anchor) || c.apiVersion != b.Identity.APIVersion {
+	if err != nil || digest != b.Identity.ProviderTermsDigest || b.FeeSubscriptionID == "" || b.FeeSubscriptionID == b.UsageSubscriptionID || b.FeeItemID == "" || b.CustomerID == "" || b.Anchor.IsZero() || b.FeeAnchor.IsZero() || b.FeeAnchor.Nanosecond() != 0 || b.FeeAnchor.Before(b.Anchor) || b.FeeAnchor.After(b.StartsAt) || b.StartsAt.Before(b.Anchor) || c.apiVersion != b.Identity.APIVersion {
 		return empty, errors.New("paired payment binding is incomplete")
 	}
 	var account struct{ ID string }
@@ -140,10 +141,10 @@ func (c *stripeHTTPClient) verifyProviderPairPayment(ctx context.Context, b Cont
 	}
 	l := ev.Invoice.Lines.Data[0]
 	start := time.Unix(ev.Start, 0).UTC()
-	months := (start.Year()-b.Anchor.UTC().Year())*12 + int(start.Month()-b.Anchor.UTC().Month())
-	first := (b.StartsAt.UTC().Year()-b.Anchor.UTC().Year())*12 + int(b.StartsAt.UTC().Month()-b.Anchor.UTC().Month())
-	if l.Parent.SubscriptionItemDetails == nil || l.Parent.SubscriptionItemDetails.SubscriptionItem != b.FeeItemID || l.Pricing.PriceDetails == nil || l.Pricing.PriceDetails.Product != b.Terms.FeeProductID || months < first || (months-first)%int(b.Terms.FeeMonths) != 0 || ev.Start != annualBoundary(b.Anchor, months).Unix() || ev.End != annualBoundary(b.Anchor, months+int(b.Terms.FeeMonths)).Unix() {
-		return empty, errors.New("paired payment item or original-anchor cadence differs")
+	months := (start.Year()-b.FeeAnchor.UTC().Year())*12 + int(start.Month()-b.FeeAnchor.UTC().Month())
+	first := (b.StartsAt.UTC().Year()-b.FeeAnchor.UTC().Year())*12 + int(b.StartsAt.UTC().Month()-b.FeeAnchor.UTC().Month())
+	if l.Parent.SubscriptionItemDetails == nil || l.Parent.SubscriptionItemDetails.SubscriptionItem != b.FeeItemID || l.Pricing.PriceDetails == nil || l.Pricing.PriceDetails.Product != b.Terms.FeeProductID || months < first || (months-first)%int(b.Terms.FeeMonths) != 0 || ev.Start != annualBoundary(b.FeeAnchor, months).Unix() || ev.End != annualBoundary(b.FeeAnchor, months+int(b.Terms.FeeMonths)).Unix() {
+		return empty, errors.New("paired payment item or verified fee cadence differs")
 	}
 	return ev, nil
 }

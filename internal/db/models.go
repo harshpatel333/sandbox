@@ -494,6 +494,7 @@ type BillingContractProviderBinding struct {
 	FeeSubscriptionID        string             `json:"fee_subscription_id"`
 	FeeItemID                string             `json:"fee_item_id"`
 	Anchor                   time.Time          `json:"anchor"`
+	FeeAnchor                time.Time          `json:"fee_anchor"`
 	StartsAt                 time.Time          `json:"starts_at"`
 	EndsAt                   pgtype.Timestamptz `json:"ends_at"`
 	Binding                  []byte             `json:"binding"`

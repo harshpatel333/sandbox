@@ -55,7 +55,7 @@ func validatePairSuccessor(previous, next ContractProviderBinding) error {
 		i.Merchant != old.Merchant || i.Live != old.Live || i.APIVersion != old.APIVersion ||
 		next.ContractID == uuid.Nil || previous.ContractID == uuid.Nil || next.ContractID == previous.ContractID ||
 		next.CustomerID != previous.CustomerID || next.FeeSubscriptionID != previous.FeeSubscriptionID || next.UsageSubscriptionID != previous.UsageSubscriptionID || next.FeeItemID == "" ||
-		!next.Anchor.Equal(previous.Anchor) || previous.EndsAt == nil || !next.StartsAt.Equal(*previous.EndsAt) || next.StartsAt.After(time.Now()) ||
+		!next.Anchor.Equal(previous.Anchor) || next.FeeAnchor.IsZero() || next.FeeAnchor.Nanosecond() != 0 || (!next.FeeAnchor.Equal(previous.FeeAnchor) && !next.FeeAnchor.Equal(next.StartsAt)) || previous.EndsAt == nil || !next.StartsAt.Equal(*previous.EndsAt) || next.StartsAt.After(time.Now()) ||
 		!reflect.DeepEqual(next.Terms.Resources, previous.Terms.Resources) || next.Terms.Rounding != previous.Terms.Rounding {
 		return errors.New("successor differs from the saved provider pair or confirmed boundary")
 	}
@@ -105,18 +105,18 @@ func (c *stripeHTTPClient) verifySuccessorProviderPair(ctx context.Context, prev
 			}
 		}
 	}
-	if (fee.Status != "active" && fee.Status != "past_due" && fee.Status != "unpaid") || usage.Status != "active" || fee.ID != next.FeeSubscriptionID || fee.PauseCollection != nil || len(fee.Items.Data) != 1 || (fee.BillingCycleAnchor != next.Anchor.Unix() && fee.BillingCycleAnchor != next.StartsAt.Unix()) || usage.ID != next.UsageSubscriptionID || usage.Schedule != "" || usage.PauseCollection == nil || usage.PauseCollection.Behavior != "keep_as_draft" || usage.PauseCollection.ResumesAt != 0 {
+	if (fee.Status != "active" && fee.Status != "past_due" && fee.Status != "unpaid") || usage.Status != "active" || fee.ID != next.FeeSubscriptionID || fee.PauseCollection != nil || len(fee.Items.Data) != 1 || fee.BillingCycleAnchor != next.FeeAnchor.Unix() || usage.ID != next.UsageSubscriptionID || usage.Schedule != "" || usage.PauseCollection == nil || usage.PauseCollection.Behavior != "keep_as_draft" || usage.PauseCollection.ResumesAt != 0 {
 		return result, errors.New("successor fee identity or usage hold differs")
 	}
 	item := fee.Items.Data[0]
-	months := (next.StartsAt.Year()-next.Anchor.Year())*12 + int(next.StartsAt.Month()-next.Anchor.Month())
+	months := (next.StartsAt.Year()-next.FeeAnchor.Year())*12 + int(next.StartsAt.Month()-next.FeeAnchor.Month())
 	if err = validatePairFeeItem(next.Terms, next.Identity.Live, item); err != nil {
 		return result, err
 	}
 	currentStart := time.Unix(item.Start, 0).UTC()
-	currentMonths := (currentStart.Year()-next.Anchor.Year())*12 + int(currentStart.Month()-next.Anchor.Month())
-	if item.ID != next.FeeItemID || currentMonths < months || (currentMonths-months)%int(next.Terms.FeeMonths) != 0 || item.Start != annualBoundary(next.Anchor, currentMonths).Unix() || item.End != annualBoundary(next.Anchor, currentMonths+int(next.Terms.FeeMonths)).Unix() || item.Start > time.Now().Unix() || item.End <= time.Now().Unix() {
-		return result, errors.New("successor fee item differs from the original-anchor cadence")
+	currentMonths := (currentStart.Year()-next.FeeAnchor.Year())*12 + int(currentStart.Month()-next.FeeAnchor.Month())
+	if item.ID != next.FeeItemID || currentMonths < months || (currentMonths-months)%int(next.Terms.FeeMonths) != 0 || item.Start != annualBoundary(next.FeeAnchor, currentMonths).Unix() || item.End != annualBoundary(next.FeeAnchor, currentMonths+int(next.Terms.FeeMonths)).Unix() || item.Start > time.Now().Unix() || item.End <= time.Now().Unix() {
+		return result, errors.New("successor fee item differs from the verified fee cadence")
 	}
 	a := invoiceAccount{Customer: next.CustomerID, Subscription: next.UsageSubscriptionID, Price: next.Terms.Rounding.PriceID, Meter: next.Terms.Rounding.MeterID, Event: next.Terms.Rounding.EventName}
 	if err = validatePairUsageSubscription(next, a, usage); err != nil {
@@ -172,8 +172,8 @@ func validatePairSuccessorInvoice(b ContractProviderBinding, id string, inv proP
 		return errors.New("successor boundary invoice differs from its licensed fee")
 	}
 	l := inv.Lines.Data[0]
-	months := (b.StartsAt.Year()-b.Anchor.Year())*12 + int(b.StartsAt.Month()-b.Anchor.Month())
-	if l.Parent.SubscriptionItemDetails == nil || l.Parent.SubscriptionItemDetails.Subscription != b.FeeSubscriptionID || l.Parent.SubscriptionItemDetails.SubscriptionItem != b.FeeItemID || l.Parent.SubscriptionItemDetails.Proration || l.Pricing.PriceDetails == nil || l.Pricing.PriceDetails.Price != b.Terms.FeePriceID || l.Pricing.PriceDetails.Product != b.Terms.FeeProductID || l.Amount != b.Terms.FeeAmount || l.Currency != b.Terms.Currency || l.Quantity != 1 || baseLineHasCredits(l) || l.Period.Start != b.StartsAt.Unix() || l.Period.End != annualBoundary(b.Anchor, months+int(b.Terms.FeeMonths)).Unix() {
+	months := (b.StartsAt.Year()-b.FeeAnchor.Year())*12 + int(b.StartsAt.Month()-b.FeeAnchor.Month())
+	if l.Parent.SubscriptionItemDetails == nil || l.Parent.SubscriptionItemDetails.Subscription != b.FeeSubscriptionID || l.Parent.SubscriptionItemDetails.SubscriptionItem != b.FeeItemID || l.Parent.SubscriptionItemDetails.Proration || l.Pricing.PriceDetails == nil || l.Pricing.PriceDetails.Price != b.Terms.FeePriceID || l.Pricing.PriceDetails.Product != b.Terms.FeeProductID || l.Amount != b.Terms.FeeAmount || l.Currency != b.Terms.Currency || l.Quantity != 1 || baseLineHasCredits(l) || l.Period.Start != b.StartsAt.Unix() || l.Period.End != annualBoundary(b.FeeAnchor, months+int(b.Terms.FeeMonths)).Unix() {
 		return errors.New("successor original boundary line differs from its bound item")
 	}
 	return nil
