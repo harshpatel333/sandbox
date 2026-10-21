@@ -494,6 +494,7 @@ type BillingContractProviderBinding struct {
 	FeeSubscriptionID        string             `json:"fee_subscription_id"`
 	FeeItemID                string             `json:"fee_item_id"`
 	Anchor                   time.Time          `json:"anchor"`
+	FeeAnchor                time.Time          `json:"fee_anchor"`
 	StartsAt                 time.Time          `json:"starts_at"`
 	EndsAt                   pgtype.Timestamptz `json:"ends_at"`
 	Binding                  []byte             `json:"binding"`
@@ -989,6 +990,13 @@ type BillingProviderCredit struct {
 	ObservedAt    time.Time `json:"observed_at"`
 }
 
+type BillingProviderPairRevocation struct {
+	ContractID uuid.UUID `json:"contract_id"`
+	TeamID     uuid.UUID `json:"team_id"`
+	Identity   []byte    `json:"identity"`
+	RevokedAt  time.Time `json:"revoked_at"`
+}
+
 type BillingProviderPairWaiver struct {
 	ID                  uuid.UUID          `json:"id"`
 	TeamID              uuid.UUID          `json:"team_id"`
@@ -1160,6 +1168,7 @@ type BillingUsageEntitlement struct {
 	CreatedAt                    time.Time          `json:"created_at"`
 	WaiverID                     pgtype.UUID        `json:"waiver_id"`
 	SponsorshipID                pgtype.UUID        `json:"sponsorship_id"`
+	PairedWaiverID               pgtype.UUID        `json:"paired_waiver_id"`
 }
 
 type BillingUsageExport struct {

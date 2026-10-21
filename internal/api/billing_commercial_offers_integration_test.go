@@ -295,6 +295,7 @@ func commercialOfferRestrictedPool(t *testing.T, admin *pgxpool.Pool) *pgxpool.P
 		{"billing_commercial_checkout_attempt", "SELECT,INSERT,UPDATE"},
 		{"team_billing_account", "SELECT,INSERT,UPDATE"},
 		{"billing_commercial_contract", "SELECT,UPDATE"},
+		{"billing_contract_provider_binding", "SELECT"},
 		{"billing_yc_operation", "SELECT,UPDATE"},
 		{"billing_contract_waiver", "SELECT"},
 		{"billing_contract_entitlement_schedule", "SELECT"},
