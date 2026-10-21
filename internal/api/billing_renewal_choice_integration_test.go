@@ -36,8 +36,8 @@ func newRenewalPostgresFixture(t *testing.T) (*renewalChoiceService, *fixtureRen
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ConnConfig.Host != "127.0.0.1" || cfg.ConnConfig.Database != "renewal_choice_test" {
-		t.Fatal("requires dedicated local renewal_choice_test database")
+	if cfg.ConnConfig.Host != "127.0.0.1" || (cfg.ConnConfig.Database != "renewal_choice_test" && cfg.ConnConfig.Database != "sandbox_test") {
+		t.Fatal("requires loopback renewal_choice_test or CI sandbox_test database")
 	}
 	admin, err := pgxpool.NewWithConfig(t.Context(), cfg)
 	if err != nil {

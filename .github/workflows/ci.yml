@@ -191,6 +191,11 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
         run: go run -tags integration ./cmd/setup-integration-db
 
+      - name: Run renewal journal race contracts
+        env:
+          RENEWAL_JOURNAL_TEST_DSN: postgres://postgres:postgres@127.0.0.1:5432/sandbox_test?sslmode=disable
+        run: go test -v -race -tags integration -count=1 -timeout 2m -run '^TestRenewalChoice' ./internal/api
+
       - name: Run billing worker load race contract
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable

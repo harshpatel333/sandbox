@@ -65,6 +65,7 @@ func validRenewalStep(op renewalChoiceOperation, r renewalChoiceStepRequest) boo
 func (s *renewalChoiceService) reconcileSteps(ctx context.Context, k renewalChoiceKey, p renewalChoiceStagedProvider) error {
 	var captured renewalChoiceOperation
 	var revision int64
+	var boundaryPassed bool
 	if err := s.Store.Transact(ctx, k, func(tx renewalChoiceTransaction) error {
 		j := tx.Journal()
 		if j.Requested == nil {
@@ -72,6 +73,7 @@ func (s *renewalChoiceService) reconcileSteps(ctx context.Context, k renewalChoi
 		}
 		captured = *j.Requested
 		revision = j.Revision
+		boundaryPassed = !tx.Now().Before(k.Boundary)
 		return nil
 	}); err != nil {
 		return err
@@ -89,6 +91,16 @@ func (s *renewalChoiceService) reconcileSteps(ctx context.Context, k renewalChoi
 	}
 	needsPlan := len(captured.Steps) == 0 || (len(captured.Steps) == 1 && captured.Steps[0].State == "confirmed" && captured.Steps[0].Request.Kind == "create_schedule")
 	if needsPlan {
+		if boundaryPassed {
+			return s.Store.Transact(ctx, k, func(tx renewalChoiceTransaction) error {
+				j := tx.Journal()
+				if j.Revision != revision || j.Requested == nil || j.Requested.ID != captured.ID {
+					return errRenewalConflict
+				}
+				j.Requested.State = "review_required"
+				return tx.Save("boundary_passed_without_step")
+			})
+		}
 		request, err := p.PrepareStep(ctx, k, captured)
 		if err != nil {
 			return err
@@ -105,7 +117,8 @@ func (s *renewalChoiceService) reconcileSteps(ctx context.Context, k renewalChoi
 				return err
 			}
 			if !tx.Now().Before(k.Boundary) {
-				return errRenewalConflict
+				j.Requested.State = "review_required"
+				return tx.Save("boundary_passed_without_step")
 			}
 			j.Requested.Steps = append(j.Requested.Steps, renewalChoiceStep{Request: request, State: "prepared"})
 			// Planning has made no provider write. The first prepared request may still

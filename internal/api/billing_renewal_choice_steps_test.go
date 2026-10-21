@@ -196,3 +196,30 @@ func TestRenewalChoiceStagedUpgradePreservesUnknownFence(t *testing.T) {
 		t.Fatal("adapter change released unknown fence", j)
 	}
 }
+
+func TestRenewalChoiceUnplannedStepExpiry(t *testing.T) {
+	for _, created := range []bool{false, true} {
+		t.Run(strconv.FormatBool(created), func(t *testing.T) {
+			s, store, a := newRenewalFixture(t)
+			submitRenewal(t, s, a, "free")
+			p := &fixtureRenewalSteps{fixtureRenewalProvider: &fixtureRenewalProvider{}, now: func() renewalChoiceProof { return renewalChoiceProof{VerifiedAt: store.now} }}
+			s.Provider = p
+			if created {
+				for range 2 {
+					if err := s.reconcile(t.Context(), a.key); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			before := p.calls.Load()
+			store.now = a.key.Boundary
+			if err := s.reconcile(t.Context(), a.key); err != nil {
+				t.Fatal(err)
+			}
+			j, _ := s.status(t.Context(), a.key, a.actor)
+			if j.Requested.State != "review_required" || j.Confirmed.Request.Choice != "annual" || p.calls.Load() != before {
+				t.Fatal("expired plan remained pending", j)
+			}
+		})
+	}
+}
