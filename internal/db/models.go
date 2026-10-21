@@ -2338,3 +2338,37 @@ type YcClaimTeamIntent struct {
 	CreatedAt  time.Time          `json:"created_at"`
 	ReleasedAt pgtype.Timestamptz `json:"released_at"`
 }
+
+type YcOfferAcceptance struct {
+	ID                 uuid.UUID          `json:"id"`
+	ClaimID            uuid.UUID          `json:"claim_id"`
+	TeamID             uuid.UUID          `json:"team_id"`
+	UserID             uuid.UUID          `json:"user_id"`
+	HomeRegion         string             `json:"home_region"`
+	Authority          []byte             `json:"authority"`
+	Terms              []byte             `json:"terms"`
+	RenewalTerms       []byte             `json:"renewal_terms"`
+	TermsDigest        string             `json:"terms_digest"`
+	RenewalTermsDigest string             `json:"renewal_terms_digest"`
+	PricingAt          time.Time          `json:"pricing_at"`
+	CreatedAt          time.Time          `json:"created_at"`
+	RequestID          pgtype.UUID        `json:"request_id"`
+	AcceptedAt         pgtype.Timestamptz `json:"accepted_at"`
+	AssignmentID       pgtype.UUID        `json:"assignment_id"`
+	OperationID        pgtype.UUID        `json:"operation_id"`
+	State              string             `json:"state"`
+	NextAttemptAt      time.Time          `json:"next_attempt_at"`
+	Attempts           int32              `json:"attempts"`
+	LeaseID            pgtype.UUID        `json:"lease_id"`
+	LeaseUntil         pgtype.Timestamptz `json:"lease_until"`
+	LastError          *string            `json:"last_error"`
+}
+
+type YcOfferAcceptanceControl struct {
+	RequestID    uuid.UUID `json:"request_id"`
+	AcceptanceID uuid.UUID `json:"acceptance_id"`
+	ActorID      uuid.UUID `json:"actor_id"`
+	Action       string    `json:"action"`
+	Reason       string    `json:"reason"`
+	CreatedAt    time.Time `json:"created_at"`
+}
