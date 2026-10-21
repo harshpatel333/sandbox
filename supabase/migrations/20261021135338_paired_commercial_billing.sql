@@ -194,6 +194,90 @@ END $$;
 
 
 
+-- Cash periods and allowance periods are separate immutable facts. Monthly
+-- receipts authorize the same ordinal allowance, never a stretched cash period.
+CREATE TABLE billing_provider_pair_monthly_payment (
+ payment_id uuid PRIMARY KEY,
+ team_id uuid NOT NULL,
+ contract_id uuid NOT NULL,
+ invoice_id text NOT NULL UNIQUE,
+ fee_item_id text NOT NULL,
+ fee_period_start timestamptz NOT NULL,
+ fee_period_end timestamptz NOT NULL,
+ period_start timestamptz NOT NULL,
+ period_end timestamptz NOT NULL,
+ amount_cents bigint NOT NULL CHECK(amount_cents=100000),
+ created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ FOREIGN KEY(team_id,contract_id,payment_id) REFERENCES billing_contract_payment(team_id,contract_id,id),
+ FOREIGN KEY(team_id,contract_id) REFERENCES billing_contract_provider_binding(team_id,contract_id),
+ UNIQUE(team_id,period_start),
+ UNIQUE(contract_id,fee_period_start),
+ CHECK(isfinite(period_start) AND isfinite(period_end) AND period_start<period_end),
+ CHECK(isfinite(fee_period_start) AND isfinite(fee_period_end) AND fee_period_start<fee_period_end)
+);
+ALTER TABLE billing_provider_pair_monthly_payment ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON billing_provider_pair_monthly_payment FROM PUBLIC;
+CREATE FUNCTION guard_billing_provider_pair_monthly_payment() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE c billing_commercial_contract; b billing_contract_provider_binding; p billing_contract_payment; m integer; fm integer;
+BEGIN
+ IF TG_OP<>'INSERT' THEN RAISE EXCEPTION 'monthly payment mapping is immutable'; END IF;
+ SELECT * INTO STRICT c FROM billing_commercial_contract WHERE id=NEW.contract_id AND team_id=NEW.team_id FOR UPDATE;
+ SELECT * INTO STRICT b FROM billing_contract_provider_binding WHERE contract_id=c.id AND team_id=c.team_id;
+ SELECT * INTO STRICT p FROM billing_contract_payment WHERE id=NEW.payment_id AND contract_id=c.id AND team_id=c.team_id;
+ IF c.status='ended' OR EXISTS(SELECT 1 FROM billing_provider_pair_revocation WHERE contract_id=c.id)
+  OR (c.offer_key,c.charge_kind,c.charge_amount_cents,c.charge_interval_months,c.entitlement_kind,c.entitlement_cadence,c.entitlement_amount_cents,c.currency)
+    IS DISTINCT FROM ('pro_monthly','subscription',120000::bigint,1,'metered_usage','monthly',100000::bigint,'usd')
+  OR (NEW.invoice_id,NEW.fee_item_id,NEW.fee_period_start,NEW.fee_period_end)
+    IS DISTINCT FROM (p.invoice_id,b.fee_item_id,p.service_period_start,p.service_period_end)
+  OR (p.customer_id,p.subscription_id,p.base_price_id,p.base_amount_paid_cents,p.invoice_amount_paid_cents,p.currency)
+    IS DISTINCT FROM (b.customer_id,b.fee_subscription_id,c.base_price_id,120000::bigint,120000::bigint,'usd')
+  OR p.evidence#>>'{invoice,id}' IS DISTINCT FROM p.invoice_id
+  OR p.evidence#>>'{invoice,lines,data,0,parent,subscription_item_details,subscription_item}' IS DISTINCT FROM b.fee_item_id
+  OR jsonb_array_length(p.evidence#>'{invoice,lines,data}') IS DISTINCT FROM 1
+  OR NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND NOT v.review_required AND v.observed_at>clock_timestamp()-interval '1 minute') THEN
+  RAISE EXCEPTION 'monthly mapping requires exact verified paid choice and fee receipt';
+ END IF;
+ m := (extract(year FROM p.service_period_start AT TIME ZONE 'UTC')::integer-extract(year FROM b.anchor AT TIME ZONE 'UTC')::integer)*12
+      +extract(month FROM p.service_period_start AT TIME ZONE 'UTC')::integer-extract(month FROM b.anchor AT TIME ZONE 'UTC')::integer;
+ fm := (extract(year FROM p.service_period_start AT TIME ZONE 'UTC')::integer-extract(year FROM b.fee_anchor AT TIME ZONE 'UTC')::integer)*12
+      +extract(month FROM p.service_period_start AT TIME ZONE 'UTC')::integer-extract(month FROM b.fee_anchor AT TIME ZONE 'UTC')::integer;
+ IF (NEW.period_start,NEW.period_end) IS DISTINCT FROM (billing_anniversary_boundary(b.anchor,m),billing_anniversary_boundary(b.anchor,m+1))
+  OR (p.service_period_start,p.service_period_end) IS DISTINCT FROM (billing_anniversary_boundary(b.fee_anchor,fm),billing_anniversary_boundary(b.fee_anchor,fm+1))
+  OR NEW.period_start<c.starts_at OR (c.ends_at IS NOT NULL AND NEW.period_end>c.ends_at)
+  OR NEW.created_at>clock_timestamp() THEN
+  RAISE EXCEPTION 'monthly payment maps only to its corresponding original-calendar allowance';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER billing_provider_pair_monthly_payment_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_provider_pair_monthly_payment
+ FOR EACH ROW EXECUTE FUNCTION guard_billing_provider_pair_monthly_payment();
+REVOKE ALL ON FUNCTION guard_billing_provider_pair_monthly_payment() FROM PUBLIC;
+DO $$ BEGIN
+ IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+  GRANT SELECT,INSERT ON billing_provider_pair_monthly_payment TO service_role;
+  CREATE POLICY provider_monthly_payment_backend ON billing_provider_pair_monthly_payment TO service_role USING(true) WITH CHECK(true);
+ END IF;
+END $$;
+
+CREATE FUNCTION billing_payment_authorizes_entitlement(c billing_commercial_contract,p billing_contract_payment,s timestamptz,e timestamptz)
+RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT p.team_id=c.team_id AND p.contract_id=c.id AND CASE WHEN c.charge_interval_months=1
+  AND EXISTS(SELECT 1 FROM billing_contract_provider_binding b WHERE b.contract_id=c.id)
+ THEN EXISTS(SELECT 1 FROM billing_provider_pair_monthly_payment m WHERE m.payment_id=p.id
+  AND m.contract_id=c.id AND m.team_id=c.team_id AND m.period_start=s AND m.period_end=e)
+ ELSE p.service_period_start<=s AND p.service_period_end>=e END;
+$$;
+
+CREATE FUNCTION billing_payment_allows_activation(c billing_commercial_contract,p billing_contract_payment)
+RETURNS boolean LANGUAGE sql VOLATILE AS $$
+ SELECT p.team_id=c.team_id AND p.contract_id=c.id AND CASE WHEN c.charge_interval_months=1
+  AND EXISTS(SELECT 1 FROM billing_contract_provider_binding b WHERE b.contract_id=c.id)
+ THEN EXISTS(SELECT 1 FROM billing_provider_pair_monthly_payment m JOIN billing_pro_payment_verification v ON v.invoice_id=m.invoice_id
+  WHERE m.payment_id=p.id AND m.contract_id=c.id AND m.period_start<=clock_timestamp() AND m.period_end>clock_timestamp()
+  AND NOT v.review_required AND v.observed_at>clock_timestamp()-interval '1 minute')
+ ELSE p.service_period_start<=clock_timestamp() AND p.service_period_end>clock_timestamp() END;
+$$;
+
 CREATE OR REPLACE FUNCTION guard_billing_contract_payment() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE c billing_commercial_contract; m integer; first_month integer; fee_anchor timestamptz;
 BEGIN
@@ -280,7 +364,7 @@ BEGIN
         END IF;
         IF OLD.status = 'pending' AND NEW.status = 'active' AND NOT billing_provider_pair_covered(NEW,NEW.starts_at,NEW.ends_at,false) AND NOT billing_sponsored_covered(NEW, NEW.starts_at, NEW.ends_at, false) AND NOT billing_yc_covered(NEW, NEW.starts_at, NEW.ends_at, false) AND NOT EXISTS (
             SELECT 1 FROM billing_contract_payment p WHERE p.contract_id = NEW.id
-                AND p.service_period_start <= clock_timestamp() AND p.service_period_end > clock_timestamp()) THEN
+                AND billing_payment_allows_activation(NEW,p)) THEN
             RAISE EXCEPTION 'activation requires verified base payment coverage';
         END IF;
     END IF;
@@ -292,7 +376,7 @@ CREATE OR REPLACE FUNCTION guard_pro_payment_activation() RETURNS trigger LANGUA
 BEGIN
  IF OLD.status='pending' AND NEW.status='active' AND NOT billing_provider_pair_covered(NEW,NEW.starts_at,NEW.ends_at,false) AND NOT billing_sponsored_covered(NEW,NEW.starts_at,NEW.ends_at,false) AND NOT billing_yc_covered(NEW,NEW.starts_at,NEW.ends_at,false) AND NOT EXISTS(
   SELECT 1 FROM billing_contract_payment p WHERE p.contract_id=NEW.id
-   AND p.service_period_start<=clock_timestamp() AND p.service_period_end>clock_timestamp()
+   AND billing_payment_allows_activation(NEW,p)
    AND NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND v.review_required))
  THEN RAISE EXCEPTION 'activation requires an unquestioned base payment'; END IF;
  RETURN NEW;
@@ -309,7 +393,7 @@ RETURNS boolean LANGUAGE sql VOLATILE AS $$
      AND (c.collection_evidence->>'period_start')::timestamptz=s
      AND (c.collection_evidence->>'period_end')::timestamptz=e))
   AND (billing_provider_pair_covered(c,s,e,true) OR billing_sponsored_covered(c,s,e,true) OR billing_yc_covered(c,s,e,true) OR EXISTS(SELECT 1 FROM billing_contract_payment p WHERE p.contract_id=c.id
-   AND p.service_period_start<=s AND p.service_period_end>=e
+   AND billing_payment_authorizes_entitlement(c,p,s,e)
    AND NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND v.review_required)
    AND (c.offer_key NOT IN ('pro_monthly','pro_annual','yc_2026','sponsored_usage') OR EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND NOT v.review_required AND v.observed_at>clock_timestamp()-interval '1 minute'))))
   AND EXISTS(SELECT 1 FROM team_billing_account a WHERE a.team_id=c.team_id
@@ -420,7 +504,7 @@ BEGIN
         SELECT period_start, period_end, amount_cents INTO s, e, amount FROM billing_contract_entitlement(c, clock_timestamp());
         IF (NEW.kind, NEW.amount_cents, NEW.currency)
             IS DISTINCT FROM (c.entitlement_kind, amount, c.currency)
-            OR (NEW.payment_id IS NOT NULL AND (p.service_period_start > NEW.period_start OR p.service_period_end < NEW.period_end)) THEN
+            OR (NEW.payment_id IS NOT NULL AND NOT billing_payment_authorizes_entitlement(c,p,NEW.period_start,NEW.period_end)) THEN
             RAISE EXCEPTION 'entitlement lacks eligible paid contract';
         END IF;
         IF s IS NULL OR (NEW.period_start, NEW.period_end) IS DISTINCT FROM (s, e) THEN

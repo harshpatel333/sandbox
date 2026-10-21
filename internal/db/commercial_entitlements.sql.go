@@ -313,7 +313,7 @@ INSERT INTO billing_usage_entitlement (team_id, contract_id, payment_id, waiver_
 SELECT c.team_id, c.id, p.id, w.id, sp.id, pw.id, c.entitlement_kind, period.period_start, period.period_end, period.amount_cents, c.currency
 FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) period
 LEFT JOIN billing_contract_payment p ON p.contract_id = c.id
-    AND p.service_period_start <= period.period_start AND p.service_period_end >= period.period_end
+    AND billing_payment_authorizes_entitlement(c::billing_commercial_contract,p::billing_contract_payment,period.period_start,period.period_end)
 LEFT JOIN billing_contract_waiver w ON w.contract_id=c.id AND p.id IS NULL
     AND billing_yc_covered(c::billing_commercial_contract,period.period_start,period.period_end,true)
 LEFT JOIN billing_sponsored_operation sp ON sp.contract_id=c.id AND p.id IS NULL AND w.id IS NULL
