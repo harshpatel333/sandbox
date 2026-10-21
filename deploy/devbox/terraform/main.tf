@@ -297,7 +297,7 @@ resource "google_project_iam_member" "engineer_access" {
   member  = each.value.member
 
   condition {
-    title       = "devbox-instances-only"
+    title       = "devbox-instances-only-${each.value.zone}"
     description = "Devbox VMs, matched by name prefix."
     expression  = "resource.type == \"compute.googleapis.com/Instance\" && resource.name.startsWith(\"${local.instance_name_prefix[each.value.zone]}\")"
   }

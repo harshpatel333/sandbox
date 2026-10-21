@@ -13,8 +13,8 @@ variable "zones" {
   type        = list(string)
 
   validation {
-    condition     = length(var.zones) > 0 && alltrue([for zone in var.zones : startswith(zone, "${var.region}-")])
-    error_message = "zones must be a non-empty list of zones in region."
+    condition     = length(var.zones) > 0 && length(distinct(var.zones)) == length(var.zones) && alltrue([for zone in var.zones : can(regex("^${var.region}-[a-z]$", zone))])
+    error_message = "zones must be a non-empty list of distinct zones in region."
   }
 }
 
