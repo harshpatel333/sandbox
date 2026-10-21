@@ -127,18 +127,15 @@ jobs:
           terraform -chdir=infra/envs/staging/us-central1 apply -input=false -auto-approve host-logging-iam.tfplan
           python3 .github/workflows/scripts/wait_host_logging_iam.py --project "${{ vars.GCP_PROJECT }}" --zone us-central1-a
 
-      - name: Verify migration execution receipt
-        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target staging
-        env:
-          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
-          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.staging_receipt }}
-
       - name: Terraform apply staging/us-central1
         env:
           TF_VAR_proxy_generation_frontends_enabled: ${{ vars.PROXY_STAGING_FRONTEND_MIGRATED == 'true' && 'true' || 'false' }}
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.staging_receipt }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: staging/us-central1" >> "$GITHUB_STEP_SUMMARY"
+          python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target staging
           cd infra/envs/staging/us-central1
           terraform init -input=false
           terraform validate

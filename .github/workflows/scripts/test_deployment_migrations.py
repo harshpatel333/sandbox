@@ -293,7 +293,9 @@ class DependencyTests(unittest.TestCase):
             for job, mutation in expected.items():
                 block = jobs[job]
                 self.assertIn("wait-for-migrations", dependencies(block))
-                self.assertLess(block.index("--verify-receipt"), block.index("- name: " + mutation))
+                consumer = ("          terraform apply -input=false -auto-approve tfplan" if job.endswith("-infra")
+                            else "- name: " + mutation)
+                self.assertLess(block.index("--verify-receipt"), block.index(consumer))
                 self.assertIn("MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}", block)
                 receipt = "staging_receipt" if "staging" in job else "production_receipt"
                 self.assertIn("MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs." + receipt + " }}", block)
