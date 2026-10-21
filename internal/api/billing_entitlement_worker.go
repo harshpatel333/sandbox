@@ -138,7 +138,7 @@ func (h *Handlers) processEntitlementJob(ctx context.Context, j entitlementJob) 
  failures=CASE WHEN $4::text IS NULL THEN 0 ELSE least(failures+1,10000) END,
  problem_since=CASE WHEN $4::text IS NULL THEN NULL ELSE COALESCE(problem_since,clock_timestamp()) END,
  last_error=$4,
- alerted_at=CASE WHEN (($4::text IS NOT NULL AND COALESCE(problem_since,clock_timestamp())<clock_timestamp()-interval '5 minutes') OR EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=$1 AND e.state<>'issued' AND (e.state='uncertain' OR NOT (EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL) OR EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL))) AND (e.first_attempt_at<clock_timestamp()-interval '5 minutes' OR e.period_end<clock_timestamp()+interval '15 minutes'))) AND (alerted_at IS NULL OR alerted_at<clock_timestamp()-interval '1 hour') THEN clock_timestamp() ELSE alerted_at END
+ alerted_at=CASE WHEN (($4::text IS NOT NULL AND COALESCE(problem_since,clock_timestamp())<clock_timestamp()-interval '5 minutes') OR EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=$1 AND e.state<>'issued' AND (e.state='uncertain' OR NOT (EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL) OR EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.contract_id=e.contract_id AND o.revoked_at IS NOT NULL) OR EXISTS(SELECT 1 FROM billing_provider_pair_revocation r WHERE r.contract_id=e.contract_id))) AND (e.first_attempt_at<clock_timestamp()-interval '5 minutes' OR e.period_end<clock_timestamp()+interval '15 minutes'))) AND (alerted_at IS NULL OR alerted_at<clock_timestamp()-interval '1 hour') THEN clock_timestamp() ELSE alerted_at END
  FROM previous WHERE contract_id=previous.old_contract_id AND lease_token=$2 RETURNING alerted_at) SELECT finished.alerted_at IS DISTINCT FROM previous.old_alerted_at FROM finished CROSS JOIN previous`, j.Contract, j.Token, next, message).Scan(&alert)
 	if alert {
 		_, incidentErr := h.Pool.Exec(ack, `INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence,platform_failure_at)
@@ -169,6 +169,14 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err != nil {
 		return next, err
 	}
+	pair, pairErr := loadContractProviderBinding(ctx, h.Pool, id)
+	if pairErr != nil && !errors.Is(pairErr, pgx.ErrNoRows) {
+		return next, pairErr
+	}
+	paired := pairErr == nil
+	if paired && (pair.Identity.TeamID != team || pair.CustomerID != c.CustomerID || pair.UsageSubscriptionID != c.SubscriptionID) {
+		return next, errors.New("paired entitlement billing identity differs")
+	}
 	// Recover a possible success before deciding whether a new period is eligible.
 	var unresolved uuid.UUID
 	err = h.Pool.QueryRow(ctx, `SELECT id FROM billing_usage_entitlement WHERE contract_id=$1 AND state<>'issued' ORDER BY period_start LIMIT 1`, id).Scan(&unresolved)
@@ -193,7 +201,19 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 				return next, errors.New("unknown grant outcome exceeded safe replay window; operator recovery required")
 			}
 		}
-		if c.OfferKey == "yc_2026" {
+		if paired {
+			var revoked bool
+			if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_provider_pair_revocation WHERE contract_id=$1)`, id).Scan(&revoked); err != nil {
+				return next, err
+			}
+			if revoked {
+				if e.State == "uncertain" {
+					return next, nil
+				}
+				return time.Now().Add(time.Hour), nil
+			}
+		}
+		if c.OfferKey == "yc_2026" && !paired {
 			operation, e := h.ycOperation(ctx, team)
 			if e != nil {
 				return next, e
@@ -214,7 +234,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 				return time.Now().Add(time.Hour), nil
 			}
 		}
-		if e.State == "pending" && c.OfferKey == "yc_2026" {
+		if e.State == "pending" && c.OfferKey == "yc_2026" && !paired {
 			var revoked bool
 			if err = h.Pool.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM billing_yc_operation WHERE contract_id=$1`, c.ID).Scan(&revoked); err != nil {
 				return next, err
@@ -242,6 +262,18 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 			return time.Now().Add(time.Hour), nil
 		}
 	}
+	if paired {
+		var revoked bool
+		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_provider_pair_revocation WHERE contract_id=$1)`, id).Scan(&revoked); err != nil {
+			return next, err
+		}
+		if revoked {
+			return time.Now().Add(time.Hour), nil
+		}
+		if err = h.withProviderPairEntitlementAuthority(ctx, pair, func(context.Context, pgx.Tx) error { return nil }); err != nil {
+			return next, err
+		}
+	}
 	start, end, ok := billing.AnniversaryPeriod(c.EntitlementAnchor, time.Now())
 	if !ok {
 		return next, errors.New("commercial anniversary unavailable")
@@ -253,7 +285,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return next, err
 	}
-	if c.OfferKey == "yc_2026" {
+	if c.OfferKey == "yc_2026" && !paired {
 		operation, e := h.ycOperation(ctx, team)
 		if e != nil {
 			return next, e
@@ -262,7 +294,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 			return next, e
 		}
 	}
-	if c.OfferKey == "yc_2026" {
+	if c.OfferKey == "yc_2026" && !paired {
 		var allowed bool
 		if err = h.Pool.QueryRow(ctx, `SELECT billing_yc_covered(c,$2,$3,true) FROM billing_commercial_contract c WHERE id=$1`, id, start, end).Scan(&allowed); err != nil {
 			return next, err
@@ -273,10 +305,13 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	}
 	// Reuse the verified payment path; an invoice event alone cannot establish coverage.
 	var paid bool
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_contract_payment p WHERE contract_id=$1 AND service_period_start<=$2 AND service_period_end>=$3 AND NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND v.review_required))`, id, start, end).Scan(&paid); err != nil {
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_contract_payment p JOIN billing_commercial_contract c ON c.id=p.contract_id WHERE p.contract_id=$1 AND billing_payment_authorizes_entitlement(c,p,$2,$3) AND ($4 OR NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND v.review_required)))`, id, start, end, paired).Scan(&paid); err != nil {
 		return next, err
 	}
 	if !paid && c.OfferKey != "yc_2026" && c.ChargeKind != "sponsored_entitlement" {
+		if paired {
+			return next, nil
+		} // Successor reconciliation owns missing cash receipts.
 		var adopted bool
 		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_annual_authority WHERE renewal_contract_id=$1)`, id).Scan(&adopted); err != nil {
 			return next, err
@@ -379,17 +414,34 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if c.OfferKey != "yc_2026" && c.ChargeKind != "sponsored_entitlement" {
 		// Refresh the exact covering receipt through the existing payment verifier.
 		var paymentInvoice string
-		if err = h.Pool.QueryRow(ctx, `SELECT invoice_id FROM billing_contract_payment WHERE contract_id=$1 AND service_period_start<=$2 AND service_period_end>=$3 ORDER BY service_period_start DESC,invoice_id LIMIT 1`, id, start, end).Scan(&paymentInvoice); err != nil {
+		if err = h.Pool.QueryRow(ctx, `SELECT p.invoice_id FROM billing_contract_payment p JOIN billing_commercial_contract c ON c.id=p.contract_id WHERE p.contract_id=$1 AND billing_payment_authorizes_entitlement(c,p,$2,$3) ORDER BY p.service_period_start DESC,p.invoice_id LIMIT 1`, id, start, end).Scan(&paymentInvoice); err != nil {
 			return next, err
 		}
-		payment, verified, verifyErr := client.verifyProInvoice(ctx, paymentInvoice, proOffer{Key: c.OfferKey, Price: c.BasePriceID, Amount: c.ChargeAmountCents, Months: c.ChargeIntervalMonths}, c.CustomerID, c.SubscriptionID)
+		var payment proPaymentEvidence
+		var verified bool
+		var verifyErr error
+		if paired {
+			payment, verifyErr = client.verifyProviderPairPayment(ctx, pair, paymentInvoice)
+			verified = verifyErr == nil
+		} else {
+			payment, verified, verifyErr = client.verifyProInvoice(ctx, paymentInvoice, proOffer{Key: c.OfferKey, Price: c.BasePriceID, Amount: c.ChargeAmountCents, Months: c.ChargeIntervalMonths}, c.CustomerID, c.SubscriptionID)
+		}
+		if paired && verifyErr == nil {
+			var same bool
+			if err = h.Pool.QueryRow(ctx, `SELECT service_period_start=$3 AND service_period_end=$4 AND payment_reference=$5 FROM billing_contract_payment WHERE contract_id=$1 AND invoice_id=$2`, id, paymentInvoice, time.Unix(payment.Start, 0), time.Unix(payment.End, 0), payment.Reference).Scan(&same); err != nil {
+				return next, err
+			}
+			if !same {
+				verifyErr = &proPaymentReviewError{reason: "paired payment changed its immutable receipt period or settlement identity"}
+			}
+		}
 		if observeErr := h.observeProPaymentReview(ctx, team, paymentInvoice, payment, verifyErr); observeErr != nil {
 			return next, observeErr
 		}
 		if verifyErr != nil {
 			return next, verifyErr
 		}
-		if !verified || payment.Start > start.Unix() || payment.End < end.Unix() {
+		if !verified || (!paired && (payment.Start > start.Unix() || payment.End < end.Unix())) {
 			return next, errors.New("current base coverage could not be freshly verified")
 		}
 	}
@@ -410,7 +462,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err != nil {
 		return next, fmt.Errorf("observe entitlement collection: %w", err)
 	}
-	if c.OfferKey == "yc_2026" {
+	if c.OfferKey == "yc_2026" && !paired {
 		operation, e := h.ycOperation(ctx, team)
 		if e != nil {
 			return next, e
@@ -422,20 +474,29 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		defer authority()
 	}
 
-	if e.ID == uuid.Nil {
-		e, err = h.DB.ClaimCurrentUsageEntitlement(ctx, db.ClaimCurrentUsageEntitlementParams{TeamID: team, ContractID: id})
-		if errors.Is(err, pgx.ErrNoRows) {
-			e, err = h.DB.GetCurrentUsageEntitlement(ctx, db.GetCurrentUsageEntitlementParams{TeamID: team, Kind: c.EntitlementKind})
-		}
+	if paired {
+		raw, _ := json.Marshal(prices)
+		e, err = h.prepareProviderPairEntitlement(ctx, pair, db.BeginImmediateUsageEntitlementIssuanceParams{TeamID: team, ContractID: id, InvoiceStart: pgtype.Timestamptz{Time: mapped.Start, Valid: true}, InvoiceEnd: pgtype.Timestamptz{Time: mapped.End, Valid: true}, Prices: raw}, prices)
 		if err != nil {
 			return next, err
 		}
 	}
-	if e.State == "pending" {
-		raw, _ := json.Marshal(prices)
-		e, err = h.beginValidatedUsageEntitlementIssuance(ctx, db.BeginImmediateUsageEntitlementIssuanceParams{TeamID: team, ContractID: id, EntitlementID: e.ID, InvoiceStart: pgtype.Timestamptz{Time: mapped.Start, Valid: true}, InvoiceEnd: pgtype.Timestamptz{Time: mapped.End, Valid: true}, Prices: raw}, prices)
-		if err != nil {
-			return next, err
+	if !paired {
+		if e.ID == uuid.Nil {
+			e, err = h.DB.ClaimCurrentUsageEntitlement(ctx, db.ClaimCurrentUsageEntitlementParams{TeamID: team, ContractID: id})
+			if errors.Is(err, pgx.ErrNoRows) {
+				e, err = h.DB.GetCurrentUsageEntitlement(ctx, db.GetCurrentUsageEntitlementParams{TeamID: team, Kind: c.EntitlementKind})
+			}
+			if err != nil {
+				return next, err
+			}
+		}
+		if e.State == "pending" {
+			raw, _ := json.Marshal(prices)
+			e, err = h.beginValidatedUsageEntitlementIssuance(ctx, db.BeginImmediateUsageEntitlementIssuanceParams{TeamID: team, ContractID: id, EntitlementID: e.ID, InvoiceStart: pgtype.Timestamptz{Time: mapped.Start, Valid: true}, InvoiceEnd: pgtype.Timestamptz{Time: mapped.End, Valid: true}, Prices: raw}, prices)
+			if err != nil {
+				return next, err
+			}
 		}
 	}
 	if e.State == "issued" {
@@ -468,6 +529,20 @@ func (h *Handlers) dispatchUsageEntitlement(ctx context.Context, c db.BillingCom
 	form, err := entitlementGrantForm(e.RequestPayload, prices)
 	if err != nil {
 		return err
+	}
+	pair, pairErr := loadContractProviderBinding(ctx, h.Pool, c.ID)
+	if pairErr != nil && !errors.Is(pairErr, pgx.ErrNoRows) {
+		return pairErr
+	}
+	if pairErr == nil {
+		// Admission is serialized with effective revocation after the final provider
+		// reads. A committed uncertain request remains recoverable as history.
+		if err = h.withProviderPairEntitlementAuthority(ctx, pair, func(ctx context.Context, tx pgx.Tx) error {
+			_, err := h.DB.WithTx(tx).GetReplayableUsageEntitlement(ctx, db.GetReplayableUsageEntitlementParams{TeamID: c.TeamID, EntitlementID: e.ID})
+			return err
+		}); err != nil {
+			return err
+		}
 	}
 	var grant entitlementGrant
 	if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey); err != nil {

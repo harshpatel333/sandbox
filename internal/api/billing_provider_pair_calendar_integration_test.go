@@ -13,7 +13,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-func monthlyPairMappingFixture(t *testing.T, anchor time.Time) (pgx.Tx, ContractProviderBinding, *pairFixture) {
+func monthlyPairMappingFixture(t *testing.T, anchor time.Time) (pgx.Tx, ContractProviderBinding, *pairFixture, *Handlers) {
 	h, team := fundingTransitionFixture(t)
 	f := newPairFixture(t)
 	f.p.Identity.TeamID = team
@@ -63,7 +63,7 @@ func monthlyPairMappingFixture(t *testing.T, anchor time.Time) (pgx.Tx, Contract
 	if _, err = ConfirmSuccessorProviderPair(t.Context(), tx, proof); err != nil {
 		t.Fatal(err)
 	}
-	return tx, next, f
+	return tx, next, f, h
 }
 
 func recordMonthlyPairCash(t *testing.T, tx pgx.Tx, b ContractProviderBinding, f *pairFixture, offset int) db.BillingContractPayment {
@@ -106,7 +106,7 @@ func TestProviderPairMonthlyPaymentCalendarMapping(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			anchor, _ := time.Parse("2006-01-02", tc.anchor)
-			tx, b, f := monthlyPairMappingFixture(t, anchor)
+			tx, b, f, _ := monthlyPairMappingFixture(t, anchor)
 			p := recordMonthlyPairCash(t, tx, b, f, tc.offset)
 			m, err := ConfirmProviderPairMonthlyPayment(t.Context(), tx, b.ContractID, b.Identity, p.ID)
 			if err != nil {
@@ -161,7 +161,7 @@ func TestProviderPairMonthlyPaymentCalendarMapping(t *testing.T) {
 }
 
 func TestProviderPairMonthlyPaymentClaimGates(t *testing.T) {
-	tx, b, f := monthlyPairMappingFixture(t, time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC))
+	tx, b, f, _ := monthlyPairMappingFixture(t, time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC))
 	start, end, _ := billing.AnniversaryPeriod(b.Anchor, time.Now())
 	offset := (start.Year()-b.FeeAnchor.Year())*12 + int(start.Month()-b.FeeAnchor.Month())
 	p := recordMonthlyPairCash(t, tx, b, f, offset)
