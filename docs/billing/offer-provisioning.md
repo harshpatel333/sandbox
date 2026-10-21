@@ -102,14 +102,29 @@ locks. Pending admission checks the same fence before creating or advancing work
 exact target, materializes SQL-only authority and records finalization in the same
 transaction. `RevokeFinancialTarget` serializes against it and requires commercial
 revocation when already finalized. Its durable acknowledgement is read back from
-the pool after commit, including after a lost commit response. Shared invalidation
-acknowledgement must follow that readback. Missing operations still receive a
+the pool after commit, including after a lost commit response. For finalized
+targets, the adapter also rechecks the exact binding and requires every admitted
+grant dispatch to be resolved before acknowledging shared invalidation. This check
+runs again on already-revoked retries. Missing operations still receive a
 permanent tombstone; replay cannot reopen it. Provider history recovery never
 clears financial revocation. Existing ledgers and grant history remain intact.
 
-The shared invalidation consumer commits regional fencing and commercial
-revocation before acknowledging delivery. Initial and successor materialization
-share the same financial commit boundary. Deployed behavior still requires
+Grant dispatch admission commits under the same financial fence and freezes the
+request, binding, idempotency key and sender identity. Only a newly committed
+admission permits one POST, outside the transaction. Effective revocation remains
+pending until that sender has durably finished and the exact positive grant outcome
+is verified. Read-only discovery, lease expiry, a timeout or an absent provider
+result cannot release a paused sender's attempt. A crash before sender completion
+can require manual recovery. Regional denial remains committed while resolution
+is pending, and normal readiness stays denied.
+
+Before upgrading an existing issuer, stop older issuer processes and account for
+their in-flight requests. The new journal cannot fence a paused old binary that
+never registered its dispatch. Preexisting ambiguous paired requests remain
+unresolved; migration does not authorize a replacement send.
+
+Initial and successor materialization share the same financial commit boundary.
+Deployed behavior still requires
 verification with the exact source, schema, configuration and fixture binding.
 
 The background worker observes pending dispatch count and oldest age at most once

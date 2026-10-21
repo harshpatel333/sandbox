@@ -102,7 +102,7 @@ func offerCompositionBoundaryFixture(t *testing.T, anchor time.Time, confirmed .
 		exec(`INSERT INTO billing_offer_provisioning_request(operation_id,step,idempotency_key,request,state,dispatched_at,receipt) VALUES($1,$2,$3,$4,'confirmed',clock_timestamp(),$5)`, o.ID, string(step), fmt.Sprintf("offer-provisioning/%s/%s/v1", o.ID, step), request, receipt)
 		o.Requests[step] = provisioning.SavedRequest{State: "confirmed", Receipt: receipt}
 	}
-	a := &offerProvisioningAuthority{h: h, admission: &YCAcceptedProvisioningAdmission{Service: s, Handlers: h}, client: client}
+	a := &offerProvisioningAuthority{h: h, admission: &YCAcceptedProvisioningAdmission{Service: s, Handlers: h}, client: client, dispatchesResolved: CheckProviderPairDispatchesResolved}
 	service := &provisioning.Service{Pool: h.Pool, Authority: a, Provider: provider}
 	h.OfferProvisioning, s.Provisioning = service, ycAcceptanceProvisioner{service: service}
 	return a, service, r, o, f

@@ -21,7 +21,7 @@ func (h *Handlers) AcceptedOfferProvisioningStatus(ctx context.Context, team, as
 func (h *Handlers) startOfferProvisioning(ctx context.Context) {
 	if h.YCOfferAcceptance.available() {
 		client, configured := h.Stripe.(*stripeHTTPClient)
-		authority := &offerProvisioningAuthority{h: h, admission: &YCAcceptedProvisioningAdmission{Service: h.YCOfferAcceptance, Handlers: h}, client: client, successorRequester: RenewalSuccessorRequester}
+		authority := &offerProvisioningAuthority{h: h, admission: &YCAcceptedProvisioningAdmission{Service: h.YCOfferAcceptance, Handlers: h}, client: client, successorRequester: RenewalSuccessorRequester, dispatchesResolved: CheckProviderPairDispatchesResolved}
 		if h.ProviderPairEntitlementAuthority == nil {
 			h.ProviderPairEntitlementAuthority = authority
 		}

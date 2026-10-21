@@ -5,7 +5,11 @@ package api
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -97,5 +101,132 @@ func TestOfferCompositionRevocationWaitsForDispatchResolution(t *testing.T) {
 	replayed, err := provisioning.LoadFinancialRevocationReceipt(ctx, a.h.Pool, target, delivery.InvalidationID)
 	if err != nil || replayed.AcknowledgementID != receipt.AcknowledgementID || replayed.FenceID != receipt.FenceID {
 		t.Fatal("pending recovery replaced durable receipt", err)
+	}
+}
+
+func TestOfferCompositionPausedGrantCannotOutrunRevocationAcknowledgement(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		name := "confirmed"
+		if lost {
+			name = "lost_response"
+		}
+		t.Run(name, func(t *testing.T) {
+			a, service, r, o := offerCompositionFixture(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			if a.dispatchesResolved == nil {
+				t.Fatal("actual durable dispatch checker must be composed")
+			}
+			if err := service.Reconcile(ctx, o.TeamID, o.AssignmentID); err != nil {
+				t.Fatal(err)
+			}
+			binding, err := loadContractProviderBinding(ctx, a.h.Pool, o.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a.h.Config.BillingUsageEntitlementsEnabled = true
+			a.h.ProviderPairEntitlementAuthority = a
+			wf := &pairWorkerFixture{h: a.h, b: binding}
+			provider := newPairFixture(t)
+			provider.p.CustomerID = binding.CustomerID
+			configurePairWorkerProvider(t, wf, provider)
+			wf.lost.Store(lost)
+			client := *a.client
+			transport := client.httpClient.Transport
+			if transport == nil {
+				transport = http.DefaultTransport
+			}
+			entered, release := make(chan struct{}), make(chan struct{})
+			var enteredOnce, releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			defer unblock()
+			httpClient := *client.httpClient
+			httpClient.Transport = stripeCheckoutRecoveryRoundTripper(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodPost && req.URL.Path == "/v1/billing/credit_grants" {
+					enteredOnce.Do(func() { close(entered) })
+					select {
+					case <-release:
+					case <-req.Context().Done():
+						return nil, req.Context().Err()
+					}
+				}
+				response := httptest.NewRecorder()
+				if provider.serve(response, req) {
+					return response.Result(), nil
+				}
+				return transport.RoundTrip(req)
+			})
+			client.httpClient = &httpClient
+			a.h.Stripe = &client
+			finished := make(chan error, 1)
+			workerDone := make(chan struct{})
+			go func() {
+				defer close(workerDone)
+				_, err := a.h.reconcileUsageEntitlement(ctx, binding.ContractID)
+				finished <- err
+			}()
+			t.Cleanup(func() {
+				cancel()
+				unblock()
+				<-workerDone
+			})
+			select {
+			case <-entered:
+			case err := <-finished:
+				t.Fatal("worker did not reach provider boundary", err)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			if _, err = a.h.Pool.Exec(ctx, `SELECT public.revoke_yc_activation_authority($1,$2,$3)`, r.ApprovalID, r.TeamID, uuid.New()); err != nil {
+				t.Fatal(err)
+			}
+			deliveries, err := a.admission.Service.LeaseFinancialInvalidations(ctx, uuid.New(), 25)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var delivery YCFinancialInvalidation
+			for _, d := range deliveries {
+				if d.AcceptanceID == r.ID {
+					delivery = d
+				}
+			}
+			if delivery.InvalidationID == uuid.Nil {
+				t.Fatal("missing actual shared invalidation")
+			}
+			for range 2 {
+				if err = a.revokeFinancialDelivery(ctx, delivery); err == nil {
+					t.Fatal("effective revocation acknowledged while admitted sender can still POST")
+				}
+				state, err := a.admission.Service.FinancialState(ctx, r.ClaimID)
+				if err != nil || state == nil || state.PendingInvalidations != 1 || state.State == "revoked" || wf.posts.Load() != 0 {
+					t.Fatal("paused dispatch did not retain pending acknowledgement", state, err, wf.posts.Load())
+				}
+			}
+			unblock()
+			select {
+			case err = <-finished:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			if (err != nil) != lost || wf.posts.Load() != 1 {
+				t.Fatal("admitted dispatch outcome differs", err, wf.posts.Load())
+			}
+			if lost {
+				if err = a.revokeFinancialDelivery(ctx, delivery); err == nil {
+					t.Fatal("unknown provider outcome released acknowledgement")
+				}
+				if _, err = a.h.reconcileUsageEntitlement(ctx, binding.ContractID); err != nil {
+					t.Fatal("historical grant recovery failed", err)
+				}
+			}
+			if err = a.revokeFinancialDelivery(ctx, delivery); err != nil {
+				t.Fatal("resolved dispatch remained unacknowledged", err)
+			}
+			requireFinancialState(t, a.admission.Service, r, "revoked", 0)
+			_, _ = a.h.reconcileUsageEntitlement(ctx, binding.ContractID)
+			if wf.posts.Load() != 1 {
+				t.Fatal("late replay created another grant after effective revocation", wf.posts.Load())
+			}
+		})
 	}
 }
