@@ -22,6 +22,7 @@ type pairFixture struct {
 	pending        bool
 	extraInvoice   bool
 	requests       []string
+	serve          func(http.ResponseWriter, *http.Request) bool
 }
 
 func newPairFixture(t *testing.T) *pairFixture {
@@ -92,6 +93,9 @@ func (f *pairFixture) client(t *testing.T) *stripeHTTPClient {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.requests = append(f.requests, r.Method+" "+r.URL.Path)
+		if f.serve != nil && f.serve(w, r) {
+			return
+		}
 		if r.Method != http.MethodGet {
 			t.Errorf("verification attempted mutation: %s", r.Method)
 			http.Error(w, "read only", 405)
