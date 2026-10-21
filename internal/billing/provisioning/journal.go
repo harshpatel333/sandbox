@@ -58,7 +58,16 @@ func controls(o Operation) error {
 }
 
 func (s *Service) guarded(ctx context.Context, o Operation, f func(context.Context, pgx.Tx) error) error {
-	return s.Authority.WithAcceptedOffer(ctx, o.TeamID, o.AssignmentID, func(ctx context.Context, tx pgx.Tx, offer AcceptedOffer) error {
+	return s.guardOperation(o, func(f func(context.Context, pgx.Tx, AcceptedOffer) error) error {
+		return s.Authority.WithAcceptedOffer(ctx, o.TeamID, o.AssignmentID, f)
+	}, f)
+}
+
+func (s *Service) guardOperation(o Operation, guard func(func(context.Context, pgx.Tx, AcceptedOffer) error) error, f func(context.Context, pgx.Tx) error) error {
+	return guard(func(ctx context.Context, tx pgx.Tx, offer AcceptedOffer) error {
+		if err := CheckFinancialTarget(ctx, tx, InitialFinancialTarget(o.TeamID, o.AssignmentID)); err != nil {
+			return err
+		}
 		if err := offer.validate(); err != nil {
 			return err
 		}
@@ -185,10 +194,12 @@ func (s *Service) Reconcile(ctx context.Context, team, assignment uuid.UUID) (er
 	if err != nil {
 		return err
 	}
-	if !object(evidence) {
+	if !object(evidence.Evidence) {
 		return ErrUnknown
 	}
-	return s.guarded(ctx, o, func(ctx context.Context, tx pgx.Tx) error {
+	return s.guardOperation(o, func(f func(context.Context, pgx.Tx, AcceptedOffer) error) error {
+		return s.Authority.WithFinalization(ctx, o, f)
+	}, func(ctx context.Context, tx pgx.Tx) error {
 		// Re-read inside the transaction so a stale verifier cannot authorize a
 		// different operation or finalize twice after a lost commit response.
 		current, e := load(ctx, tx, team, assignment)
@@ -206,7 +217,7 @@ func (s *Service) Reconcile(ctx context.Context, team, assignment uuid.UUID) (er
 		if e = s.Authority.Finalize(ctx, tx, current, evidence); e != nil {
 			return e
 		}
-		_, e = tx.Exec(ctx, `UPDATE billing_offer_provisioning_operation SET state='grant_pending',verification=$2,finalized_at=clock_timestamp(),last_error=NULL,updated_at=clock_timestamp() WHERE id=$1 AND finalized_at IS NULL`, o.ID, evidence)
+		_, e = tx.Exec(ctx, `UPDATE billing_offer_provisioning_operation SET state='grant_pending',verification=$2,finalized_at=clock_timestamp(),last_error=NULL,updated_at=clock_timestamp() WHERE id=$1 AND finalized_at IS NULL`, o.ID, evidence.Evidence)
 		return e
 	})
 }

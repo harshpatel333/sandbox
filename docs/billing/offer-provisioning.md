@@ -24,7 +24,7 @@ Before each create, the service commits the dispatch marker, then obtains a fres
 shared dispatch guard. That guard rechecks the exact acceptance and holds shared
 authority through one bounded provider attempt. The callback takes no regional
 row locks. Both admission and dispatch callbacks receive the guard-owned context;
-all SQL, finalization and the provider POST must use that context. Adapters must
+all pending SQL and the provider POST must use that context. Adapters must
 not retry creates internally.
 
 `provisioning.Provider` prepares exact immutable requests and recovers complete
@@ -37,17 +37,32 @@ No test-only response is valid production evidence.
 The unregistered HTTP transport sends saved bodies without POST replay or redirects,
 checks the pinned account/mode/API version before the dispatch marker, and bounds
 response sizes. Failed preflight reads leave the request prepared and retryable;
-the adapter must retain the same immutable client through preflight and POST. Its raw
-response is not a confirmed receipt: the concrete adapter still must validate and
-project identity/economics before passing evidence back to the journal.
+the adapter must retain the same immutable client through preflight and POST. The concrete provider adapter builds all five saved writes from pinned terms and
+confirmed prior receipts, projects only identity/calendar fields, and verifies the
+complete pair through the shared pair verifier. Recovery uses GET-only exact coupon
+and hold lookups or bounded complete list pagination. A customer inventory larger
+than 2,000 objects remains unknown and requires recovery investigation. Missing,
+duplicate, malformed or incomplete results never authorize another POST.
 
-`provisioning.Activation.Finalize` runs in the guarded regional transaction. The
+`provisioning.Activation.WithFinalization` is a separate financial authorization
+boundary. Pending admission's shared session lock cannot authorize regional benefit
+activation: independent database commits can survive loss of that shared connection.
+The composed adapter must first obtain exact committed shared authorization, then
+use the regional financial fence and current regional authority in a short local
+transaction. It must reject already-invalidated shared readback as new authority.
+
+`Verification` carries audit JSON and the actual sealed verifier proof in-process.
+Only audit JSON is persisted; process loss requires fresh verification. There is no
+proof cache or reconstruction of a private seal from JSON.
+
+`provisioning.Activation.Finalize` runs in that financially authorized transaction. The
 adapter must bind verified commercial authority, enroll invoice reconciliation,
 materialize the assignment, and hand off to existing entitlement issuance
 atomically. It must not issue another allowance or perform network I/O.
 
 `Readiness` returns a fresh observation for that same assignment, customer and
-usage subscription. Ready requires current authority, verified pair, materialized
+usage subscription. It must query current shared invalidation state, not only a
+regional cached result. Ready requires current authority, verified pair, materialized
 assignment, invoice enrollment, known inventory and clear debt, a confirmed current
 eligible grant, positive fresh funding and existing sandbox billing eligibility.
 The status projection is informational; the existing billing gate still controls
@@ -74,3 +89,27 @@ context per operation. Recovery remains scheduled for held/revoked operations wi
 unresolved dispatched requests. Requests and audit history must be retained during
 rollback. Schema must precede writers; adapter registration and rollout enablement
 require separate integrated verification.
+
+## Financial revocation
+
+A permanent regional fence exists independently of operation delivery. Initial
+fences use the assignment; successor fences use the shared authorization operation.
+Team/account locks precede fence locks, then operation and commercial-contract
+locks. Pending admission checks the same fence before creating or advancing work.
+
+`FinalizeFinancialAuthorization` associates one immutable shared receipt with the
+exact target, materializes SQL-only authority and records finalization in the same
+transaction. `RevokeFinancialTarget` serializes against it and requires commercial
+revocation when already finalized. Its durable acknowledgement is read back from
+the pool after commit, including after a lost commit response. Shared invalidation
+acknowledgement must follow that readback. Missing operations still receive a
+permanent tombstone; replay cannot reopen it. Provider history recovery never
+clears financial revocation. Existing ledgers and grant history remain intact.
+
+The shared invalidation consumer, commercial activation and runtime registration
+remain integration prerequisites. Tests of the regional fence do not establish
+end-to-end shared invalidation delivery or deployed access revocation.
+
+The background worker observes pending dispatch count and oldest age at most once
+per minute, logging an operator-recovery warning after fifteen minutes. Deployment
+alert routing still requires environment verification.
