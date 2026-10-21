@@ -288,3 +288,97 @@ func TestYCAcceptancePendingAdmissionRejectsBenefitFinalization(t *testing.T) {
 		t.Fatal("finalization escaped pending-only transaction", finalized, err)
 	}
 }
+
+func TestYCAcceptanceFinancialValidatorUsesCallerTransaction(t *testing.T) {
+	s, r := acceptedCatalogFixture(t)
+	ctx := t.Context()
+	h := s.Catalog.(ycAcceptedCatalog).h
+	admission := &YCAcceptedProvisioningAdmission{Service: s, Handlers: h}
+	journal := &provisioning.Service{Pool: s.Pool, Authority: acceptedJournalAuthority{admission: admission}, Provider: &acceptanceNoProvider{}}
+	s.Provisioning = ycAcceptanceProvisioner{service: journal}
+	if _, err := s.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r, err := loadYCAcceptance(ctx, s.Pool, r.TeamID, r.ClaimID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO profile(id,email) VALUES($1,$2)`, []any{r.UserID, r.UserID.String() + "@example.test"}},
+		{`INSERT INTO team_memberships(team_id,user_id) VALUES($1,$2)`, []any{r.TeamID, r.UserID}},
+		{`INSERT INTO user_role_assignments(user_id,role_id,scope_type,team_id) SELECT $1,id,'team',$2 FROM roles WHERE name='team_owner'`, []any{r.UserID, r.TeamID}},
+	} {
+		if _, err = s.Pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	receipt, err := s.IssueFinancialAuthorization(ctx, r, "initial", *r.OperationID, r.TermsDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frozen provisioning.AcceptedOffer
+	var raw []byte
+	if err = s.Pool.QueryRow(ctx, `SELECT accepted_offer FROM billing_offer_provisioning_operation WHERE id=$1`, *r.OperationID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(raw, &frozen); err != nil {
+		t.Fatal(err)
+	}
+	operation := provisioning.Operation{ID: *r.OperationID, TeamID: r.TeamID, AssignmentID: *r.AssignmentID, Offer: frozen}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollbackYCAcceptance(ctx, tx)
+	// Taking every remaining pool connection proves the validator never needs one.
+	held := []*pgxpool.Conn{}
+	for s.Pool.Stat().AcquiredConns() < s.Pool.Stat().MaxConns() {
+		c, e := s.Pool.Acquire(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		held = append(held, c)
+	}
+	defer func() {
+		for _, c := range held {
+			c.Release()
+		}
+	}()
+	bounded, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	offer, err := admission.ValidateFinancialAcceptance(bounded, tx, operation, receipt)
+	if err != nil || offer.AcceptanceID != r.ID || string(offer.Snapshot) == "" {
+		t.Fatal("SQL-only validator", err)
+	}
+	changed := receipt
+	changed.TargetTermsDigest = r.RenewalTermsDigest
+	if _, err = admission.ValidateFinancialAcceptance(bounded, tx, operation, changed); err == nil {
+		t.Fatal("changed target accepted")
+	}
+	changed = receipt
+	changed.InvalidatedAt = &receipt.AuthorizedAt
+	if _, err = admission.ValidateFinancialAcceptance(bounded, tx, operation, changed); err == nil {
+		t.Fatal("historical invalid receipt accepted")
+	}
+	if _, err = tx.Exec(ctx, `UPDATE user_role_assignments SET revoked_at=clock_timestamp() WHERE user_id=$1 AND team_id=$2`, r.UserID, r.TeamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = admission.ValidateFinancialAcceptance(bounded, tx, operation, receipt); err == nil {
+		t.Fatal("used cached permission or another transaction")
+	}
+	// The method never committed: rollback restores this permission mutation.
+	if err = tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range held {
+		c.Release()
+	}
+	held = nil
+	var active bool
+	if err = s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_role_assignments WHERE user_id=$1 AND team_id=$2 AND revoked_at IS NULL)`, r.UserID, r.TeamID).Scan(&active); err != nil || !active {
+		t.Fatal("validator committed caller transaction", active, err)
+	}
+}

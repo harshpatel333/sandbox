@@ -91,6 +91,7 @@ type YCAcceptanceProvisioningStatus struct {
 }
 
 type YCAcceptanceRecord struct {
+	FinancialAuthority *YCFinancialState `json:"financial_authority"`
 	YCAcceptanceAuthority
 	ID                 uuid.UUID         `json:"acceptance_id"`
 	RequestID          *uuid.UUID        `json:"request_id"`

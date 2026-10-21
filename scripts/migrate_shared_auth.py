@@ -56,12 +56,20 @@ APPROVAL_FUNCTIONS = ("public.yc_staff_claim_rpc(text,jsonb)", "public.yc_claim_
 
 ACCEPTANCE_VERSION = "20261021135531"
 ACCEPTANCE_NAME = "yc_offer_acceptance_authority"
-ACCEPTANCE_HASH = "b249903f3c0165cfd4414195285522e7313e779077387126c496d620f60f82c4"
-ACCEPTANCE_TABLES = ("public.yc_offer_acceptance_authority", "public.yc_preferred_identity_review")
+ACCEPTANCE_HASH = "2c1ecb84f54bbb3c0d9234e40a487cc302a5d4a8e3beaaffa65b339dd8dffe4e"
+ACCEPTANCE_TABLES = ("public.yc_offer_acceptance_authority", "public.yc_preferred_identity_review",
+    "public.yc_financial_serialization", "public.yc_financial_authorization", "public.yc_financial_invalidation")
+ACCEPTANCE_WRITER_TRIGGERS = {
+    "yc_financial_auth_writer": "auth.users", "yc_financial_history_writer": "public.yc_claim_identity_history",
+    "yc_financial_company_writer": "public.yc_company_activation_authority", "yc_financial_claim_writer": "public.yc_claim",
+    "yc_financial_decision_writer": "public.yc_claim_decision",
+}
 ACCEPTANCE_RPCS = ("public.yc_offer_acceptance_rpc(text,jsonb)", "public.yc_preferred_claim_rpc(text,jsonb)",
-                   "public.yc_preferred_staff_rpc(text,jsonb)")
+                   "public.yc_preferred_staff_rpc(text,jsonb)", "public.yc_financial_authority_rpc(text,jsonb)")
 ACCEPTANCE_FUNCTIONS = ACCEPTANCE_RPCS + ("public.yc_offer_acceptance_immutable()",
-    "public.yc_preferred_identity_immutable()", "public.yc_preferred_claim_view(public.yc_claim)")
+    "public.yc_preferred_identity_immutable()", "public.yc_preferred_claim_view(public.yc_claim)",
+    "public.yc_financial_touch(text)", "public.yc_financial_authorization_immutable()",
+    "public.yc_financial_invalidate(text,text,text)", "public.yc_financial_writer()", "public.yc_financial_state(uuid,boolean)")
 
 
 ACCEPTANCE_HARDENED_FUNCTIONS = (CLAIM_FUNCTIONS[1], *APPROVAL_FUNCTIONS,
@@ -147,6 +155,9 @@ def acceptance_catalog(conn):
     return {
         "tables": {table: catalog(conn, table, ACCEPTANCE_CHANGED_FUNCTIONS if i == 0 else ())
                    for i, table in enumerate(ACCEPTANCE_TABLES)},
+        "writer_triggers": conn.execute("""SELECT jsonb_agg(jsonb_build_array(n.nspname,c.relname,t.tgname,pg_get_triggerdef(t.oid),t.tgenabled) ORDER BY t.tgname)
+            FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE t.tgname=ANY(%s::text[]) AND NOT t.tgisinternal""", (list(ACCEPTANCE_WRITER_TRIGGERS),)).fetchone()[0],
         "indexes": conn.execute("""SELECT jsonb_agg(pg_get_indexdef(i.indexrelid) ORDER BY c.relname)
             FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
             WHERE i.indrelid=ANY(SELECT to_regclass(t) FROM unnest(%s::text[]) t)""",
@@ -193,6 +204,8 @@ def predecessor_acceptance_catalog(current):
     signatures = {f.replace("public.", "") for f in ACCEPTANCE_HARDENED_FUNCTIONS}
     def visit(value):
         if isinstance(value, dict):
+            if value.get("triggers"):
+                value["triggers"] = [row for row in value["triggers"] if row[0] not in ACCEPTANCE_WRITER_TRIGGERS] or None
             for function in value.get("functions") or ():
                 if function[0] in signatures:
                     for path in ("'pg_catalog', 'public', 'auth'", "'pg_catalog', 'public'"):

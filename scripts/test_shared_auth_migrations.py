@@ -101,6 +101,9 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
             "GRANT SELECT ON public.yc_offer_acceptance_authority TO authenticated",
             "GRANT EXECUTE ON FUNCTION public.yc_preferred_staff_rpc(text,jsonb) TO service_role",
             "ALTER TABLE public.yc_preferred_identity_review DISABLE ROW LEVEL SECURITY",
+            "GRANT SELECT ON public.yc_financial_authorization TO authenticated",
+            "GRANT EXECUTE ON FUNCTION public.yc_financial_touch(text) TO service_role",
+            "ALTER TABLE public.yc_financial_invalidation DISABLE ROW LEVEL SECURITY",
         ):
             with self.conn.transaction(force_rollback=True):
                 self.conn.execute(sql)
@@ -376,7 +379,7 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
 
     def check_query_budgets(self, target):
         migrations = (("authority", shared.source, 11), ("claims", shared.claim_source, 17),
-                      ("approvals", shared.approval_source, 21), ("acceptances", shared.acceptance_source, 13))
+                      ("approvals", shared.approval_source, 21), ("acceptances", shared.acceptance_source, 17))
         before = self.history()
         with patch.object(shared, "inspect", side_effect=AssertionError("implicit audit")):
             for migration, source, budget in migrations:

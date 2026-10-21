@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/superserve-ai/sandbox/internal/authz"
 	"github.com/superserve-ai/sandbox/internal/billing/provisioning"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -184,4 +185,71 @@ func (p ycAcceptanceProvisioner) RecoverAcceptance(ctx context.Context, r YCAcce
 		return uuid.Nil, false, errYCAcceptanceConflict
 	}
 	return id, true, nil
+}
+
+// ValidateFinancialAcceptance validates initial activation inside the caller's
+// regional transaction, after its team/account and permanent financial fence
+// locks. The caller supplies an exact committed shared receipt. This method
+// performs regional SQL only and neither commits nor opens another connection.
+func (a *YCAcceptedProvisioningAdmission) ValidateFinancialAcceptance(ctx context.Context, tx pgx.Tx, operation provisioning.Operation, authorization YCFinancialAuthorization) (provisioning.AcceptedOffer, error) {
+	var empty provisioning.AcceptedOffer
+	if tx == nil || a == nil || !a.Service.available() || a.Handlers == nil {
+		return empty, provisioning.ErrUnavailable
+	}
+	if authorization.AuthorizationID == uuid.Nil || authorization.AuthorizedAt.IsZero() || authorization.InvalidatedAt != nil || authorization.Phase != "initial" || authorization.OperationID != operation.ID || authorization.TeamID != operation.TeamID || authorization.AssignmentID != operation.AssignmentID || authorization.HomeRegion != a.Service.Region || authorization.TargetTermsDigest != authorization.TermsDigest {
+		return empty, provisioning.ErrConflict
+	}
+	var home string
+	if err := tx.QueryRow(ctx, `SELECT home_region FROM public.team WHERE id=$1 FOR NO KEY UPDATE`, operation.TeamID).Scan(&home); err != nil {
+		return empty, err
+	}
+	if home != a.Service.Region {
+		return empty, provisioning.ErrConflict
+	}
+	if err := lockCommercialOfferAccount(ctx, tx, operation.TeamID); err != nil {
+		return empty, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM public.yc_offer_acceptance WHERE team_id=$1 AND assignment_id=$2 FOR UPDATE`, operation.TeamID, operation.AssignmentID); err != nil {
+		return empty, err
+	}
+	r, err := a.record(ctx, tx, operation.TeamID, operation.AssignmentID)
+	if err != nil {
+		return empty, err
+	}
+	if authorization.AcceptanceID != r.ID || authorization.ClaimID != r.ClaimID || authorization.UserID != r.UserID || authorization.Company != r.Company || authorization.ApprovalID != r.ApprovalID || authorization.ApprovalRevision != r.ApprovalRevision || authorization.TermsDigest != r.TermsDigest || authorization.RenewalTermsDigest != r.RenewalTermsDigest || (r.OperationID != nil && *r.OperationID != operation.ID) {
+		return empty, provisioning.ErrConflict
+	}
+	if err = authz.New(tx).RequireTeamPermission(ctx, r.UserID, r.TeamID, "billing:write"); err != nil {
+		return empty, err
+	}
+	offer, err := acceptedProvisioningSnapshot(r)
+	if err != nil {
+		return empty, err
+	}
+	var same, finalized bool
+	err = tx.QueryRow(ctx, `SELECT accepted_offer->>'acceptance_id'=$4 AND accepted_offer->>'terms_digest'=$5 AND accepted_offer->'snapshot'=$6::jsonb
+ AND accepted_offer->'snapshot'=$7::jsonb AND NOT held AND NOT control_pending AND revoked_at IS NULL,finalized_at IS NOT NULL
+ FROM public.billing_offer_provisioning_operation WHERE id=$1 AND team_id=$2 AND assignment_id=$3 FOR UPDATE`, operation.ID, r.TeamID, operation.AssignmentID, r.ID.String(), r.TermsDigest, offer.Snapshot, operation.Offer.Snapshot).Scan(&same, &finalized)
+	if err != nil {
+		return empty, err
+	}
+	if !same {
+		return empty, provisioning.ErrConflict
+	}
+	if !finalized {
+		if err = a.Service.lockNewSignup(ctx, tx, r.YCAcceptanceAuthority); err != nil {
+			return empty, err
+		}
+		if err = a.Handlers.sponsoredLocalPreflight(ctx, tx, r.TeamID); err != nil {
+			return empty, err
+		}
+		var reserved bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.billing_commercial_checkout_attempt WHERE team_id=$1 AND (state IN ('dispatched','customer_observed') OR (state='prepared' AND prepared_until>clock_timestamp())))`, r.TeamID).Scan(&reserved); err != nil {
+			return empty, err
+		}
+		if reserved {
+			return empty, provisioning.ErrConflict
+		}
+	}
+	return offer, nil
 }

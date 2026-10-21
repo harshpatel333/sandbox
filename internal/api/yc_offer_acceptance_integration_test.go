@@ -41,6 +41,7 @@ func (f *acceptanceCatalogFixture) Assign(context.Context, YCAcceptanceRecord) (
 }
 
 type acceptanceProvisioningFixture struct {
+	statusHook          func()
 	operation           uuid.UUID
 	calls               int
 	loseAcknowledgement bool
@@ -59,10 +60,17 @@ func (f *acceptanceProvisioningFixture) Enqueue(context.Context, uuid.UUID, uuid
 	return f.operation, nil
 }
 func (f *acceptanceProvisioningFixture) Status(context.Context, uuid.UUID, uuid.UUID) (YCAcceptanceProvisioningStatus, error) {
+	if f.statusHook != nil {
+		f.statusHook()
+	}
 	return f.status, nil
 }
 
 func acceptanceFixture(t *testing.T) (*YCOfferAcceptanceService, *Handlers, YCAcceptanceRecord, *acceptanceCatalogFixture, *acceptanceProvisioningFixture) {
+	return acceptanceFixtureBeforeApproval(t, nil)
+}
+
+func acceptanceFixtureBeforeApproval(t *testing.T, before func(*Handlers, uuid.UUID)) (*YCOfferAcceptanceService, *Handlers, YCAcceptanceRecord, *acceptanceCatalogFixture, *acceptanceProvisioningFixture) {
 	t.Helper()
 	pool := staffTestPool(t)
 	ctx := context.Background()
@@ -97,6 +105,9 @@ func acceptanceFixture(t *testing.T) (*YCOfferAcceptanceService, *Handlers, YCAc
 		if _, err = pool.Exec(ctx, statement.sql, statement.args...); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if before != nil {
+		before(h, claim.ID)
 	}
 	p := gin.H{"id": claim.ID, "user_id": user, "team_id": team, "home_region": "use", "actor_id": uuid.New(), "request_id": uuid.New(), "expected_revision": 0, "reason": "Reviewed synthetic signup", "evidence_reference": "synthetic-review"}
 	if _, err = h.ycBindWithIntentRPC(ctx, "approve", p, h.ycStaffRPC); err != nil {
@@ -355,6 +366,27 @@ func TestYCPreferredReviewBindsExactApprovedRecipient(t *testing.T) {
 	if _, err = s.rpc(ctx, pool, "offer", gin.H{"claim_id": claim.ID, "team_id": team, "user_id": user, "home_region": "use"}); err != nil {
 		t.Fatal("approved preferred identity cannot accept", err)
 	}
+	// Commit a financial receipt for B so lifecycle isolation covers the durable
+	// invalidation path as well as read-time acceptance validation.
+	authorityRaw, e := s.rpc(ctx, pool, "offer", gin.H{"claim_id": claim.ID, "team_id": team, "user_id": user, "home_region": "use"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	var authority YCAcceptanceAuthority
+	if e = json.Unmarshal(authorityRaw, &authority); e != nil {
+		t.Fatal(e)
+	}
+	acceptedAt, request, assignment, operation := time.Now().UTC(), uuid.New(), uuid.New(), uuid.New()
+	financialRecord := YCAcceptanceRecord{YCAcceptanceAuthority: authority, ID: uuid.New(), RequestID: &request, AcceptedAt: &acceptedAt, AssignmentID: &assignment, OperationID: &operation, TermsDigest: ycclaims.Hash("preferred initial"), RenewalTermsDigest: ycclaims.Hash("preferred successor")}
+	for _, op := range []string{"accept", "link"} {
+		if _, e = s.rpc(ctx, pool, op, ycAcceptanceParameters(financialRecord)); e != nil {
+			t.Fatal(e)
+		}
+	}
+	var financialReceipt YCFinancialAuthorization
+	if e = ycFinancialRPC(ctx, pool, "issue", financialParams(financialRecord), &financialReceipt); e != nil {
+		t.Fatal(e)
+	}
 	// Staff approved B explicitly. An unrelated account later using A cannot
 	// revoke that decision, but B and the claim/company authority remain fences.
 	originalUser := uuid.New()
@@ -371,6 +403,10 @@ func TestYCPreferredReviewBindsExactApprovedRecipient(t *testing.T) {
 		}
 		if _, err = s.rpc(ctx, pool, "offer", gin.H{"claim_id": claim.ID, "team_id": team, "user_id": user, "home_region": "use"}); err != nil {
 			t.Fatal("original account lifecycle stranded preferred approval", err)
+		}
+		var financialState YCFinancialState
+		if e = ycFinancialRPC(ctx, pool, "state", gin.H{"claim_id": claim.ID, "automated": true}, &financialState); e != nil || !financialState.valid() {
+			t.Fatal("original A invalidated B permit", financialState, e)
 		}
 	}
 	for _, change := range []struct {

@@ -307,8 +307,11 @@ func (h *Handlers) ycOfferHandler(c *gin.Context, operation string) {
 	var err error
 	switch operation {
 	case "offer":
-		r, err = s.Offer(ctx, user, in.TeamID, in.ClaimID)
-		if err == nil && r.AcceptedAt != nil {
+		r, err = loadYCAcceptance(ctx, s.Pool, in.TeamID, in.ClaimID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			r, err = s.Offer(ctx, user, in.TeamID, in.ClaimID)
+		}
+		if err == nil {
 			r, err = s.Status(ctx, user, in.TeamID, in.ClaimID)
 		}
 	case "accept":
@@ -320,7 +323,7 @@ func (h *Handlers) ycOfferHandler(c *gin.Context, operation string) {
 		r, err = s.Status(ctx, user, in.TeamID, in.ClaimID)
 	}
 	if errors.Is(err, pgx.ErrNoRows) && operation == "status" {
-		c.JSON(200, gin.H{"state": "acceptance_required", "ready": false})
+		c.JSON(200, gin.H{"state": "acceptance_required", "ready": false, "financial_authority": YCFinancialState{Kind: "accepted_offer", State: "acceptance_pending"}})
 		return
 	}
 	if err != nil {

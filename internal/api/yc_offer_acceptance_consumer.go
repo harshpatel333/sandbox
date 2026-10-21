@@ -26,14 +26,17 @@ func (s *YCOfferAcceptanceService) Status(ctx context.Context, user, team, claim
 	if r.UserID != user || r.HomeRegion != s.Region {
 		return r, errYCAcceptanceConflict
 	}
-	if r.AcceptedAt == nil {
-		return s.Offer(ctx, user, team, claim)
+	r.FinancialAuthority, err = s.FinancialState(ctx, claim)
+	if err != nil {
+		return r, err
 	}
-	if r.State == "confirming" {
+	if !r.FinancialAuthority.valid() {
+		if r.FinancialAuthority.State != "acceptance_pending" {
+			r.State = "review_required"
+		}
 		return r, nil
 	}
-	if err = s.WithGuard(ctx, r, func(context.Context) error { return nil }); err != nil {
-		r.State = "review_required"
+	if r.AcceptedAt == nil || r.State == "confirming" {
 		return r, nil
 	}
 	if r.State == "held" || r.State == "revoked" {
@@ -50,6 +53,17 @@ func (s *YCOfferAcceptanceService) Status(ctx context.Context, user, team, claim
 			return r, nil
 		}
 		if status.OperationID != *r.OperationID {
+			r.State = "review_required"
+			return r, nil
+		}
+		// Provider readiness can become true while a previously committed permit
+		// is being invalidated. Read shared authority after that observation so two
+		// states that were never valid together cannot synthesize readiness.
+		r.FinancialAuthority, err = s.FinancialState(ctx, claim)
+		if err != nil {
+			return r, err
+		}
+		if !r.FinancialAuthority.valid() {
 			r.State = "review_required"
 			return r, nil
 		}
