@@ -36,7 +36,7 @@ def gce(name, devbox_id='3f9c0a1b2c4d'):
 class FakeCloud:
     def __init__(self):
         self.instances_, self.disks_, self.buckets_ = [], [], []
-        self.calls, self.fail = [], set()
+        self.calls, self.zoned, self.fail = [], [], set()
 
     def add_box(self, name, devbox_id, *, vm=True, disks=True, bucket=True, project=PROJECT, zone=ZONE,
                 manifest=None, unlabelled=(), **label_args):
@@ -47,7 +47,7 @@ class FakeCloud:
                 name=name, devbox_id=devbox_id, owner=tags['owner'], actor=tags['owner'],
                 created_at=at(NOW - 26 * 3600), expires_at=at(int(tags['expires-at'])),
                 revisions={'sandbox': {'branch': 'main', 'sha': 'a' * 40},
-                           'ui': {'branch': 'feature-x', 'sha': 'b' * 40}}), 'ready')
+                           'ui': {'branch': 'feature-x', 'sha': 'b' * 40}}, zone=zone), 'ready')
         if vm:
             self.instances_.append({'name': instance, 'zone': f'projects/{project}/zones/{zone}', 'status': 'RUNNING',
                                     'labels': dict(tags), 'selfLink': link('instances', instance, project, zone),
@@ -73,11 +73,13 @@ class FakeCloud:
     def buckets(self):
         return [dict(b) for b in self.buckets_]
 
-    def _delete(self, kind, collection, name):
+    def _delete(self, kind, collection, name, zone=None):
         self.calls.append((kind, name))
+        self.zoned.append((kind, name, zone))
         if (kind, name) in self.fail:
             return f'{kind} {name}: permission denied'
-        collection[:] = [item for item in collection if item['name'] != name]
+        collection[:] = [item for item in collection
+                         if item['name'] != name or (zone is not None and item['zone'].rsplit('/', 1)[-1] != zone)]
         return None
 
     def label(self, resource, labels):
@@ -94,11 +96,11 @@ class FakeCloud:
 
     def delete_instance(self, name, zone):
         for disk in self.disks_:
-            disk['users'] = [u for u in disk['users'] if u != link('instances', name)]
-        return self._delete('instance', self.instances_, name)
+            disk['users'] = [u for u in disk['users'] if u != link('instances', name, zone=zone)]
+        return self._delete('instance', self.instances_, name, zone)
 
     def delete_disk(self, name, zone):
-        return self._delete('disk', self.disks_, name)
+        return self._delete('disk', self.disks_, name, zone)
 
     def delete_bucket(self, name):
         return self._delete('bucket', self.buckets_, name)
@@ -162,7 +164,7 @@ class EligibilityTest(unittest.TestCase):
         reasons = {r.name: reason for r, reason in ignored}
         self.assertIn(f'not in project {PROJECT}', reasons[gce('alice-dev-a7f3c9')[0]])
         self.assertIn('sandbox_role', reasons[gce('bob-dev-0d1e2f')[0]])
-        self.assertIn(f'not in zone {ZONE}', reasons[gce('carol-dev-1f2a3b')[0]])
+        self.assertIn('not in a devbox zone', reasons[gce('carol-dev-1f2a3b')[0]])
         self.assertEqual(len(ignored), 10)
 
     def test_orphan_disks_and_buckets_remain_eligible_without_vm(self):
@@ -516,6 +518,43 @@ class DestroyNameTest(unittest.TestCase):
         for name, ids in (('alice-dev-a7f3c9', ''), ('alice-dev-a7f3c9', 'XYZ'), ('Bad_Name', '3f9c0a1b2c4d')):
             with self.subTest(name=name, ids=ids), self.assertRaises(SystemExit):
                 inv.destroy_name(FakeCloud(), PROJECT, name, ids)
+
+
+class ZoneTest(unittest.TestCase):
+    def test_box_in_any_devbox_zone_is_listed_reached_and_destroyed_in_that_zone(self):
+        for zone in contract.DEVBOX_ZONES:
+            with self.subTest(zone=zone):
+                cloud = FakeCloud()
+                cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', zone=zone)
+                [box], ignored = boxes(cloud)
+                self.assertEqual((ignored, box.zone, box.missing), ([], zone, []))
+                self.assertIn(contract.forwarding_command('alice-dev-a7f3c9', zone), inv.render([box], [], NOW))
+                inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+                self.assertEqual({z for kind, _, z in cloud.zoned if kind != 'bucket'}, {zone})
+                self.assertEqual((cloud.instances_, cloud.disks_, cloud.buckets_), ([], [], []))
+
+    def test_leftovers_of_a_failed_zone_attempt_are_destroyed_with_the_box(self):
+        first, final = contract.DEVBOX_ZONES[0], contract.DEVBOX_ZONES[2]
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', zone=first, bucket=False)
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', zone=final)
+        [box], ignored = boxes(cloud)
+        self.assertEqual((ignored, box.zones, box.unhandled), ([], sorted([first, final]), []))
+        inv.destroy(cloud, PROJECT, 'alice-dev-a7f3c9', '3f9c0a1b2c4d')
+        instance, boot, data = gce('alice-dev-a7f3c9')
+        self.assertEqual(sorted(c for c in cloud.zoned if c[0] != 'bucket'), sorted(
+            [('instance', instance, z) for z in (first, final)] + [('disk', d, z) for d in (boot, data)
+                                                                   for z in (first, final)]))
+        self.assertEqual((cloud.instances_, cloud.disks_, cloud.buckets_), ([], [], []))
+
+    def test_target_binds_every_zone_of_the_box(self):
+        cloud = FakeCloud()
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', zone=contract.DEVBOX_ZONES[1])
+        [box], _ = boxes(cloud)
+        token = inv.set_token([box.target()])
+        cloud.add_box('alice-dev-a7f3c9', '3f9c0a1b2c4d', zone=contract.DEVBOX_ZONES[3], vm=False, bucket=False)
+        [grown], _ = boxes(cloud)
+        self.assertNotEqual(inv.set_token([grown.target()]), token)
 
 
 class RenderTest(unittest.TestCase):
