@@ -53,7 +53,7 @@ class FakeCloud:
         self.deployed_sha = NEW_SHA
         self.disks, self.buckets, self.unlabelled = [], [], set()
         self.disk_zones, self.deleted, self.stockout = {}, [], {}
-        self.leak_boot_disk, self.created_at = False, {}
+        self.leak_boot_disk, self.created_at, self.vanished = False, {}, set()
         self.relabel_after_checkouts = None
         self.pending_instance = False
         self.fail_disk_create = False
@@ -110,6 +110,8 @@ class FakeCloud:
             self.deleted.append(("instance", args[4], arg(args, "--zone")))
             self.instances.pop(args[4], None)
             return ok()
+        if verb == ["compute", "disks", "delete"] and args[4] in self.vanished:
+            return fail(1, f"ERROR: (gcloud.compute.disks.delete) The resource '{args[4]}' was not found")
         if verb == ["compute", "disks", "delete"]:
             self.deleted.append(("disk", args[4], arg(args, "--zone")))
             self.disk_zones.pop(args[4], None)
@@ -464,6 +466,12 @@ class CreateTests(WorkflowCase):
                                              ("disk", "devbox-my-box-data", "us-central1-a")])
         self.assertEqual(cloud.metadata_writes[-1]["zone"], "us-central1-b")
 
+    def test_a_disk_gone_during_cleanup_does_not_stop_the_next_zone(self):
+        cloud = FakeCloud()
+        cloud.stockout, cloud.vanished = {"us-central1-a": "instance"}, {"devbox-my-box-data"}
+        self.assertEqual(self.create(cloud), 0)
+        self.assertEqual(cloud.metadata_writes[-1]["zone"], "us-central1-b")
+
     def test_an_old_unlabelled_disk_with_the_box_name_is_left_alone(self):
         cloud = FakeCloud()
         cloud.stockout = {"us-central1-a": "instance"}
@@ -475,7 +483,8 @@ class CreateTests(WorkflowCase):
         self.assertNotIn(("disk", "devbox-my-box", "us-central1-a"), cloud.deleted)
 
     def test_capacity_check_ignores_names_and_case(self):
-        for text, capacity in (("ZONE_RESOURCE_POOL_EXHAUSTED", True), ("reason: stockout", True),
+        for text, capacity in (("ZONE_RESOURCE_POOL_EXHAUSTED", True), ("ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS", True),
+                               ("reason: stockout", True),
                                ("The zone does not have enough resources available to fulfill the request.", True),
                                ("disk 'devbox-stockout-demo' already exists", False),
                                ("resource_exhausted", False), ("QUOTA_EXCEEDED", False)):

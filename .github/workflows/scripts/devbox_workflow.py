@@ -599,7 +599,7 @@ def create(env, profile_path=PROFILE_PATH):
 
 # GCE reports a zone that can't host the VM or its disks this way; anything
 # else is a real failure and must not be retried in another zone.
-CAPACITY_ERRORS = re.compile(r"\bZONE_RESOURCE_POOL_EXHAUSTED\b|\bRESOURCE_EXHAUSTED\b|reason: stockout"
+CAPACITY_ERRORS = re.compile(r"\bZONE_RESOURCE_POOL_EXHAUSTED(?:_WITH_DETAILS)?\b|\bRESOURCE_EXHAUSTED\b|reason: stockout"
                              r"|does not have enough resources available to fulfill the request")
 
 
@@ -674,7 +674,7 @@ def delete_if_present(args, zone):
     try:
         run([*args, f"--zone={zone}", f"--project={contract.PROJECT}", "--quiet"])
     except StepError as error:
-        if "not found" not in str(error) and "was not found" not in str(error):
+        if "not found" not in str(error):
             raise
 
 
