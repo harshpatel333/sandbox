@@ -33,6 +33,12 @@ func (s *YCOfferAcceptanceService) Status(ctx context.Context, user, team, claim
 	if !r.FinancialAuthority.valid() {
 		if r.FinancialAuthority.State != "acceptance_pending" {
 			r.State = "review_required"
+		} else if r.AcceptedAt == nil || r.State == "confirming" {
+			// Pending shared state does not identify the locally disclosed approval.
+			// Offer compares current authority with that immutable saved snapshot.
+			if _, err = s.Offer(ctx, user, team, claim); err != nil {
+				return r, err
+			}
 		}
 		return r, nil
 	}

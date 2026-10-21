@@ -646,6 +646,61 @@ func TestYCAcceptanceHTTPResumeAndReplayProjectPublicStatus(t *testing.T) {
 	}
 }
 
+func TestYCAcceptancePendingHTTPRejectsChangedApproval(t *testing.T) {
+	for _, confirming := range []bool{false, true} {
+		t.Run(map[bool]string{false: "offered", true: "confirming"}[confirming], func(t *testing.T) {
+			s, h, r, catalog, _ := acceptanceFixture(t)
+			ctx := context.Background()
+			h.YCOfferAcceptance = s
+			role, permission := uuid.New(), uuid.New()
+			for _, q := range []struct {
+				sql  string
+				args []any
+			}{
+				{`INSERT INTO roles VALUES($1,'team')`, []any{role}},
+				{`INSERT INTO permissions VALUES($1,'billing:write')`, []any{permission}},
+				{`INSERT INTO role_permissions VALUES($1,$2)`, []any{role, permission}},
+				{`INSERT INTO user_role_assignments VALUES($1,$2,'team',$3,NULL)`, []any{r.UserID, role, r.TeamID}},
+				{`INSERT INTO team_memberships VALUES($1,$2,'active')`, []any{r.TeamID, r.UserID}},
+			} {
+				if _, err := s.Pool.Exec(ctx, q.sql, q.args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if confirming {
+				if _, err := s.Accept(ctx, r.UserID, acceptanceRequest(r)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := s.Status(ctx, r.UserID, r.TeamID, r.ClaimID)
+			if err != nil || before.State != map[bool]string{false: "offered", true: "confirming"}[confirming] {
+				t.Fatal("unchanged pending approval rejected", before.State, err)
+			}
+			if _, err := s.Shared.Exec(ctx, `INSERT INTO public.yc_claim_decision(claim_id,revision,decision,actor_id,reason,evidence_reference) VALUES($1,100,'operator',gen_random_uuid(),'review','synthetic')`, r.ClaimID); err != nil {
+				t.Fatal(err)
+			}
+			requireFinancialState(t, s, r, "acceptance_pending", 0)
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.Use(func(c *gin.Context) { c.Set("actor_id", r.UserID); c.Set("yc_acceptance_verified", true) })
+			router.POST("/offer", h.YCOffer)
+			router.POST("/status", h.YCOfferStatus)
+			for _, path := range []string{"/offer", "/status"} {
+				raw, _ := json.Marshal(acceptanceRequest(r))
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, httptest.NewRequest("POST", path, bytes.NewReader(raw)))
+				if w.Code != 409 || !strings.Contains(w.Body.String(), "acceptance_conflict") {
+					t.Fatal("stale approval still offered", path, w.Code, w.Body.String())
+				}
+			}
+			stored, err := loadYCAcceptance(ctx, s.Pool, r.TeamID, r.ClaimID)
+			if err != nil || !stored.YCAcceptanceAuthority.equal(r.YCAcceptanceAuthority) || stored.TermsDigest != r.TermsDigest || stored.RenewalTermsDigest != r.RenewalTermsDigest || !stored.PricingAt.Equal(r.PricingAt) || catalog.calls != 0 {
+				t.Fatal("status changed frozen disclosure", stored, catalog.calls, err)
+			}
+		})
+	}
+}
+
 func TestYCAcceptanceExpiredFinalLeaseBecomesRecoverableHold(t *testing.T) {
 	s, _, r, _, _ := acceptanceFixture(t)
 	ctx := context.Background()
