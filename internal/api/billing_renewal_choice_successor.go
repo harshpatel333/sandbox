@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -9,6 +10,31 @@ import (
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+// RenewalSuccessorRequester resolves regional permission ownership without
+// replacing the original accepter's shared identity or financial receipt.
+func RenewalSuccessorRequester(ctx context.Context, tx pgx.Tx, b ContractProviderBinding) (uuid.UUID, error) {
+	if tx == nil {
+		return uuid.Nil, errRenewalDisabled
+	}
+	k, previous, err := loadRenewalChoicePair(ctx, tx, b.Identity.TeamID, b.Identity.AssignmentID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	var raw []byte
+	if err = tx.QueryRow(ctx, `SELECT snapshot FROM billing_renewal_choice WHERE team_id=$1 AND assignment_id=$2 AND intended_boundary=$3 FOR UPDATE`, k.Team, k.Assignment, k.Boundary).Scan(&raw); err != nil {
+		return uuid.Nil, err
+	}
+	var j renewalChoiceJournal
+	if json.Unmarshal(raw, &j) != nil || j.Confirmed == nil || j.SuccessorState != "active" || j.Successor != b.ContractID || j.Successor != renewalSuccessorID(k) || j.Confirmed.Actor == uuid.Nil || j.Confirmed.Request.Acceptance != b.Identity.AcceptanceID || j.Confirmed.Request.ApprovalRevision != b.Identity.ApprovalSemanticRevision || j.Confirmed.State != "confirmed" {
+		return uuid.Nil, errRenewalConflict
+	}
+	expected, err := renewalSuccessorBinding(k, *j.Confirmed, previous, b.FeeItemID)
+	if err != nil || renewalHash(expected) != renewalHash(b) {
+		return uuid.Nil, errRenewalConflict
+	}
+	return j.Confirmed.Actor, nil
+}
 
 type renewalFinancialFinalizer func(context.Context, YCAcceptanceRecord, string, uuid.UUID, string, time.Time, func(context.Context, pgx.Tx, YCFinancialAuthorization) error) error
 type renewalBenefitRemoval func(context.Context, YCAcceptanceRecord, uuid.UUID, uuid.UUID, func(context.Context, pgx.Tx) error) error
