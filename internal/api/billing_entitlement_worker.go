@@ -646,7 +646,7 @@ func (h *Handlers) dispatchUsageEntitlement(ctx context.Context, c db.BillingCom
 	var grant entitlementGrant
 	err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey)
 	if attempt != uuid.Nil {
-		if finishErr := h.finishProviderPairDispatch(ctx, attempt); finishErr != nil {
+		if finishErr := h.finishProviderPairDispatch(ctx, attempt, err); finishErr != nil {
 			return errors.Join(err, finishErr)
 		}
 	}

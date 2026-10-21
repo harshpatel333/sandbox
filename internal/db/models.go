@@ -932,19 +932,21 @@ type BillingProviderCredit struct {
 }
 
 type BillingProviderPairDispatch struct {
-	ID               uuid.UUID          `json:"id"`
-	EntitlementID    uuid.UUID          `json:"entitlement_id"`
-	ContractID       uuid.UUID          `json:"contract_id"`
-	TeamID           uuid.UUID          `json:"team_id"`
-	Binding          []byte             `json:"binding"`
-	RequestPayload   []byte             `json:"request_payload"`
-	RequestForm      string             `json:"request_form"`
-	IdempotencyKey   string             `json:"idempotency_key"`
-	LegacyUntracked  bool               `json:"legacy_untracked"`
-	AdmittedAt       time.Time          `json:"admitted_at"`
-	SenderFinishedAt pgtype.Timestamptz `json:"sender_finished_at"`
-	ResolvedAt       pgtype.Timestamptz `json:"resolved_at"`
-	GrantID          *string            `json:"grant_id"`
+	ID                uuid.UUID          `json:"id"`
+	EntitlementID     uuid.UUID          `json:"entitlement_id"`
+	ContractID        uuid.UUID          `json:"contract_id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	Binding           []byte             `json:"binding"`
+	RequestPayload    []byte             `json:"request_payload"`
+	RequestForm       string             `json:"request_form"`
+	IdempotencyKey    string             `json:"idempotency_key"`
+	LegacyUntracked   bool               `json:"legacy_untracked"`
+	AdmittedAt        time.Time          `json:"admitted_at"`
+	SenderFinishedAt  pgtype.Timestamptz `json:"sender_finished_at"`
+	ResolvedAt        pgtype.Timestamptz `json:"resolved_at"`
+	GrantID           *string            `json:"grant_id"`
+	RejectedAt        pgtype.Timestamptz `json:"rejected_at"`
+	RejectionEvidence []byte             `json:"rejection_evidence"`
 }
 
 type BillingProviderPairMonthlyPayment struct {
