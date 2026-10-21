@@ -83,12 +83,19 @@ type renewalChoiceProof struct {
 }
 
 type renewalChoiceJournal struct {
-	Key            renewalChoiceKey        `json:"key"`
-	Revision       int64                   `json:"revision"`
-	Requested      *renewalChoiceOperation `json:"requested,omitempty"`
-	Confirmed      *renewalChoiceOperation `json:"last_confirmed,omitempty"`
-	Successor      uuid.UUID               `json:"successor_id"`
-	SuccessorState string                  `json:"successor_state"`
+	OwnedSchedule  *renewalChoiceOwnedSchedule `json:"owned_schedule,omitempty"`
+	Key            renewalChoiceKey            `json:"key"`
+	Revision       int64                       `json:"revision"`
+	Requested      *renewalChoiceOperation     `json:"requested,omitempty"`
+	Confirmed      *renewalChoiceOperation     `json:"last_confirmed,omitempty"`
+	Successor      uuid.UUID                   `json:"successor_id"`
+	SuccessorState string                      `json:"successor_state"`
+}
+
+type renewalChoiceOwnedSchedule struct {
+	Operation uuid.UUID                `json:"operation_id"`
+	Request   renewalChoiceStepRequest `json:"request"`
+	Proof     renewalChoiceStepProof   `json:"proof"`
 }
 
 type renewalChoiceAuthority struct {
@@ -324,6 +331,9 @@ func (s *renewalChoiceService) submit(ctx context.Context, k renewalChoiceKey, a
 		if j.Requested != nil && (j.Requested.State == "dispatched" || j.Requested.State == "outcome_unknown") {
 			return errRenewalPending
 		}
+		if !renewalCalendarSupported(req.Choice, a.Binding.Anchor, k.Boundary) {
+			return errRenewalDisabled
+		}
 		terms, err := s.Authority.Resolve(ctx, tx.SQL(), k, req.Choice)
 		if err != nil {
 			return err
@@ -508,4 +518,10 @@ func (s *renewalChoiceService) reconcileSuccessor(ctx context.Context, k renewal
 		j.Confirmed.Proof = &proof
 		return tx.Save("successor_" + state)
 	})
+}
+
+// Until payment-to-grant mapping is integrated, all admission and execution paths
+// use the same compatibility restriction for differing monthly calendars.
+func renewalCalendarSupported(choice string, anchor, boundary time.Time) bool {
+	return choice != "monthly" || annualBoundary(boundary, 1).Equal(annualBoundary(anchor, 13))
 }

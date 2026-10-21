@@ -815,3 +815,45 @@ func (a *fixtureCancelAuthority) DispatchGuard(ctx context.Context, k renewalCho
 		return guarded.Err()
 	})
 }
+
+func TestRenewalChoiceMonthlyCalendarAdmissionMatchesDispatch(t *testing.T) {
+	s, store, a := newRenewalFixture(t)
+	a.monthly = true
+	a.authority.Binding.Anchor = time.Date(2028, 2, 29, 0, 0, 0, 0, time.UTC)
+	a.key.Boundary = annualBoundary(a.authority.Binding.Anchor, 12)
+	store.now = a.key.Boundary.Add(-time.Hour)
+	a.now = store.now
+	if err := s.initialize(t.Context(), a.key, a.actor); err != nil {
+		t.Fatal(err)
+	}
+	provider := &fixtureRenewalProvider{}
+	s.Provider = provider
+	before, err := s.status(t.Context(), a.key, a.actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := s.view(t.Context(), a.key, a.actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, option := range view.Options {
+		if option.Choice == "monthly" {
+			if option.Available || option.UnavailableReason != "integration_unavailable" {
+				t.Fatal(option)
+			}
+		} else if !option.Available {
+			t.Fatal("unrelated option blocked", option)
+		}
+	}
+	req := renewalChoiceRequest{ID: uuid.New(), Choice: "monthly", ApprovalRevision: a.authority.Revision, Acceptance: a.authority.Acceptance, ChoiceRevision: before.Revision}
+	if _, err := s.submit(t.Context(), a.key, a.actor, req); !errors.Is(err, errRenewalDisabled) {
+		t.Fatal(err)
+	}
+	after, err := s.status(t.Context(), a.key, a.actor)
+	if err != nil || after.Revision != before.Revision || after.Requested != nil || after.Confirmed.Request.Choice != "annual" || provider.writes.Load() != 0 {
+		t.Fatal("unsupported choice changed journal", after, err)
+	}
+	if _, ok := store.requests[req.ID]; ok {
+		t.Fatal("rejected request persisted")
+	}
+}

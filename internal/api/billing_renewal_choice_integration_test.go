@@ -311,4 +311,15 @@ func TestRenewalChoicePostgresStagedRestart(t *testing.T) {
 	if p.calls.Load() != 2 || j.Confirmed.Request.Choice != "free" || len(j.Confirmed.Steps) != 2 || j.Confirmed.Steps[0].Request.Kind != "create_schedule" || j.Confirmed.Steps[1].Request.Kind != "update_schedule" {
 		t.Fatal("restart lost stage identity", j)
 	}
+	if j.OwnedSchedule == nil || j.OwnedSchedule.Operation != j.Confirmed.ID || j.OwnedSchedule.Proof.Schedule != "sub_sched_owned" {
+		t.Fatal("restart lost durable creation ownership", j)
+	}
+	owned := renewalHash(j.OwnedSchedule)
+	if _, err = restart.submit(t.Context(), a.key, a.actor, renewalChoiceRequest{ID: uuid.New(), Choice: "annual", Acceptance: a.authority.Acceptance, ApprovalRevision: a.authority.Revision, ChoiceRevision: j.Revision}); err != nil {
+		t.Fatal(err)
+	}
+	j, err = restart.status(t.Context(), a.key, a.actor)
+	if err != nil || renewalHash(j.OwnedSchedule) != owned {
+		t.Fatal("new generation replaced schedule ownership", j, err)
+	}
 }

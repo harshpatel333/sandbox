@@ -204,6 +204,13 @@ func (s *renewalChoiceService) reconcileSteps(ctx context.Context, k renewalChoi
 		current.State = "confirmed"
 		current.Proof = &proof
 		if step.Request.Kind == "create_schedule" {
+			if owned := j.OwnedSchedule; owned != nil {
+				if owned.Operation != captured.ID || renewalHash(owned.Request) != renewalHash(step.Request) || owned.Proof.Schedule != proof.Schedule || owned.Proof.BindingHash != proof.BindingHash {
+					return errRenewalConflict
+				}
+			} else {
+				j.OwnedSchedule = &renewalChoiceOwnedSchedule{Operation: captured.ID, Request: step.Request, Proof: proof}
+			}
 			j.Requested.State = "dispatched"
 			return tx.Save("provider_schedule_created")
 		}

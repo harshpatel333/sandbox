@@ -250,7 +250,7 @@ func verifyRenewalScheduleReceipt(k renewalChoiceKey, op renewalChoiceOperation,
 		}
 		count := 1
 		if op.Request.Choice == "monthly" {
-			if !annualBoundary(k.Boundary, 1).Equal(annualBoundary(op.Binding.Anchor, 13)) {
+			if !renewalCalendarSupported(op.Request.Choice, op.Binding.Anchor, k.Boundary) {
 				return result, errRenewalDisabled
 			}
 			count = 2
