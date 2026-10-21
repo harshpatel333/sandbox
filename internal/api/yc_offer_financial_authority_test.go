@@ -470,3 +470,39 @@ func TestYCFinancialReadinessRechecksAfterProvider(t *testing.T) {
 		t.Fatal("combined stale shared validity with later readiness", status, err)
 	}
 }
+
+func TestYCFinancialSuccessorGuardUsesRequestingActor(t *testing.T) {
+	s, r := financialFixture(t)
+	ctx := context.Background()
+	requester := uuid.New()
+	s.Authorize = func(_ context.Context, user, team uuid.UUID) error {
+		if user != requester || team != r.TeamID {
+			return errYCAcceptanceConflict
+		}
+		return nil
+	}
+	invoked := false
+	callback := func(guard context.Context) error {
+		invoked = true
+		if _, ok := guard.Deadline(); !ok {
+			t.Fatal("successor guard dropped bounded context")
+		}
+		return nil
+	}
+	if err := s.WithGuard(ctx, r, callback); err == nil || invoked {
+		t.Fatal("initial guard skipped original permission", err)
+	}
+	if err := s.WithSuccessorGuard(ctx, r, requester, callback); err != nil || !invoked {
+		t.Fatal("authorized successor actor blocked by original regional permission", err)
+	}
+	invoked = false
+	if err := s.WithSuccessorGuard(ctx, r, uuid.New(), callback); err == nil || invoked {
+		t.Fatal("unauthorized requester admitted", err)
+	}
+	if _, err := s.Shared.Exec(ctx, `UPDATE auth.users SET email_confirmed_at=NULL WHERE id=$1`, r.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WithSuccessorGuard(ctx, r, requester, callback); err == nil || invoked {
+		t.Fatal("successor bypassed original shared authority", err)
+	}
+}

@@ -318,6 +318,7 @@ CREATE TABLE public.yc_financial_authorization (
  UNIQUE(acceptance_id,phase,operation_id)
 );
 CREATE UNIQUE INDEX yc_financial_initial_once ON public.yc_financial_authorization(acceptance_id) WHERE phase='initial';
+CREATE INDEX yc_financial_claim ON public.yc_financial_authorization(claim_id) WHERE invalidated_at IS NULL;
 CREATE INDEX yc_financial_user ON public.yc_financial_authorization(user_id) WHERE invalidated_at IS NULL;
 CREATE INDEX yc_financial_email ON public.yc_financial_authorization(approved_email_hash) WHERE invalidated_at IS NULL;
 CREATE INDEX yc_financial_company ON public.yc_financial_authorization(company_identity) WHERE invalidated_at IS NULL;
@@ -340,6 +341,7 @@ CREATE TABLE public.yc_financial_invalidation (
  CHECK ((acknowledgement_id IS NULL)=(acknowledged_at IS NULL)),
  CHECK ((regional_fence_id IS NULL)=(acknowledged_at IS NULL))
 );
+CREATE INDEX yc_financial_invalidation_acceptance ON public.yc_financial_invalidation(acceptance_id) WHERE acknowledged_at IS NULL;
 CREATE INDEX yc_financial_invalidation_pending ON public.yc_financial_invalidation(home_region,invalidated_at,invalidation_id) WHERE acknowledged_at IS NULL;
 
 CREATE FUNCTION public.yc_financial_touch(k text) RETURNS void
@@ -362,13 +364,17 @@ CREATE TRIGGER yc_financial_authorization_immutable BEFORE UPDATE OR DELETE ON p
 
 CREATE FUNCTION public.yc_financial_invalidate(kind text,target text,why text) RETURNS void
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE r public.yc_financial_authorization; invalidated timestamptz:=clock_timestamp();
+DECLARE r public.yc_financial_authorization; invalidated timestamptz:=clock_timestamp(); predicate text;
 BEGIN
+ -- Only this closed list supplies SQL; the target remains a bound parameter.
+ -- Replanning keeps every Auth lifecycle lookup indexable, independent of a
+ -- cached generic plan for other invalidation kinds.
+ predicate:=CASE kind WHEN 'user' THEN 'user_id=$1::uuid' WHEN 'email' THEN 'approved_email_hash=$1'
+  WHEN 'company' THEN 'company_identity=$1' WHEN 'claim' THEN 'claim_id=$1::uuid' END;
+ IF predicate IS NULL THEN RAISE EXCEPTION 'invalid financial invalidation kind' USING ERRCODE='22023'; END IF;
  -- Callers serialize the relevant writer before this separate, fresh scan.
- FOR r IN SELECT * FROM public.yc_financial_authorization a WHERE a.invalidated_at IS NULL AND
-  CASE kind WHEN 'user' THEN a.user_id::text=target WHEN 'email' THEN a.approved_email_hash=target
-   WHEN 'company' THEN a.company_identity=target WHEN 'claim' THEN a.claim_id::text=target ELSE false END
-  ORDER BY a.authorization_id FOR UPDATE LOOP
+ FOR r IN EXECUTE 'SELECT * FROM public.yc_financial_authorization WHERE invalidated_at IS NULL AND '
+  ||predicate||' ORDER BY authorization_id FOR UPDATE' USING target LOOP
   UPDATE public.yc_financial_authorization SET invalidated_at=invalidated WHERE authorization_id=r.authorization_id;
   INSERT INTO public.yc_financial_invalidation(authorization_id,acceptance_id,team_id,home_region,assignment_id,phase,operation_id,invalidated_at,reason)
    VALUES(r.authorization_id,r.acceptance_id,r.team_id,r.home_region,r.assignment_id,r.phase,r.operation_id,invalidated,why);
