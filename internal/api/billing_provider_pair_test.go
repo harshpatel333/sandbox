@@ -22,6 +22,7 @@ type pairFixture struct {
 	pending        bool
 	extraInvoice   bool
 	requests       []string
+	serve          func(http.ResponseWriter, *http.Request) bool
 }
 
 func newPairFixture(t *testing.T) *pairFixture {
@@ -92,6 +93,9 @@ func (f *pairFixture) client(t *testing.T) *stripeHTTPClient {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.requests = append(f.requests, r.Method+" "+r.URL.Path)
+		if f.serve != nil && f.serve(w, r) {
+			return
+		}
 		if r.Method != http.MethodGet {
 			t.Errorf("verification attempted mutation: %s", r.Method)
 			http.Error(w, "read only", 405)
@@ -162,11 +166,11 @@ func (f *pairFixture) client(t *testing.T) *stripeHTTPClient {
 		case "/v1/billing/credit_grants":
 			value = map[string]any{"data": []any{}}
 		case "/v1/invoice_payments":
-			value = map[string]any{"data": []any{map[string]any{"id": "ip_example", "invoice": f.invoice.ID, "status": "paid", "currency": "usd", "amount_paid": 1200000, "payment": map[string]any{"type": "payment_intent", "payment_intent": "pi_example"}}}}
+			value = map[string]any{"data": []any{map[string]any{"id": "ip_example", "invoice": f.invoice.ID, "status": "paid", "currency": "usd", "amount_paid": f.invoice.AmountPaid, "payment": map[string]any{"type": "payment_intent", "payment_intent": "pi_example"}}}}
 		case "/v1/payment_intents/pi_example":
-			value = map[string]any{"id": "pi_example", "customer": f.p.CustomerID, "status": "succeeded", "currency": "usd", "amount_received": 1200000, "latest_charge": "ch_example"}
+			value = map[string]any{"id": "pi_example", "customer": f.p.CustomerID, "status": "succeeded", "currency": "usd", "amount_received": f.invoice.AmountPaid, "latest_charge": "ch_example"}
 		case "/v1/charges/ch_example":
-			value = map[string]any{"id": "ch_example", "customer": f.p.CustomerID, "currency": "usd", "payment_intent": "pi_example", "paid": true, "captured": true, "amount_captured": 1200000}
+			value = map[string]any{"id": "ch_example", "customer": f.p.CustomerID, "currency": "usd", "payment_intent": "pi_example", "paid": true, "captured": true, "amount_captured": f.invoice.AmountPaid}
 		default:
 			t.Errorf("unexpected provider read %s", r.URL.String())
 			http.NotFound(w, r)
@@ -202,7 +206,7 @@ func TestProviderPairCollectionSeparatesLicensedFee(t *testing.T) {
 			if tc.change != nil {
 				tc.change(f)
 			}
-			b := ContractProviderBinding{Identity: f.p.Identity, Terms: f.p.Terms, CustomerID: f.p.CustomerID, UsageSubscriptionID: f.p.UsageSubscriptionID, FeeSubscriptionID: f.p.FeeSubscriptionID, Anchor: f.p.Anchor}
+			b := ContractProviderBinding{Identity: f.p.Identity, Terms: f.p.Terms, CustomerID: f.p.CustomerID, UsageSubscriptionID: f.p.UsageSubscriptionID, FeeSubscriptionID: f.p.FeeSubscriptionID, Anchor: f.p.Anchor, FeeAnchor: f.p.Anchor}
 			a := invoiceAccount{Pair: &b, Customer: b.CustomerID, Subscription: b.UsageSubscriptionID, Price: b.Terms.Rounding.PriceID, Meter: b.Terms.Rounding.MeterID, Event: b.Terms.Rounding.EventName}
 			got, err := f.client(t).ensureInvoiceSubscription(t.Context(), a, true, false)
 			valid := tc.name == "annual" || tc.name == "monthly successor licensed only"
@@ -326,7 +330,7 @@ func TestProviderPairPaymentRequiresExactCashSibling(t *testing.T) {
 			f.invoice.AmountDue = 1200000
 			f.invoice.StatusTransitions.PaidAt = f.p.Anchor.Unix() + 1
 			end := annualBoundary(f.p.Anchor, 12)
-			b := ContractProviderBinding{ContractID: uuid.New(), Identity: f.p.Identity, Terms: f.p.Terms, CustomerID: f.p.CustomerID, UsageSubscriptionID: f.p.UsageSubscriptionID, FeeSubscriptionID: f.p.FeeSubscriptionID, FeeItemID: f.p.FeeItemID, Anchor: f.p.Anchor, StartsAt: f.p.Anchor, EndsAt: &end}
+			b := ContractProviderBinding{ContractID: uuid.New(), Identity: f.p.Identity, Terms: f.p.Terms, CustomerID: f.p.CustomerID, UsageSubscriptionID: f.p.UsageSubscriptionID, FeeSubscriptionID: f.p.FeeSubscriptionID, FeeItemID: f.p.FeeItemID, Anchor: f.p.Anchor, FeeAnchor: f.p.Anchor, StartsAt: f.p.Anchor, EndsAt: &end}
 			if tc.change != nil {
 				tc.change(f, &b)
 			}
