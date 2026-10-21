@@ -19,6 +19,12 @@ import (
 
 func offerCompositionFixture(t *testing.T, confirmed ...int) (*offerProvisioningAuthority, *provisioning.Service, YCAcceptanceRecord, provisioning.Operation) {
 	t.Helper()
+	a, service, r, o, _ := offerCompositionBoundaryFixture(t, time.Now().UTC().Add(-time.Minute).Truncate(time.Second), confirmed...)
+	return a, service, r, o
+}
+
+func offerCompositionBoundaryFixture(t *testing.T, anchor time.Time, confirmed ...int) (*offerProvisioningAuthority, *provisioning.Service, YCAcceptanceRecord, provisioning.Operation, *pairFixture) {
+	t.Helper()
 	s, r := acceptedCatalogFixture(t)
 	h := s.Catalog.(ycAcceptedCatalog).h
 	h.YCOfferAcceptance = s
@@ -46,7 +52,7 @@ func offerCompositionFixture(t *testing.T, confirmed ...int) (*offerProvisioning
 	f := newPairFixture(t)
 	f.p.UsageSubscriptionID = "sub_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	f.usage.ID = f.p.UsageSubscriptionID
-	movePairFixture(f, time.Now().UTC().Add(-time.Minute).Truncate(time.Second))
+	movePairFixture(f, anchor)
 	f.p.Identity.OperationID, f.p.Identity.TeamID, f.p.Identity.AssignmentID, f.p.Identity.AcceptanceID = *r.OperationID, r.TeamID, *r.AssignmentID, r.ID
 	f.p.Identity.ApprovalSemanticRevision, f.p.Identity.TermsDigest = r.ApprovalRevision, r.TermsDigest
 	for i := range f.p.Terms.Resources {
@@ -99,7 +105,7 @@ func offerCompositionFixture(t *testing.T, confirmed ...int) (*offerProvisioning
 	a := &offerProvisioningAuthority{h: h, admission: &YCAcceptedProvisioningAdmission{Service: s, Handlers: h}, client: client}
 	service := &provisioning.Service{Pool: h.Pool, Authority: a, Provider: provider}
 	h.OfferProvisioning, s.Provisioning = service, ycAcceptanceProvisioner{service: service}
-	return a, service, r, o
+	return a, service, r, o, f
 }
 
 type offerExportFaultProvider struct {

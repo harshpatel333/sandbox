@@ -52,9 +52,10 @@ func (h *Handlers) ReadProviderPairFinancialAuthority(ctx context.Context, bindi
 }
 
 type offerProvisioningAuthority struct {
-	h         *Handlers
-	admission *YCAcceptedProvisioningAdmission
-	client    *stripeHTTPClient
+	h                  *Handlers
+	admission          *YCAcceptedProvisioningAdmission
+	client             *stripeHTTPClient
+	successorRequester func(context.Context, pgx.Tx, ContractProviderBinding) (uuid.UUID, error)
 }
 
 var _ provisioning.Authority = (*offerProvisioningAuthority)(nil)
@@ -99,7 +100,17 @@ func (a *offerProvisioningAuthority) WithProviderPairAuthority(ctx context.Conte
 	if !exact {
 		return provisioning.ErrConflict
 	}
-	if err = authz.New(tx).RequireTeamPermission(ctx, shared.UserID, shared.TeamID, "billing:write"); err != nil {
+	requester := shared.UserID
+	if shared.Phase == "successor" {
+		if a.successorRequester == nil {
+			return provisioning.ErrUnavailable
+		}
+		requester, err = a.successorRequester(ctx, tx, binding)
+		if err != nil {
+			return err
+		}
+	}
+	if err = authz.New(tx).RequireTeamPermission(ctx, requester, shared.TeamID, "billing:write"); err != nil {
 		return err
 	}
 	r, err := a.admission.record(ctx, tx, shared.TeamID, shared.AssignmentID)
