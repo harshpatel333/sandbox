@@ -33,7 +33,8 @@ The workflows cannot create a box until they are complete.
 
 The project also runs staging, so the workflow identity's rights to modify,
 SSH into or delete anything are conditioned on resource names: VMs and disks
-named `devbox-*` in the devbox zone, and buckets named `superserve-devbox-*`.
+named `devbox-*` in the devbox zones (`zones` in `terraform.tfvars`, which must
+list the same zones as create), and buckets named `superserve-devbox-*`.
 Listing instances, disks and buckets, following zonal operations and creating
 buckets are evaluated against the project and cannot carry a name condition,
 so they are granted unconditionally; none of them can change an existing

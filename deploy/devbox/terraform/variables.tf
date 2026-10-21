@@ -8,9 +8,14 @@ variable "region" {
   type        = string
 }
 
-variable "zone" {
-  description = "Zone devbox VMs and disks are created in; the IAM name conditions are scoped to it."
-  type        = string
+variable "zones" {
+  description = "Zones devbox VMs and disks may be created in, in the order create tries them; the IAM name conditions cover each."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.zones) > 0 && alltrue([for zone in var.zones : startswith(zone, "${var.region}-")])
+    error_message = "zones must be a non-empty list of zones in region."
+  }
 }
 
 variable "subnet_cidr" {
