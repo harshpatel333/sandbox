@@ -31,19 +31,31 @@ def arguments():
 
 def pinned_engine(revision):
     root = Path(__file__).resolve().parents[1]
+    # Ignore caller Git configuration/executable lookup and keep object reads
+    # local. No worktree Git operation may invoke fsmonitor or content filters.
+    git = ["/usr/bin/git", "--no-pager", "-c", "core.fsmonitor=false",
+           "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never"]
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_ATTR_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0",
+           "GIT_TERMINAL_PROMPT": "0", "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": ""}
+    def read(*args):
+        return subprocess.check_output([*git, *args], cwd=root, env=env, stderr=subprocess.PIPE)
     if not re.fullmatch(r"[a-f0-9]{40}", revision):
         raise ValueError("invalid_revision")
-    if subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip() != revision:
+    if read("rev-parse", "HEAD").decode().strip() != revision:
         raise ValueError("source_revision_mismatch")
-    subprocess.run(["git", "ls-files", "--error-unmatch", "--", "scripts/migrate_devbox_shared_auth.py"],
-                   cwd=root, check=True, capture_output=True)
-    subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "scripts", "supabase/shared-auth-migrations"],
-                   cwd=root, check=True, capture_output=True)
+    sources = {}
+    for name in ("migrate_devbox_shared_auth", "migrate_database", "migrate_shared_auth"):
+        path = f"scripts/{name}.py"
+        sources[name] = read("cat-file", "blob", f"{revision}:{path}")
+        if (root / path).read_bytes() != sources[name]:
+            raise ValueError("source_checkout_mismatch")
     # Never add the checkout to sys.path. Load helpers from the selected Git
     # objects, bypassing untracked modules and executable bytecode caches.
     for name in ("migrate_database", "migrate_shared_auth"):
         path = f"scripts/{name}.py"
-        code = subprocess.check_output(["git", "show", f"{revision}:{path}"], cwd=root)
+        code = sources[name]
         module = types.ModuleType(name)
         module.__file__ = str(root / path)
         sys.modules[name] = module

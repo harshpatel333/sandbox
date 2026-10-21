@@ -46,9 +46,22 @@ class IdentityTest(unittest.TestCase):
             poison = f"open({str(marker)!r}, 'w').write('executed')\nraise RuntimeError('untrusted import')\n"
             for name in ("psycopg.py", "argparse.py", "json.py"):
                 (scripts / name).write_text(poison)
+            hook = root / "untrusted-hook"
+            hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 0\n")
+            hook.chmod(0o755)
+            git("config", "core.fsmonitor", str(hook))
+            git("config", "diff.external", str(hook))
+            git("config", "filter.untrusted.clean", str(hook))
+            git("config", "filter.untrusted.process", str(hook))
+            (root / ".git/info/attributes").write_text("scripts/*.py filter=untrusted\n")
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            shutil.copyfile(hook, fake_bin / "git")
+            (fake_bin / "git").chmod(0o755)
             args = [str(scripts / "migrate_devbox_shared_auth.py"), "inspect", "--revision", revision,
                     "--binding", str(root / "absent-binding.json")]
-            env = dict(os.environ, PYTHONPATH=str(scripts))
+            env = dict(os.environ, PYTHONPATH=str(scripts), PATH=str(fake_bin) + os.pathsep + os.environ['PATH'],
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.fsmonitor", GIT_CONFIG_VALUE_0=str(hook))
             plain = subprocess.run([sys.executable, *args], env=env, capture_output=True, text=True)
             self.assertIn("python -I", plain.stderr)
             isolated = subprocess.run([sys.executable, "-I", *args], env=env, capture_output=True, text=True)

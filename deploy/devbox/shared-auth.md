@@ -62,6 +62,9 @@ Use the literal full tool commit. Save all three JSON results with the candidate
 build and deployment receipts. No output contains connection credentials.
 The `-I` option is required: repository helpers load directly from the selected
 Git commit, while other imports come from the isolated Python environment.
+Git reads use `/usr/bin/git` with a restricted environment, executable hooks and
+network transports disabled. Source comparison uses raw file bytes, avoiding
+worktree content filters. The four SQL files retain their pinned SHA-256 checks.
 
 The guard compares Google metadata with the lease binding and installed
 `/var/lib/superserve-devbox/runtime.json`, and checks `DEVBOX_ID` in
