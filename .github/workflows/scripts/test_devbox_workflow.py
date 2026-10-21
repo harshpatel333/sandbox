@@ -1,6 +1,7 @@
 """Exercise the devbox create and deploy workflows against a mocked gcloud."""
 
 from datetime import datetime, timezone
+import io
 import json
 import os
 from pathlib import Path
@@ -517,6 +518,26 @@ class CreateTests(WorkflowCase):
         self.assertEqual(self.create(cloud), 0)
         self.assertEqual(cloud.scripts, list(contract.CREATE_SCRIPTS))
         self.assertEqual(len(cloud.denied), 2)
+
+    def test_error_annotations_cannot_start_workflow_commands(self):
+        with patch("sys.stderr", new=io.StringIO()) as stderr:
+            workflow.annotate("error", "failed: x\n::warning::injected\r\n50%")
+        self.assertEqual(stderr.getvalue(), "::error::failed: x%0A::warning::injected%0D%0A50%25\n")
+        with patch("sys.stdout", new=io.StringIO()) as stdout:
+            workflow.log("waiting: x\n::add-mask::secret")
+        self.assertFalse([line for line in stdout.getvalue().splitlines()[1:] if line.startswith("::")])
+
+    def test_script_runs_stream_output_and_keep_only_errors(self):
+        seen = []
+
+        def record(args, **kwargs):
+            seen.append(kwargs)
+            return subprocess.CompletedProcess(args, 0, None, "")
+
+        with patch.object(workflow.subprocess, "run", side_effect=record):
+            workflow.Box("my-box", "us-central1-a").run_script("install-vmd.sh")
+        self.assertIsNone(seen[-1]["stdout"])
+        self.assertEqual(seen[-1]["stderr"], subprocess.PIPE)
 
     def test_only_os_login_denials_count_as_settling(self):
         for text, settling in (("PERMISSION_DENIED: User does not have compute.instances.osLogin permission", True),

@@ -99,6 +99,19 @@ class Deadline:
 DEADLINE = Deadline()
 
 
+def annotate(kind, message):
+    # Error text can carry box output; escaping keeps every line of it inside
+    # this one annotation instead of letting a line start a workflow command.
+    escaped = str(message).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{kind}::{escaped}", file=sys.stderr)
+
+
+def log(message):
+    # Indenting continuation lines keeps box output in an error from starting a
+    # workflow command.
+    print("\n  ".join(str(message).splitlines()), flush=True)
+
+
 def run(args, *, input=None, capture=True, timeout=600):
     # capture="stderr" streams stdout (long box scripts) but keeps gcloud's
     # own errors so a failure can say why.
@@ -107,8 +120,10 @@ def run(args, *, input=None, capture=True, timeout=600):
                "stderr": subprocess.PIPE if capture else None}
     try:
         result = subprocess.run(args, input=input, text=True, timeout=timeout, **streams)
-    except subprocess.TimeoutExpired:
-        raise StepError(f"{' '.join(args[:4])} timed out after {timeout}s") from None
+    except subprocess.TimeoutExpired as error:
+        detail = (error.stderr or "").strip() if isinstance(error.stderr, str) else ""
+        raise StepError(f"{' '.join(args[:4])} timed out after {timeout}s"
+                        + (f": {detail}" if detail else "")) from None
     if capture == "stderr" and result.stderr and not result.returncode:
         sys.stderr.write(result.stderr)
     if result.returncode:
@@ -303,7 +318,7 @@ class Box:
                 if not (self.login_granted is not None and LOGIN_DENIED.search(str(error))
                         and time.monotonic() - self.login_granted < LOGIN_PROPAGATION_SECONDS):
                     raise
-                print(f"waiting for the OS Login grant on {self.name} to settle: {error}")
+                log(f"waiting for the OS Login grant on {self.name} to settle: {error}")
                 time.sleep(DEADLINE.cap(SSH_RETRY_SECONDS))
 
     def wait_for_ssh(self, attempts=SSH_ATTEMPTS, delay=SSH_RETRY_SECONDS):
@@ -314,7 +329,7 @@ class Box:
             except DeadlineExceeded:
                 raise
             except StepError as error:
-                print(f"waiting for SSH over IAP ({attempt}/{attempts}): {error}")
+                log(f"waiting for SSH over IAP ({attempt}/{attempts}): {error}")
                 if attempt < attempts:
                     time.sleep(DEADLINE.cap(delay))
         raise StepError(f"{self.name} did not accept SSH over IAP")
@@ -417,7 +432,7 @@ class Box:
                 self.write_file(f"{contract.BOX_CONFIG_DIR}/manifest.json",
                                 json.dumps(manifest, indent=2) + "\n", "0644")
             except StepError as error:
-                print(f"::warning::Could not copy the manifest to {self.name}: {error}")
+                annotate("warning", f"Could not copy the manifest to {self.name}: {error}")
 
 
 def manifest_from(instance):
@@ -802,7 +817,7 @@ def report_create_failure(env, name, devbox_id, error, instance_started, zone=No
     settled = (instance is not None and marked is not False) or not instance_started
     save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": settled,
                        "instance_started": instance_started, "zone": zone})
-    print(f"::error::Devbox {name} failed: {describe(error)}", file=sys.stderr)
+    annotate("error", f"Devbox {name} failed: {describe(error)}")
 
 
 def load_attempt(env):
@@ -936,7 +951,7 @@ def conclude_deploy(env, box, manifest, state, devbox_id, components, revisions,
     save_attempt(env, {"name": box.name, "devbox_id": devbox_id, "reported": reported, "progress": progress})
     append_summary(env, deploy_summary(recorded, manifest, components, progress["deployed"], migrations, failure))
     if failure is not None:
-        print(f"::error::Deploy to {box.name} failed: {describe(failure)}", file=sys.stderr)
+        annotate("error", f"Deploy to {box.name} failed: {describe(failure)}")
         return 1
     return 0
 
@@ -1023,7 +1038,7 @@ def main(argv=None):
             DEADLINE.start(DEADLINE_SECONDS)
             return deploy(env)
     except (StepError, contract.ContractError) as error:
-        print(f"::error::{error}", file=sys.stderr)
+        annotate("error", error)
         return 1
     return 0
 
