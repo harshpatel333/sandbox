@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
@@ -54,12 +56,16 @@ func (a *pairWorkerAuthority) WithProviderPairAuthority(ctx context.Context, b C
 }
 
 type pairWorkerFixture struct {
-	h         *Handlers
-	b         ContractProviderBinding
-	authority *pairWorkerAuthority
-	posts     atomic.Int32
-	lost      atomic.Bool
-	grant     *entitlementGrant
+	h           *Handlers
+	b           ContractProviderBinding
+	authority   *pairWorkerAuthority
+	posts       atomic.Int32
+	lost        atomic.Bool
+	debt        atomic.Bool
+	debtAtCheck atomic.Int32
+	debtChecks  atomic.Int32
+	grant       *entitlementGrant
+	requests    atomic.Int32
 }
 
 func newPairWorkerFixture(t *testing.T, anchors ...time.Time) *pairWorkerFixture {
@@ -246,7 +252,15 @@ func TestProviderPairRevocationKeepsUncertainInvoiceBlocked(t *testing.T) {
 
 func configurePairWorkerProvider(t *testing.T, wf *pairWorkerFixture, f *pairFixture) {
 	f.serve = func(w http.ResponseWriter, req *http.Request) bool {
+		wf.requests.Add(1)
 		w.Header().Set("Content-Type", "application/json")
+		if req.URL.Path == "/v1/invoices" && req.URL.Query().Get("status") == "open" && req.URL.Query().Get("limit") == "1" {
+			check := wf.debtChecks.Add(1)
+			if wf.debt.Load() || (wf.debtAtCheck.Load() > 0 && check >= wf.debtAtCheck.Load()) {
+				json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]string{"id": "in_unpaid", "customer": f.p.CustomerID, "status": "open"}}})
+				return true
+			}
+		}
 		if req.URL.Path == "/v1/invoices" || req.URL.Path == "/v1/billing/credit_balance_transactions" {
 			fmt.Fprint(w, `{"data":[]}`)
 			return true
@@ -338,6 +352,137 @@ func TestProviderPairWorkerMonthlyMappedCashRefresh(t *testing.T) {
 			if err != nil || e.State != "issued" || e.AmountCents != 100000 || !e.PeriodEnd.Equal(end) || wf.posts.Load() != 1 {
 				t.Fatal("mapped monthly worker failed", e, err)
 			}
+			counter := countPairWorkerQueries(t, h)
+			wf.requests.Store(0)
+			began := time.Now()
+			next, err := h.reconcileUsageEntitlement(t.Context(), b.ContractID)
+			t.Logf("paid issued refresh: provider_requests=%d regional_statements=%d duration=%s", wf.requests.Load(), counter.calls.Load(), time.Since(began))
+			if err != nil || wf.posts.Load() != 1 || next.After(time.Now().Add(21*time.Second)) {
+				t.Fatal("mapped paid refresh lost bounded single grant", next, err)
+			}
 		})
 	}
+}
+
+func TestProviderPairIssuedGrantRefreshesExpiredObservations(t *testing.T) {
+	f := newPairWorkerFixture(t)
+	ctx := t.Context()
+	run := func(wantError bool) time.Time {
+		t.Helper()
+		token := uuid.New()
+		if _, err := f.h.Pool.Exec(ctx, `UPDATE billing_entitlement_work SET lease_token=$2,lease_until=clock_timestamp()+interval '1 minute' WHERE contract_id=$1`, f.b.ContractID, token); err != nil {
+			t.Fatal(err)
+		}
+		err := f.h.processEntitlementJob(ctx, entitlementJob{Contract: f.b.ContractID, Token: token})
+		if (err != nil) != wantError {
+			t.Fatal("worker error", err)
+		}
+		var next time.Time
+		if err = f.h.Pool.QueryRow(ctx, `SELECT next_check_at FROM billing_entitlement_work WHERE contract_id=$1 AND lease_token IS NULL`, f.b.ContractID).Scan(&next); err != nil {
+			t.Fatal(err)
+		}
+		return next
+	}
+	next := run(false)
+	if next.After(time.Now().Add(21 * time.Second)) {
+		t.Fatal("issued grant did not schedule bounded refresh", next)
+	}
+	var expires time.Time
+	if err := f.h.Pool.QueryRow(ctx, `SELECT greatest(w.authority_valid_until,c.collection_valid_until) FROM billing_provider_pair_waiver w JOIN billing_commercial_contract c ON c.id=w.contract_id WHERE c.id=$1`, f.b.ContractID).Scan(&expires); err != nil {
+		t.Fatal(err)
+	}
+	// A deliberately late worker must fail closed until it refreshes real expired observations.
+	if wait := time.Until(expires.Add(20 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	eligible := func() bool {
+		t.Helper()
+		var valid bool
+		if err := f.h.Pool.QueryRow(ctx, `SELECT billing_contract_eligible(c,e.period_start,e.period_end) FROM billing_commercial_contract c JOIN billing_usage_entitlement e ON e.contract_id=c.id WHERE c.id=$1`, f.b.ContractID).Scan(&valid); err != nil {
+			t.Fatal(err)
+		}
+		return valid
+	}
+	if eligible() {
+		t.Fatal("late scheduler retained expired authority")
+	}
+	counter := countPairWorkerQueries(t, f.h)
+	for range 2 {
+		counter.calls.Store(0)
+		f.requests.Store(0)
+		began := time.Now()
+		next = run(false)
+		t.Logf("issued refresh: provider_requests=%d regional_statements=%d duration=%s", f.requests.Load(), counter.calls.Load(), time.Since(began))
+		if next.After(time.Now().Add(21*time.Second)) || !eligible() || f.posts.Load() != 1 {
+			t.Fatal("issued grant refresh duplicated issuance or stalled", next, f.posts.Load())
+		}
+	}
+	f.debt.Store(true)
+	next = run(false)
+	if eligible() || next.After(time.Now().Add(21*time.Second)) || f.posts.Load() != 1 {
+		t.Fatal("new debt retained positive authorization", next)
+	}
+	f.debt.Store(false)
+	run(false)
+	if !eligible() {
+		t.Fatal("settled debt did not recover fresh observation")
+	}
+	f.authority.invalid.Store(true)
+	f.debt.Store(true)
+	run(false)
+	if eligible() || f.posts.Load() != 1 {
+		t.Fatal("authority failure hid newly observed debt")
+	}
+	f.debt.Store(false)
+	next = run(true)
+	if next.After(time.Now().Add(11*time.Second)) || next.Before(time.Now()) || f.posts.Load() != 1 {
+		t.Fatal("authority failure lost bounded retry", next)
+	}
+	f.revoke(t)
+	run(false)
+	e, err := f.h.DB.GetCurrentUsageEntitlement(ctx, db.GetCurrentUsageEntitlementParams{TeamID: f.b.Identity.TeamID, Kind: "metered_usage"})
+	if err != nil || eligible() || e.State != "issued" || f.posts.Load() != 1 {
+		t.Fatal("revocation lost grant history or retained new authority", err)
+	}
+}
+
+func TestProviderPairFinalDebtObservationDeniesGrant(t *testing.T) {
+	f := newPairWorkerFixture(t)
+	f.debtAtCheck.Store(2)
+	if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.b.ContractID); err != nil {
+		t.Fatal(err)
+	}
+	var overdue bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT collection_has_overdue_balance FROM billing_commercial_contract WHERE id=$1`, f.b.ContractID).Scan(&overdue); err != nil || !overdue || f.posts.Load() != 0 {
+		t.Fatal("final debt observation retained clean evidence", overdue, err)
+	}
+}
+
+type pairWorkerQueryCounter struct {
+	calls      atomic.Int32
+	mu         sync.Mutex
+	statements []string
+}
+
+func (c *pairWorkerQueryCounter) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	c.calls.Add(1)
+	c.mu.Lock()
+	c.statements = append(c.statements, data.SQL)
+	c.mu.Unlock()
+	return ctx
+}
+func (*pairWorkerQueryCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+func countPairWorkerQueries(t *testing.T, h *Handlers) *pairWorkerQueryCounter {
+	t.Helper()
+	counter := &pairWorkerQueryCounter{}
+	cfg := h.Pool.Config()
+	cfg.ConnConfig.Tracer = counter
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	h.Pool = pool
+	h.DB = db.New(pool)
+	return counter
 }
