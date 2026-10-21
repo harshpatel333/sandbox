@@ -38,7 +38,7 @@ func acceptedJournalMapping(o provisioning.AcceptedOffer) provisioning.AcceptedO
 	o.ProviderTerms = json.RawMessage(`{"fixture":true}`)
 	return o
 }
-func (acceptedJournalAuthority) Finalize(context.Context, pgx.Tx, provisioning.Operation, json.RawMessage) error {
+func (acceptedJournalAuthority) Finalize(context.Context, pgx.Tx, provisioning.Operation, provisioning.Verification) error {
 	return provisioning.ErrUnavailable
 }
 func (acceptedJournalAuthority) Readiness(context.Context, provisioning.Operation) (provisioning.Readiness, error) {
@@ -61,8 +61,8 @@ func (p *acceptanceNoProvider) Create(context.Context, provisioning.SavedRequest
 func (*acceptanceNoProvider) Recover(context.Context, provisioning.SavedRequest) (json.RawMessage, error) {
 	return nil, provisioning.ErrUnavailable
 }
-func (*acceptanceNoProvider) Verify(context.Context, provisioning.Operation) (json.RawMessage, error) {
-	return nil, provisioning.ErrUnavailable
+func (*acceptanceNoProvider) Verify(context.Context, provisioning.Operation) (provisioning.Verification, error) {
+	return provisioning.Verification{}, provisioning.ErrUnavailable
 }
 
 type acceptanceLostJournalAck struct {
@@ -381,4 +381,8 @@ func TestYCAcceptanceFinancialValidatorUsesCallerTransaction(t *testing.T) {
 	if err = s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_role_assignments WHERE user_id=$1 AND team_id=$2 AND revoked_at IS NULL)`, r.UserID, r.TeamID).Scan(&active); err != nil || !active {
 		t.Fatal("validator committed caller transaction", active, err)
 	}
+}
+
+func (acceptedJournalAuthority) WithFinalization(context.Context, provisioning.Operation, func(context.Context, pgx.Tx, provisioning.AcceptedOffer) error) error {
+	return provisioning.ErrUnavailable
 }
