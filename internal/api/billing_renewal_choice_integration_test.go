@@ -285,7 +285,13 @@ func TestRenewalChoiceHTTPCurrentPermissionAndReplay(t *testing.T) {
 func TestRenewalChoicePostgresStagedRestart(t *testing.T) {
 	s, a, pool := newRenewalPostgresFixture(t)
 	submitRenewal(t, s, a, "free")
-	p := &fixtureRenewalSteps{fixtureRenewalProvider: &fixtureRenewalProvider{}, loseCreate: true, observed: true, now: func() renewalChoiceProof { return renewalChoiceProof{VerifiedAt: time.Now().UTC()} }}
+	p := &fixtureRenewalSteps{fixtureRenewalProvider: &fixtureRenewalProvider{}, loseCreate: true, observed: true, now: func() renewalChoiceProof {
+		var at time.Time
+		if err := pool.QueryRow(t.Context(), `SELECT clock_timestamp()`).Scan(&at); err != nil {
+			t.Fatal(err)
+		}
+		return renewalChoiceProof{VerifiedAt: at}
+	}}
 	s.Provider = p
 	for range 2 {
 		if err := s.reconcile(t.Context(), a.key); err != nil {
