@@ -17,6 +17,7 @@ Subcommands:
 """
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
 import secrets
 import os
@@ -598,14 +599,15 @@ def create(env, profile_path=PROFILE_PATH):
 
 # GCE reports a zone that can't host the VM or its disks this way; anything
 # else is a real failure and must not be retried in another zone.
-CAPACITY_ERRORS = re.compile(r"ZONE_RESOURCE_POOL_EXHAUSTED|RESOURCE_EXHAUSTED|stockout"
-                             r"|does not have enough resources available", re.IGNORECASE)
+CAPACITY_ERRORS = re.compile(r"\bZONE_RESOURCE_POOL_EXHAUSTED\b|\bRESOURCE_EXHAUSTED\b|reason: stockout"
+                             r"|does not have enough resources available to fulfill the request")
 
 
 def place(env, name, devbox_id, profile, labels, zones, manifest_in):
     data = profile["data_disk"]
     failures = []
     for zone in zones:
+        started = datetime.now(timezone.utc)
         where = [f"--zone={zone}", f"--project={contract.PROJECT}"]
         save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "instance_started": False,
                            "zone": zone})
@@ -624,7 +626,11 @@ def place(env, name, devbox_id, profile, labels, zones, manifest_in):
                 raise
             print(f"::warning::{zone} has no capacity for this devbox; removing what this attempt created there")
             failures.append((zone, error))
-            clean_zone(name, devbox_id, zone)
+            try:
+                clean_zone(name, devbox_id, zone, started)
+            except StepError as cleanup_error:
+                raise StepError(f"Could not remove this attempt's resources in {zone}: {cleanup_error}\n"
+                                + "\n".join(f"- {failed}: {reason}" for failed, reason in failures)) from None
             save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "instance_started": False})
             continue
         tried = ", ".join(f"{failed} out of capacity" for failed, _ in failures)
@@ -632,28 +638,44 @@ def place(env, name, devbox_id, profile, labels, zones, manifest_in):
     raise StepError("No devbox zone had capacity:\n" + "\n".join(f"- {zone}: {error}" for zone, error in failures))
 
 
-def clean_zone(name, devbox_id, zone):
+def clean_zone(name, devbox_id, zone, started):
     # Removes what carries this attempt's devbox-id in this zone and the disks
-    # attached to such an instance (its boot disk is not labelled yet). An
-    # unlabelled, detached boot disk left by an earlier partial cleanup is this
-    # attempt's too: the name was checked unused in every zone and this run
-    # holds the box's lock.
+    # attached to such an instance (its boot disk is not labelled yet). GCE can
+    # also leave a failed insert's boot disk behind, unlabelled and detached;
+    # one created during this attempt is this attempt's, since the name was
+    # checked unused in every zone and this run holds the box's lock.
     owned = [f"--zones={zone}", f"--project={contract.PROJECT}", f"--filter=labels.devbox-id={devbox_id}",
              "--format=json"]
-    where = [f"--zone={zone}", f"--project={contract.PROJECT}", "--quiet"]
     disks = set()
     for instance in json.loads(run(["gcloud", "compute", "instances", "list", *owned], timeout=120).stdout or "[]"):
         disks.update((disk.get("source") or "").rsplit("/", 1)[-1] for disk in instance.get("disks") or [])
-        run(["gcloud", "compute", "instances", "delete", instance["name"], *where])
+        delete_if_present(["gcloud", "compute", "instances", "delete", instance["name"]], zone)
     disks.update(disk["name"] for disk in json.loads(
         run(["gcloud", "compute", "disks", "list", *owned], timeout=120).stdout or "[]"))
     boot = json.loads(run(["gcloud", "compute", "disks", "list", f"--zones={zone}", f"--project={contract.PROJECT}",
                            f"--filter=name={contract.instance_name(name)}", "--format=json"], timeout=120).stdout or "[]")
     disks.update(disk["name"] for disk in boot
                  if disk.get("name") == contract.instance_name(name) and not disk.get("users")
-                 and (disk.get("labels") or {}).get("devbox-id") in (None, devbox_id))
+                 and "devbox-id" not in (disk.get("labels") or {}) and created_since(disk, started))
     for disk in sorted(disks - {""}):
-        run(["gcloud", "compute", "disks", "delete", disk, *where])
+        delete_if_present(["gcloud", "compute", "disks", "delete", disk], zone)
+
+
+def created_since(resource, moment):
+    try:
+        return datetime.fromisoformat(resource["creationTimestamp"]) >= moment - timedelta(minutes=1)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def delete_if_present(args, zone):
+    # GCE may already be rolling back a failed insert; a resource that is gone
+    # is what the cleanup wants.
+    try:
+        run([*args, f"--zone={zone}", f"--project={contract.PROJECT}", "--quiet"])
+    except StepError as error:
+        if "not found" not in str(error) and "was not found" not in str(error):
+            raise
 
 
 def engineer_members(value):
@@ -709,8 +731,8 @@ def discover(name, devbox_id):
 
 
 def mark_failed(name, devbox_id, zone):
-    box = Box(name, zone)
     try:
+        box = Box(name, zone)
         manifest = manifest_from(box.verify(devbox_id))
         if manifest["state"] != "creating":
             return None, f"The instance is already {manifest['state']}; left unchanged"
@@ -726,9 +748,12 @@ def report_create_failure(env, name, devbox_id, error, instance_started, zone=No
         found = discover(name, devbox_id)
         discovery = ""
     except Exception as discover_error:
-        found = [resource for candidate in ([zone] if zone else contract.DEVBOX_ZONES)
-                 for resource in contract.resources(name, devbox_id, candidate) if resource.get("zone")]
-        found.append({"type": "bucket", "name": contract.bucket_name(devbox_id)})
+        if zone is None and not instance_started:
+            found = []
+        else:
+            found = [resource for candidate in ([zone] if zone else contract.DEVBOX_ZONES)
+                     for resource in contract.resources(name, devbox_id, candidate) if resource.get("zone")]
+            found.append({"type": "bucket", "name": contract.bucket_name(devbox_id)})
         discovery = f" (could not list them: {describe(discover_error)}; these may exist)"
     instance = next((resource for resource in found if resource["type"] == "instance"), None)
     marked, note = (None, "") if instance is None else mark_failed(name, devbox_id, instance["zone"])
