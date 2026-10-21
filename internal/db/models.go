@@ -398,6 +398,30 @@ type BillingContractPayment struct {
 	Evidence                    []byte    `json:"evidence"`
 }
 
+type BillingContractProviderBinding struct {
+	ContractID               uuid.UUID          `json:"contract_id"`
+	TeamID                   uuid.UUID          `json:"team_id"`
+	AssignmentID             uuid.UUID          `json:"assignment_id"`
+	AcceptanceID             uuid.UUID          `json:"acceptance_id"`
+	ApprovalSemanticRevision int64              `json:"approval_semantic_revision"`
+	Merchant                 string             `json:"merchant"`
+	LiveMode                 bool               `json:"live_mode"`
+	ApiVersion               string             `json:"api_version"`
+	TermsDigest              string             `json:"terms_digest"`
+	ProviderTermsDigest      string             `json:"provider_terms_digest"`
+	CustomerID               string             `json:"customer_id"`
+	UsageSubscriptionID      string             `json:"usage_subscription_id"`
+	FeeSubscriptionID        string             `json:"fee_subscription_id"`
+	FeeItemID                string             `json:"fee_item_id"`
+	Anchor                   time.Time          `json:"anchor"`
+	StartsAt                 time.Time          `json:"starts_at"`
+	EndsAt                   pgtype.Timestamptz `json:"ends_at"`
+	Binding                  []byte             `json:"binding"`
+	Evidence                 []byte             `json:"evidence"`
+	VerifiedAt               time.Time          `json:"verified_at"`
+	CreatedAt                time.Time          `json:"created_at"`
+}
+
 type BillingContractWaiver struct {
 	ID                   uuid.UUID `json:"id"`
 	TeamID               uuid.UUID `json:"team_id"`
@@ -822,6 +846,21 @@ type BillingProviderCredit struct {
 	ExpiresAt     int64     `json:"expires_at"`
 	EntitlementID *string   `json:"entitlement_id"`
 	ObservedAt    time.Time `json:"observed_at"`
+}
+
+type BillingProviderPairWaiver struct {
+	ID                  uuid.UUID          `json:"id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	ContractID          uuid.UUID          `json:"contract_id"`
+	InvoiceID           string             `json:"invoice_id"`
+	CouponID            string             `json:"coupon_id"`
+	StartsAt            time.Time          `json:"starts_at"`
+	EndsAt              time.Time          `json:"ends_at"`
+	Evidence            []byte             `json:"evidence"`
+	CreatedAt           time.Time          `json:"created_at"`
+	AuthorityCheckedAt  time.Time          `json:"authority_checked_at"`
+	AuthorityValidUntil time.Time          `json:"authority_valid_until"`
+	RevokedAt           pgtype.Timestamptz `json:"revoked_at"`
 }
 
 type BillingRollupBackfillState struct {
