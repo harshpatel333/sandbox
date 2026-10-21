@@ -990,6 +990,20 @@ type BillingProviderCredit struct {
 	ObservedAt    time.Time `json:"observed_at"`
 }
 
+type BillingProviderPairMonthlyPayment struct {
+	PaymentID      uuid.UUID `json:"payment_id"`
+	TeamID         uuid.UUID `json:"team_id"`
+	ContractID     uuid.UUID `json:"contract_id"`
+	InvoiceID      string    `json:"invoice_id"`
+	FeeItemID      string    `json:"fee_item_id"`
+	FeePeriodStart time.Time `json:"fee_period_start"`
+	FeePeriodEnd   time.Time `json:"fee_period_end"`
+	PeriodStart    time.Time `json:"period_start"`
+	PeriodEnd      time.Time `json:"period_end"`
+	AmountCents    int64     `json:"amount_cents"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
 type BillingProviderPairRevocation struct {
 	ContractID uuid.UUID `json:"contract_id"`
 	TeamID     uuid.UUID `json:"team_id"`
