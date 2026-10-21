@@ -174,6 +174,10 @@ func TestProviderPairDispatchLostResponseRequiresPositiveRecovery(t *testing.T) 
 
 func TestProviderPairDispatchBackendRolePermissions(t *testing.T) {
 	f := newPairWorkerFixture(t)
+	var privileged bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname='service_role'`).Scan(&privileged); err != nil || privileged {
+		t.Fatal("backend permission test requires an unprivileged role", privileged, err)
+	}
 	f.lost.Store(true)
 	if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.b.ContractID); err == nil {
 		t.Fatal("expected lost response")
