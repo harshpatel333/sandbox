@@ -108,7 +108,7 @@ func (s *renewalChoiceService) reconcileSteps(ctx context.Context, k renewalChoi
 		if !validRenewalStep(captured, request) {
 			return errRenewalConflict
 		}
-		return s.guardedTransaction(ctx, k, captured.Actor, func(tx renewalChoiceTransaction) error {
+		return s.guardedTransaction(ctx, k, captured.Actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
 			j := tx.Journal()
 			if j.Revision != revision || j.Requested == nil || j.Requested.ID != captured.ID {
 				return errRenewalConflict
@@ -133,7 +133,7 @@ func (s *renewalChoiceService) reconcileSteps(ctx context.Context, k renewalChoi
 	direct := false
 	if step.State == "prepared" {
 		sent := false
-		err := s.Authority.Guard(ctx, k, captured.Actor, func() error {
+		err := s.Authority.Guard(ctx, k, captured.Actor, func(ctx context.Context) error {
 			if err := s.Store.Transact(ctx, k, func(tx renewalChoiceTransaction) error {
 				j := tx.Journal()
 				if j.Requested == nil || j.Requested.ID != captured.ID || len(j.Requested.Steps) != len(captured.Steps) || j.Requested.Steps[index].State != "prepared" {

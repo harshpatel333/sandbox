@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,11 +93,11 @@ func (a *fixtureRenewalAuthority) Locate(_ context.Context, team, assignment, ac
 	}
 	return a.key, nil
 }
-func (a *fixtureRenewalAuthority) Guard(_ context.Context, k renewalChoiceKey, actor uuid.UUID, f func() error) error {
+func (a *fixtureRenewalAuthority) Guard(ctx context.Context, k renewalChoiceKey, actor uuid.UUID, f func(context.Context) error) error {
 	if k != a.key || actor != a.actor || a.revoked {
 		return errRenewalConflict
 	}
-	return f()
+	return f(ctx)
 }
 func (a *fixtureRenewalAuthority) Authorize(_ context.Context, _ pgx.Tx, k renewalChoiceKey, actor uuid.UUID) (renewalChoiceAuthority, error) {
 	if k != a.key || actor != a.actor || a.revoked {
@@ -609,5 +610,67 @@ func TestRenewalChoiceRejectsPreBoundaryHistoryTimestamp(t *testing.T) {
 	}
 	if successor.calls != 0 {
 		t.Fatal("pre-boundary proof adopted")
+	}
+}
+
+type renewalGuardContextKey struct{}
+type fixtureContextAuthority struct{ *fixtureRenewalAuthority }
+
+func (a fixtureContextAuthority) Guard(ctx context.Context, k renewalChoiceKey, actor uuid.UUID, f func(context.Context) error) error {
+	return a.fixtureRenewalAuthority.Guard(ctx, k, actor, func(ctx context.Context) error {
+		guarded, cancel := context.WithCancel(context.WithValue(ctx, renewalGuardContextKey{}, true))
+		defer cancel()
+		return f(guarded)
+	})
+}
+func (a fixtureContextAuthority) Authorize(ctx context.Context, tx pgx.Tx, k renewalChoiceKey, actor uuid.UUID) (renewalChoiceAuthority, error) {
+	if ctx.Value(renewalGuardContextKey{}) != true {
+		return renewalChoiceAuthority{}, errors.New("guard context lost")
+	}
+	return a.fixtureRenewalAuthority.Authorize(ctx, tx, k, actor)
+}
+
+type fixtureContextProvider struct{ *fixtureRenewalProvider }
+
+func (p fixtureContextProvider) Dispatch(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+	if ctx.Value(renewalGuardContextKey{}) != true {
+		return renewalChoiceProof{}, errors.New("dispatch context lost")
+	}
+	return p.fixtureRenewalProvider.Dispatch(ctx, k, op)
+}
+
+type fixtureContextSteps struct{ *fixtureRenewalSteps }
+
+func (p fixtureContextSteps) DispatchStep(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation, r renewalChoiceStepRequest) (renewalChoiceStepProof, error) {
+	if ctx.Value(renewalGuardContextKey{}) != true {
+		return renewalChoiceStepProof{}, errors.New("stage context lost")
+	}
+	return p.fixtureRenewalSteps.DispatchStep(ctx, k, op, r)
+}
+func TestRenewalChoiceCarriesGuardContext(t *testing.T) {
+	for _, staged := range []bool{false, true} {
+		t.Run(fmt.Sprint(staged), func(t *testing.T) {
+			s, store, a := newRenewalFixture(t)
+			s.Authority = fixtureContextAuthority{a}
+			submitRenewal(t, s, a, "free")
+			iterations := 1
+			if staged {
+				s.Provider = fixtureContextSteps{&fixtureRenewalSteps{fixtureRenewalProvider: &fixtureRenewalProvider{}, now: func() renewalChoiceProof { return renewalChoiceProof{VerifiedAt: store.now} }}}
+				iterations = 4
+			} else {
+				s.Provider = fixtureContextProvider{&fixtureRenewalProvider{dispatch: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+					return fixtureRenewalProof(k, op, store.now), nil
+				}}}
+			}
+			for range iterations {
+				if err := s.reconcile(t.Context(), a.key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			j, err := s.status(t.Context(), a.key, a.actor)
+			if err != nil || j.Confirmed.Request.Choice != "free" {
+				t.Fatal("guard context not carried through confirmation", err, j)
+			}
+		})
 	}
 }
