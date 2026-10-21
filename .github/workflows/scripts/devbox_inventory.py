@@ -154,7 +154,7 @@ class Gcloud:
 
 
 def expected(name, devbox_id):
-    return {(r['type'], r['name']) for r in contract.resources(name, devbox_id)}
+    return {(r['type'], r['name']) for zone in contract.DEVBOX_ZONES for r in contract.resources(name, devbox_id, zone)}
 
 
 def leftovers(name, devbox_id):
@@ -227,7 +227,9 @@ def _placement(resource, project):
     match = PROJECT_IN_LINK.search(resource.link)
     if not match or match.group(1) != project:
         return f'not in project {project}'
-    if resource.zone not in contract.DEVBOX_ZONES:
+    try:
+        contract.validate_zone(resource.zone)
+    except contract.ContractError:
         return f'not in a devbox zone ({", ".join(contract.DEVBOX_ZONES)})'
     return None
 
