@@ -113,7 +113,6 @@ def echo(text):
     print(f"::stop-commands::{token}\n{text}\n::{token}::", flush=True)
 
 
-
 def run(args, *, input=None, capture=True, timeout=600):
     # capture="stderr" streams stdout (long box scripts) but keeps gcloud's
     # own errors so a failure can say why.
@@ -127,7 +126,8 @@ def run(args, *, input=None, capture=True, timeout=600):
         raise StepError(f"{' '.join(args[:4])} timed out after {timeout}s"
                         + (f": {detail}" if detail else "")) from None
     if capture == "stderr" and result.stderr and not result.returncode:
-        sys.stderr.write(result.stderr)
+        sys.stdout.write(result.stderr)
+        sys.stdout.flush()
     if result.returncode:
         detail = (result.stderr or "").strip() if capture else ""
         raise StepError(f"{' '.join(args[:4])} failed (exit {result.returncode})"
