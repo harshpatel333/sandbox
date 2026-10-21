@@ -54,6 +54,23 @@ func saveOfferTestRequest(t *testing.T, p *offerProvisioningProvider, o *provisi
 
 func TestOfferProviderBuildsOriginalPairAndProjectsReceipts(t *testing.T) {
 	o, f, responses := offerProviderFixture(t)
+	// Flexible backdating preserves S even when creation is later. This matches
+	// the observed 17-second provider gap and Stripe's billing-mode comparison.
+	withCreationTime := func(raw json.RawMessage) json.RawMessage {
+		var object map[string]any
+		if err := json.Unmarshal(raw, &object); err != nil {
+			t.Fatal(err)
+		}
+		object["created"] = f.p.Anchor.Unix() + 17
+		result, err := json.Marshal(object)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	for _, step := range []provisioning.Step{provisioning.Usage, provisioning.UsageHold} {
+		responses[step] = withCreationTime(responses[step])
+	}
 	p := &offerProvisioningProvider{}
 	for _, step := range []provisioning.Step{provisioning.Customer, provisioning.Waiver, provisioning.Fee, provisioning.Usage, provisioning.UsageHold} {
 		r := saveOfferTestRequest(t, p, &o, step)
@@ -64,7 +81,7 @@ func TestOfferProviderBuildsOriginalPairAndProjectsReceipts(t *testing.T) {
 				t.Fatal("fee mixes usage or loses annual waiver")
 			}
 		case provisioning.Usage:
-			if form.Get("backdate_start_date") != strconv.FormatInt(f.p.Anchor.Unix(), 10) || form.Get("items[3][price]") != f.p.Terms.Rounding.PriceID || form.Get("items[4][price]") != "" || form.Get("discounts[0][coupon]") != "" {
+			if form.Get("billing_mode[type]") != "flexible" || form.Get("proration_behavior") != "none" || form.Has("billing_cycle_anchor") || form.Get("backdate_start_date") != strconv.FormatInt(f.p.Anchor.Unix(), 10) || form.Get("items[3][price]") != f.p.Terms.Rounding.PriceID || form.Get("items[4][price]") != "" || form.Get("discounts[0][coupon]") != "" {
 				t.Fatal("usage shifted original anchor or mixed fee")
 			}
 		case provisioning.UsageHold:
@@ -89,6 +106,17 @@ func TestOfferProviderBuildsOriginalPairAndProjectsReceipts(t *testing.T) {
 		t.Fatalf("original identity/calendar changed: %#v %v", input, err)
 	}
 	// A future verifier receives the actual sealed object, not a JSON reconstruction.
+	f.serve = func(w http.ResponseWriter, req *http.Request) bool {
+		if req.Method != http.MethodGet || req.URL.Path != "/v1/subscriptions/"+f.p.UsageSubscriptionID {
+			return false
+		}
+		raw, err := json.Marshal(f.usage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write(withCreationTime(raw))
+		return true
+	}
 	client := f.client(t)
 	// This fixture server uses the dependency's original coupon endpoint.
 	f.p.WaiverCouponID = "waiver_example"
@@ -101,6 +129,10 @@ func TestOfferProviderBuildsOriginalPairAndProjectsReceipts(t *testing.T) {
 	proof, ok := v.Proof.(VerifiedProviderPair)
 	if err != nil || !ok || proof.seal == ([32]byte{}) || proof.seal != pairSeal(proof) || proof.Input.Identity.OperationID != o.ID {
 		t.Fatalf("sealed proof lost: %v", err)
+	}
+	f.usage.BillingCycleAnchor += 5
+	if _, err = p.Verify(t.Context(), o); err == nil {
+		t.Fatal("later creation must not permit a shifted billing anchor")
 	}
 }
 
