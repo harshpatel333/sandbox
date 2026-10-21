@@ -87,6 +87,15 @@ func acceptedCatalogFixture(t *testing.T) (*YCOfferAcceptanceService, YCAcceptan
 	if _, err = s.rpc(ctx, s.Shared, "accept", ycAcceptanceParameters(r)); err != nil {
 		t.Fatal(err)
 	}
+	// This disposable database keeps immutable audit rows across serial tests.
+	// Only the current fixture may be due for the region-wide consumer.
+	if _, err = s.Pool.Exec(ctx, `UPDATE yc_offer_acceptance SET next_attempt_at='infinity' WHERE id<>$1`, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	fixturePool := s.Pool
+	t.Cleanup(func() {
+		fixturePool.Exec(context.Background(), `UPDATE yc_offer_acceptance SET next_attempt_at='infinity' WHERE id=$1`, r.ID)
+	})
 	return s, r
 }
 

@@ -70,11 +70,12 @@ func (s *YCOfferAcceptanceService) RunOnce(ctx context.Context) (bool, error) {
 	defer cancel()
 	lease := uuid.New()
 	var team, claim uuid.UUID
-	err := s.Pool.QueryRow(ctx, `WITH due AS (SELECT id FROM yc_offer_acceptance WHERE home_region=$1
- AND state IN ('confirming','accepted','assignment_linked') AND attempts<8 AND next_attempt_at<=clock_timestamp()
+	var priorAttempts int
+	err := s.Pool.QueryRow(ctx, `WITH due AS (SELECT id,attempts FROM yc_offer_acceptance WHERE home_region=$1
+ AND (state IN ('confirming','accepted','assignment_linked') OR (state='held' AND assignment_id IS NOT NULL AND operation_id IS NULL)) AND next_attempt_at<=clock_timestamp()
  AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY next_attempt_at,id LIMIT 1 FOR UPDATE SKIP LOCKED)
- UPDATE yc_offer_acceptance a SET lease_id=$2,lease_until=clock_timestamp()+interval '2 minutes',attempts=attempts+1
- FROM due WHERE a.id=due.id RETURNING a.team_id,a.claim_id`, s.Region, lease).Scan(&team, &claim)
+ UPDATE yc_offer_acceptance a SET lease_id=$2,lease_until=clock_timestamp()+interval '2 minutes',attempts=LEAST(8,a.attempts+1)
+ FROM due WHERE a.id=due.id RETURNING a.team_id,a.claim_id,due.attempts`, s.Region, lease).Scan(&team, &claim, &priorAttempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -83,7 +84,11 @@ func (s *YCOfferAcceptanceService) RunOnce(ctx context.Context) (bool, error) {
 	}
 	r, err := loadYCAcceptance(ctx, s.Pool, team, claim)
 	if err == nil {
-		err = s.advance(ctx, &r, lease)
+		if priorAttempts >= 8 || r.State == "held" {
+			err = s.recoverExhausted(ctx, r, lease)
+		} else {
+			err = s.advance(ctx, &r, lease)
+		}
 	}
 	if err != nil {
 		state := ""
@@ -103,6 +108,30 @@ func (s *YCOfferAcceptanceService) RunOnce(ctx context.Context) (bool, error) {
 		}
 	}
 	return true, err
+}
+
+// Recovery after the write budget expires can only attach an already committed
+// exact journal. It never calls Enqueue or creates provider effects.
+func (s *YCOfferAcceptanceService) recoverExhausted(ctx context.Context, r YCAcceptanceRecord, lease uuid.UUID) error {
+	if r.AssignmentID != nil {
+		if recovery, ok := s.Provisioning.(interface {
+			RecoverAcceptance(context.Context, YCAcceptanceRecord) (uuid.UUID, bool, error)
+		}); ok {
+			operation, found, err := recovery.RecoverAcceptance(ctx, r)
+			if err != nil {
+				return err
+			}
+			if found {
+				tag, err := s.Pool.Exec(ctx, `UPDATE yc_offer_acceptance SET operation_id=$3,state='dispatched',lease_id=NULL,lease_until=NULL,last_error=NULL WHERE id=$1 AND lease_id=$2`, r.ID, lease, operation)
+				if err == nil && tag.RowsAffected() != 1 {
+					return errYCAcceptanceConflict
+				}
+				return err
+			}
+		}
+	}
+	_, err := s.Pool.Exec(ctx, `UPDATE yc_offer_acceptance SET state='held',lease_id=NULL,lease_until=NULL,last_error='retry_exhausted',next_attempt_at=clock_timestamp()+interval '5 minutes' WHERE id=$1 AND lease_id=$2`, r.ID, lease)
+	return err
 }
 
 func (s *YCOfferAcceptanceService) advance(ctx context.Context, r *YCAcceptanceRecord, lease uuid.UUID) error {

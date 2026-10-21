@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,8 +12,9 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-// YCAcceptedProvisioningAdmission supplies identity and economic authority only.
-// The provider owner supplies frozen merchant/mode/API mapping and Activation.
+// YCAcceptedProvisioningAdmission authorizes pending journal work and dispatch.
+// It rejects new finalization: a shared-session loss cannot safely authorize a
+// regional benefit commit. Activation requires a separate reviewed protocol.
 type YCAcceptedProvisioningAdmission struct {
 	Service  *YCOfferAcceptanceService
 	Handlers *Handlers
@@ -65,7 +67,7 @@ func acceptedProvisioningSnapshot(r YCAcceptanceRecord) (provisioning.AcceptedOf
 
 // WithAcceptedOffer permits regional SQL only. Bounded locks turn conflicts with
 // existing regional-before-shared signup paths into retries, never provider I/O.
-func (a *YCAcceptedProvisioningAdmission) WithAcceptedOffer(ctx context.Context, team, assignment uuid.UUID, f func(pgx.Tx, provisioning.AcceptedOffer) error) error {
+func (a *YCAcceptedProvisioningAdmission) WithAcceptedOffer(ctx context.Context, team, assignment uuid.UUID, f func(context.Context, pgx.Tx, provisioning.AcceptedOffer) error) error {
 	if a == nil || !a.Service.available() {
 		return provisioning.ErrUnavailable
 	}
@@ -118,8 +120,15 @@ func (a *YCAcceptedProvisioningAdmission) WithAcceptedOffer(ctx context.Context,
 		if err != nil {
 			return err
 		}
-		if err = f(tx, offer); err != nil {
+		if err = f(guardCtx, tx, offer); err != nil {
 			return err
+		}
+		var finalizedAfter bool
+		if err = tx.QueryRow(guardCtx, `SELECT EXISTS(SELECT 1 FROM billing_offer_provisioning_operation WHERE team_id=$1 AND assignment_id=$2 AND finalized_at IS NOT NULL)`, team, assignment).Scan(&finalizedAfter); err != nil {
+			return err
+		}
+		if finalizedAfter != finalized {
+			return provisioning.ErrUnavailable
 		}
 		return tx.Commit(guardCtx)
 	})
@@ -127,7 +136,7 @@ func (a *YCAcceptedProvisioningAdmission) WithAcceptedOffer(ctx context.Context,
 
 // WithDispatchGuard begins only after the regional marker commits. Its callback
 // performs provider I/O only and must never acquire regional rows.
-func (a *YCAcceptedProvisioningAdmission) WithDispatchGuard(ctx context.Context, team, assignment uuid.UUID, f func(provisioning.AcceptedOffer) error) error {
+func (a *YCAcceptedProvisioningAdmission) WithDispatchGuard(ctx context.Context, team, assignment uuid.UUID, f func(context.Context, provisioning.AcceptedOffer) error) error {
 	if a == nil || !a.Service.available() {
 		return provisioning.ErrUnavailable
 	}
@@ -139,7 +148,7 @@ func (a *YCAcceptedProvisioningAdmission) WithDispatchGuard(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	return a.Service.WithGuard(ctx, r, func(context.Context) error { return f(offer) })
+	return a.Service.WithGuard(ctx, r, func(guardCtx context.Context) error { return f(guardCtx, offer) })
 }
 
 type ycAcceptanceProvisioner struct{ service *provisioning.Service }
@@ -150,4 +159,29 @@ func (p ycAcceptanceProvisioner) Enqueue(ctx context.Context, team, assignment u
 func (p ycAcceptanceProvisioner) Status(ctx context.Context, team, assignment uuid.UUID) (YCAcceptanceProvisioningStatus, error) {
 	status, err := p.service.Status(ctx, team, assignment)
 	return YCAcceptanceProvisioningStatus{OperationID: status.OperationID, State: status.State, Ready: status.Ready, Held: status.Held, Revoked: status.Revoked, ControlPending: status.ControlPending}, err
+}
+
+// RecoverAcceptance reads immutable journal evidence even after revocation. This
+// only repairs a lost local acknowledgement; Status and dispatch recheck authority.
+func (p ycAcceptanceProvisioner) RecoverAcceptance(ctx context.Context, r YCAcceptanceRecord) (uuid.UUID, bool, error) {
+	if p.service == nil || p.service.Pool == nil || r.AssignmentID == nil {
+		return uuid.Nil, false, provisioning.ErrUnavailable
+	}
+	offer, err := acceptedProvisioningSnapshot(r)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	var id uuid.UUID
+	var same bool
+	err = p.service.Pool.QueryRow(ctx, `SELECT id,accepted_offer->>'acceptance_id'=$3 AND accepted_offer->>'terms_digest'=$4 AND accepted_offer->'snapshot'=$5::jsonb FROM billing_offer_provisioning_operation WHERE team_id=$1 AND assignment_id=$2`, r.TeamID, *r.AssignmentID, r.ID.String(), r.TermsDigest, offer.Snapshot).Scan(&id, &same)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	if !same {
+		return uuid.Nil, false, errYCAcceptanceConflict
+	}
+	return id, true, nil
 }

@@ -54,7 +54,7 @@ CREATE TABLE public.yc_offer_acceptance (
  CHECK (operation_id IS NULL OR assignment_id IS NOT NULL)
 );
 CREATE INDEX yc_offer_acceptance_pending ON public.yc_offer_acceptance(home_region,next_attempt_at)
- WHERE state IN ('confirming','accepted','assignment_linked');
+ WHERE state IN ('confirming','accepted','assignment_linked','held');
 CREATE TABLE public.yc_offer_acceptance_control (
  request_id uuid PRIMARY KEY,
  acceptance_id uuid NOT NULL REFERENCES public.yc_offer_acceptance(id),

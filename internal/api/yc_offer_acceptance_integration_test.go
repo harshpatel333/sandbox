@@ -609,3 +609,24 @@ func TestYCAcceptanceHTTPResumeAndReplayProjectPublicStatus(t *testing.T) {
 		t.Fatal("cached permission survived revocation")
 	}
 }
+
+func TestYCAcceptanceExpiredFinalLeaseBecomesRecoverableHold(t *testing.T) {
+	s, _, r, _, _ := acceptanceFixture(t)
+	ctx := context.Background()
+	if _, err := s.Accept(ctx, r.UserID, acceptanceRequest(r)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE yc_offer_acceptance SET attempts=8,lease_id=$2,lease_until=now()-interval '1 second' WHERE id=$1`, r.ID, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if work, err := s.RunOnce(ctx); !work || err != nil {
+		t.Fatal(work, err)
+	}
+	current, err := loadYCAcceptance(ctx, s.Pool, r.TeamID, r.ClaimID)
+	if err != nil || current.State != "held" {
+		t.Fatal("exhausted lease stranded", current, err)
+	}
+	if err = s.control(ctx, uuid.New(), ycAcceptanceControl{RequestID: uuid.New(), AcceptanceID: r.ID, Action: "retry", Reason: "Reviewed expired lease"}); err != nil {
+		t.Fatal("held item not recoverable", err)
+	}
+}
