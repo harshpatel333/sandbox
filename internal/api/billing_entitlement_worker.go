@@ -320,20 +320,19 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		return next, err
 	}
 	if !paid && c.OfferKey != "yc_2026" && c.ChargeKind != "sponsored_entitlement" {
-		if paired {
-			return next, nil
-		} // Successor reconciliation owns missing cash receipts.
-		var adopted bool
-		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_annual_authority WHERE renewal_contract_id=$1)`, id).Scan(&adopted); err != nil {
-			return next, err
-		}
-		if adopted {
-			err = h.reconcileSponsoredAnnual(ctx, team)
-		} else {
-			_, err = h.reconcileProCheckout(ctx, team, false)
-		}
-		if err != nil {
-			return next, err
+		if !paired {
+			var adopted bool
+			if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_annual_authority WHERE renewal_contract_id=$1)`, id).Scan(&adopted); err != nil {
+				return next, err
+			}
+			if adopted {
+				err = h.reconcileSponsoredAnnual(ctx, team)
+			} else {
+				_, err = h.reconcileProCheckout(ctx, team, false)
+			}
+			if err != nil {
+				return next, err
+			}
 		}
 	}
 	token := uuid.New()
@@ -365,6 +364,12 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 			_, err = h.Pool.Exec(ctx, `INSERT INTO billing_entitlement_debt(contract_id,period_start,invoice_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, id, start, debt)
 		}
 		return next, err
+	}
+	if paired && !paid && c.OfferKey != "yc_2026" && c.ChargeKind != "sponsored_entitlement" {
+		found, err := h.discoverProviderPairReceipt(ctx, pair, c, start, end, token, client)
+		if err != nil || !found {
+			return next, err
+		}
 	}
 	// A prior debt observation cannot excuse a later platform failure after settlement.
 	if _, err = h.Pool.Exec(ctx, `UPDATE billing_entitlement_withheld SET evidence='{}'::jsonb WHERE contract_id=$1 AND period_start=$2`, id, start); err != nil {

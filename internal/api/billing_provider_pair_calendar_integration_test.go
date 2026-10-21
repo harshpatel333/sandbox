@@ -14,6 +14,10 @@ import (
 )
 
 func monthlyPairMappingFixture(t *testing.T, anchor time.Time) (pgx.Tx, ContractProviderBinding, *pairFixture, *Handlers) {
+	return paidPairMappingFixture(t, anchor, true)
+}
+
+func paidPairMappingFixture(t *testing.T, anchor time.Time, monthly bool) (pgx.Tx, ContractProviderBinding, *pairFixture, *Handlers) {
 	h, team := fundingTransitionFixture(t)
 	f := newPairFixture(t)
 	f.p.Identity.TeamID = team
@@ -47,8 +51,13 @@ func monthlyPairMappingFixture(t *testing.T, anchor time.Time) (pgx.Tx, Contract
 		t.Fatal(err)
 	}
 	exec(`UPDATE billing_commercial_contract SET status='ended',revision=revision+1 WHERE id=$1`, contract)
-	next := successorPairFixture(f, previous, true)
+	next := successorPairFixture(f, previous, monthly)
 	start, finish, _ := billing.AnniversaryPeriod(next.FeeAnchor, time.Now())
+	if !monthly {
+		m := (start.Year()-next.FeeAnchor.Year())*12 + int(start.Month()-next.FeeAnchor.Month())
+		m -= m % 12
+		start, finish = annualBoundary(next.FeeAnchor, m), annualBoundary(next.FeeAnchor, m+12)
+	}
 	f.fee.Items.Data[0].Start, f.fee.Items.Data[0].End = start.Unix(), finish.Unix()
 	start, finish, _ = billing.AnniversaryPeriod(next.Anchor, time.Now())
 	for i := range f.usage.Items.Data {
@@ -58,8 +67,12 @@ func monthlyPairMappingFixture(t *testing.T, anchor time.Time) (pgx.Tx, Contract
 	if err != nil {
 		t.Fatal(err)
 	}
+	offer := "pro_annual"
+	if monthly {
+		offer = "pro_monthly"
+	}
 	exec(`INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_kind,entitlement_amount_cents,entitlement_cadence,entitlement_anchor)
- VALUES($1,$2,'pro_monthly',$3,$4,$5,$6,120000,1,'metered_usage',100000,'monthly',$7)`, next.ContractID, team, next.StartsAt, next.CustomerID, next.UsageSubscriptionID, next.Terms.FeePriceID, next.Anchor)
+ VALUES($1,$2,$8,$3,$4,$5,$6,$9,$10,'metered_usage',100000,'monthly',$7)`, next.ContractID, team, next.StartsAt, next.CustomerID, next.UsageSubscriptionID, next.Terms.FeePriceID, next.Anchor, offer, next.Terms.FeeAmount, next.Terms.FeeMonths)
 	if _, err = ConfirmSuccessorProviderPair(t.Context(), tx, proof); err != nil {
 		t.Fatal(err)
 	}
