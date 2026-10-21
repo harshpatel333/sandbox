@@ -60,6 +60,7 @@ jobs:
       actions: read
     with:
       revision: ${{ github.sha }}
+      shared_auth_required: true
       production: true
     secrets: inherit
 
@@ -129,9 +130,12 @@ jobs:
       - name: Terraform apply staging/us-central1
         env:
           TF_VAR_proxy_generation_frontends_enabled: ${{ vars.PROXY_STAGING_FRONTEND_MIGRATED == 'true' && 'true' || 'false' }}
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.staging_receipt }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: staging/us-central1" >> "$GITHUB_STEP_SUMMARY"
+          python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target staging
           cd infra/envs/staging/us-central1
           terraform init -input=false
           terraform validate
@@ -145,7 +149,7 @@ jobs:
     name: Deploy API staging/us-central1
     runs-on: ubuntu-latest
     environment: staging
-    needs: [build-api-image, staging-us-central1-infra]
+    needs: [build-api-image, staging-us-central1-infra, wait-for-migrations]
     permissions:
       contents: read
       id-token: write
@@ -182,6 +186,12 @@ jobs:
           docker tag controlplane:${{ github.sha }} ${IMAGE}:${{ github.sha }}
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target staging
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.staging_receipt }}
 
       - name: Deploy to Cloud Run
         run: |
@@ -308,7 +318,7 @@ jobs:
     name: Apply production/us-west2
     runs-on: ubuntu-latest
     environment: production
-    needs: [staging-us-central1-api, production-us-central1-bootstrap]
+    needs: [staging-us-central1-api, production-us-central1-bootstrap, wait-for-migrations]
     permissions:
       contents: read
       id-token: write
@@ -337,6 +347,12 @@ jobs:
           set -euo pipefail
           command -v jq
           command -v curl
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target use4
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.production_receipt }}
 
       - name: Terraform apply production/us-west2
         run: |
@@ -381,7 +397,7 @@ jobs:
     name: Deploy API production/us-west2
     runs-on: ubuntu-latest
     environment: production
-    needs: [build-api-image, production-us-west2-infra]
+    needs: [build-api-image, production-us-west2-infra, wait-for-migrations]
     permissions:
       contents: read
       id-token: write
@@ -418,6 +434,12 @@ jobs:
           docker tag controlplane:${{ github.sha }} ${IMAGE}:${{ github.sha }}
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target use4
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.production_receipt }}
 
       - name: Deploy to Cloud Run
         run: |
@@ -524,7 +546,7 @@ jobs:
     if: vars.EAST_USAGE_ENTITLEMENTS_APPLIED == 'true'
     runs-on: ubuntu-latest
     environment: production
-    needs: [staging-us-central1-api, production-us-central1-bootstrap]
+    needs: [staging-us-central1-api, production-us-central1-bootstrap, wait-for-migrations]
     permissions:
       contents: read
       id-token: write
@@ -547,6 +569,12 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target use4
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.production_receipt }}
 
       - name: Terraform apply production/us-east4
         env:
@@ -594,7 +622,7 @@ jobs:
     name: Deploy API production/us-east4
     runs-on: ubuntu-latest
     environment: production
-    needs: [build-api-image, production-us-east4-infra]
+    needs: [build-api-image, production-us-east4-infra, wait-for-migrations]
     permissions:
       contents: read
       id-token: write
@@ -631,6 +659,12 @@ jobs:
           docker tag controlplane:${{ github.sha }} ${IMAGE}:${{ github.sha }}
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
+
+      - name: Verify migration execution receipt
+        run: python3 .github/workflows/scripts/deployment_migration_gate.py --verify-receipt --target use4
+        env:
+          MIGRATION_REVISION: ${{ needs.wait-for-migrations.outputs.migration_revision }}
+          MIGRATION_RECEIPT: ${{ needs.wait-for-migrations.outputs.production_receipt }}
 
       - name: Deploy to Cloud Run
         run: |
