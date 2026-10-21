@@ -40,10 +40,13 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 		workers = min(h.Config.BillingEntitlementWorkers, 32)
 	}
 	for lane, retry := range []bool{false, true} {
+		var idleDelay time.Duration
 		go runEntitlementLane(ctx, workers/2, func(ctx context.Context, limit int) ([]entitlementJob, error) {
-			return h.claimUsageEntitlements(ctx, retry, limit)
-		}, h.runUsageEntitlementJob, func(ctx context.Context) time.Duration {
-			return h.entitlementIdleDelay(ctx, retry, lane)
+			jobs, delay, err := h.claimUsageEntitlementsWithDelay(ctx, retry, limit, lane)
+			idleDelay = delay
+			return jobs, err
+		}, h.runUsageEntitlementJob, func(context.Context) time.Duration {
+			return idleDelay
 		})
 	}
 	go func() {
@@ -124,50 +127,50 @@ func runEntitlementLane(ctx context.Context, workers int, claim func(context.Con
 	}
 }
 
-func (h *Handlers) entitlementIdleDelay(ctx context.Context, retry bool, slot int) time.Duration {
-	ctx, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	var seconds float64
-	err := h.Pool.QueryRow(ctx, `SELECT COALESCE((SELECT extract(epoch FROM next_check_at-clock_timestamp())::double precision FROM billing_entitlement_work WHERE (failures>0)=$1 AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY next_check_at,contract_id LIMIT 1),1)`, retry).Scan(&seconds)
-	if err != nil {
-		return time.Second
-	}
-	return entitlementPollDelay(time.Duration(max(0.1, min(1, seconds))*float64(time.Second)), slot)
-}
-
 func entitlementPollDelay(until time.Duration, slot int) time.Duration {
-	delay := max(100*time.Millisecond, min(time.Second, until))
+	delay := max(100*time.Millisecond, min(5*time.Second, until))
 	// Stagger idle lanes without postponing the next due deadline.
-	if delay > 300*time.Millisecond {
+	if delay == 5*time.Second {
 		delay -= time.Duration((slot*37)%200) * time.Millisecond
 	}
 	return delay
 }
 
 func (h *Handlers) claimUsageEntitlements(ctx context.Context, retry bool, limit int) ([]entitlementJob, error) {
+	jobs, _, err := h.claimUsageEntitlementsWithDelay(ctx, retry, limit, 0)
+	return jobs, err
+}
+
+// The next-due observation shares the claim snapshot and excludes our newly
+// claimed rows. Concurrent inserts and earlier reschedules are rediscovered
+// within five seconds, even when the snapshot contains no eligible work.
+func (h *Handlers) claimUsageEntitlementsWithDelay(ctx context.Context, retry bool, limit, slot int) ([]entitlementJob, time.Duration, error) {
 	claim, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	token := uuid.New()
-	rows, err := h.Pool.Query(claim, `WITH due AS (SELECT contract_id FROM billing_entitlement_work WHERE next_check_at<=clock_timestamp() AND (failures>0)=$2 AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY next_check_at,contract_id FOR UPDATE SKIP LOCKED LIMIT $3)
- UPDATE billing_entitlement_work w SET lease_token=$1,lease_until=clock_timestamp()+interval '1 minute',next_check_at=clock_timestamp()+interval '1 minute' FROM due WHERE w.contract_id=due.contract_id RETURNING w.contract_id`, token, retry, limit)
+	rows, err := h.Pool.Query(claim, `WITH due AS (SELECT contract_id FROM billing_entitlement_work WHERE next_check_at<=clock_timestamp() AND (failures>0)=$2 AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY next_check_at,contract_id FOR UPDATE SKIP LOCKED LIMIT $3),
+ claimed AS (UPDATE billing_entitlement_work w SET lease_token=$1,lease_until=clock_timestamp()+interval '1 minute',next_check_at=clock_timestamp()+interval '1 minute' FROM due WHERE w.contract_id=due.contract_id RETURNING w.contract_id),
+ next_due AS (SELECT COALESCE((SELECT CASE WHEN w.next_check_at='infinity'::timestamptz THEN 5::double precision ELSE extract(epoch FROM w.next_check_at-clock_timestamp())::double precision END FROM billing_entitlement_work w WHERE (w.failures>0)=$2 AND (w.lease_until IS NULL OR w.lease_until<clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM claimed c WHERE c.contract_id=w.contract_id) ORDER BY w.next_check_at,w.contract_id LIMIT 1),5) AS seconds)
+ SELECT c.contract_id,n.seconds FROM next_due n LEFT JOIN claimed c ON true`, token, retry, limit)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	defer rows.Close()
 	var jobs []entitlementJob
+	var seconds float64
 	for rows.Next() {
-		j := entitlementJob{Token: token}
-		if err = rows.Scan(&j.Contract); err != nil {
-			rows.Close()
-			return nil, err
+		var contract pgtype.UUID
+		if err = rows.Scan(&contract, &seconds); err != nil {
+			return nil, 0, err
 		}
-		jobs = append(jobs, j)
+		if contract.Valid {
+			jobs = append(jobs, entitlementJob{Contract: contract.Bytes, Token: token})
+		}
 	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return nil, err
+	if err = rows.Err(); err != nil {
+		return nil, 0, err
 	}
-	return jobs, nil
+	return jobs, entitlementPollDelay(time.Duration(max(0.1, min(5, seconds))*float64(time.Second)), slot), nil
 }
 
 func (h *Handlers) usageEntitlementBatch(ctx context.Context, retry bool, limit int) (int, error) {
@@ -644,7 +647,7 @@ func (h *Handlers) dispatchUsageEntitlement(ctx context.Context, c db.BillingCom
 	var grant entitlementGrant
 	err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey)
 	if attempt != uuid.Nil {
-		if finishErr := h.finishProviderPairDispatch(ctx, attempt); finishErr != nil {
+		if finishErr := h.finishProviderPairDispatch(ctx, attempt, err); finishErr != nil {
 			return errors.Join(err, finishErr)
 		}
 	}

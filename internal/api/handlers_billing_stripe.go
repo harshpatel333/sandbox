@@ -532,8 +532,9 @@ func (c *stripeHTTPClient) RetrieveEvent(ctx context.Context, eventID string) (j
 }
 
 type stripeRequestError struct {
-	Status  int
-	Message string
+	Status         int
+	Message        string
+	grantRejection *stripeGrantRejection
 }
 
 func (e *stripeRequestError) Error() string { return e.Message }
@@ -581,7 +582,7 @@ func (c *stripeHTTPClient) doForm(ctx context.Context, method, path string, form
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &stripeRequestError{Status: resp.StatusCode, Message: fmt.Sprintf("stripe %s %s returned %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(body)))}
+		return &stripeRequestError{Status: resp.StatusCode, Message: fmt.Sprintf("stripe %s %s returned %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(body))), grantRejection: classifyStripeGrantRejection(req, resp, body, form.Encode(), idempotencyKey)}
 	}
 	if out == nil {
 		return nil

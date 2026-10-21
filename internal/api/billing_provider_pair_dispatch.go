@@ -29,7 +29,7 @@ func CheckProviderPairDispatchesResolved(ctx context.Context, q db.DBTX, binding
 		return err
 	}
 	var blocked bool
-	err = q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_provider_pair_dispatch WHERE contract_id=$1 AND (binding<>$2::jsonb OR resolved_at IS NULL OR sender_finished_at IS NULL))`, binding.ContractID, raw).Scan(&blocked)
+	err = q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_provider_pair_dispatch WHERE contract_id=$1 AND (binding<>$2::jsonb OR (resolved_at IS NULL AND rejected_at IS NULL) OR sender_finished_at IS NULL))`, binding.ContractID, raw).Scan(&blocked)
 	if err != nil {
 		return err
 	}
@@ -75,9 +75,25 @@ func jsonBytesEqual(a, b []byte) bool {
 
 // Called only after the sole POST has returned; cancellation cannot suppress this
 // durable proof that this executor will never send again. A crash leaves it pending.
-func (h *Handlers) finishProviderPairDispatch(ctx context.Context, id uuid.UUID) error {
+func (h *Handlers) finishProviderPairDispatch(ctx context.Context, id uuid.UUID, outcome error) error {
 	finished, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
+	var providerErr *stripeRequestError
+	if errors.As(outcome, &providerErr) && providerErr.grantRejection != nil {
+		rejection := providerErr.grantRejection
+		raw, err := json.Marshal(rejection)
+		if err != nil {
+			return err
+		}
+		tag, err := h.Pool.Exec(finished, `UPDATE billing_provider_pair_dispatch SET sender_finished_at=clock_timestamp(),rejected_at=clock_timestamp(),rejection_evidence=$2 WHERE id=$1 AND NOT legacy_untracked AND sender_finished_at IS NULL AND request_form=$3 AND idempotency_key=$4`, id, raw, rejection.form, rejection.IdempotencyKey)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return errProviderPairDispatchPending
+		}
+		return nil
+	}
 	tag, err := h.Pool.Exec(finished, `UPDATE billing_provider_pair_dispatch SET sender_finished_at=COALESCE(sender_finished_at,clock_timestamp()) WHERE id=$1 AND NOT legacy_untracked`, id)
 	if err != nil {
 		return err
