@@ -26,7 +26,7 @@ import (
 
 // This fixture tests only journal persistence in its own disposable schema. It
 // does not stand in for production authority, catalog or payment guard adapters.
-func newRenewalPostgresFixture(t *testing.T) (*renewalChoiceService, *fixtureRenewalAuthority, *pgxpool.Pool) {
+func newRenewalPostgresFixture(t *testing.T, initialize ...bool) (*renewalChoiceService, *fixtureRenewalAuthority, *pgxpool.Pool) {
 	t.Helper()
 	dsn := os.Getenv("RENEWAL_JOURNAL_TEST_DSN")
 	if dsn == "" {
@@ -75,8 +75,10 @@ func newRenewalPostgresFixture(t *testing.T) (*renewalChoiceService, *fixtureRen
 		t.Fatal(err)
 	}
 	s := &renewalChoiceService{Enabled: true, Store: postgresRenewalChoiceStore{Pool: pool}, Authority: a}
-	if err = s.initialize(t.Context(), a.key, a.actor); err != nil {
-		t.Fatal(err)
+	if len(initialize) == 0 || initialize[0] {
+		if err = s.initialize(t.Context(), a.key, a.actor); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return s, a, pool
 }
@@ -201,7 +203,7 @@ func TestRenewalChoiceMonthlyPublicationRejectsConflictingVersion(t *testing.T) 
 }
 
 func TestRenewalChoiceHTTPCurrentPermissionAndReplay(t *testing.T) {
-	s, a, pool := newRenewalPostgresFixture(t)
+	s, a, pool := newRenewalPostgresFixture(t, false)
 	_, err := pool.Exec(t.Context(), `CREATE TABLE roles(id uuid,scope_type text); CREATE TABLE permissions(id uuid,name text); CREATE TABLE role_permissions(role_id uuid,permission_id uuid); CREATE TABLE team_memberships(team_id uuid,user_id uuid,status text); CREATE TABLE user_role_assignments(user_id uuid,team_id uuid,role_id uuid,scope_type text,revoked_at timestamptz)`)
 	if err != nil {
 		t.Fatal(err)
@@ -242,8 +244,18 @@ func TestRenewalChoiceHTTPCurrentPermissionAndReplay(t *testing.T) {
 		return out
 	}
 	statusBody, _ := json.Marshal(map[string]any{"team_id": a.key.Team, "assignment_id": a.key.Assignment})
-	if out := send(statusPath, statusBody, a.actor); out.Code != 200 {
-		t.Fatal(out.Code, out.Body.String())
+	var initial renewalChoiceView
+	for range 2 {
+		out := send(statusPath, statusBody, a.actor)
+		if out.Code != 200 {
+			t.Fatal(out.Code, out.Body.String())
+		}
+		if err = json.Unmarshal(out.Body.Bytes(), &initial); err != nil {
+			t.Fatal(err)
+		}
+		if initial.Revision != 1 || initial.Confirmed == nil || initial.Confirmed.Choice != "annual" {
+			t.Fatal("status did not bootstrap a single confirmed default", initial)
+		}
 	}
 	req := struct {
 		renewalChoiceKey

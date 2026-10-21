@@ -109,5 +109,8 @@ func (s *renewalChoiceService) currentView(ctx context.Context, team, assignment
 	if key.Team != team || key.Assignment != assignment || !validRenewalKey(key) {
 		return renewalChoiceView{}, errRenewalConflict
 	}
+	if err := s.initialize(ctx, key, actor); err != nil {
+		return renewalChoiceView{}, err
+	}
 	return s.view(ctx, key, actor)
 }
