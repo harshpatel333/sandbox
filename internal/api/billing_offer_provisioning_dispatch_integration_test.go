@@ -230,3 +230,92 @@ func TestOfferCompositionPausedGrantCannotOutrunRevocationAcknowledgement(t *tes
 		})
 	}
 }
+
+func TestOfferCompositionRevocationAfterGrantRejection(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		proven bool
+	}{
+		{"validation", 400, `{"error":{"type":"invalid_request_error","code":"parameter_unknown"}}`, true},
+		{"raw_status", 400, `rejected`, false},
+		{"idempotency", 400, `{"error":{"type":"idempotency_error","message":"different parameters"}}`, false},
+		{"rate_limit", 429, `{"error":{"type":"invalid_request_error","code":"parameter_unknown"}}`, false},
+		{"server", 503, `{"error":{"type":"invalid_request_error","code":"parameter_unknown"}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, service, r, o := offerCompositionFixture(t)
+			ctx := t.Context()
+			if err := service.Reconcile(ctx, o.TeamID, o.AssignmentID); err != nil {
+				t.Fatal(err)
+			}
+			binding, err := loadContractProviderBinding(ctx, a.h.Pool, o.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a.h.Config.BillingUsageEntitlementsEnabled = true
+			a.h.ProviderPairEntitlementAuthority = a
+			wf := &pairWorkerFixture{h: a.h, b: binding}
+			provider := newPairFixture(t)
+			provider.p.CustomerID = binding.CustomerID
+			configurePairWorkerProvider(t, wf, provider)
+			client := *a.client
+			transport := client.httpClient.Transport
+			if transport == nil {
+				transport = http.DefaultTransport
+			}
+			httpClient := *client.httpClient
+			httpClient.Transport = stripeCheckoutRecoveryRoundTripper(func(req *http.Request) (*http.Response, error) {
+				response := httptest.NewRecorder()
+				if provider.serve(response, req) {
+					return response.Result(), nil
+				}
+				return transport.RoundTrip(req)
+			})
+			client.httpClient = &httpClient
+			a.h.Stripe = &client
+			posts := configurePairRejectionProvider(t, a.h, tc.status, tc.body)
+			if _, err = a.h.reconcileUsageEntitlement(ctx, binding.ContractID); err == nil || posts.Load() != 1 {
+				t.Fatal("expected exactly one rejected grant request", err, posts.Load())
+			}
+			if _, err = a.h.Pool.Exec(ctx, `SELECT public.revoke_yc_activation_authority($1,$2,$3)`, r.ApprovalID, r.TeamID, uuid.New()); err != nil {
+				t.Fatal(err)
+			}
+			deliveries, err := a.admission.Service.LeaseFinancialInvalidations(ctx, uuid.New(), 25)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var delivery YCFinancialInvalidation
+			for _, d := range deliveries {
+				if d.AcceptanceID == r.ID {
+					delivery = d
+				}
+			}
+			if delivery.InvalidationID == uuid.Nil {
+				t.Fatal("missing actual shared invalidation")
+			}
+			for range 2 {
+				err = a.revokeFinancialDelivery(ctx, delivery)
+				if tc.proven {
+					if err != nil {
+						t.Fatal("proven no-effect rejection blocked shared acknowledgement", err)
+					}
+					requireFinancialState(t, a.admission.Service, r, "revoked", 0)
+				} else {
+					if err == nil {
+						t.Fatal("ambiguous response released shared acknowledgement")
+					}
+					state, readErr := a.admission.Service.FinancialState(ctx, r.ClaimID)
+					if readErr != nil || state == nil || state.PendingInvalidations != 1 || state.State == "revoked" {
+						t.Fatal("ambiguous response lost pending acknowledgement", state, readErr)
+					}
+				}
+			}
+			_, _ = a.h.reconcileUsageEntitlement(ctx, binding.ContractID)
+			if posts.Load() != 1 {
+				t.Fatal("rejection allowed a replacement grant request", posts.Load())
+			}
+		})
+	}
+}

@@ -112,11 +112,16 @@ clears financial revocation. Existing ledgers and grant history remain intact.
 Grant dispatch admission commits under the same financial fence and freezes the
 request, binding, idempotency key and sender identity. Only a newly committed
 admission permits one POST, outside the transaction. Effective revocation remains
-pending until that sender has durably finished and the exact positive grant outcome
-is verified. Read-only discovery, lease expiry, a timeout or an absent provider
-result cannot release a paused sender's attempt. A crash before sender completion
-can require manual recovery. Regional denial remains committed while resolution
-is pending, and normal readiness stays denied.
+pending until that sender has durably finished and either the exact positive grant
+outcome is verified or an immutable, proven no-effect validation rejection is
+recorded. Rejection proof is limited to the sole attempt's authenticated Stripe
+response with the exact request identity and a supported pre-execution parameter
+error. Raw status codes, replayed errors, authentication failures and ambiguous
+responses do not qualify. Neither outcome transfers permission to send again.
+Read-only discovery, lease expiry, a timeout or an absent provider result cannot
+release a paused sender's attempt. A crash before sender completion can require
+manual recovery. Regional denial remains committed while resolution is pending,
+and normal readiness stays denied.
 
 Before upgrading an existing issuer, stop older issuer processes and account for
 their in-flight requests. The new journal cannot fence a paused old binary that
