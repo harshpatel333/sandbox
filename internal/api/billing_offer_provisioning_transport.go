@@ -16,13 +16,22 @@ import (
 
 var offerUsageHoldPath = regexp.MustCompile(`^/v1/subscriptions/sub_[A-Za-z0-9]+$`)
 
-// sendOfferProviderRequest sends one saved request. Callers must first commit its
-// dispatch marker and retain current acceptance authority. The returned bytes are
-// untrusted provider evidence; the adapter must validate/project them before saving
-// a receipt. This transport does not grant authority or register an adapter.
+// sendOfferProviderRequest sends one saved request after successful preflight
+// and dispatch-marker commit, using the current acceptance guard context. The
+// adapter must validate and project the untrusted response before saving a receipt.
 func (c *stripeHTTPClient) sendOfferProviderRequest(ctx context.Context, r provisioning.SavedRequest) (json.RawMessage, error) {
+	if r.State != "dispatched" || r.DispatchedAt == nil {
+		return nil, provisioning.ErrConflict
+	}
+	if err := c.validateOfferProviderRequest(r); err != nil {
+		return nil, err
+	}
+	return c.offerProviderHTTP(ctx, r.Request.Method, r.Request.Path, r.Request.Payload, r.Key, r.Offer.APIVersion)
+}
+
+func (c *stripeHTTPClient) validateOfferProviderRequest(r provisioning.SavedRequest) error {
 	if c == nil || c.secretKey == "" || c.httpClient == nil {
-		return nil, provisioning.ErrUnavailable
+		return provisioning.ErrUnavailable
 	}
 	validPath := false
 	switch r.Step {
@@ -35,32 +44,44 @@ func (c *stripeHTTPClient) sendOfferProviderRequest(ctx context.Context, r provi
 	case provisioning.UsageHold:
 		validPath = offerUsageHoldPath.MatchString(r.Request.Path)
 	}
-	if !validPath || r.OperationID == uuid.Nil || r.Offer.AcceptanceID == uuid.Nil || r.State != "dispatched" || r.DispatchedAt == nil || r.Key != fmt.Sprintf("offer-provisioning/%s/%s/v1", r.OperationID, r.Step) || r.Request.Method != http.MethodPost || r.Request.Payload == "" || len(r.Request.Payload) > 128*1024 || r.Request.SHA256 != provisioning.NewRequest(r.Request.Path, r.Request.Payload).SHA256 || r.Offer.Merchant == "" || r.Offer.APIVersion == "" || c.apiVersion != r.Offer.APIVersion {
-		return nil, provisioning.ErrConflict
+	if !validPath || r.OperationID == uuid.Nil || r.Offer.AcceptanceID == uuid.Nil || r.Key != fmt.Sprintf("offer-provisioning/%s/%s/v1", r.OperationID, r.Step) || r.Request.Method != http.MethodPost || r.Request.Payload == "" || len(r.Request.Payload) > 128*1024 || r.Request.SHA256 != provisioning.NewRequest(r.Request.Path, r.Request.Payload).SHA256 || r.Offer.Merchant == "" || r.Offer.APIVersion == "" || c.apiVersion != r.Offer.APIVersion {
+		return provisioning.ErrConflict
+	}
+	return nil
+}
+
+// preflightOfferProviderRequest is retryable and runs before the dispatch marker.
+// The adapter retains this immutable client through the subsequent single POST.
+func (c *stripeHTTPClient) preflightOfferProviderRequest(ctx context.Context, r provisioning.SavedRequest) error {
+	if r.State != "prepared" || r.DispatchedAt != nil {
+		return provisioning.ErrConflict
+	}
+	if err := c.validateOfferProviderRequest(r); err != nil {
+		return err
 	}
 	// Account and mode belong to the frozen operation, not the current key's
 	// ambient defaults. Check both using this exact client's credentials.
 	account, err := c.offerProviderHTTP(ctx, http.MethodGet, "/v1/account", "", "", r.Offer.APIVersion)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	var identity struct {
 		ID string `json:"id"`
 	}
 	if json.Unmarshal(account, &identity) != nil || identity.ID != r.Offer.Merchant {
-		return nil, provisioning.ErrConflict
+		return provisioning.ErrConflict
 	}
 	balance, err := c.offerProviderHTTP(ctx, http.MethodGet, "/v1/balance", "", "", r.Offer.APIVersion)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	var mode struct {
 		Live *bool `json:"livemode"`
 	}
 	if json.Unmarshal(balance, &mode) != nil || mode.Live == nil || *mode.Live != r.Offer.Live {
-		return nil, provisioning.ErrConflict
+		return provisioning.ErrConflict
 	}
-	return c.offerProviderHTTP(ctx, r.Request.Method, r.Request.Path, r.Request.Payload, r.Key, r.Offer.APIVersion)
+	return nil
 }
 
 func (c *stripeHTTPClient) offerProviderHTTP(ctx context.Context, method, path, body, key, version string) (json.RawMessage, error) {

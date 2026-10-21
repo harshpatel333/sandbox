@@ -23,7 +23,9 @@ acceptance snapshot or be remapped from ambient configuration on replay.
 Before each create, the service commits the dispatch marker, then obtains a fresh
 shared dispatch guard. That guard rechecks the exact acceptance and holds shared
 authority through one bounded provider attempt. The callback takes no regional
-row locks. Adapters must not retry creates internally.
+row locks. Both admission and dispatch callbacks receive the guard-owned context;
+all SQL, finalization and the provider POST must use that context. Adapters must
+not retry creates internally.
 
 `provisioning.Provider` prepares exact immutable requests and recovers complete
 same-identity evidence. Its final verification must establish the entire supported
@@ -33,7 +35,9 @@ its confirmed receipt. Verification and recovery must not apply that hold themse
 No test-only response is valid production evidence.
 
 The unregistered HTTP transport sends saved bodies without POST replay or redirects,
-checks the pinned account/mode/API version, and bounds response sizes. Its raw
+checks the pinned account/mode/API version before the dispatch marker, and bounds
+response sizes. Failed preflight reads leave the request prepared and retryable;
+the adapter must retain the same immutable client through preflight and POST. Its raw
 response is not a confirmed receipt: the concrete adapter still must validate and
 project identity/economics before passing evidence back to the journal.
 

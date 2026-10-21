@@ -25,23 +25,30 @@ type testAuthority struct {
 	reject          bool
 	beforeGuard     func()
 	guardErrorAfter bool
+	callbackContext func(context.Context) context.Context
 }
 
-func (a *testAuthority) WithDispatchGuard(ctx context.Context, team, assignment uuid.UUID, f func(AcceptedOffer) error) error {
+func (a *testAuthority) WithDispatchGuard(ctx context.Context, team, assignment uuid.UUID, f func(context.Context, AcceptedOffer) error) error {
+	if a.callbackContext != nil {
+		ctx = a.callbackContext(ctx)
+	}
 	if a.beforeGuard != nil {
 		a.beforeGuard()
 	}
 	if a.reject {
 		return ErrRevoked
 	}
-	err := f(a.offer)
+	err := f(ctx, a.offer)
 	if a.guardErrorAfter && err == nil {
 		return ErrUnknown
 	}
 	return err
 }
 
-func (a *testAuthority) WithAcceptedOffer(ctx context.Context, team, assignment uuid.UUID, f func(pgx.Tx, AcceptedOffer) error) error {
+func (a *testAuthority) WithAcceptedOffer(ctx context.Context, team, assignment uuid.UUID, f func(context.Context, pgx.Tx, AcceptedOffer) error) error {
+	if a.callbackContext != nil {
+		ctx = a.callbackContext(ctx)
+	}
 	tx, err := a.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -53,7 +60,7 @@ func (a *testAuthority) WithAcceptedOffer(ctx context.Context, team, assignment 
 	if a.reject {
 		return ErrRevoked
 	}
-	if err = f(tx, a.offer); err != nil {
+	if err = f(ctx, tx, a.offer); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -74,12 +81,20 @@ type testProvider struct {
 	recoverUnknown bool
 	enter, release chan struct{}
 	afterCreate    func(SavedRequest)
+	preflightError error
+	createContext  func(context.Context) error
 }
 
 func (p *testProvider) Prepare(_ context.Context, o Operation, step Step) (Request, error) {
 	return NewRequest("/v1/"+string(step), "assignment="+o.AssignmentID.String()), nil
 }
-func (p *testProvider) Create(_ context.Context, r SavedRequest) (json.RawMessage, error) {
+func (p *testProvider) Preflight(context.Context, SavedRequest) error { return p.preflightError }
+func (p *testProvider) Create(ctx context.Context, r SavedRequest) (json.RawMessage, error) {
+	if p.createContext != nil {
+		if err := p.createContext(ctx); err != nil {
+			return nil, err
+		}
+	}
 	p.mu.Lock()
 	p.creates[r.Step]++
 	raw := json.RawMessage(fmt.Sprintf(`{"id":%q}`, r.Key))
@@ -684,5 +699,57 @@ func TestJournalProviderTermsPinnedApartFromAcceptance(t *testing.T) {
 	}
 	if len(f.p.creates) != 0 {
 		t.Fatal("changed provider terms reached provider")
+	}
+}
+
+func TestJournalPreflightFailureRemainsRetryable(t *testing.T) {
+	f := newFixture(t)
+	f.p.preflightError = errors.New("temporary preflight read failure")
+	if err := f.reconcile(t); err == nil {
+		t.Fatal("expected read failure")
+	}
+	o, err := load(t.Context(), f.s.Pool, f.team, f.assignment)
+	if err != nil || o.Requests[Customer].State != "prepared" || o.Requests[Customer].DispatchedAt != nil || len(f.p.creates) != 0 {
+		t.Fatal(o, err)
+	}
+	f.p.preflightError = nil
+	if err := f.reconcile(t); err != nil {
+		t.Fatal(err)
+	}
+	f.assertOnce(t)
+}
+
+func TestJournalProviderUsesDispatchGuardContext(t *testing.T) {
+	f := newFixture(t)
+	type guardKey struct{}
+	f.a.callbackContext = func(ctx context.Context) context.Context { return context.WithValue(ctx, guardKey{}, true) }
+	f.p.createContext = func(ctx context.Context) error {
+		if ctx.Value(guardKey{}) != true {
+			t.Fatal("provider received outer context")
+		}
+		return nil
+	}
+	if err := f.reconcile(t); err != nil {
+		t.Fatal(err)
+	}
+	f.assertOnce(t)
+}
+
+func TestJournalDispatchGuardCancellationReachesProvider(t *testing.T) {
+	f := newFixture(t)
+	guard, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	f.a.callbackContext = func(context.Context) context.Context { return guard }
+	f.a.beforeGuard = cancel
+	f.p.createContext = func(ctx context.Context) error { return ctx.Err() }
+	if err := f.reconcile(t); !errors.Is(err, context.Canceled) || !errors.Is(err, ErrUnknown) {
+		t.Fatal(err)
+	}
+	if len(f.p.creates) != 0 {
+		t.Fatal("provider ignored guard cancellation")
+	}
+	o, err := load(t.Context(), f.s.Pool, f.team, f.assignment)
+	if err != nil || o.Requests[Customer].State != "dispatched" || o.FinalizedAt != nil {
+		t.Fatal(o, err)
 	}
 }

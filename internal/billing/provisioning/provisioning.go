@@ -108,16 +108,16 @@ type SavedRequest struct {
 
 // WithAcceptedOffer serializes team/account and current shared approval authority,
 // validates durable acceptance, region, rollout and all new-signup conflict guards,
-// then invokes f inside that transaction. It must reject revoked/changed authority.
+// then invokes f inside that transaction using its guard-owned context. It must reject revoked/changed authority.
 // Finalize runs in that same transaction after provider verification. It binds the
 // pair, enrolls invoices, materializes the assignment, and wakes existing grant
 // issuance atomically; it must not make network calls or issue a second allowance.
 type Admission interface {
-	WithAcceptedOffer(context.Context, uuid.UUID, uuid.UUID, func(pgx.Tx, AcceptedOffer) error) error
+	WithAcceptedOffer(context.Context, uuid.UUID, uuid.UUID, func(context.Context, pgx.Tx, AcceptedOffer) error) error
 	// The regional dispatch marker is already committed. Recheck the exact
 	// acceptance and retain shared approval authority across f; hold no regional
 	// row locks, and do not acquire them from f. Revocation must wait for f.
-	WithDispatchGuard(context.Context, uuid.UUID, uuid.UUID, func(AcceptedOffer) error) error
+	WithDispatchGuard(context.Context, uuid.UUID, uuid.UUID, func(context.Context, AcceptedOffer) error) error
 }
 type Activation interface {
 	Finalize(context.Context, pgx.Tx, Operation, json.RawMessage) error
@@ -195,6 +195,8 @@ func equalJSON(a, b any) bool {
 // Verify checks the complete pair, original calendar, bounded waiver and inventory.
 type Provider interface {
 	Prepare(context.Context, Operation, Step) (Request, error)
+	// Preflight performs retryable reads before the irreversible dispatch marker.
+	Preflight(context.Context, SavedRequest) error
 	Create(context.Context, SavedRequest) (json.RawMessage, error)
 	Recover(context.Context, SavedRequest) (json.RawMessage, error)
 	Verify(context.Context, Operation) (json.RawMessage, error)
@@ -218,7 +220,7 @@ func (s *Service) Enqueue(ctx context.Context, team, assignment uuid.UUID) (uuid
 		return uuid.Nil, ErrConflict
 	}
 	var id uuid.UUID
-	err := s.Authority.WithAcceptedOffer(ctx, team, assignment, func(tx pgx.Tx, offer AcceptedOffer) error {
+	err := s.Authority.WithAcceptedOffer(ctx, team, assignment, func(ctx context.Context, tx pgx.Tx, offer AcceptedOffer) error {
 		if err := offer.validate(); err != nil {
 			return err
 		}
