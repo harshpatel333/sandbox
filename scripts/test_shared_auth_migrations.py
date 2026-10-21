@@ -450,13 +450,71 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
         self.assertFalse(shared.objects_present(self.conn))
 
     def test_shared_version_in_regional_history_blocks_pending_apply(self):
-        for version in (shared.VERSION, shared.CLAIM_VERSION, shared.APPROVAL_VERSION):
+        for version in (shared.VERSION, shared.CLAIM_VERSION, shared.APPROVAL_VERSION, shared.ACCEPTANCE_VERSION):
             with self.conn.transaction(force_rollback=True):
                 self.conn.execute("INSERT INTO supabase_migrations.schema_migrations(version,name,statements) VALUES(%s,'unexpected',ARRAY[]::text[])",
                                   (version,))
                 with self.assertRaisesRegex(shared.SharedMigrationError, "shared_version_in_regional_history"):
                     self.apply()
                 self.assertFalse(shared.receipt_ledger_exists(self.conn))
+
+    def install_acceptance_fixture(self):
+        self.apply()
+        self.apply_claims()
+        self.apply_approvals()
+        sql = shared.acceptance_source()
+        executed = shared.acceptance_execution(sql)
+        with self.conn.transaction():
+            self.conn.execute(executed)
+            shared.verify_acceptance_permissions(self.conn)
+            self.conn.execute(f"INSERT INTO {shared.LEDGER} "
+                "(version,name,source_sql,applied_sql,source_sha256,catalog,revision) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                (shared.ACCEPTANCE_VERSION, shared.ACCEPTANCE_NAME, sql, executed, shared.ACCEPTANCE_HASH,
+                 shared.Jsonb(shared.acceptance_catalog(self.conn)), self.revision))
+
+    def test_optional_acceptance_receipt_preserves_deployment_and_inspection(self):
+        self.apply()
+        self.apply_claims()
+        self.apply_approvals()
+        self.assertNotIn(shared.ACCEPTANCE_VERSION, shared.receipt_versions(self.conn))
+        self.assertFalse(shared.acceptance_objects_present(self.conn))
+        with self.assertRaisesRegex(shared.SharedMigrationError, "unsupported_shared_migration"):
+            shared.apply(self.conn, "use4", self.revision, shared.acceptance_source(), True, "acceptances")
+        self.install_acceptance_fixture()
+        prior = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
+        history = self.history()
+        for migration, source in (("authority", shared.source), ("claims", shared.claim_source),
+                                  ("approvals", shared.approval_source)):
+            measured = MeasuredConnection(self.conn)
+            self.assertEqual(shared.apply(measured, "use4", self.revision, source(), True, migration)["state"], "applied")
+            self.assertEqual(measured.calls, 2)
+            self.assertEqual(measured.transactions, 0)
+            self.assertEqual(shared.apply(self.conn, "use4", self.revision, source(), False, migration)["state"], "applied")
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version"), prior)
+        self.assertEqual(self.history(), history)
+
+    def test_optional_acceptance_receipt_rejects_tampering_and_missing_predecessor(self):
+        self.install_acceptance_fixture()
+        for column, value in (("name", "unexpected"), ("source_sql", "changed"),
+                              ("applied_sql", "changed"), ("source_sha256", "0" * 64), ("revision", "main")):
+            with self.subTest(column=column), self.conn.transaction(force_rollback=True):
+                self.conn.execute(f"UPDATE {shared.LEDGER} SET {column}=%s WHERE version=%s", (value, shared.ACCEPTANCE_VERSION))
+                with self.assertRaisesRegex(shared.SharedMigrationError, "shared_history_mismatch"):
+                    self.apply()
+        with self.conn.transaction(force_rollback=True):
+            self.conn.execute(f"DELETE FROM {shared.LEDGER} WHERE version=%s", (shared.APPROVAL_VERSION,))
+            with self.assertRaisesRegex(shared.SharedMigrationError, "acceptance_approval_history_missing"):
+                self.apply()
+
+    def test_optional_acceptance_inspection_rejects_schema_drift(self):
+        self.install_acceptance_fixture()
+        for sql in ("ALTER TABLE auth.users DISABLE TRIGGER yc_financial_auth_writer",
+                    "GRANT EXECUTE ON FUNCTION public.yc_offer_acceptance_rpc(text,jsonb) TO authenticated",
+                    "ALTER FUNCTION public.yc_claim_rpc(text,jsonb) SET search_path TO public"):
+            with self.subTest(sql=sql), self.conn.transaction(force_rollback=True):
+                self.conn.execute(sql)
+                with self.assertRaises(shared.SharedMigrationError):
+                    self.apply(False)
 
     def test_commit_acknowledgement_loss_requires_inspection(self):
         class LostAcknowledgement(MeasuredConnection):
