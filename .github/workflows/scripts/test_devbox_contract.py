@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 import sys
 import unittest
 
@@ -277,6 +278,12 @@ class ZoneTests(unittest.TestCase):
         for bad in ("us-east1-b", "us-central1-d", "us-central1", "AUTO"):
             with self.subTest(zone=bad), self.assertRaises(contract.ContractError):
                 contract.zone_candidates(bad)
+
+    def test_zones_match_the_terraform_iam_conditions(self):
+        tfvars = (Path(__file__).resolve().parents[3] / "deploy/devbox/terraform/terraform.tfvars").read_text()
+        zones = re.search(r"^zones\s*=\s*\[(.*)\]$", tfvars, re.M)
+        self.assertIsNotNone(zones, "terraform.tfvars must list the devbox zones")
+        self.assertEqual(tuple(re.findall(r'"([^"]+)"', zones.group(1))), contract.DEVBOX_ZONES)
 
     def test_zones_stay_in_the_devbox_region(self):
         self.assertEqual(len(set(contract.DEVBOX_ZONES)), len(contract.DEVBOX_ZONES))

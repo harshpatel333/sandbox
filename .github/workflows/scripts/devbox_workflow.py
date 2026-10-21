@@ -210,7 +210,6 @@ def load_profile(path=PROFILE_PATH):
         expected = {
             "schema_version": (profile.get("schema_version"), 1),
             "project": (profile.get("project"), contract.PROJECT),
-            "zones": (profile.get("zones"), list(contract.DEVBOX_ZONES)),
             "resource_name_prefix": (profile.get("resource_name_prefix"), contract.RESOURCE_PREFIX),
             "data_disk.name_suffix": (data.get("name_suffix"), contract.DATA_DISK_SUFFIX),
             "data_disk.device_name": (data.get("device_name"), contract.DATA_DISK_DEVICE_NAME),
