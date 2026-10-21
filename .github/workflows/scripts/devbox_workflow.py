@@ -106,10 +106,12 @@ def annotate(kind, message):
     print(f"::{kind}::{escaped}", file=sys.stderr)
 
 
-def log(message):
-    # Indenting continuation lines keeps box output in an error from starting a
-    # workflow command.
-    print("\n  ".join(str(message).splitlines()), flush=True)
+def echo(text):
+    # Text that can carry box output is printed with workflow commands off, so
+    # no line of it (a leading ::, or ##[ anywhere) is run as one.
+    token = secrets.token_hex(16)
+    print(f"::stop-commands::{token}\n{text}\n::{token}::", flush=True)
+
 
 
 def run(args, *, input=None, capture=True, timeout=600):
@@ -188,7 +190,7 @@ def append_summary(env, text):
     if path:
         with open(path, "a") as summary:
             summary.write(text.rstrip() + "\n")
-    print(text)
+    echo(text)
 
 
 def prepare_create(env, profile_path=PROFILE_PATH):
@@ -318,7 +320,7 @@ class Box:
                 if not (self.login_granted is not None and LOGIN_DENIED.search(str(error))
                         and time.monotonic() - self.login_granted < LOGIN_PROPAGATION_SECONDS):
                     raise
-                log(f"waiting for the OS Login grant on {self.name} to settle: {error}")
+                echo(f"waiting for the OS Login grant on {self.name} to settle: {error}")
                 time.sleep(DEADLINE.cap(SSH_RETRY_SECONDS))
 
     def wait_for_ssh(self, attempts=SSH_ATTEMPTS, delay=SSH_RETRY_SECONDS):
@@ -329,7 +331,7 @@ class Box:
             except DeadlineExceeded:
                 raise
             except StepError as error:
-                log(f"waiting for SSH over IAP ({attempt}/{attempts}): {error}")
+                echo(f"waiting for SSH over IAP ({attempt}/{attempts}): {error}")
                 if attempt < attempts:
                     time.sleep(DEADLINE.cap(delay))
         raise StepError(f"{self.name} did not accept SSH over IAP")

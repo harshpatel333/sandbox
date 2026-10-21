@@ -524,8 +524,12 @@ class CreateTests(WorkflowCase):
             workflow.annotate("error", "failed: x\n::warning::injected\r\n50%")
         self.assertEqual(stderr.getvalue(), "::error::failed: x%0A::warning::injected%0D%0A50%25\n")
         with patch("sys.stdout", new=io.StringIO()) as stdout:
-            workflow.log("waiting: x\n::add-mask::secret")
-        self.assertFalse([line for line in stdout.getvalue().splitlines()[1:] if line.startswith("::")])
+            workflow.echo("waiting: x\n  ::add-mask::secret\n##[warning]injected")
+        lines = stdout.getvalue().splitlines()
+        token = lines[0].removeprefix("::stop-commands::")
+        self.assertTrue(lines[0].startswith("::stop-commands::") and len(token) == 32)
+        self.assertEqual(lines[-1], f"::{token}::")
+        self.assertNotIn(token, "\n".join(lines[1:-1]))
 
     def test_script_runs_stream_output_and_keep_only_errors(self):
         seen = []
