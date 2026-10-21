@@ -54,7 +54,7 @@ class FakeCloud:
         self.disks, self.buckets, self.unlabelled = [], [], set()
         self.disk_zones, self.deleted, self.stockout = {}, [], {}
         self.leak_boot_disk, self.created_at, self.vanished = False, {}, set()
-        self.login_denials, self.ssh_ready, self.denied = 0, False, []
+        self.login_denials, self.ssh_ready, self.denied, self.script_denials = 0, False, [], 0
         self.relabel_after_checkouts = None
         self.pending_instance = False
         self.fail_disk_create = False
@@ -208,6 +208,11 @@ class FakeCloud:
                 return fail(255, "Connection closed by remote host")
             return ok()
         script = re.search(r"deploy/devbox/([a-z-]+\.sh)'? 2>&1", unquote(command))
+        if script and self.script_denials:
+            self.script_denials -= 1
+            self.denied.append(command)
+            return fail(1, "ERROR: (gcloud.compute.ssh) PERMISSION_DENIED: User does not have "
+                           "compute.instances.osLogin permission.")
         if script:
             self.scripts.append(script.group(1))
             if script.group(1) == self.expire_on_script:
@@ -506,6 +511,22 @@ class CreateTests(WorkflowCase):
         self.assertEqual(cloud.metadata_writes[-1]["state"], "ready")
         self.assertEqual(cloud.checkouts, [SANDBOX_SHA, UI_SHA])
 
+    def test_a_denied_script_run_is_retried_not_blamed_on_the_script(self):
+        cloud = FakeCloud()
+        cloud.script_denials = 2
+        self.assertEqual(self.create(cloud), 0)
+        self.assertEqual(cloud.scripts, list(contract.CREATE_SCRIPTS))
+        self.assertEqual(len(cloud.denied), 2)
+
+    def test_only_os_login_denials_count_as_settling(self):
+        for text, settling in (("PERMISSION_DENIED: User does not have compute.instances.osLogin permission", True),
+                               ("PERMISSION_DENIED: compute.instances.osLoginExternalUser", False),
+                               ("PERMISSION_DENIED: compute.instances.setMetadata", False),
+                               ("Permission denied (publickey).", False),
+                               ("Error while connecting [4047: 'Failed to lookup instance']", False)):
+            with self.subTest(text=text):
+                self.assertEqual(bool(workflow.LOGIN_DENIED.search(text)), settling)
+
     def test_os_login_settling_is_waited_out_in_a_fallback_zone(self):
         cloud = FakeCloud()
         cloud.stockout, cloud.login_denials = {"us-central1-a": "instance"}, 2
@@ -520,6 +541,7 @@ class CreateTests(WorkflowCase):
         with patch.object(workflow.time, "monotonic", side_effect=lambda: clock[0]), \
              patch.object(workflow.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
             self.assertEqual(self.create(cloud), 1)
+        self.assertGreater(len(cloud.denied), workflow.LOGIN_PROPAGATION_SECONDS // workflow.SSH_RETRY_SECONDS - 2)
         self.assertLessEqual(len(cloud.denied), workflow.LOGIN_PROPAGATION_SECONDS // workflow.SSH_RETRY_SECONDS + 1)
         self.assertIn("compute.instances.osLogin", self.summary.read_text())
 

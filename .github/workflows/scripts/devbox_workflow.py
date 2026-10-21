@@ -48,8 +48,8 @@ SSH_ATTEMPTS = 40
 SSH_RETRY_SECONDS = 15
 # A fresh per-instance OS Login grant takes a few minutes to settle and can
 # flap meanwhile: one connection is let in, the next denied.
-LOGIN_PROPAGATION_SECONDS = 5 * 60
-LOGIN_DENIED = re.compile(r"PERMISSION_DENIED.*compute\.instances\.osLogin", re.S)
+LOGIN_PROPAGATION_SECONDS = 7 * 60
+LOGIN_DENIED = re.compile(r"PERMISSION_DENIED.*compute\.instances\.osLogin\b", re.S)
 # Kept below the job's timeout-minutes so a slow step fails here, with the box
 # marked failed, rather than being killed by the runner.
 DEADLINE_SECONDS = 160 * 60
@@ -100,11 +100,17 @@ DEADLINE = Deadline()
 
 
 def run(args, *, input=None, capture=True, timeout=600):
+    # capture="stderr" streams stdout (long box scripts) but keeps gcloud's
+    # own errors so a failure can say why.
     timeout = DEADLINE.cap(timeout)
+    streams = {"stdout": subprocess.PIPE if capture is True else None,
+               "stderr": subprocess.PIPE if capture else None}
     try:
-        result = subprocess.run(args, input=input, capture_output=capture, text=True, timeout=timeout)
+        result = subprocess.run(args, input=input, text=True, timeout=timeout, **streams)
     except subprocess.TimeoutExpired:
         raise StepError(f"{' '.join(args[:4])} timed out after {timeout}s") from None
+    if capture == "stderr" and result.stderr and not result.returncode:
+        sys.stderr.write(result.stderr)
     if result.returncode:
         detail = (result.stderr or "").strip() if capture else ""
         raise StepError(f"{' '.join(args[:4])} failed (exit {result.returncode})"
@@ -389,7 +395,7 @@ class Box:
         print(f"::group::{script}", flush=True)
         print(f"::stop-commands::{token}", flush=True)
         try:
-            self.ssh("sudo bash -c " + shlex.quote(command), input="", capture=False, timeout=3600)
+            self.ssh("sudo bash -c " + shlex.quote(command), input="", capture="stderr", timeout=3600)
         except StepError as error:
             raise StepError(f"{script} failed on {self.name}; see {log} on the box ({error})") from None
         finally:
