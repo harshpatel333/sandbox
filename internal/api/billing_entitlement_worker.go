@@ -270,20 +270,31 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		if revoked {
 			return time.Now().Add(time.Hour), nil
 		}
-		if err = h.withProviderPairEntitlementAuthority(ctx, pair, func(context.Context, pgx.Tx) error { return nil }); err != nil {
-			return next, err
-		}
 	}
 	start, end, ok := billing.AnniversaryPeriod(c.EntitlementAnchor, time.Now())
 	if !ok {
 		return next, errors.New("commercial anniversary unavailable")
 	}
+	completedNext := end.Add(time.Second)
+	if paired && completedNext.After(next) {
+		// Current paired readiness depends on bounded authority and debt evidence,
+		// including after this period's grant has already been issued.
+		completedNext = next
+	}
 	e, err := h.DB.GetCurrentUsageEntitlement(ctx, db.GetCurrentUsageEntitlementParams{TeamID: team, Kind: c.EntitlementKind})
 	if err == nil && e.State == "issued" {
+		if paired {
+			return completedNext, h.refreshIssuedProviderPair(ctx, pair, c, e, client)
+		}
 		return end.Add(time.Second), nil
 	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return next, err
+	}
+	if paired {
+		if err = h.withProviderPairEntitlementAuthority(ctx, pair, func(context.Context, pgx.Tx) error { return nil }); err != nil {
+			return next, err
+		}
 	}
 	if c.OfferKey == "yc_2026" && !paired {
 		operation, e := h.ycOperation(ctx, team)
@@ -344,6 +355,11 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	}
 	if debt != "" {
 		evidence, _ := json.Marshal(map[string]string{"unpaid_invoice": debt})
+		if paired {
+			if err = h.observeProviderPairDebt(ctx, c, debt); err != nil {
+				return next, err
+			}
+		}
 		_, err = h.Pool.Exec(ctx, `INSERT INTO billing_entitlement_withheld(contract_id,period_start,period_end,evidence) VALUES($1,$2,$3,$4) ON CONFLICT(contract_id,period_start) DO UPDATE SET observed_at=clock_timestamp(),evidence=EXCLUDED.evidence`, id, start, end, evidence)
 		if err == nil {
 			_, err = h.Pool.Exec(ctx, `INSERT INTO billing_entitlement_debt(contract_id,period_start,invoice_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, id, start, debt)
@@ -451,6 +467,9 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		return next, err
 	}
 	if debt != "" {
+		if paired {
+			return next, h.observeProviderPairDebt(ctx, c, debt)
+		}
 		return next, nil
 	}
 	var observed time.Time
@@ -500,7 +519,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		}
 	}
 	if e.State == "issued" {
-		return end.Add(time.Second), nil
+		return completedNext, nil
 	}
 	e, err = h.DB.GetReplayableUsageEntitlement(ctx, db.GetReplayableUsageEntitlementParams{TeamID: team, EntitlementID: e.ID})
 	if err != nil {
@@ -519,7 +538,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 	if err = tx.Commit(ctx); err != nil {
 		return next, err
 	}
-	return end.Add(time.Second), h.dispatchUsageEntitlement(ctx, c, e, client, prices)
+	return completedNext, h.dispatchUsageEntitlement(ctx, c, e, client, prices)
 }
 
 func (h *Handlers) dispatchUsageEntitlement(ctx context.Context, c db.BillingCommercialContract, e db.BillingUsageEntitlement, client *stripeHTTPClient, prices []map[string]string) error {
