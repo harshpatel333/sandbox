@@ -1,0 +1,536 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+type memoryRenewalStore struct {
+	mu       sync.Mutex
+	now      time.Time
+	journals map[renewalChoiceKey]renewalChoiceJournal
+	requests map[uuid.UUID]renewalChoiceOperation
+	events   []string
+}
+type memoryRenewalTx struct {
+	s        *memoryRenewalStore
+	journal  renewalChoiceJournal
+	requests map[uuid.UUID]renewalChoiceOperation
+	events   []string
+}
+
+func renewalClone[T any](v T) T {
+	raw, _ := json.Marshal(v)
+	var copy T
+	_ = json.Unmarshal(raw, &copy)
+	return copy
+}
+func (s *memoryRenewalStore) Transact(_ context.Context, k renewalChoiceKey, f func(renewalChoiceTransaction) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.journals == nil {
+		s.journals = map[renewalChoiceKey]renewalChoiceJournal{}
+		s.requests = map[uuid.UUID]renewalChoiceOperation{}
+	}
+	j, ok := s.journals[k]
+	if !ok {
+		j = renewalChoiceJournal{Key: k, Successor: uuid.New()}
+	}
+	tx := &memoryRenewalTx{s: s, journal: renewalClone(j), requests: map[uuid.UUID]renewalChoiceOperation{}}
+	if err := f(tx); err != nil {
+		return err
+	}
+	s.journals[k] = renewalClone(tx.journal)
+	for id, op := range tx.requests {
+		s.requests[id] = renewalClone(op)
+	}
+	s.events = append(s.events, tx.events...)
+	return nil
+}
+func (t *memoryRenewalTx) SQL() pgx.Tx                    { return nil }
+func (t *memoryRenewalTx) Now() time.Time                 { return t.s.now }
+func (t *memoryRenewalTx) Journal() *renewalChoiceJournal { return &t.journal }
+func (t *memoryRenewalTx) Find(id uuid.UUID) (*renewalChoiceOperation, error) {
+	op, ok := t.s.requests[id]
+	if !ok {
+		return nil, nil
+	}
+	copy := renewalClone(op)
+	return &copy, nil
+}
+func (t *memoryRenewalTx) Insert(op renewalChoiceOperation) error {
+	t.requests[op.Request.ID] = op
+	return nil
+}
+func (t *memoryRenewalTx) Save(event string) error {
+	t.journal.Revision++
+	t.events = append(t.events, event)
+	return nil
+}
+
+type fixtureRenewalAuthority struct {
+	key       renewalChoiceKey
+	actor     uuid.UUID
+	authority renewalChoiceAuthority
+	monthly   bool
+	revoked   bool
+	now       time.Time
+}
+
+func (a *fixtureRenewalAuthority) Locate(_ context.Context, team, assignment, actor uuid.UUID) (renewalChoiceKey, error) {
+	if team != a.key.Team || assignment != a.key.Assignment || actor != a.actor || a.revoked {
+		return renewalChoiceKey{}, errRenewalConflict
+	}
+	return a.key, nil
+}
+func (a *fixtureRenewalAuthority) Guard(_ context.Context, k renewalChoiceKey, actor uuid.UUID, f func() error) error {
+	if k != a.key || actor != a.actor || a.revoked {
+		return errRenewalConflict
+	}
+	return f()
+}
+func (a *fixtureRenewalAuthority) Authorize(_ context.Context, _ pgx.Tx, k renewalChoiceKey, actor uuid.UUID) (renewalChoiceAuthority, error) {
+	if k != a.key || actor != a.actor || a.revoked {
+		return renewalChoiceAuthority{}, errRenewalConflict
+	}
+	return a.authority, nil
+}
+func (a *fixtureRenewalAuthority) Resolve(_ context.Context, _ pgx.Tx, _ renewalChoiceKey, choice string) (*renewalChoiceTerms, error) {
+	if choice == "free" {
+		return nil, nil
+	}
+	if choice == "monthly" && !a.monthly {
+		return nil, errors.New("offer version unavailable")
+	}
+	months, amount := 12, int64(1200000)
+	if choice == "monthly" {
+		months, amount = 1, 120000
+	}
+	allowances := make([]int64, months)
+	for i := range allowances {
+		allowances[i] = 100000
+	}
+	return &renewalChoiceTerms{Offer: "pro_" + choice, Version: 1, RateCard: "payg", Price: "price_" + choice, Product: "prod_pro", Currency: "usd", Amount: amount, Months: months, Allowances: allowances}, nil
+}
+func (a *fixtureRenewalAuthority) DefaultProof(_ context.Context, _ pgx.Tx, k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+	return fixtureRenewalProof(k, op, a.now), nil
+}
+func fixtureRenewalProof(k renewalChoiceKey, op renewalChoiceOperation, now time.Time) renewalChoiceProof {
+	timing := "future_configuration"
+	if !now.Before(k.Boundary) {
+		timing = "boundary_history"
+	}
+	return renewalChoiceProof{Operation: op.ID, Boundary: k.Boundary, BindingHash: renewalHash(op.Binding), TermsHash: renewalHash(op.Terms), Outcome: "confirmed", Timing: timing, VerifiedAt: now, Evidence: json.RawMessage(`{"fixture_verification":"exact_boundary"}`)}
+}
+
+type fixtureRenewalProvider struct {
+	dispatch func(renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error)
+	observe  func(renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error)
+	writes   atomic.Int32
+}
+
+func (p *fixtureRenewalProvider) Dispatch(_ context.Context, k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+	p.writes.Add(1)
+	return p.dispatch(k, op)
+}
+func (p *fixtureRenewalProvider) Observe(_ context.Context, k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+	return p.observe(k, op)
+}
+
+type fixtureRenewalSuccessor struct {
+	calls  int
+	state  string
+	choice string
+	id     uuid.UUID
+}
+
+func (p *fixtureRenewalSuccessor) Reconcile(_ context.Context, _ pgx.Tx, _ renewalChoiceKey, op renewalChoiceOperation, id uuid.UUID) (string, error) {
+	p.calls++
+	p.choice = op.Request.Choice
+	if p.id != uuid.Nil && p.id != id {
+		return "", errRenewalConflict
+	}
+	p.id = id
+	return p.state, nil
+}
+func newRenewalFixture(t *testing.T) (*renewalChoiceService, *memoryRenewalStore, *fixtureRenewalAuthority) {
+	t.Helper()
+	now := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	key := renewalChoiceKey{Team: uuid.New(), Assignment: uuid.New(), Boundary: now.AddDate(0, 1, 0)}
+	a := &fixtureRenewalAuthority{key: key, actor: uuid.New(), now: now, authority: renewalChoiceAuthority{Revision: 7, Acceptance: uuid.New(), Binding: renewalChoiceBinding{Contract: uuid.New(), ProviderBinding: uuid.New(), Merchant: "acct_fixture", Customer: "cus_fixture", Fee: "sub_fee", Usage: "sub_usage", Anchor: key.Boundary.AddDate(-1, 0, 0)}}}
+	store := &memoryRenewalStore{now: now}
+	s := &renewalChoiceService{Enabled: true, Store: store, Authority: a}
+	if err := s.initialize(t.Context(), key, a.actor); err != nil {
+		t.Fatal(err)
+	}
+	return s, store, a
+}
+func submitRenewal(t *testing.T, s *renewalChoiceService, a *fixtureRenewalAuthority, choice string) renewalChoiceJournal {
+	t.Helper()
+	j, err := s.status(t.Context(), a.key, a.actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err = s.submit(t.Context(), a.key, a.actor, renewalChoiceRequest{ID: uuid.New(), Choice: choice, ApprovalRevision: a.authority.Revision, Acceptance: a.authority.Acceptance, ChoiceRevision: j.Revision})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return j
+}
+
+func TestRenewalChoiceDefaultClosedAndCatalog(t *testing.T) {
+	var empty renewalChoiceService
+	if err := empty.initialize(t.Context(), renewalChoiceKey{}, uuid.New()); !errors.Is(err, errRenewalDisabled) {
+		t.Fatal(err)
+	}
+	s, _, a := newRenewalFixture(t)
+	if s.Provider != nil || s.Successors != nil {
+		t.Fatal("fixture must start without provider or successor adapters")
+	}
+	j, _ := s.status(t.Context(), a.key, a.actor)
+	if j.Confirmed.Request.Choice != "annual" || j.Requested != nil || j.SuccessorState != "scheduled" {
+		t.Fatal(j)
+	}
+	_, err := s.submit(t.Context(), a.key, a.actor, renewalChoiceRequest{ID: uuid.New(), Choice: "monthly", ApprovalRevision: 7, Acceptance: a.authority.Acceptance, ChoiceRevision: j.Revision})
+	if err == nil {
+		t.Fatal("unpublished monthly accepted")
+	}
+	other := a.key
+	other.Team = uuid.New()
+	if _, err = s.status(t.Context(), other, a.actor); err == nil {
+		t.Fatal("foreign tenant read accepted")
+	}
+	if _, err = s.status(t.Context(), a.key, uuid.New()); err == nil {
+		t.Fatal("foreign actor accepted")
+	}
+	if err = s.reconcile(t.Context(), a.key); !errors.Is(err, errRenewalDisabled) {
+		t.Fatal(err)
+	}
+}
+
+func TestRenewalChoiceReplayAndConcurrentRevisions(t *testing.T) {
+	s, _, a := newRenewalFixture(t)
+	j := submitRenewal(t, s, a, "free")
+	req := j.Requested.Request
+	replay, err := s.submit(t.Context(), a.key, a.actor, req)
+	if err != nil || replay.Revision != j.Revision || replay.Requested.ID != j.Requested.ID {
+		t.Fatal(replay, err)
+	}
+	changed := req
+	changed.Choice = "annual"
+	if _, err = s.submit(t.Context(), a.key, a.actor, changed); !errors.Is(err, errRenewalConflict) {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var accepted atomic.Int32
+	for range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, e := s.submit(t.Context(), a.key, a.actor, renewalChoiceRequest{ID: uuid.New(), Choice: "annual", ApprovalRevision: 7, Acceptance: a.authority.Acceptance, ChoiceRevision: j.Revision})
+			if e == nil {
+				accepted.Add(1)
+			} else if !errors.Is(e, errRenewalConflict) {
+				t.Error(e)
+			}
+		}()
+	}
+	wg.Wait()
+	if accepted.Load() != 1 {
+		t.Fatal("lost revision fence", accepted.Load())
+	}
+	a.authority.Revision++
+	j, _ = s.status(t.Context(), a.key, a.actor)
+	if err = s.reconcile(t.Context(), a.key); !errors.Is(err, errRenewalDisabled) {
+		t.Fatal(err)
+	}
+	_, err = s.submit(t.Context(), a.key, a.actor, renewalChoiceRequest{ID: uuid.New(), Choice: "free", ApprovalRevision: 7, Acceptance: a.authority.Acceptance, ChoiceRevision: j.Revision})
+	if !errors.Is(err, errRenewalConflict) {
+		t.Fatal("stale authority", err)
+	}
+}
+
+func TestRenewalChoiceUnknownPreservesConfirmedAndNeverRedispatches(t *testing.T) {
+	s, store, a := newRenewalFixture(t)
+	j := submitRenewal(t, s, a, "free")
+	p := &fixtureRenewalProvider{dispatch: func(renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error) {
+		return renewalChoiceProof{}, errors.New("response lost")
+	}}
+	p.observe = func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+		return fixtureRenewalProof(k, op, store.now), nil
+	}
+	s.Provider = p
+	if err := s.reconcile(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	j, _ = s.status(t.Context(), a.key, a.actor)
+	if j.Requested.State != "outcome_unknown" || j.Confirmed.Request.Choice != "annual" {
+		t.Fatal(j)
+	}
+	_, err := s.submit(t.Context(), a.key, a.actor, renewalChoiceRequest{ID: uuid.New(), Choice: "annual", ApprovalRevision: 7, Acceptance: a.authority.Acceptance, ChoiceRevision: j.Revision})
+	if !errors.Is(err, errRenewalPending) {
+		t.Fatal(err)
+	}
+	// A later read-only history proof may recover the original write after B.
+	store.now = a.key.Boundary.Add(time.Hour)
+	if err = s.reconcile(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	j, _ = s.status(t.Context(), a.key, a.actor)
+	if j.Confirmed.Request.Choice != "free" || p.writes.Load() != 1 {
+		t.Fatal(j, p.writes.Load())
+	}
+}
+
+func TestRenewalChoiceLateAndMismatchedProofsRemainUnknown(t *testing.T) {
+	for _, kind := range []string{"wrong_boundary", "wrong_terms", "wrong_binding", "future_get_after_boundary", "empty_evidence"} {
+		t.Run(kind, func(t *testing.T) {
+			s, store, a := newRenewalFixture(t)
+			submitRenewal(t, s, a, "free")
+			p := &fixtureRenewalProvider{dispatch: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+				proof := fixtureRenewalProof(k, op, store.now)
+				switch kind {
+				case "wrong_boundary":
+					proof.Boundary = proof.Boundary.AddDate(0, 1, 0)
+				case "wrong_terms":
+					proof.TermsHash = "different"
+				case "wrong_binding":
+					proof.BindingHash = "different"
+				case "empty_evidence":
+					proof.Evidence = json.RawMessage(`{}`)
+				case "future_get_after_boundary":
+					store.now = k.Boundary.Add(time.Second)
+				}
+				return proof, nil
+			}}
+			s.Provider = p
+			if err := s.reconcile(t.Context(), a.key); err != nil {
+				t.Fatal(err)
+			}
+			j, _ := s.status(t.Context(), a.key, a.actor)
+			if j.Requested.State != "outcome_unknown" || j.Confirmed.Request.Choice != "annual" {
+				t.Fatal(j)
+			}
+		})
+	}
+}
+
+func TestRenewalChoiceBoundaryAndRevocationPreventDispatch(t *testing.T) {
+	for _, kind := range []string{"boundary", "revoked", "revision"} {
+		t.Run(kind, func(t *testing.T) {
+			s, store, a := newRenewalFixture(t)
+			submitRenewal(t, s, a, "free")
+			p := &fixtureRenewalProvider{dispatch: func(renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error) {
+				t.Fatal("forbidden dispatch")
+				return renewalChoiceProof{}, nil
+			}}
+			s.Provider = p
+			switch kind {
+			case "boundary":
+				store.now = a.key.Boundary
+			case "revoked":
+				a.revoked = true
+			case "revision":
+				a.authority.Revision++
+			}
+			err := s.reconcile(t.Context(), a.key)
+			if kind != "boundary" && err == nil {
+				t.Fatal("stale authority accepted")
+			}
+			if p.writes.Load() != 0 {
+				t.Fatal("provider mutated")
+			}
+		})
+	}
+}
+
+func TestRenewalChoiceConcurrentObservationCannotUndoConfirmation(t *testing.T) {
+	s, store, a := newRenewalFixture(t)
+	submitRenewal(t, s, a, "free")
+	entered, release := make(chan struct{}), make(chan struct{})
+	p := &fixtureRenewalProvider{dispatch: func(renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error) {
+		close(entered)
+		<-release
+		return renewalChoiceProof{}, errors.New("late transport error")
+	}, observe: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+		return fixtureRenewalProof(k, op, store.now), nil
+	}}
+	s.Provider = p
+	done := make(chan error, 1)
+	go func() { done <- s.reconcile(t.Context(), a.key) }()
+	<-entered
+	if err := s.reconcile(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	j, _ := s.status(t.Context(), a.key, a.actor)
+	if j.Confirmed.Request.Choice != "free" || j.Requested.State != "confirmed" || p.writes.Load() != 1 {
+		t.Fatal(j)
+	}
+}
+
+func TestRenewalChoiceSuccessorUsesLastConfirmedAndPaymentGate(t *testing.T) {
+	s, store, a := newRenewalFixture(t)
+	submitRenewal(t, s, a, "free")
+	p := &fixtureRenewalProvider{dispatch: func(renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error) {
+		return renewalChoiceProof{}, errors.New("unknown")
+	}}
+	s.Provider = p
+	if err := s.reconcile(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	p.observe = func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+		return fixtureRenewalProof(k, op, store.now), nil
+	}
+	successor := &fixtureRenewalSuccessor{state: "payment_pending"}
+	s.Successors = successor
+	if err := s.reconcileSuccessor(t.Context(), a.key); err != nil || successor.calls != 0 {
+		t.Fatal(err, successor.calls)
+	}
+	store.now = a.key.Boundary
+	for range 2 {
+		if err := s.reconcileSuccessor(t.Context(), a.key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	j, _ := s.status(t.Context(), a.key, a.actor)
+	if j.SuccessorState != "payment_pending" || successor.choice != "annual" {
+		t.Fatal(j, successor.choice)
+	}
+	successor.state = "active"
+	if err := s.reconcileSuccessor(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	j, _ = s.status(t.Context(), a.key, a.actor)
+	if j.SuccessorState != "active" {
+		t.Fatal(j)
+	}
+	a.revoked = true
+	before := successor.calls
+	if err := s.reconcileSuccessor(t.Context(), a.key); err == nil || successor.calls != before {
+		t.Fatal("revoked authority adopted")
+	}
+}
+
+func TestRenewalChoiceBoundaryProofPreventsStaleFreeAdoption(t *testing.T) {
+	s, store, a := newRenewalFixture(t)
+	p := &fixtureRenewalProvider{dispatch: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+		return fixtureRenewalProof(k, op, store.now), nil
+	}}
+	s.Provider = p
+	submitRenewal(t, s, a, "free")
+	if err := s.reconcile(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	a.monthly = true
+	submitRenewal(t, s, a, "monthly")
+	p.dispatch = func(renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error) {
+		return renewalChoiceProof{}, errors.New("response lost")
+	}
+	if err := s.reconcile(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	store.now = a.key.Boundary.Add(time.Hour)
+	// The saved Free instruction differs from actual provider boundary history.
+	p.observe = func(renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error) {
+		return renewalChoiceProof{}, errors.New("boundary actually billed monthly")
+	}
+	successor := &fixtureRenewalSuccessor{state: "free"}
+	s.Successors = successor
+	if err := s.reconcileSuccessor(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	j, _ := s.status(t.Context(), a.key, a.actor)
+	if successor.calls != 0 || j.SuccessorState != "review_required" || j.Confirmed.Request.Choice != "free" {
+		t.Fatal(j, successor.calls)
+	}
+	// Recover the unknown operation, then adopt only its exact effective terms.
+	p.observe = func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+		return fixtureRenewalProof(k, op, store.now), nil
+	}
+	if err := s.reconcile(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	successor.state = "payment_pending"
+	if err := s.reconcileSuccessor(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	if successor.calls != 1 || successor.choice != "monthly" {
+		t.Fatal(successor)
+	}
+}
+
+func TestRenewalChoiceStaleBoundaryFailureCannotUndoActive(t *testing.T) {
+	s, store, a := newRenewalFixture(t)
+	store.now = a.key.Boundary
+	entered, release := make(chan struct{}), make(chan struct{})
+	var observations atomic.Int32
+	s.Provider = &fixtureRenewalProvider{observe: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+		if observations.Add(1) == 1 {
+			close(entered)
+			<-release
+			return renewalChoiceProof{}, errors.New("old observation failed")
+		}
+		return fixtureRenewalProof(k, op, store.now), nil
+	}}
+	s.Successors = &fixtureRenewalSuccessor{state: "active"}
+	done := make(chan error, 1)
+	go func() { done <- s.reconcileSuccessor(t.Context(), a.key) }()
+	<-entered
+	if err := s.reconcileSuccessor(t.Context(), a.key); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, errRenewalConflict) {
+		t.Fatal(err)
+	}
+	j, _ := s.status(t.Context(), a.key, a.actor)
+	if j.SuccessorState != "active" {
+		t.Fatal(j)
+	}
+}
+
+func TestRenewalChoiceCustomerProjectionPreservesPinnedTermsAndHidesEvidence(t *testing.T) {
+	s, store, a := newRenewalFixture(t)
+	s.Provider = &fixtureRenewalProvider{}
+	a.monthly = true
+	before := submitRenewal(t, s, a, "monthly")
+	view, err := s.view(t.Context(), a.key, a.actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Requested.Choice != "monthly" || view.Confirmed.Choice != "annual" || view.Requested.Terms.Amount != 120000 || view.Confirmed.Terms.Amount != 1200000 {
+		t.Fatal(view)
+	}
+	raw, _ := json.Marshal(view)
+	for _, private := range []string{"cus_fixture", "sub_fee", "acct_fixture", "fixture_verification", "actor_id", "price_monthly"} {
+		if strings.Contains(string(raw), private) {
+			t.Fatalf("private provider field in projection: %s", private)
+		}
+	}
+	if before.Requested.Terms.Price != "price_monthly" {
+		t.Fatal("saved execution mapping lost")
+	}
+	store.now = a.key.Boundary
+	view, err = s.view(t.Context(), a.key, a.actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, option := range view.Options {
+		if option.Available || option.UnavailableReason != "boundary_passed" {
+			t.Fatal(option)
+		}
+	}
+}
