@@ -17,12 +17,15 @@ import (
 )
 
 func TestProviderPairWorkerDiscoversOngoingCash(t *testing.T) {
-	for _, mode := range []string{"second_monthly", "later_annual", "paid_after_unpaid_pagination", "missing_mapping", "changed_receipt", "revoked_during_discovery", "debt_during_discovery"} {
+	for _, mode := range []string{"second_monthly", "skewed_monthly", "later_annual", "paid_after_unpaid_pagination", "missing_mapping", "changed_receipt", "revoked_during_discovery", "debt_during_discovery"} {
 		t.Run(mode, func(t *testing.T) {
 			monthly := mode != "later_annual"
 			anchor := time.Now().UTC().AddDate(-1, -1, 0).Add(-time.Hour).Truncate(time.Second)
 			if !monthly {
 				anchor = anchor.AddDate(-1, 0, 0)
+			}
+			if mode == "skewed_monthly" {
+				anchor = time.Date(2024, 2, 29, 0, 0, 0, 0, time.UTC)
 			}
 			tx, b, f, h := paidPairMappingFixture(t, anchor, monthly)
 			start, end, _ := billing.AnniversaryPeriod(b.Anchor, time.Now())
