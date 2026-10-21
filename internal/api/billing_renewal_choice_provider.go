@@ -26,7 +26,6 @@ type renewalScheduleSnapshot struct {
 }
 type renewalScheduleVerifier interface {
 	Inspect(context.Context, renewalChoiceKey, renewalChoiceOperation) (renewalScheduleSnapshot, error)
-	VerifyStep(context.Context, renewalChoiceKey, renewalChoiceOperation, renewalChoiceStepRequest, []byte) (renewalChoiceStepProof, error)
 	ObserveStep(context.Context, renewalChoiceKey, renewalChoiceOperation, renewalChoiceStepRequest) (renewalChoiceStepProof, error)
 	ObserveChoice(context.Context, renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error)
 }
@@ -67,6 +66,11 @@ func buildRenewalScheduleStep(k renewalChoiceKey, op renewalChoiceOperation, sna
 	var r renewalChoiceStepRequest
 	if !validRenewalKey(k) || !validRenewalBinding(op.Binding, k) || snapshot.BindingHash != renewalHash(op.Binding) || !snapshot.Anchor.Equal(op.Binding.Anchor) || !snapshot.Boundary.Equal(k.Boundary) {
 		return r, errRenewalConflict
+	}
+	// The paired payment verifier currently retains the original-anchor cadence.
+	// Do not schedule a Monthly period whose provider end cannot satisfy it.
+	if op.Request.Choice == "monthly" && !annualBoundary(k.Boundary, 1).Equal(annualBoundary(op.Binding.Anchor, 13)) {
+		return r, errRenewalDisabled
 	}
 	form := url.Values{}
 	if snapshot.Schedule == "" {
@@ -138,6 +142,9 @@ func (p *renewalScheduleProvider) DispatchStep(ctx context.Context, k renewalCho
 	if !p.ready(op) || r.BindingHash != renewalHash(op.Binding) || r.Merchant != p.Merchant || r.Version != p.Client.apiVersion {
 		return renewalChoiceStepProof{}, errRenewalDisabled
 	}
+	if op.Request.Choice == "monthly" && !annualBoundary(k.Boundary, 1).Equal(annualBoundary(op.Binding.Anchor, 13)) {
+		return renewalChoiceStepProof{}, errRenewalDisabled
+	}
 	// GetBody=nil disables net/http's transparent retry of an idempotent POST.
 	req, err := http.NewRequestWithContext(ctx, r.Method, p.Client.baseURL+r.Path, strings.NewReader(r.Form))
 	if err != nil {
@@ -167,7 +174,7 @@ func (p *renewalScheduleProvider) DispatchStep(ctx context.Context, k renewalCho
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return renewalChoiceStepProof{}, fmt.Errorf("schedule request returned %d", response.StatusCode)
 	}
-	return p.Verifier.VerifyStep(ctx, k, op, r, raw)
+	return verifyRenewalScheduleReceipt(k, op, r, raw, time.Now().UTC())
 }
 func (p *renewalScheduleProvider) ObserveStep(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation, r renewalChoiceStepRequest) (renewalChoiceStepProof, error) {
 	if p == nil || p.Verifier == nil {

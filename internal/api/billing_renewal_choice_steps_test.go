@@ -131,14 +131,10 @@ func TestRenewalChoiceScheduleWirePreservesTerm(t *testing.T) {
 	}
 }
 
-type fixtureRenewalVerifier struct{ calls atomic.Int32 }
+type fixtureRenewalVerifier struct{}
 
 func (v *fixtureRenewalVerifier) Inspect(context.Context, renewalChoiceKey, renewalChoiceOperation) (renewalScheduleSnapshot, error) {
 	return renewalScheduleSnapshot{}, errRenewalDisabled
-}
-func (v *fixtureRenewalVerifier) VerifyStep(context.Context, renewalChoiceKey, renewalChoiceOperation, renewalChoiceStepRequest, []byte) (renewalChoiceStepProof, error) {
-	v.calls.Add(1)
-	return renewalChoiceStepProof{}, nil
 }
 func (v *fixtureRenewalVerifier) ObserveStep(context.Context, renewalChoiceKey, renewalChoiceOperation, renewalChoiceStepRequest) (renewalChoiceStepProof, error) {
 	return renewalChoiceStepProof{}, nil
@@ -168,7 +164,7 @@ func TestRenewalChoiceScheduleTransportSingleWrite(t *testing.T) {
 	if _, err = p.DispatchStep(t.Context(), a.key, op, r); err == nil {
 		t.Fatal("redirect accepted")
 	}
-	if calls.Load() != 1 || verifier.calls.Load() != 0 {
+	if calls.Load() != 1 {
 		t.Fatal("redirect replayed")
 	}
 	p.BoundaryWritesVerified = false
