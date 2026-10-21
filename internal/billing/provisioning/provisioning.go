@@ -109,9 +109,8 @@ type SavedRequest struct {
 // WithAcceptedOffer serializes team/account and current shared approval authority,
 // validates durable acceptance, region, rollout and all new-signup conflict guards,
 // then invokes f inside that transaction using its guard-owned context. It must reject revoked/changed authority.
-// Finalize runs in that same transaction after provider verification. It binds the
-// pair, enrolls invoices, materializes the assignment, and wakes existing grant
-// issuance atomically; it must not make network calls or issue a second allowance.
+// This guard authorizes pending metadata only. It is insufficient for benefit
+// activation when shared and regional databases can commit independently.
 type Admission interface {
 	WithAcceptedOffer(context.Context, uuid.UUID, uuid.UUID, func(context.Context, pgx.Tx, AcceptedOffer) error) error
 	// The regional dispatch marker is already committed. Recheck the exact
@@ -119,8 +118,20 @@ type Admission interface {
 	// row locks, and do not acquire them from f. Revocation must wait for f.
 	WithDispatchGuard(context.Context, uuid.UUID, uuid.UUID, func(context.Context, AcceptedOffer) error) error
 }
+
+// Verification retains the verifier's in-process proof through finalization. Only
+// Evidence is journaled; a restart must obtain fresh proof through Verify.
+type Verification struct {
+	Evidence json.RawMessage
+	Proof    any
+}
+
 type Activation interface {
-	Finalize(context.Context, pgx.Tx, Operation, json.RawMessage) error
+	// WithFinalization requires durable activation authorization and regional
+	// fencing against revocation. A session lock or cancellation alone cannot
+	// authorize this transaction across independently committing databases.
+	WithFinalization(context.Context, Operation, func(context.Context, pgx.Tx, AcceptedOffer) error) error
+	Finalize(context.Context, pgx.Tx, Operation, Verification) error
 	Readiness(context.Context, Operation) (Readiness, error)
 }
 type Authority interface {
@@ -199,7 +210,7 @@ type Provider interface {
 	Preflight(context.Context, SavedRequest) error
 	Create(context.Context, SavedRequest) (json.RawMessage, error)
 	Recover(context.Context, SavedRequest) (json.RawMessage, error)
-	Verify(context.Context, Operation) (json.RawMessage, error)
+	Verify(context.Context, Operation) (Verification, error)
 }
 
 type Service struct {
@@ -222,6 +233,9 @@ func (s *Service) Enqueue(ctx context.Context, team, assignment uuid.UUID) (uuid
 	var id uuid.UUID
 	err := s.Authority.WithAcceptedOffer(ctx, team, assignment, func(ctx context.Context, tx pgx.Tx, offer AcceptedOffer) error {
 		if err := offer.validate(); err != nil {
+			return err
+		}
+		if err := CheckFinancialTarget(ctx, tx, InitialFinancialTarget(team, assignment)); err != nil {
 			return err
 		}
 		raw, err := json.Marshal(offer)
@@ -305,6 +319,13 @@ func (s *Service) Status(ctx context.Context, team, assignment uuid.UUID) (Statu
 	o, err := load(ctx, s.Pool, team, assignment)
 	if err != nil {
 		return Status{}, err
+	}
+	revoked, err := financialTargetRevoked(ctx, s.Pool, InitialFinancialTarget(team, assignment))
+	if err != nil {
+		return Status{OperationID: o.ID, State: "review_required"}, err
+	}
+	if revoked {
+		return Status{OperationID: o.ID, State: "revoked", Revoked: true, Held: o.Held, ControlPending: o.ControlPending}, nil
 	}
 	var r Readiness
 	if o.FinalizedAt != nil && !o.Held && o.RevokedAt == nil {
