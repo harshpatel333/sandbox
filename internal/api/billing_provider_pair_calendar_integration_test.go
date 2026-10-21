@@ -86,7 +86,7 @@ func recordMonthlyPairCash(t *testing.T, tx pgx.Tx, b ContractProviderBinding, f
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = tx.Exec(t.Context(), `INSERT INTO billing_pro_payment_verification(invoice_id,review_required,evidence) VALUES($1,false,$2)`, payment.InvoiceID, cash.Raw); err != nil {
+	if err = observeProPaymentReviewTx(t.Context(), tx, b.Identity.TeamID, payment.InvoiceID, cash, nil); err != nil {
 		t.Fatal(err)
 	}
 	return payment
