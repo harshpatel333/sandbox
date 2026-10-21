@@ -476,6 +476,9 @@ func run() error {
 	handlers.StartStripeCheckoutAssociationMonitor(ctx)
 	handlers.StartProPaymentReconciliation(ctx)
 	handlers.StartUsageEntitlementService(ctx)
+	if err := startRenewalChoices(ctx, handlers); err != nil {
+		log.Error().Err(err).Msg("renewal choices unavailable; other services remain active")
+	}
 	handlers.StartFundingObservationService(ctx)
 
 	// Quota watcher: alerts when a team crosses 80% of a resource limit. Fans out
