@@ -18,9 +18,6 @@ REGION = "us-central1"
 # Zonal resources may live in any of these; create tries them in this order.
 DEVBOX_ZONES = ("us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f")
 AUTO_ZONE = "auto"
-# Superseded by DEVBOX_ZONES and the manifest's zone. It and the zone defaults
-# below remain only until the inventory passes each box's real zone.
-ZONE = DEVBOX_ZONES[0]
 MANIFEST_METADATA_KEY = "devbox-manifest"
 # The devbox project also hosts staging, so the workflow identity's IAM is
 # conditioned on these name prefixes; labels carry the bare devbox name.
@@ -237,7 +234,7 @@ def zone_of(resource):
     return validate_zone((resource.get("zone") or "").rsplit("/", 1)[-1])
 
 
-def resources(name, devbox_id, zone=ZONE):
+def resources(name, devbox_id, zone):
     validate_zone(zone)
     return [
         {"type": "instance", "name": instance_name(name), "zone": zone},
@@ -255,7 +252,7 @@ def revision(branch, sha):
     return {"branch": branch, "sha": sha}
 
 
-def new_manifest(*, name, devbox_id, owner, actor, created_at, expires_at, revisions, zone=ZONE,
+def new_manifest(*, name, devbox_id, owner, actor, created_at, expires_at, revisions, zone,
                  project=PROJECT):
     revisions = {key: revision(revisions[key]["branch"], revisions[key]["sha"]) for key in REPOSITORIES}
     manifest = {
