@@ -35,7 +35,7 @@ The usage collection hold is a separate journaled write; activation cannot prece
 its confirmed receipt. Verification and recovery must not apply that hold themselves.
 No test-only response is valid production evidence.
 
-The unregistered HTTP transport sends saved bodies without POST replay or redirects,
+The HTTP transport sends saved bodies without POST replay or redirects,
 checks the pinned account/mode/API version before the dispatch marker, and bounds
 response sizes. Failed preflight reads leave the request prepared and retryable;
 the adapter must retain the same immutable client through preflight and POST. The concrete provider adapter builds all five saved writes from pinned terms and

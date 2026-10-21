@@ -58,6 +58,7 @@ type offerProvisioningAuthority struct {
 }
 
 var _ provisioning.Authority = (*offerProvisioningAuthority)(nil)
+var _ ProviderPairEntitlementAuthority = (*offerProvisioningAuthority)(nil)
 
 // WithProviderPairAuthority is the entitlement worker's SQL-only dispatch and
 // refresh boundary. Remote authority is observed before any regional lock.

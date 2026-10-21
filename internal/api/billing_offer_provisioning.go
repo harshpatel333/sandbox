@@ -22,6 +22,9 @@ func (h *Handlers) startOfferProvisioning(ctx context.Context) {
 	if h.YCOfferAcceptance.available() {
 		client, configured := h.Stripe.(*stripeHTTPClient)
 		authority := &offerProvisioningAuthority{h: h, admission: &YCAcceptedProvisioningAdmission{Service: h.YCOfferAcceptance, Handlers: h}, client: client}
+		if h.ProviderPairEntitlementAuthority == nil {
+			h.ProviderPairEntitlementAuthority = authority
+		}
 		// Revocation delivery must keep running if provider configuration or new
 		// admission flags are disabled. It performs no provider mutations.
 		go authority.runFinancialInvalidations(ctx)
