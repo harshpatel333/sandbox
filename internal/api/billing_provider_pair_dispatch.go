@@ -85,7 +85,7 @@ func (h *Handlers) finishProviderPairDispatch(ctx context.Context, id uuid.UUID,
 		if err != nil {
 			return err
 		}
-		tag, err := h.Pool.Exec(finished, `UPDATE billing_provider_pair_dispatch SET sender_finished_at=clock_timestamp(),rejected_at=clock_timestamp(),rejection_evidence=$2 WHERE id=$1 AND NOT legacy_untracked AND sender_finished_at IS NULL AND request_form=$3 AND idempotency_key=$4`, id, raw, rejection.form, rejection.IdempotencyKey)
+		tag, err := h.Pool.Exec(finished, `UPDATE billing_provider_pair_dispatch SET sender_finished_at=statement_timestamp(),rejected_at=statement_timestamp(),rejection_evidence=$2 WHERE id=$1 AND NOT legacy_untracked AND sender_finished_at IS NULL AND request_form=$3 AND idempotency_key=$4`, id, raw, rejection.form, rejection.IdempotencyKey)
 		if err != nil {
 			return err
 		}
