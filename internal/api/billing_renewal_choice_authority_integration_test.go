@@ -12,7 +12,8 @@ import (
 	"github.com/superserve-ai/sandbox/internal/billing/provisioning"
 )
 
-func TestRenewalChoiceAcceptedAuthorityUsesCurrentRequester(t *testing.T) {
+func newRenewalAcceptedPairFixture(t *testing.T, anchor time.Time) (*acceptedRenewalAuthority, *Handlers, YCAcceptanceRecord, *pairFixture, *stripeHTTPClient, uuid.UUID) {
+	t.Helper()
 	s, r := acceptedCatalogFixture(t)
 	h := s.Catalog.(ycAcceptedCatalog).h
 	admission := &YCAcceptedProvisioningAdmission{Service: s, Handlers: h}
@@ -50,7 +51,7 @@ func TestRenewalChoiceAcceptedAuthorityUsesCurrentRequester(t *testing.T) {
 	f := newPairFixture(t)
 	f.p.Identity.OperationID, f.p.Identity.TeamID, f.p.Identity.AssignmentID, f.p.Identity.AcceptanceID = *r.OperationID, r.TeamID, *r.AssignmentID, r.ID
 	f.p.Identity.ApprovalSemanticRevision, f.p.Identity.TermsDigest = r.ApprovalRevision, r.TermsDigest
-	f.p.Anchor = time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	f.p.Anchor = anchor
 	f.fee.StartDate, f.fee.BillingCycleAnchor = f.p.Anchor.Unix(), f.p.Anchor.Unix()
 	f.fee.Items.Data[0].Start, f.fee.Items.Data[0].End = f.p.Anchor.Unix(), annualBoundary(f.p.Anchor, 12).Unix()
 	f.usage.StartDate, f.usage.BillingCycleAnchor = f.p.Anchor.Unix(), f.p.Anchor.Unix()
@@ -90,6 +91,12 @@ func TestRenewalChoiceAcceptedAuthorityUsesCurrentRequester(t *testing.T) {
 		t.Fatal(err)
 	}
 	authority := &acceptedRenewalAuthority{Admission: admission, Verifier: &stripeRenewalScheduleVerifier{Pool: s.Pool, Client: client}}
+	return authority, h, r, f, client, requester
+}
+
+func TestRenewalChoiceAcceptedAuthorityUsesCurrentRequester(t *testing.T) {
+	authority, _, r, _, _, requester := newRenewalAcceptedPairFixture(t, time.Now().UTC().Add(-time.Hour).Truncate(time.Second))
+	s := authority.Admission.Service
 	renewal := &renewalChoiceService{Enabled: true, Store: postgresRenewalChoiceStore{Pool: s.Pool}, Authority: authority, Provider: &renewalScheduleProvider{Verifier: authority.Verifier}}
 	view, err := renewal.currentView(t.Context(), r.TeamID, *r.AssignmentID, requester)
 	if err != nil || view.Confirmed == nil || view.Confirmed.Choice != "annual" {
