@@ -375,6 +375,80 @@ func TestYCCommercialOfferAssignmentWaitsForCheckout(t *testing.T) {
 	}
 }
 
+func TestYCCommercialOfferPromotionRecoveryLockOrder(t *testing.T) {
+	for _, path := range []string{"checkout", "assignment", "attempt trigger"} {
+		t.Run(path, func(t *testing.T) {
+			h, team, actor, request := commercialOfferFixture(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			sponsor := uuid.New()
+			if _, err := h.Pool.Exec(ctx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_sponsored_operation(id,team_id,idempotency_key,request,resource_terms,approved_by,reason,reference,state)
+ VALUES($1,$2,'fixture','{}','{}',$3,'fixture','fixture','active')`, sponsor, team, actor); err != nil {
+				t.Fatal(err)
+			}
+			recovery, err := h.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer recovery.Rollback(context.Background())
+			if err = lockCommercialOfferAccount(ctx, recovery, team); err != nil {
+				t.Fatal(err)
+			}
+			var pid int
+			if err = recovery.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			result := make(chan error, 1)
+			go func() {
+				var err error
+				switch path {
+				case "checkout":
+					_, err = h.prepareCommercialCheckout(ctx, team)
+				case "assignment":
+					_, err = h.assignCommercialOffer(ctx, team, actor, request, true)
+				default:
+					_, err = h.Pool.Exec(ctx, `INSERT INTO billing_commercial_checkout_attempt(team_id) VALUES($1)`, team)
+				}
+				result <- err
+			}()
+			for {
+				select {
+				case err = <-result:
+					t.Fatalf("offer path did not wait for recovery account lock: %v", err)
+				default:
+				}
+				var waiting bool
+				if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			// Recovery holds the account before this insert takes the team's FK lock.
+			if _, err = recovery.Exec(ctx, `INSERT INTO billing_sponsored_promotion_recovery(team_id,sponsorship_id,idempotency_key,request,approved_by,reason,reference,customer_id,subscription_id,user_id,event_id)
+ VALUES($1,$2,'fixture','{}',$3,'fixture','fixture','cus_fixture','sub_fixture',$3,'evt_fixture')`, team, sponsor, actor); err != nil {
+				t.Fatalf("recovery insert blocked by offer team lock: %v", err)
+			}
+			if err = recovery.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			err = <-result
+			if path == "assignment" {
+				if !errors.Is(err, errCommercialOfferConflict) {
+					t.Fatalf("assignment must still reject sponsorship: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("checkout did not resume after recovery: %v", err)
+			}
+		})
+	}
+}
+
 func TestYCCommercialOfferCheckoutAttemptStates(t *testing.T) {
 	t.Run("expired preparation cannot adopt an assigned customer", func(t *testing.T) {
 		h, team, actor, r := commercialOfferFixture(t)

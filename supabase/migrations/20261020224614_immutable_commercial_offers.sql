@@ -115,7 +115,7 @@ FOR EACH ROW EXECUTE FUNCTION billing_commercial_offer_immutable();
 CREATE FUNCTION billing_commercial_offer_assignment_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE v billing_commercial_offer_version; region text;
 BEGIN
-    SELECT home_region INTO STRICT region FROM team WHERE id=NEW.team_id FOR UPDATE;
+    SELECT home_region INTO STRICT region FROM team WHERE id=NEW.team_id FOR NO KEY UPDATE;
     PERFORM 1 FROM team_billing_account WHERE team_id=NEW.team_id FOR UPDATE;
     IF NOT feature_enabled('billing_commercial_offer_assignments_enabled',NEW.team_id) THEN
         RAISE EXCEPTION 'commercial offer assignments are disabled';
@@ -279,7 +279,7 @@ END $$;
 CREATE FUNCTION billing_commercial_checkout_attempt_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP='DELETE' THEN RAISE EXCEPTION 'checkout attempt history is immutable'; END IF;
-    PERFORM 1 FROM team WHERE id=NEW.team_id FOR UPDATE;
+    PERFORM 1 FROM team WHERE id=NEW.team_id FOR NO KEY UPDATE;
     PERFORM 1 FROM team_billing_account WHERE team_id=NEW.team_id FOR UPDATE;
     IF TG_OP='INSERT' THEN
         IF NEW.state<>'prepared' OR NEW.dispatched_at IS NOT NULL OR NEW.customer_id IS NOT NULL

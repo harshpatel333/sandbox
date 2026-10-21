@@ -116,7 +116,7 @@ func (h *Handlers) assignCommercialOffer(ctx context.Context, team, actor uuid.U
 	}
 	defer tx.Rollback(ctx)
 	var region string
-	if err = tx.QueryRow(ctx, `SELECT home_region FROM team WHERE id=$1 FOR UPDATE`, team).Scan(&region); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT home_region FROM team WHERE id=$1 FOR NO KEY UPDATE`, team).Scan(&region); err != nil {
 		return nil, err
 	}
 	if region != r.Region {
@@ -357,6 +357,7 @@ func commercialOfferEnabled(ctx context.Context, q db.DBTX, team uuid.UUID) erro
 
 // Every attempt transition uses the same order as assignment, including the team
 // lock needed by first-account insertion. No transaction spans a provider call.
+// Non-key locks allow account-first recovery to insert team-referencing audit rows.
 func (h *Handlers) withCommercialCheckoutAccount(ctx context.Context, team uuid.UUID, f func(context.Context, pgx.Tx) error) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -366,7 +367,7 @@ func (h *Handlers) withCommercialCheckoutAccount(ctx context.Context, team uuid.
 	}
 	defer tx.Rollback(ctx)
 	var id uuid.UUID
-	if err = tx.QueryRow(ctx, `SELECT id FROM team WHERE id=$1 FOR UPDATE`, team).Scan(&id); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, team).Scan(&id); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO team_billing_account(team_id) VALUES($1) ON CONFLICT DO NOTHING`, team); err != nil {
