@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -17,6 +18,7 @@ func TestProviderPairComposedWorker(t *testing.T) {
 	for _, mode := range []string{"refresh", "permission_revoked", "recover_after_revocation"} {
 		t.Run(mode, func(t *testing.T) {
 			a, service, r, o := offerCompositionFixture(t)
+			a.dispatchesResolved = CheckProviderPairDispatchesResolved
 			ctx := t.Context()
 			if err := service.Reconcile(ctx, o.TeamID, o.AssignmentID); err != nil {
 				t.Fatal(err)
@@ -81,19 +83,31 @@ func TestProviderPairComposedWorker(t *testing.T) {
 					t.Fatal(e)
 				}
 				found := false
+				var pendingDelivery YCFinancialInvalidation
 				for _, delivery := range deliveries {
 					if delivery.AcceptanceID == r.ID {
 						found = true
-						if e = a.revokeFinancialDelivery(ctx, delivery); e != nil {
-							t.Fatal(e)
+						pendingDelivery = delivery
+						if e = a.revokeFinancialDelivery(ctx, delivery); !errors.Is(e, errProviderPairDispatchPending) {
+							t.Fatal("unrecovered dispatch allowed effective revocation", e)
 						}
 					}
 				}
 				if !found {
 					t.Fatal("missing actual invalidation delivery")
 				}
-				requireFinancialState(t, a.admission.Service, r, "revoked", 0)
+				state, stateErr := a.admission.Service.FinancialState(ctx, r.ClaimID)
+				if stateErr != nil || state == nil || state.PendingInvalidations != 1 || state.State == "revoked" {
+					t.Fatal("unrecovered dispatch acknowledged revocation", state, stateErr)
+				}
 				_, err = a.h.reconcileUsageEntitlement(ctx, b.ContractID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = a.revokeFinancialDelivery(ctx, pendingDelivery); err != nil {
+					t.Fatal("recovered dispatch did not permit acknowledgement", err)
+				}
+				requireFinancialState(t, a.admission.Service, r, "revoked", 0)
 			}
 			if err != nil {
 				t.Fatal(err)
