@@ -37,6 +37,7 @@ CREATE TABLE billing_offer_provisioning_request (
 );
 CREATE INDEX billing_offer_provisioning_due ON billing_offer_provisioning_operation(next_check_at,id)
     WHERE finalized_at IS NULL AND NOT held AND revoked_at IS NULL;
+CREATE INDEX billing_offer_provisioning_dispatched ON billing_offer_provisioning_request(dispatched_at) WHERE state='dispatched';
 
 CREATE TABLE billing_offer_provisioning_audit (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -99,4 +100,66 @@ DO $$ DECLARE r text; BEGIN
             EXECUTE format('REVOKE ALL ON billing_offer_provisioning_operation,billing_offer_provisioning_request,billing_offer_provisioning_audit FROM %I',r);
         END IF;
     END LOOP;
+END $$;
+
+-- No operation foreign key: revocation may precede regional operation delivery.
+CREATE TABLE billing_offer_financial_fence (
+    id uuid NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    team_id uuid NOT NULL,
+    assignment_id uuid NOT NULL,
+    phase text NOT NULL CHECK (phase IN ('initial','successor')),
+    target_id uuid NOT NULL,
+    authorization_receipt jsonb CHECK (jsonb_typeof(authorization_receipt)='object'),
+    finalized_at timestamptz,
+    revoked_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY(team_id,assignment_id,phase,target_id),
+    CHECK ((phase='initial')=(target_id=assignment_id)),
+    CHECK (finalized_at IS NULL OR authorization_receipt IS NOT NULL)
+);
+CREATE UNIQUE INDEX billing_offer_financial_authorization_id ON billing_offer_financial_fence ((authorization_receipt->>'authorization_id')) WHERE authorization_receipt IS NOT NULL;
+CREATE TABLE billing_offer_financial_revocation (
+    id uuid PRIMARY KEY,
+    acknowledgement_id uuid NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    team_id uuid NOT NULL,
+    assignment_id uuid NOT NULL,
+    phase text NOT NULL,
+    target_id uuid NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    FOREIGN KEY(team_id,assignment_id,phase,target_id) REFERENCES billing_offer_financial_fence(team_id,assignment_id,phase,target_id)
+);
+CREATE FUNCTION guard_offer_financial_fence() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF TG_OP='DELETE' THEN RAISE EXCEPTION 'financial fences are permanent'; END IF;
+ IF TG_OP='UPDATE' AND (
+   (NEW.id,NEW.team_id,NEW.assignment_id,NEW.phase,NEW.target_id,NEW.created_at) IS DISTINCT FROM (OLD.id,OLD.team_id,OLD.assignment_id,OLD.phase,OLD.target_id,OLD.created_at)
+   OR OLD.authorization_receipt IS NOT NULL AND NEW.authorization_receipt IS DISTINCT FROM OLD.authorization_receipt
+   OR OLD.finalized_at IS NOT NULL AND NEW.finalized_at IS DISTINCT FROM OLD.finalized_at
+   OR OLD.revoked_at IS NOT NULL AND NEW.revoked_at IS DISTINCT FROM OLD.revoked_at
+   OR OLD.revoked_at IS NOT NULL AND (NEW.authorization_receipt,NEW.finalized_at) IS DISTINCT FROM (OLD.authorization_receipt,OLD.finalized_at)) THEN
+   RAISE EXCEPTION 'financial fence history is immutable';
+ END IF;
+ IF NEW.authorization_receipt IS NOT NULL AND NEW.authorization_receipt->'target' IS DISTINCT FROM jsonb_build_object('team_id',NEW.team_id,'assignment_id',NEW.assignment_id,'phase',NEW.phase,'target_id',NEW.target_id) THEN
+   RAISE EXCEPTION 'financial authorization_receipt target differs';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER billing_offer_financial_fence_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_offer_financial_fence FOR EACH ROW EXECUTE FUNCTION guard_offer_financial_fence();
+CREATE TRIGGER billing_offer_financial_revocation_immutable BEFORE UPDATE OR DELETE ON billing_offer_financial_revocation FOR EACH ROW EXECUTE FUNCTION guard_offer_provisioning_journal();
+ALTER TABLE billing_offer_financial_fence ENABLE ROW LEVEL SECURITY;
+ALTER TABLE billing_offer_financial_revocation ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON billing_offer_financial_fence,billing_offer_financial_revocation FROM PUBLIC;
+REVOKE ALL ON FUNCTION guard_offer_financial_fence() FROM PUBLIC;
+DO $$ DECLARE r text; BEGIN
+ FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
+   EXECUTE format('REVOKE ALL ON billing_offer_financial_fence,billing_offer_financial_revocation FROM %I',r);
+  END IF;
+ END LOOP;
+ IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+  GRANT SELECT,INSERT,UPDATE ON billing_offer_financial_fence TO service_role;
+  GRANT SELECT,INSERT ON billing_offer_financial_revocation TO service_role;
+  CREATE POLICY offer_financial_fence_backend ON billing_offer_financial_fence TO service_role USING(true) WITH CHECK(true);
+  CREATE POLICY offer_financial_revocation_backend ON billing_offer_financial_revocation TO service_role USING(true) WITH CHECK(true);
+ END IF;
 END $$;

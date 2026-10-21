@@ -65,7 +65,10 @@ func (a *testAuthority) WithAcceptedOffer(ctx context.Context, team, assignment 
 	}
 	return tx.Commit(ctx)
 }
-func (a *testAuthority) Finalize(ctx context.Context, tx pgx.Tx, o Operation, e json.RawMessage) error {
+func (a *testAuthority) WithFinalization(ctx context.Context, o Operation, f func(context.Context, pgx.Tx, AcceptedOffer) error) error {
+	return a.WithAcceptedOffer(ctx, o.TeamID, o.AssignmentID, f)
+}
+func (a *testAuthority) Finalize(ctx context.Context, tx pgx.Tx, o Operation, e Verification) error {
 	_, err := tx.Exec(ctx, `INSERT INTO test_finalization(id) VALUES($1)`, o.ID)
 	return err
 }
@@ -123,8 +126,8 @@ func (p *testProvider) Recover(_ context.Context, r SavedRequest) (json.RawMessa
 	}
 	return nil, ErrUnknown
 }
-func (p *testProvider) Verify(context.Context, Operation) (json.RawMessage, error) {
-	return json.RawMessage(`{"verified":true}`), nil
+func (p *testProvider) Verify(context.Context, Operation) (Verification, error) {
+	return Verification{Evidence: json.RawMessage(`{"verified":true}`)}, nil
 }
 
 type fixture struct {

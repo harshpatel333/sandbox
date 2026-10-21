@@ -10,6 +10,16 @@ import (
 
 func (s *Service) Available() bool { return s.available() }
 
+func (s *Service) PendingDispatches(ctx context.Context) (int64, time.Duration, error) {
+	if s == nil || s.Pool == nil {
+		return 0, 0, ErrUnavailable
+	}
+	var count int64
+	var seconds float64
+	err := s.Pool.QueryRow(ctx, `SELECT count(*),COALESCE(EXTRACT(EPOCH FROM clock_timestamp()-min(dispatched_at)),0)::float8 FROM billing_offer_provisioning_request WHERE state='dispatched'`).Scan(&count, &seconds)
+	return count, time.Duration(seconds * float64(time.Second)), err
+}
+
 // RunBatch reserves bounded capacity before releasing row locks. Reconcile uses
 // durable dispatch claims for concurrent operator recovery; reservation expiry
 // alone never authorizes repeating a provider create.
