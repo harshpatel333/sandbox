@@ -22,7 +22,6 @@ UI_SHA = "2" * 40
 NEW_SHA = "3" * 40
 PROFILE = {
     "schema_version": 1, "project": "rayai-dev", "region": "us-central1",
-    "zones": ["us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f"],
     "resource_name_prefix": "devbox-", "labels": {"managed-by": "superserve-devbox"},
     "instance": {"machine_type": "n2-standard-8", "enable_nested_virtualization": True,
                  "image_project": "ubuntu-os-cloud", "image_family": "ubuntu-2404-lts-amd64",
