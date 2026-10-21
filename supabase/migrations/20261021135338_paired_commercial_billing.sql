@@ -592,3 +592,8 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+-- Independent of the grant-inventory cursor; reset when the current allowance changes.
+ALTER TABLE billing_entitlement_work
+ ADD COLUMN paired_invoice_cursor text,
+ ADD COLUMN paired_invoice_period_start timestamptz;

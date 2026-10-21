@@ -406,6 +406,23 @@ func TestProviderPairIssuedGrantRefreshesExpiredObservations(t *testing.T) {
 	if eligible() {
 		t.Fatal("late scheduler retained expired authority")
 	}
+	checkExpirySample := func(expired bool) {
+		t.Helper()
+		rows, err := f.h.entitlementCoveragePage(ctx, uuid.Nil, time.Now(), 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			if row.Contract == f.b.ContractID {
+				if (row.PairExpiryAge > 0) != expired {
+					t.Fatal("paired refresh monitor lost actual proof expiry", row)
+				}
+				return
+			}
+		}
+		t.Fatal("paired contract missing from bounded coverage sample")
+	}
+	checkExpirySample(true)
 	counter := countPairWorkerQueries(t, f.h)
 	for range 2 {
 		counter.calls.Store(0)
@@ -416,6 +433,7 @@ func TestProviderPairIssuedGrantRefreshesExpiredObservations(t *testing.T) {
 		if next.After(time.Now().Add(21*time.Second)) || !eligible() || f.posts.Load() != 1 {
 			t.Fatal("issued grant refresh duplicated issuance or stalled", next, f.posts.Load())
 		}
+		checkExpirySample(false)
 	}
 	f.debt.Store(true)
 	next = run(false)
