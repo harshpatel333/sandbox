@@ -1,9 +1,12 @@
 # Shared Auth authority migration
 
 API and Terraform control-plane deployments run the existing shared Auth executor
-before regional migrations: `authority`, `claims`, `approvals`, then `acceptances`. Staging uses
+before regional migrations: `authority`, `claims`, then `approvals`. Staging uses
 its isolated authority; both production regions use the primary production
 authority (`use4`). Proxy-only deployments retain their regional prerequisite.
+Acceptance is prepared separately before releasing its consumers; follow the
+[target-specific preparation procedure](../../deploy/shared-auth-preparation.md).
+An ordinary deployment receipt does not establish acceptance readiness.
 All executors share the existing `database-migrations` queue. Do not add new shared versions to
 `supabase_migrations.schema_migrations`: the ordinary runner has no matching input
 and will refuse subsequent deployments.
@@ -100,7 +103,16 @@ Local database tests establish atomicity, privilege checks and regional-runner
 compatibility; they do not establish staging card setup, product access, grants or
 overage invoice behavior. Production customer activation remains a separate action.
 
-After approvals, `acceptances` adds immutable customer acceptance and preferred-account review authority. Deployment validates four shared receipts in order (eight database calls on an already-applied path). This migration does not enable provider adapters or automated provisioning. Original receipt snapshots remain unchanged; explicit inspection also audits the new tables and RPCs.
+After approvals, explicit `acceptances` preparation adds immutable customer
+acceptance and preferred-account review authority. General deployment applies
+only the three baseline migrations (six database calls on an already-applied
+path), while validating any known optional acceptance receipt in the protected
+ledger. It does not apply acceptance or produce acceptance-preparation evidence.
+Release the compatible executor first, then retain exact-target full inspection
+evidence before releasing acceptance consumers, including new targets, restores
+and changed Auth connections. This migration does not enable provider adapters
+or automated provisioning. Original receipt snapshots remain unchanged;
+explicit inspection also audits the new tables, RPCs and writer triggers.
 
 The acceptance migration also creates exact financial authorization receipts and a
 separate regional invalidation outbox. Relevant Auth identity, identity-history,
