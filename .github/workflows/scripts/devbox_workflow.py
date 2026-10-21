@@ -46,6 +46,10 @@ LOG_DIR = "/var/log/superserve-devbox"
 API_DEPLOY_FILE = contract.BOX_STATE_DIR + "/api-deploy.json"
 SSH_ATTEMPTS = 40
 SSH_RETRY_SECONDS = 15
+# A fresh per-instance OS Login grant takes a few minutes to settle and can
+# flap meanwhile: one connection is let in, the next denied.
+LOGIN_PROPAGATION_SECONDS = 5 * 60
+LOGIN_DENIED = re.compile(r"PERMISSION_DENIED.*compute\.instances\.osLogin", re.S)
 # Kept below the job's timeout-minutes so a slow step fails here, with the box
 # marked failed, rather than being killed by the runner.
 DEADLINE_SECONDS = 160 * 60
@@ -272,16 +276,29 @@ class Box:
         # steps can take many minutes, and a box replaced meanwhile must never be
         # touched under the old identity.
         self.devbox_id = devbox_id
+        self.login_granted = None
 
     def guard(self):
         if self.devbox_id is not None:
             self.verify(self.devbox_id)
 
     def ssh(self, command, *, input=None, capture=True, timeout=600):
-        return run(["gcloud", "compute", "ssh", self.instance, *self.where, "--quiet", "--tunnel-through-iap",
-                    "--ssh-key-expire-after=4h", "--ssh-flag=-o ServerAliveInterval=30",
-                    "--ssh-flag=-o ServerAliveCountMax=6", "--command", command],
-                   input=input, capture=capture, timeout=timeout)
+        while True:
+            try:
+                return run(["gcloud", "compute", "ssh", self.instance, *self.where, "--quiet",
+                            "--tunnel-through-iap", "--ssh-key-expire-after=4h",
+                            "--ssh-flag=-o ServerAliveInterval=30", "--ssh-flag=-o ServerAliveCountMax=6",
+                            "--command", command], input=input, capture=capture, timeout=timeout)
+            except DeadlineExceeded:
+                raise
+            except StepError as error:
+                # A denied login never reaches the box, so retrying can't repeat
+                # the command.
+                if not (self.login_granted is not None and LOGIN_DENIED.search(str(error))
+                        and time.monotonic() - self.login_granted < LOGIN_PROPAGATION_SECONDS):
+                    raise
+                print(f"waiting for the OS Login grant on {self.name} to settle: {error}")
+                time.sleep(DEADLINE.cap(SSH_RETRY_SECONDS))
 
     def wait_for_ssh(self, attempts=SSH_ATTEMPTS, delay=SSH_RETRY_SECONDS):
         for attempt in range(1, attempts + 1):
@@ -564,6 +581,7 @@ def create(env, profile_path=PROFILE_PATH):
         for member in engineers:
             run(["gcloud", "compute", "instances", "add-iam-policy-binding", box.instance, *where,
                  f"--member={member}", "--role=roles/compute.osAdminLogin", "--condition=None", "--quiet"])
+        box.login_granted = time.monotonic()
 
         box.wait_for_ssh()
         box.devbox_id = devbox_id

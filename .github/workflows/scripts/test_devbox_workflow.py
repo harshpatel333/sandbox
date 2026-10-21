@@ -54,6 +54,7 @@ class FakeCloud:
         self.disks, self.buckets, self.unlabelled = [], [], set()
         self.disk_zones, self.deleted, self.stockout = {}, [], {}
         self.leak_boot_disk, self.created_at, self.vanished = False, {}, set()
+        self.login_denials, self.ssh_ready, self.denied = 0, False, []
         self.relabel_after_checkouts = None
         self.pending_instance = False
         self.fail_disk_create = False
@@ -179,8 +180,14 @@ class FakeCloud:
         self.unlabelled.add(name)
 
     def ssh(self, args, command, input, ok, fail):
+        if self.login_denials and command != "true" and self.ssh_ready:
+            self.login_denials -= 1
+            self.denied.append(command)
+            return fail(1, "ERROR: (gcloud.compute.ssh) PERMISSION_DENIED: User does not have "
+                           "compute.instances.osLogin permission.")
         self.inputs[command] = input
         if command == "true":
+            self.ssh_ready = True
             return ok()
         target = re.search(r"mv -f \S+ (/\S+?)'?$", unquote(command))
         if target and input is not None and "cat >" in unquote(command):
@@ -490,6 +497,31 @@ class CreateTests(WorkflowCase):
                                ("resource_exhausted", False), ("QUOTA_EXCEEDED", False)):
             with self.subTest(text=text):
                 self.assertEqual(bool(workflow.CAPACITY_ERRORS.search(text)), capacity)
+
+    def test_os_login_denials_after_the_first_connection_are_waited_out(self):
+        cloud = FakeCloud()
+        cloud.login_denials = 3
+        self.assertEqual(self.create(cloud), 0)
+        self.assertEqual(len(cloud.denied), 3)
+        self.assertEqual(cloud.metadata_writes[-1]["state"], "ready")
+        self.assertEqual(cloud.checkouts, [SANDBOX_SHA, UI_SHA])
+
+    def test_os_login_settling_is_waited_out_in_a_fallback_zone(self):
+        cloud = FakeCloud()
+        cloud.stockout, cloud.login_denials = {"us-central1-a": "instance"}, 2
+        self.assertEqual(self.create(cloud), 0)
+        self.assertEqual(len(cloud.denied), 2)
+        self.assertEqual(cloud.metadata_writes[-1]["zone"], "us-central1-b")
+
+    def test_os_login_denials_past_the_settling_window_fail(self):
+        cloud = FakeCloud()
+        cloud.login_denials = 100
+        clock = [0.0]
+        with patch.object(workflow.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(workflow.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            self.assertEqual(self.create(cloud), 1)
+        self.assertLessEqual(len(cloud.denied), workflow.LOGIN_PROPAGATION_SECONDS // workflow.SSH_RETRY_SECONDS + 1)
+        self.assertIn("compute.instances.osLogin", self.summary.read_text())
 
     def test_explicit_zone_is_the_only_zone_tried(self):
         cloud = FakeCloud()
@@ -853,6 +885,14 @@ class DeployTests(WorkflowCase):
         with self.assertRaisesRegex(workflow.StepError, "manifest says us-central1-a"):
             self.deploy(cloud, "vmd")
         self.assertEqual(cloud.metadata_writes, [])
+
+    def test_deploy_does_not_wait_out_os_login_denials(self):
+        cloud = FakeCloud(instances=self.box())
+        cloud.login_denials, cloud.ssh_ready = 100, True
+        with patch.object(workflow.time, "sleep") as sleep:
+            self.assertEqual(self.deploy(cloud, "vmd"), 1)
+        self.assertTrue(cloud.denied)
+        sleep.assert_not_called()
 
     def test_failed_box_can_be_redeployed(self):
         cloud = FakeCloud(instances=self.box(state="failed"))
