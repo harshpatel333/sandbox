@@ -50,7 +50,7 @@ func (h *Handlers) VerifySuccessorProviderPair(ctx context.Context, previousCont
 func validatePairSuccessor(previous, next ContractProviderBinding) error {
 	i, old := next.Identity, previous.Identity
 	digest, err := next.Terms.Digest()
-	if err != nil || digest != i.ProviderTermsDigest || !validPairDigest(i.TermsDigest) || i.OperationID == uuid.Nil ||
+	if err != nil || digest != i.ProviderTermsDigest || !validPairDigest(i.TermsDigest) || i.OperationID == uuid.Nil || i.OperationID == old.OperationID ||
 		i.TeamID != old.TeamID || i.AssignmentID != old.AssignmentID || i.AcceptanceID != old.AcceptanceID || i.ApprovalSemanticRevision != old.ApprovalSemanticRevision ||
 		i.Merchant != old.Merchant || i.Live != old.Live || i.APIVersion != old.APIVersion ||
 		next.ContractID == uuid.Nil || previous.ContractID == uuid.Nil || next.ContractID == previous.ContractID ||

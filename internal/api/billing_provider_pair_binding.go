@@ -52,6 +52,13 @@ func confirmProviderBinding(ctx context.Context, tx pgx.Tx, b ContractProviderBi
 	if _, err = tx.Exec(ctx, `SELECT 1 FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, b.Identity.TeamID); err != nil {
 		return ContractProviderBinding{}, err
 	}
+	var revoked bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_provider_pair_revocation WHERE contract_id=$1)`, b.ContractID).Scan(&revoked); err != nil {
+		return ContractProviderBinding{}, err
+	}
+	if revoked {
+		return ContractProviderBinding{}, errors.New("paired authority is revoked")
+	}
 	var same bool
 	err = tx.QueryRow(ctx, `SELECT binding=$2::jsonb FROM billing_contract_provider_binding WHERE contract_id=$1`, b.ContractID, payload).Scan(&same)
 	if err == nil {

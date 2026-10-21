@@ -928,6 +928,13 @@ type BillingProviderCredit struct {
 	ObservedAt    time.Time `json:"observed_at"`
 }
 
+type BillingProviderPairRevocation struct {
+	ContractID uuid.UUID `json:"contract_id"`
+	TeamID     uuid.UUID `json:"team_id"`
+	Identity   []byte    `json:"identity"`
+	RevokedAt  time.Time `json:"revoked_at"`
+}
+
 type BillingProviderPairWaiver struct {
 	ID                  uuid.UUID          `json:"id"`
 	TeamID              uuid.UUID          `json:"team_id"`

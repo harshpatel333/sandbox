@@ -121,6 +121,43 @@ SELECT $1,team_id,assignment_id,acceptance_id,approval_semantic_revision,merchan
 	if _, err = ConfirmSuccessorProviderPair(t.Context(), tx, verifiedSuccessor); err != nil {
 		t.Fatalf("successor binding replay: %v", err)
 	}
+	// A cash receipt belongs to the licensed sibling while the account and
+	// commercial contract keep their metered usage identity.
+	f.invoice.Status, f.invoice.AmountRemaining = "paid", 0
+	f.invoice.AmountPaid = observed.Terms.FeeAmount
+	f.invoice.StatusTransitions.PaidAt = observed.StartsAt.Add(time.Minute).Unix()
+	cash, err := f.client(t).verifyProviderPairPayment(t.Context(), observed, f.invoice.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := db.RecordCommercialBasePaymentParams{TeamID: observed.Identity.TeamID, ContractID: observed.ContractID, InvoiceID: cash.Invoice.ID, PaymentReference: cash.Reference, CustomerID: observed.CustomerID, SubscriptionID: &observed.FeeSubscriptionID, BasePriceID: observed.Terms.FeePriceID, ServicePeriodStart: time.Unix(cash.Start, 0), ServicePeriodEnd: time.Unix(cash.End, 0), BaseAmountPaidCents: observed.Terms.FeeAmount, InvoiceAmountPaidCents: cash.Invoice.AmountPaid, Currency: "usd", PaidAt: time.Unix(cash.Invoice.StatusTransitions.PaidAt, 0), VerifiedAt: time.Now(), Evidence: cash.Raw}
+	wrongPayment := params
+	wrongPayment.SubscriptionID = &observed.UsageSubscriptionID
+	sp, err = tx.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.New(sp).RecordCommercialBasePayment(t.Context(), wrongPayment)
+	_ = sp.Rollback(t.Context())
+	if err == nil {
+		t.Fatal("usage subscription substituted for licensed payment identity")
+	}
+	if _, err = db.New(tx).RecordCommercialBasePayment(t.Context(), params); err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO billing_pro_payment_verification(invoice_id,review_required,evidence) VALUES($1,false,$2)`, cash.Invoice.ID, cash.Raw)
+	exec(`UPDATE billing_commercial_contract SET status='active',revision=revision+1 WHERE id=$1`, observed.ContractID)
+	exec(`UPDATE billing_commercial_contract SET collection_has_overdue_balance=false,collection_checked_at=clock_timestamp(),collection_valid_until=clock_timestamp()+interval '1 minute',collection_evidence=jsonb_build_object('gate','finalized_invoice_gate_v1','period_start',$2::timestamptz,'period_end',$3::timestamptz),revision=revision+1 WHERE id=$1`, observed.ContractID, observed.StartsAt, annualBoundary(observed.Anchor, 13))
+	var eligible bool
+	if err = tx.QueryRow(t.Context(), `SELECT billing_contract_eligible(c,$2,$3) FROM billing_commercial_contract c WHERE id=$1`, observed.ContractID, observed.StartsAt, annualBoundary(observed.Anchor, 13)).Scan(&eligible); err != nil || !eligible {
+		t.Fatalf("paid successor not eligible: %v", err)
+	}
+	if err = RevokeProviderPairAuthority(t.Context(), tx, observed.ContractID, observed.Identity); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.QueryRow(t.Context(), `SELECT billing_contract_eligible(c,$2,$3) FROM billing_commercial_contract c WHERE id=$1`, observed.ContractID, observed.StartsAt, annualBoundary(observed.Anchor, 13)).Scan(&eligible); err != nil || eligible {
+		t.Fatalf("paid receipt bypassed acknowledged revocation: %v", err)
+	}
 	a := invoiceAccount{Customer: f.p.CustomerID, Subscription: f.p.UsageSubscriptionID, Base: invoiceBase{Price: "stale_base"}, Price: "ambient_rounding"}
 	paired, err := loadInvoiceProviderPair(t.Context(), tx, f.p.Identity.TeamID, &a)
 	if err != nil || !paired || a.Base.Price != "" || a.Price != f.p.Terms.Rounding.PriceID || a.Pair == nil {

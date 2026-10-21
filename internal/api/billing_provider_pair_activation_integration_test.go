@@ -116,8 +116,30 @@ func TestProviderPairInitialActivation(t *testing.T) {
 			exec(`UPDATE billing_commercial_contract SET collection_has_overdue_balance=true,collection_checked_at=clock_timestamp(),revision=revision+1 WHERE id=$1`, contract)
 			check(false)
 			exec(`UPDATE billing_commercial_contract SET collection_has_overdue_balance=false,collection_checked_at=clock_timestamp(),revision=revision+1 WHERE id=$1`, contract)
-			exec(`UPDATE billing_provider_pair_waiver SET revoked_at=clock_timestamp() WHERE contract_id=$1`, contract)
+			wrong := b.Identity
+			wrong.OperationID = uuid.New()
+			if err = RevokeProviderPairAuthority(t.Context(), tx, contract, wrong); err == nil {
+				t.Fatal("different operation revoked finalized authority")
+			}
+			check(true)
+			for range 2 {
+				if err = RevokeProviderPairAuthority(t.Context(), tx, contract, b.Identity); err != nil {
+					t.Fatalf("revocation replay: %v", err)
+				}
+			}
 			check(false)
+			if _, err = ActivateInitialProviderPair(t.Context(), tx, contract, verified); err == nil {
+				t.Fatal("late finalizer revived revoked authority")
+			}
+			attempt, err = tx.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = attempt.Exec(t.Context(), `UPDATE billing_usage_entitlement SET state='uncertain',first_attempt_at=clock_timestamp() WHERE id=$1`, e.ID)
+			_ = attempt.Rollback(t.Context())
+			if err == nil || !strings.Contains(err.Error(), "not eligible for issuance") {
+				t.Fatalf("pending grant crossed acknowledged revocation: %v", err)
+			}
 		})
 	}
 }

@@ -38,6 +38,8 @@ func successorPairFixture(f *pairFixture, previous ContractProviderBinding, mont
 		f.usage.Items.Data[i].Start, f.usage.Items.Data[i].End = next.StartsAt.Unix(), annualBoundary(next.Anchor, 13).Unix()
 	}
 	f.invoice.BillingReason = "subscription_cycle"
+	f.p.WaiverInvoiceID = "in_successor_" + uuid.NewString()
+	f.invoice.ID, f.fee.LatestInvoice = f.p.WaiverInvoiceID, f.p.WaiverInvoiceID
 	f.invoice.Discounts, f.invoice.DiscountAmounts = nil, nil
 	f.invoice.Total, f.invoice.Subtotal, f.invoice.AmountDue = next.Terms.FeeAmount, next.Terms.FeeAmount, next.Terms.FeeAmount
 	f.invoice.AmountPaid, f.invoice.AmountRemaining, f.invoice.Status = 0, next.Terms.FeeAmount, "open"

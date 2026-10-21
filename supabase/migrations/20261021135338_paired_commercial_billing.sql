@@ -68,6 +68,7 @@ BEGIN
   AND (b.fee_subscription_id=NEW.fee_subscription_id OR b.usage_subscription_id=NEW.usage_subscription_id)
   AND ((b.team_id,b.assignment_id,b.customer_id,b.usage_subscription_id,b.fee_subscription_id,b.anchor)
    IS DISTINCT FROM (NEW.team_id,NEW.assignment_id,NEW.customer_id,NEW.usage_subscription_id,NEW.fee_subscription_id,NEW.anchor)
+   OR b.binding#>>'{identity,operation_id}'=NEW.binding#>>'{identity,operation_id}'
    OR (b.binding->'terms'->'resources',b.binding->'terms'->'rounding') IS DISTINCT FROM (t->'resources',t->'rounding')
    OR tstzrange(b.starts_at,b.ends_at,'[)') && tstzrange(NEW.starts_at,NEW.ends_at,'[)'))) THEN
   RAISE EXCEPTION 'provider pair identity or service windows overlap';
@@ -76,6 +77,38 @@ BEGIN
 END $$;
 CREATE TRIGGER billing_contract_provider_binding_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_contract_provider_binding
  FOR EACH ROW EXECUTE FUNCTION guard_billing_contract_provider_binding();
+
+-- The regional saga owns invalidation delivery and its permanent target fence.
+-- This immutable receipt fences already-finalized paired commercial authority.
+CREATE TABLE billing_provider_pair_revocation (
+ contract_id uuid PRIMARY KEY,
+ team_id uuid NOT NULL,
+ identity jsonb NOT NULL CHECK(jsonb_typeof(identity)='object'),
+ revoked_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ FOREIGN KEY(team_id,contract_id) REFERENCES billing_contract_provider_binding(team_id,contract_id)
+);
+ALTER TABLE billing_provider_pair_revocation ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON billing_provider_pair_revocation FROM PUBLIC;
+CREATE FUNCTION guard_billing_provider_pair_revocation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF TG_OP<>'INSERT' THEN RAISE EXCEPTION 'paired authority revocation is immutable'; END IF;
+ PERFORM 1 FROM team_billing_account WHERE team_id=NEW.team_id FOR UPDATE;
+ PERFORM 1 FROM billing_commercial_contract WHERE id=NEW.contract_id AND team_id=NEW.team_id FOR UPDATE;
+ IF NEW.revoked_at>clock_timestamp() OR NOT EXISTS(SELECT 1 FROM billing_contract_provider_binding b
+  WHERE b.contract_id=NEW.contract_id AND b.team_id=NEW.team_id AND b.binding->'identity'=NEW.identity) THEN
+  RAISE EXCEPTION 'revocation differs from finalized paired authority';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER billing_provider_pair_revocation_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_provider_pair_revocation
+ FOR EACH ROW EXECUTE FUNCTION guard_billing_provider_pair_revocation();
+REVOKE ALL ON FUNCTION guard_billing_provider_pair_revocation() FROM PUBLIC;
+DO $$ BEGIN
+ IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+  GRANT SELECT,INSERT ON billing_provider_pair_revocation TO service_role;
+  CREATE POLICY provider_pair_revocation_backend ON billing_provider_pair_revocation TO service_role USING(true) WITH CHECK(true);
+ END IF;
+END $$;
 
 -- A paid zero-dollar invoice proves the initial waiver, never cash settlement.
 -- Current approval observation is refreshed under the acceptance authority guard.
@@ -126,7 +159,8 @@ BEGIN
    RAISE EXCEPTION 'paired waiver differs from verified initial annual fee';
   END IF;
  END IF;
- IF NEW.authority_checked_at>clock_timestamp() OR NEW.authority_checked_at<clock_timestamp()-interval '1 minute'
+ IF NEW.authority_checked_at>clock_timestamp()
+  OR (NEW.revoked_at IS NULL AND NEW.authority_checked_at<clock_timestamp()-interval '1 minute')
   OR NEW.authority_valid_until>NEW.authority_checked_at+interval '1 minute'
   OR NEW.revoked_at>clock_timestamp() THEN RAISE EXCEPTION 'paired authority observation is stale or future'; END IF;
  RETURN NEW;
@@ -136,7 +170,8 @@ CREATE TRIGGER billing_provider_pair_waiver_guard BEFORE INSERT OR UPDATE OR DEL
 
 CREATE FUNCTION billing_provider_pair_covered(c billing_commercial_contract,s timestamptz,e timestamptz,issuing boolean)
 RETURNS boolean LANGUAGE sql VOLATILE AS $$
- SELECT c.charge_kind='subscription' AND c.offer_key='yc_2026' AND EXISTS(
+ SELECT c.charge_kind='subscription' AND c.offer_key='yc_2026'
+  AND NOT EXISTS(SELECT 1 FROM billing_provider_pair_revocation r WHERE r.contract_id=c.id) AND EXISTS(
   SELECT 1 FROM billing_provider_pair_waiver w JOIN billing_contract_provider_binding b ON b.contract_id=w.contract_id
   WHERE w.contract_id=c.id AND w.team_id=c.team_id AND b.customer_id=c.customer_id AND b.usage_subscription_id=c.subscription_id
   AND b.anchor=c.entitlement_anchor AND w.starts_at<=s AND w.ends_at>=e
@@ -236,6 +271,9 @@ BEGIN
                 RAISE EXCEPTION 'scheduled contract requires every monthly amount before activation';
             END IF;
         END IF;
+        IF OLD.status='pending' AND NEW.status='active' AND EXISTS(SELECT 1 FROM billing_provider_pair_revocation r WHERE r.contract_id=NEW.id) THEN
+            RAISE EXCEPTION 'paired authority is revoked';
+        END IF;
         IF OLD.status = 'pending' AND NEW.status = 'active' AND NOT billing_provider_pair_covered(NEW,NEW.starts_at,NEW.ends_at,false) AND NOT billing_sponsored_covered(NEW, NEW.starts_at, NEW.ends_at, false) AND NOT billing_yc_covered(NEW, NEW.starts_at, NEW.ends_at, false) AND NOT EXISTS (
             SELECT 1 FROM billing_contract_payment p WHERE p.contract_id = NEW.id
                 AND p.service_period_start <= clock_timestamp() AND p.service_period_end > clock_timestamp()) THEN
@@ -259,6 +297,7 @@ END $$;
 CREATE OR REPLACE FUNCTION billing_contract_eligible(c billing_commercial_contract, s timestamptz, e timestamptz)
 RETURNS boolean LANGUAGE sql VOLATILE AS $$
  SELECT c.status='active' AND c.collection_has_overdue_balance IS FALSE
+  AND NOT EXISTS(SELECT 1 FROM billing_provider_pair_revocation r WHERE r.contract_id=c.id)
   AND c.collection_checked_at IS NOT NULL AND c.collection_valid_until>clock_timestamp() AND c.starts_at<=s
   AND (c.ends_at IS NULL OR c.ends_at>=e)
   AND (c.offer_key NOT IN ('pro_monthly','pro_annual','yc_2026','sponsored_usage') OR
