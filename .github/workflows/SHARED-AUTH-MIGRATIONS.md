@@ -1,17 +1,39 @@
 # Shared Auth authority migration
 
-The manual **Apply shared Auth migration** workflow applies the company authority
-and claim schemas through separately selected operations. Normal deployments continue to apply only regional migrations and preserve
-the historical shared Auth aggregate. Do not add new shared versions to
+API and Terraform control-plane deployments run the existing shared Auth executor
+before regional migrations: `authority`, `claims`, then `approvals`. Staging uses
+its isolated authority; both production regions use the primary production
+authority (`use4`). Proxy-only deployments retain their regional prerequisite.
+All executors share the existing `database-migrations` queue. Do not add new shared versions to
 `supabase_migrations.schema_migrations`: the ordinary runner has no matching input
 and will refuse subsequent deployments.
 
-Before dispatch, verify the actual project used by each deployed regional
+The release contract must establish the actual project used by each deployed regional
 `PROMOTION_AUTH_DATABASE_URL` through the approved secret-safe operational path.
 Record only nonsecret target evidence. A staging-named secret does not prove an
 isolated staging database. If staging points to production Auth, stop and establish
 an explicitly approved scope or isolated staging target before any writes or
-activation tests. This workflow does not change runtime configuration.
+activation tests. Runtime retargeting requires coordination with its owning release.
+Deployments do not repeatedly inspect runtime secrets or change their configuration.
+The migration executor independently validates its actual privileged connection's
+project, required SQL, ledger and catalog on every invocation.
+
+The reusable prerequisite preserves the exact source and successful push-CI gate.
+Compatible manual branch staging uses main's identical migration bundle; changes
+to the shared helper or prerequisite source cannot reuse main's verification.
+Only the Proxy caller may omit the shared prerequisite.
+
+After shared and all selected regional migrations succeed, an executed step emits
+a receipt binding the run, attempt, deployment and migration revisions, authority
+target, required versions and source bundle. Each API-bearing full Terraform apply
+and API deployment checks that receipt before changing the consumer. A failed-job
+only rerun cannot reuse an earlier attempt's receipt: **re-run all jobs** to execute
+the prerequisite again. These workflow receipts do not rewrite historical database
+ledger revisions; identical previously applied content remains valid after live
+executor verification. No receipt attests continuous runtime configuration state.
+
+The manual **Apply shared Auth migration** workflow remains available for inspection
+and recovery through separately selected operations.
 
 Select `main`, action `inspect`, migration `authority`, the verified target (`staging` or `use4`), and its
 verified runtime project. The workflow requires successful push CI for its exact
@@ -49,6 +71,11 @@ trigger. Unknown versions, missing dependencies and unrecorded objects stop
 execution. Use the current reviewed executor after applying claims: the older
 authority-only executor deliberately refuses the additional ledger version.
 Future migrations still require an explicit extension and review.
+
+After claims, select `approvals` for the staff decision and notification schema.
+It requires the claim receipt and verifies the intentional replacements of the
+shared activation functions. Automated deployment prerequisites use the same
+executor and private ledger, and stop if any application or verification fails.
 
 Verify `inspect` reports `applied`, regional history is unchanged, and all deployed
 regions use the verified RPC authority. Then perform the
