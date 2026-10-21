@@ -624,7 +624,7 @@ def place(env, name, devbox_id, profile, labels, zones, manifest_in):
                 raise
             print(f"::warning::{zone} has no capacity for this devbox; removing what this attempt created there")
             failures.append((zone, error))
-            clean_zone(devbox_id, zone)
+            clean_zone(name, devbox_id, zone)
             save_attempt(env, {"name": name, "devbox_id": devbox_id, "reported": False, "instance_started": False})
             continue
         tried = ", ".join(f"{failed} out of capacity" for failed, _ in failures)
@@ -632,9 +632,12 @@ def place(env, name, devbox_id, profile, labels, zones, manifest_in):
     raise StepError("No devbox zone had capacity:\n" + "\n".join(f"- {zone}: {error}" for zone, error in failures))
 
 
-def clean_zone(devbox_id, zone):
-    # Removes only what carries this attempt's devbox-id in this zone, plus the
-    # disks attached to such an instance (its boot disk is not labelled yet).
+def clean_zone(name, devbox_id, zone):
+    # Removes what carries this attempt's devbox-id in this zone and the disks
+    # attached to such an instance (its boot disk is not labelled yet). An
+    # unlabelled, detached boot disk left by an earlier partial cleanup is this
+    # attempt's too: the name was checked unused in every zone and this run
+    # holds the box's lock.
     owned = [f"--zones={zone}", f"--project={contract.PROJECT}", f"--filter=labels.devbox-id={devbox_id}",
              "--format=json"]
     where = [f"--zone={zone}", f"--project={contract.PROJECT}", "--quiet"]
@@ -644,6 +647,11 @@ def clean_zone(devbox_id, zone):
         run(["gcloud", "compute", "instances", "delete", instance["name"], *where])
     disks.update(disk["name"] for disk in json.loads(
         run(["gcloud", "compute", "disks", "list", *owned], timeout=120).stdout or "[]"))
+    boot = json.loads(run(["gcloud", "compute", "disks", "list", f"--zones={zone}", f"--project={contract.PROJECT}",
+                           f"--filter=name={contract.instance_name(name)}", "--format=json"], timeout=120).stdout or "[]")
+    disks.update(disk["name"] for disk in boot
+                 if disk.get("name") == contract.instance_name(name) and not disk.get("users")
+                 and (disk.get("labels") or {}).get("devbox-id") in (None, devbox_id))
     for disk in sorted(disks - {""}):
         run(["gcloud", "compute", "disks", "delete", disk, *where])
 

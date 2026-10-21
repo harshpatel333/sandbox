@@ -51,6 +51,7 @@ class FakeCloud:
         self.deployed_sha = NEW_SHA
         self.disks, self.buckets, self.unlabelled = [], [], set()
         self.disk_zones, self.deleted, self.stockout = {}, [], {}
+        self.leak_boot_disk = False
         self.relabel_after_checkouts = None
         self.pending_instance = False
         self.fail_disk_create = False
@@ -90,6 +91,13 @@ class FakeCloud:
                 return ok(json.dumps([i for i in self.instances.values() if in_zones(i["zone"])]))
             return ok("".join(f"{name}\tus-central1-a\n" for name in self.existing))
         if verb == ["compute", "disks", "list"]:
+            if re.fullmatch(r"name=\S+", arg(args, "--filter")):
+                wanted = arg(args, "--filter")[len("name="):]
+                users = {d.get("source", "").rsplit("/", 1)[-1] for i in self.instances.values() for d in i["disks"]}
+                return ok(json.dumps([{"name": name, "zone": f"projects/p/zones/{zone}",
+                                       **({} if name in self.unlabelled else {"labels": {"devbox-id": "x"}}),
+                                       **({"users": ["vm"]} if name in users else {})}
+                                      for name, zone in self.disk_zones.items() if name == wanted and in_zones(zone)]))
             if "--format=json" in args:
                 return ok(json.dumps([{"name": name, "zone": f"projects/p/zones/{zone}"}
                                       for name, zone in self.disk_zones.items()
@@ -126,6 +134,9 @@ class FakeCloud:
             manifest = Path(arg(args, "--metadata-from-file").split("=", 1)[1]).read_text()
             zone = arg(args, "--zone")
             if self.stockout.get(zone) == "instance":
+                if self.leak_boot_disk:
+                    self.disk_zones[args[4]] = zone
+                    self.unlabelled.add(args[4])
                 return fail(1, f"ERROR: (gcloud.compute.instances.create) The zone 'projects/p/zones/{zone}' does "
                                "not have enough resources available to fulfill the request. reason: stockout")
             if self.pending_instance:
@@ -429,6 +440,13 @@ class CreateTests(WorkflowCase):
         self.assertIn("`us-central1-c` (after us-central1-a out of capacity, us-central1-b out of capacity)", summary)
         self.assertIn(contract.forwarding_command("my-box", "us-central1-c"), summary)
         self.assertIn("DEVBOX_ZONE=us-central1-c\n", cloud.box_files["/etc/superserve-devbox/devbox.env"])
+
+    def test_a_detached_boot_disk_left_in_an_abandoned_zone_is_removed(self):
+        cloud = FakeCloud()
+        cloud.stockout, cloud.leak_boot_disk = {"us-central1-a": "instance"}, True
+        self.assertEqual(self.create(cloud), 0)
+        self.assertIn(("disk", "devbox-my-box", "us-central1-a"), cloud.deleted)
+        self.assertEqual(cloud.disk_zones, {"devbox-my-box-data": "us-central1-b", "devbox-my-box": "us-central1-b"})
 
     def test_explicit_zone_is_the_only_zone_tried(self):
         cloud = FakeCloud()
