@@ -31,7 +31,7 @@ func TestEntitlementLanesSustainMixedDueWork(t *testing.T) {
 						indexes[jobs[i].id] = i
 					}
 					var mu sync.Mutex
-					var active, peak, requests, emptyClaims, idleQueries int
+					var active, peak, requests, emptyClaims, idleObservations int
 					var fastDone time.Time
 					ctx, cancel := context.WithCancel(t.Context())
 					var wg sync.WaitGroup
@@ -98,9 +98,15 @@ func TestEntitlementLanesSustainMixedDueWork(t *testing.T) {
 									}
 								}, func(context.Context) time.Duration {
 									mu.Lock()
-									idleQueries++
+									idleObservations++
+									until := 5 * time.Second
+									for _, j := range jobs {
+										if !j.busy && j.retry == retry {
+											until = min(until, time.Until(j.due))
+										}
+									}
 									mu.Unlock()
-									return entitlementPollDelay(time.Second, lane)
+									return entitlementPollDelay(until, lane)
 								})
 							}()
 						}
@@ -123,7 +129,7 @@ func TestEntitlementLanesSustainMixedDueWork(t *testing.T) {
 							t.Fatalf("job%d missed modeled freshness: %+v", i, j)
 						}
 					}
-					t.Logf("synthetic90s jobs=%d replicas=%d peak=%d provider_requests=%d max_gap=%s empty_claims=%d idle_queries=%d", n, replicas, peak, requests, worst, emptyClaims, idleQueries)
+					t.Logf("synthetic90s jobs=%d replicas=%d peak=%d provider_requests=%d max_gap=%s empty_claims=%d idle_observations=%d", n, replicas, peak, requests, worst, emptyClaims, idleObservations)
 				})
 			})
 		}
@@ -139,12 +145,12 @@ func TestEntitlementLaneIdlePollingDoesNotScaleWithWorkers(t *testing.T) {
 				done := make(chan struct{})
 				go func() {
 					defer close(done)
-					runEntitlementLane(ctx, workers, func(context.Context, int) ([]entitlementJob, error) { claims++; return nil, nil }, func(context.Context, entitlementJob) { t.Error("empty queue ran job") }, func(context.Context) time.Duration { idle++; return time.Second })
+					runEntitlementLane(ctx, workers, func(context.Context, int) ([]entitlementJob, error) { claims++; return nil, nil }, func(context.Context, entitlementJob) { t.Error("empty queue ran job") }, func(context.Context) time.Duration { idle++; return entitlementPollDelay(5*time.Second, 0) })
 				}()
-				time.Sleep(10 * time.Second)
+				time.Sleep(60 * time.Second)
 				cancel()
 				<-done
-				if claims < 10 || claims > 11 || idle != claims {
+				if claims < 12 || claims > 13 || idle != claims {
 					t.Fatal("idle polling multiplied or spun", workers, claims, idle)
 				}
 			})
@@ -166,6 +172,47 @@ func TestEntitlementLaneBacksOffClaimErrors(t *testing.T) {
 		}, func(context.Context, entitlementJob) { t.Error("failed claim ran job") }, func(context.Context) time.Duration { t.Fatal("error used idle polling"); return 0 })
 		if calls != 3 || time.Since(began) != 2*time.Second {
 			t.Fatal("claim error spun without backoff", calls, time.Since(began))
+		}
+	})
+}
+
+func TestEntitlementLaneDiscoversEarlierCrossReplicaWork(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var mu sync.Mutex
+		due := time.Now().Add(time.Hour)
+		claimed := false
+		completed := make(chan time.Time, 2)
+		var wg sync.WaitGroup
+		for replica := range 2 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var delay time.Duration
+				runEntitlementLane(ctx, 4, func(context.Context, int) ([]entitlementJob, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					delay = entitlementPollDelay(time.Until(due), replica)
+					if !claimed && !due.After(time.Now()) {
+						claimed = true
+						return []entitlementJob{{Contract: uuid.New()}}, nil
+					}
+					return nil, nil
+				}, func(context.Context, entitlementJob) { completed <- time.Now() }, func(context.Context) time.Duration { return delay })
+			}()
+		}
+		synctest.Wait()
+		time.Sleep(time.Millisecond)
+		inserted := time.Now()
+		mu.Lock()
+		due = inserted
+		mu.Unlock()
+		finished := <-completed
+		cancel()
+		wg.Wait()
+		if finished.Sub(inserted) > 5*time.Second || len(completed) != 0 {
+			t.Fatal("earlier work was missed or claimed twice", finished.Sub(inserted), len(completed))
 		}
 	})
 }
