@@ -93,7 +93,7 @@ func (a *fixtureRenewalAuthority) Locate(_ context.Context, team, assignment, ac
 	}
 	return a.key, nil
 }
-func (a *fixtureRenewalAuthority) Guard(ctx context.Context, k renewalChoiceKey, actor uuid.UUID, f func(context.Context) error) error {
+func (a *fixtureRenewalAuthority) Admit(ctx context.Context, k renewalChoiceKey, actor uuid.UUID, f func(context.Context) error) error {
 	if k != a.key || actor != a.actor || a.revoked {
 		return errRenewalConflict
 	}
@@ -616,8 +616,8 @@ func TestRenewalChoiceRejectsPreBoundaryHistoryTimestamp(t *testing.T) {
 type renewalGuardContextKey struct{}
 type fixtureContextAuthority struct{ *fixtureRenewalAuthority }
 
-func (a fixtureContextAuthority) Guard(ctx context.Context, k renewalChoiceKey, actor uuid.UUID, f func(context.Context) error) error {
-	return a.fixtureRenewalAuthority.Guard(ctx, k, actor, func(ctx context.Context) error {
+func (a fixtureContextAuthority) Admit(ctx context.Context, k renewalChoiceKey, actor uuid.UUID, f func(context.Context) error) error {
+	return a.fixtureRenewalAuthority.Admit(ctx, k, actor, func(ctx context.Context) error {
 		guarded, cancel := context.WithCancel(context.WithValue(ctx, renewalGuardContextKey{}, true))
 		defer cancel()
 		return f(guarded)
@@ -673,4 +673,145 @@ func TestRenewalChoiceCarriesGuardContext(t *testing.T) {
 			}
 		})
 	}
+}
+
+type fixtureCancelStore struct {
+	*memoryRenewalStore
+	cancel      context.CancelFunc
+	afterMarker bool
+}
+
+func (s *fixtureCancelStore) Transact(ctx context.Context, k renewalChoiceKey, f func(renewalChoiceTransaction) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	marked := false
+	err := s.memoryRenewalStore.Transact(ctx, k, func(tx renewalChoiceTransaction) error {
+		if err := f(tx); err != nil {
+			return err
+		}
+		marked = tx.Journal().Requested != nil && tx.Journal().Requested.State == "dispatched"
+		return ctx.Err()
+	})
+	if err == nil && marked && s.afterMarker && s.cancel != nil {
+		s.afterMarker = false
+		s.cancel()
+	}
+	return err
+}
+
+type fixtureCancelAuthority struct {
+	*fixtureRenewalAuthority
+	store         *fixtureCancelStore
+	beforeMarker  bool
+	afterProvider bool
+}
+
+func (a *fixtureCancelAuthority) Admit(ctx context.Context, k renewalChoiceKey, actor uuid.UUID, f func(context.Context) error) error {
+	return a.fixtureRenewalAuthority.Admit(ctx, k, actor, func(ctx context.Context) error {
+		guarded, cancel := context.WithCancel(ctx)
+		defer cancel()
+		a.store.cancel = cancel
+		if a.beforeMarker {
+			cancel()
+		}
+		if err := f(guarded); err != nil {
+			return err
+		}
+
+		return guarded.Err()
+	})
+}
+
+type fixtureCancelProvider struct {
+	*fixtureRenewalProvider
+	accepted atomic.Int32
+}
+
+func (p *fixtureCancelProvider) Dispatch(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+	if err := ctx.Err(); err != nil {
+		return renewalChoiceProof{}, err
+	}
+	p.accepted.Add(1)
+	return p.fixtureRenewalProvider.Dispatch(ctx, k, op)
+}
+func TestRenewalChoiceGuardCancellationRecovery(t *testing.T) {
+	for _, timing := range []string{"before_marker", "after_marker", "after_provider"} {
+		t.Run(timing, func(t *testing.T) {
+			s, memory, a := newRenewalFixture(t)
+			original := submitRenewal(t, s, a, "free")
+			store := &fixtureCancelStore{memoryRenewalStore: memory, afterMarker: timing == "after_marker"}
+			authority := &fixtureCancelAuthority{fixtureRenewalAuthority: a, store: store, beforeMarker: timing == "before_marker", afterProvider: timing == "after_provider"}
+			provider := &fixtureCancelProvider{fixtureRenewalProvider: &fixtureRenewalProvider{dispatch: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+				return fixtureRenewalProof(k, op, memory.now), nil
+			}, observe: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+				p := fixtureRenewalProof(k, op, memory.now)
+				if timing == "after_marker" {
+					p.Outcome = "no_effect"
+				}
+				return p, nil
+			}}}
+			s.Store = store
+			s.Authority = authority
+			s.Provider = provider
+			if err := s.reconcile(t.Context(), a.key); !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			s.Authority = a
+			j, err := s.status(t.Context(), a.key, a.actor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if j.Requested.ID != original.Requested.ID || j.Confirmed.Request.Choice != "annual" {
+				t.Fatal("cancellation changed identity or confirmed choice", j)
+			}
+			if timing == "before_marker" {
+				if j.Requested.State != "prepared" || provider.accepted.Load() != 0 {
+					t.Fatal(j)
+				}
+				return
+			}
+			if j.Requested.State != "dispatched" && j.Requested.State != "outcome_unknown" {
+				t.Fatal("lost guard became definitive outcome", j)
+			}
+			before := provider.accepted.Load()
+			restart := *s
+			if err := restart.reconcile(t.Context(), a.key); err != nil {
+				t.Fatal(err)
+			}
+			j, _ = s.status(t.Context(), a.key, a.actor)
+			if provider.accepted.Load() != before || j.Requested.ID != original.Requested.ID {
+				t.Fatal("restart rewrote operation")
+			}
+			if timing == "after_provider" && j.Confirmed.Request.Choice != "free" {
+				t.Fatal("accepted outcome not recovered", j)
+			}
+			if timing == "after_marker" && j.Requested.State != "outcome_unknown" {
+				t.Fatal("absence released canceled intent", j)
+			}
+		})
+	}
+}
+
+func (a *fixtureRenewalAuthority) DispatchGuard(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation, f func(context.Context) error) error {
+	if op.Request.Acceptance != a.authority.Acceptance || op.Request.ApprovalRevision != a.authority.Revision || renewalHash(op.Binding) != renewalHash(a.authority.Binding) {
+		return errRenewalConflict
+	}
+	return a.Admit(ctx, k, op.Actor, f)
+}
+func (a fixtureContextAuthority) DispatchGuard(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation, f func(context.Context) error) error {
+	return a.Admit(ctx, k, op.Actor, f)
+}
+func (a *fixtureCancelAuthority) DispatchGuard(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation, f func(context.Context) error) error {
+	return a.fixtureRenewalAuthority.DispatchGuard(ctx, k, op, func(ctx context.Context) error {
+		guarded, cancel := context.WithCancel(ctx)
+		defer cancel()
+		if err := f(guarded); err != nil {
+			return err
+		}
+		if a.afterProvider {
+			cancel()
+		}
+		return guarded.Err()
+	})
 }

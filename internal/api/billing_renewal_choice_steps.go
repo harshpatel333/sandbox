@@ -108,7 +108,7 @@ func (s *renewalChoiceService) reconcileSteps(ctx context.Context, k renewalChoi
 		if !validRenewalStep(captured, request) {
 			return errRenewalConflict
 		}
-		return s.guardedTransaction(ctx, k, captured.Actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
+		return s.admittedTransaction(ctx, k, captured.Actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
 			j := tx.Journal()
 			if j.Revision != revision || j.Requested == nil || j.Requested.ID != captured.ID {
 				return errRenewalConflict
@@ -133,35 +133,39 @@ func (s *renewalChoiceService) reconcileSteps(ctx context.Context, k renewalChoi
 	direct := false
 	if step.State == "prepared" {
 		sent := false
-		err := s.Authority.Guard(ctx, k, captured.Actor, func(ctx context.Context) error {
-			if err := s.Store.Transact(ctx, k, func(tx renewalChoiceTransaction) error {
-				j := tx.Journal()
-				if j.Requested == nil || j.Requested.ID != captured.ID || len(j.Requested.Steps) != len(captured.Steps) || j.Requested.Steps[index].State != "prepared" {
-					return nil
-				}
-				if err := s.recheck(ctx, tx, k, *j.Requested); err != nil {
-					return err
-				}
-				if !tx.Now().Before(k.Boundary) {
-					j.Requested.State = "review_required"
-					return tx.Save("boundary_passed_without_step")
-				}
-				j.Requested.Steps[index].State = "dispatched"
-				j.Requested.State = "dispatched"
-				now := tx.Now()
-				j.Requested.DispatchedAt = &now
-				sent = true
-				return tx.Save("provider_step_dispatch_intent")
-			}); err != nil {
+		err := s.admittedTransaction(ctx, k, captured.Actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
+			j := tx.Journal()
+			if j.Requested == nil || j.Requested.ID != captured.ID || len(j.Requested.Steps) != len(captured.Steps) || j.Requested.Steps[index].State != "prepared" {
+				return nil
+			}
+			if err := s.recheck(ctx, tx, k, *j.Requested); err != nil {
 				return err
 			}
-			if sent {
-				proof, providerErr = p.DispatchStep(ctx, k, captured, step.Request)
-				direct = true
+			if !tx.Now().Before(k.Boundary) {
+				j.Requested.State = "review_required"
+				return tx.Save("boundary_passed_without_step")
 			}
+			j.Requested.Steps[index].State = "dispatched"
+			j.Requested.State = "dispatched"
+			now := tx.Now()
+			j.Requested.DispatchedAt = &now
+			if err := tx.Save("provider_step_dispatch_intent"); err != nil {
+				return err
+			}
+			captured = *j.Requested
+			step = captured.Steps[index]
+			sent = true
 			return nil
 		})
 		if err != nil || !sent {
+			return err
+		}
+		err = s.Authority.DispatchGuard(ctx, k, captured, func(ctx context.Context) error {
+			proof, providerErr = p.DispatchStep(ctx, k, captured, step.Request)
+			direct = true
+			return nil
+		})
+		if err != nil {
 			return err
 		}
 	} else if step.State == "dispatched" || step.State == "outcome_unknown" {

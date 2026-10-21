@@ -223,3 +223,135 @@ func TestRenewalChoiceUnplannedStepExpiry(t *testing.T) {
 		})
 	}
 }
+
+type fixtureSQLFreeAuthority struct {
+	*fixtureRenewalAuthority
+	memory *memoryRenewalStore
+	active atomic.Bool
+	writes func() int32
+}
+
+func (a *fixtureSQLFreeAuthority) DispatchGuard(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation, f func(context.Context) error) error {
+	if !a.active.CompareAndSwap(false, true) {
+		return errors.New("nested dispatch guard")
+	}
+	defer a.active.Store(false)
+	a.memory.mu.Lock()
+	saved := a.memory.journals[k].Requested
+	marked := saved != nil && saved.ID == op.ID && saved.State == "dispatched"
+	a.memory.mu.Unlock()
+	if !marked {
+		return errors.New("dispatch marker not committed")
+	}
+	before := a.writes()
+	err := a.fixtureRenewalAuthority.DispatchGuard(ctx, k, op, f)
+	if a.writes()-before > 1 {
+		return errors.New("more than one provider write in guard")
+	}
+	return err
+}
+
+type fixtureSQLFreeStore struct {
+	*memoryRenewalStore
+	authority *fixtureSQLFreeAuthority
+}
+
+func (s fixtureSQLFreeStore) Transact(ctx context.Context, k renewalChoiceKey, f func(renewalChoiceTransaction) error) error {
+	if s.authority.active.Load() {
+		return errors.New("regional SQL inside dispatch guard")
+	}
+	return s.memoryRenewalStore.Transact(ctx, k, f)
+}
+func TestRenewalChoiceDispatchGuardHasNoRegionalSQL(t *testing.T) {
+	for _, staged := range []bool{false, true} {
+		t.Run(strconv.FormatBool(staged), func(t *testing.T) {
+			s, memory, a := newRenewalFixture(t)
+			submitRenewal(t, s, a, "free")
+			authority := &fixtureSQLFreeAuthority{fixtureRenewalAuthority: a, memory: memory}
+			s.Store = fixtureSQLFreeStore{memory, authority}
+			s.Authority = authority
+			iterations := 1
+			if staged {
+				p := &fixtureRenewalSteps{fixtureRenewalProvider: &fixtureRenewalProvider{}, now: func() renewalChoiceProof { return renewalChoiceProof{VerifiedAt: memory.now} }}
+				s.Provider = p
+				authority.writes = p.calls.Load
+				iterations = 4
+			} else {
+				p := &fixtureRenewalProvider{dispatch: func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+					return fixtureRenewalProof(k, op, memory.now), nil
+				}}
+				s.Provider = p
+				authority.writes = p.writes.Load
+			}
+			for range iterations {
+				if err := s.reconcile(t.Context(), a.key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			j, _ := s.status(t.Context(), a.key, a.actor)
+			if j.Confirmed.Request.Choice != "free" {
+				t.Fatal(j)
+			}
+		})
+	}
+}
+
+type fixtureCancelSteps struct{ *fixtureRenewalSteps }
+
+func (p fixtureCancelSteps) DispatchStep(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation, r renewalChoiceStepRequest) (renewalChoiceStepProof, error) {
+	if err := ctx.Err(); err != nil {
+		return renewalChoiceStepProof{}, err
+	}
+	return p.fixtureRenewalSteps.DispatchStep(ctx, k, op, r)
+}
+func TestRenewalChoiceStagedGuardCancellationRecovery(t *testing.T) {
+	for _, timing := range []string{"before_marker", "after_marker", "after_provider"} {
+		t.Run(timing, func(t *testing.T) {
+			s, memory, a := newRenewalFixture(t)
+			original := submitRenewal(t, s, a, "free")
+			provider := fixtureCancelSteps{&fixtureRenewalSteps{fixtureRenewalProvider: &fixtureRenewalProvider{}, observed: timing == "after_provider", now: func() renewalChoiceProof { return renewalChoiceProof{VerifiedAt: memory.now} }}}
+			s.Provider = provider
+			if err := s.reconcile(t.Context(), a.key); err != nil {
+				t.Fatal(err)
+			}
+			store := &fixtureCancelStore{memoryRenewalStore: memory, afterMarker: timing == "after_marker"}
+			s.Store = store
+			s.Authority = &fixtureCancelAuthority{fixtureRenewalAuthority: a, store: store, beforeMarker: timing == "before_marker", afterProvider: timing == "after_provider"}
+			if err := s.reconcile(t.Context(), a.key); !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			s.Authority = a
+			j, err := s.status(t.Context(), a.key, a.actor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if j.Requested.ID != original.Requested.ID || j.Confirmed.Request.Choice != "annual" {
+				t.Fatal(j)
+			}
+			if timing == "before_marker" {
+				if j.Requested.State != "prepared" || provider.calls.Load() != 0 {
+					t.Fatal(j)
+				}
+				return
+			}
+			if j.Requested.State != "dispatched" && j.Requested.State != "outcome_unknown" {
+				t.Fatal(j)
+			}
+			before := provider.calls.Load()
+			restart := *s
+			if err := restart.reconcile(t.Context(), a.key); err != nil {
+				t.Fatal(err)
+			}
+			j, _ = s.status(t.Context(), a.key, a.actor)
+			if provider.calls.Load() != before || j.Requested.ID != original.Requested.ID || j.Confirmed.Request.Choice != "annual" {
+				t.Fatal("creation replayed or adopted choice", j)
+			}
+			if timing == "after_provider" && j.Requested.Steps[0].State != "confirmed" {
+				t.Fatal(j)
+			}
+			if timing == "after_marker" && j.Requested.State != "outcome_unknown" {
+				t.Fatal(j)
+			}
+		})
+	}
+}

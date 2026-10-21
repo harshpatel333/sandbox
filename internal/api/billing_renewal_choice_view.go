@@ -64,7 +64,7 @@ func (s *renewalChoiceService) view(ctx context.Context, k renewalChoiceKey, act
 	if !validRenewalKey(k) || actor == uuid.Nil {
 		return view, errRenewalConflict
 	}
-	err := s.guardedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
+	err := s.admittedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
 		a, err := s.Authority.Authorize(ctx, tx.SQL(), k, actor)
 		if err != nil {
 			return err

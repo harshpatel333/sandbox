@@ -33,7 +33,8 @@ func (s postgresRenewalChoiceStore) Transact(ctx context.Context, key renewalCho
 	}
 	defer tx.Rollback(ctx)
 	// Account-first ordering matches other billing writers. Authority adapters may
-	// then lock their assignment/acceptance rows; no provider call holds this lock.
+	// then inspect regional assignment/acceptance rows. Shared dispatch guards
+	// and provider calls run only after this transaction has committed.
 	var team uuid.UUID
 	if err = tx.QueryRow(ctx, `SELECT team_id FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, key.Team).Scan(&team); err != nil {
 		return err

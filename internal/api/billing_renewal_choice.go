@@ -97,16 +97,21 @@ type renewalChoiceAuthority struct {
 	Binding    renewalChoiceBinding
 }
 
-// These adapters must lock/recheck team, assignment, durable acceptance and actor
-// authority using tx. Resolve returns published terms, including provider prices.
-// They must not perform network I/O while the journal transaction holds locks.
+// Regional admission checks current team, assignment, acceptance and actor
+// authority. It does not promise atomicity across databases. Resolve returns
+// published terms; neither Authorize nor Resolve performs provider I/O.
 type renewalChoiceAuthoritySource interface {
 	// Locate reads the original activated term; callers never calculate it from
-	// acceptance time. Authorize must revalidate the located key under Guard.
+	// acceptance time. Authorize must revalidate the located key during admission.
 	Locate(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (renewalChoiceKey, error)
-	// Guard holds shared acceptance/company and identity authority before regional
-	// locks, through commit and any financial dispatch. Revocation waits for it.
-	Guard(context.Context, renewalChoiceKey, uuid.UUID, func(context.Context) error) error
+	// Admit checks point-in-time authority and permits bounded regional-only work.
+	// It is separate from DispatchGuard and must not reuse its shared lock lease.
+	// Pending metadata grants no dispatch or benefit authority; successor adoption
+	// still requires its own fresh payment/debt/authority checks.
+	Admit(context.Context, renewalChoiceKey, uuid.UUID, func(context.Context) error) error
+	// DispatchGuard rechecks this exact accepted operation and holds shared Auth
+	// authority for one provider call only. Its callback must perform no SQL.
+	DispatchGuard(context.Context, renewalChoiceKey, renewalChoiceOperation, func(context.Context) error) error
 	Authorize(context.Context, pgx.Tx, renewalChoiceKey, uuid.UUID) (renewalChoiceAuthority, error)
 	Resolve(context.Context, pgx.Tx, renewalChoiceKey, string) (*renewalChoiceTerms, error)
 	DefaultProof(context.Context, pgx.Tx, renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error)
@@ -212,8 +217,8 @@ func validateRenewalProof(k renewalChoiceKey, op renewalChoiceOperation, p renew
 	return nil
 }
 
-func (s *renewalChoiceService) guardedTransaction(ctx context.Context, k renewalChoiceKey, actor uuid.UUID, f func(context.Context, renewalChoiceTransaction) error) error {
-	return s.Authority.Guard(ctx, k, actor, func(guardCtx context.Context) error {
+func (s *renewalChoiceService) admittedTransaction(ctx context.Context, k renewalChoiceKey, actor uuid.UUID, f func(context.Context, renewalChoiceTransaction) error) error {
+	return s.Authority.Admit(ctx, k, actor, func(guardCtx context.Context) error {
 		return s.Store.Transact(guardCtx, k, func(tx renewalChoiceTransaction) error { return f(guardCtx, tx) })
 	})
 }
@@ -226,7 +231,7 @@ func (s *renewalChoiceService) status(ctx context.Context, k renewalChoiceKey, a
 	if !validRenewalKey(k) || actor == uuid.Nil {
 		return result, errRenewalConflict
 	}
-	err := s.guardedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
+	err := s.admittedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
 		if _, err := s.Authority.Authorize(ctx, tx.SQL(), k, actor); err != nil {
 			return err
 		}
@@ -245,7 +250,7 @@ func (s *renewalChoiceService) initialize(ctx context.Context, k renewalChoiceKe
 	if !validRenewalKey(k) || actor == uuid.Nil {
 		return errRenewalConflict
 	}
-	return s.guardedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
+	return s.admittedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
 		a, err := s.Authority.Authorize(ctx, tx.SQL(), k, actor)
 		if err != nil {
 			return err
@@ -293,7 +298,7 @@ func (s *renewalChoiceService) submit(ctx context.Context, k renewalChoiceKey, a
 	if !validRenewalKey(k) || actor == uuid.Nil || req.ID == uuid.Nil || req.Acceptance == uuid.Nil || req.ChoiceRevision < 0 || req.ApprovalRevision < 0 {
 		return result, errRenewalConflict
 	}
-	err := s.guardedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
+	err := s.admittedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
 		a, err := s.Authority.Authorize(ctx, tx.SQL(), k, actor)
 		if err != nil {
 			return err
@@ -379,38 +384,37 @@ func (s *renewalChoiceService) reconcile(ctx context.Context, k renewalChoiceKey
 	directResult := false
 	if op.State == "prepared" {
 		dispatched := false
-		err = s.Authority.Guard(ctx, k, op.Actor, func(ctx context.Context) error {
-			if err := s.Store.Transact(ctx, k, func(tx renewalChoiceTransaction) error {
-				current := tx.Journal().Requested
-				if current == nil || current.ID != op.ID || current.State != "prepared" {
-					return nil
-				}
-				if err := s.recheck(ctx, tx, k, *current); err != nil {
-					return err
-				}
-				if !tx.Now().Before(k.Boundary) {
-					current.State = "review_required"
-					return tx.Save("boundary_passed_without_dispatch")
-				}
-				now := tx.Now()
-				current.State, current.DispatchedAt = "dispatched", &now
-				if err := tx.Save("dispatch_intent"); err != nil {
-					return err
-				}
-				copy := *current
-				op = &copy
-				dispatched = true
+		err = s.admittedTransaction(ctx, k, op.Actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
+			current := tx.Journal().Requested
+			if current == nil || current.ID != op.ID || current.State != "prepared" {
 				return nil
-			}); err != nil {
+			}
+			if err := s.recheck(ctx, tx, k, *current); err != nil {
 				return err
 			}
-			if dispatched {
-				proof, providerErr = s.Provider.Dispatch(ctx, k, *op)
-				directResult = true
+			if !tx.Now().Before(k.Boundary) {
+				current.State = "review_required"
+				return tx.Save("boundary_passed_without_dispatch")
 			}
+			now := tx.Now()
+			current.State, current.DispatchedAt = "dispatched", &now
+			if err := tx.Save("dispatch_intent"); err != nil {
+				return err
+			}
+			copy := *current
+			op = &copy
+			dispatched = true
 			return nil
 		})
 		if err != nil || !dispatched {
+			return err
+		}
+		err = s.Authority.DispatchGuard(ctx, k, *op, func(ctx context.Context) error {
+			proof, providerErr = s.Provider.Dispatch(ctx, k, *op)
+			directResult = true
+			return nil
+		})
+		if err != nil {
 			return err
 		}
 	} else {
@@ -472,7 +476,7 @@ func (s *renewalChoiceService) reconcileSuccessor(ctx context.Context, k renewal
 	// Even an initially confirmed default needs actual boundary history. In
 	// particular, an unknown newer write may have changed what took effect.
 	proof, observeErr := s.Provider.Observe(ctx, k, *confirmed)
-	return s.guardedTransaction(ctx, k, confirmed.Actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
+	return s.admittedTransaction(ctx, k, confirmed.Actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
 		j := tx.Journal()
 		if j.Confirmed == nil || j.Confirmed.ID != confirmed.ID || j.Revision != expectedRevision {
 			return errRenewalConflict
