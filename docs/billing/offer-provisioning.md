@@ -44,9 +44,11 @@ access. Exhaustion does not auto-resume a sandbox when funds return.
 
 ## Recovery and controls
 
-A session advisory lock serializes worker and manual reconciliation. A distinct
-per-attempt lock coordinates local hold/revoke with one external call. Neither
-database locks nor connection cancellation can undo a provider-accepted request.
+Short row-lock transactions serialize request preparation, the one permitted
+dispatch transition, receipt confirmation and controls. Concurrent reconcilers may
+read provider inventory, but only the caller that commits `prepared -> dispatched`
+may send the POST. No database connection is reserved across provider I/O, so the
+journal works with transaction pooling and a single application pool connection.
 
 Controls persist their desired hold/revoke even when an old dispatch is unresolved.
 Such controls return an unknown-outcome error and status exposes `held`, `revoked`

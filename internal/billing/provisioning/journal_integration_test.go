@@ -286,8 +286,8 @@ func TestJournalConcurrentAdmissionAndManualRecovery(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("create did not start")
 	}
-	if err := f.reconcile(t); !errors.Is(err, ErrBusy) {
-		t.Fatal(err)
+	if err := f.reconcile(t); err != nil {
+		t.Fatal("concurrent read-only recovery", err)
 	}
 	close(f.p.release)
 	if err := <-done; err != nil {
@@ -387,7 +387,7 @@ func TestJournalRevocationBeforeAndAfterDispatchMarker(t *testing.T) {
 	}
 }
 
-func TestJournalHoldWaitsForOneAttemptAndStopsNextCreate(t *testing.T) {
+func TestJournalHoldReportsPendingAttemptAndStopsNextCreate(t *testing.T) {
 	f := newFixture(t)
 	f.p.enter = make(chan struct{})
 	f.p.release = make(chan struct{})
@@ -398,31 +398,14 @@ func TestJournalHoldWaitsForOneAttemptAndStopsNextCreate(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("create did not start")
 	}
-	held := make(chan error, 1)
-	go func() { held <- f.s.Control(t.Context(), f.team, f.assignment, uuid.New(), "hold", "operator test") }()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var waiting bool
-		if err := f.s.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND classid=$1::oid)`, dispatchNamespace).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		if waiting {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("hold did not wait for dispatch")
-		}
-		time.Sleep(5 * time.Millisecond)
+	if err := f.s.Control(t.Context(), f.team, f.assignment, uuid.New(), "hold", "operator test"); !errors.Is(err, ErrUnknown) {
+		t.Fatal("in-flight control falsely acknowledged settled outcome", err)
 	}
-	select {
-	case err := <-held:
-		t.Fatal("hold completed during POST", err)
-	default:
+	status, err := f.s.Status(t.Context(), f.team, f.assignment)
+	if err != nil || !status.Held || !status.ControlPending || status.Ready {
+		t.Fatal(status, err)
 	}
 	close(f.p.release)
-	if err := <-held; err != nil && !errors.Is(err, ErrUnknown) {
-		t.Fatal(err)
-	}
 	if err := <-done; !errors.Is(err, ErrHeld) {
 		t.Fatal(err)
 	}
@@ -439,18 +422,10 @@ func TestJournalNumericTermsSurviveJSONB(t *testing.T) {
 	f.assertOnce(t)
 }
 
-func TestJournalLostLockCannotAcknowledgeCompletedRevocation(t *testing.T) {
+func TestJournalMarkedAttemptCannotAcknowledgeCompletedRevocation(t *testing.T) {
 	f := newFixture(t)
 	f.a.beforeGuard = func() {
-		// Simulate the marker-to-POST gap with a failed advisory session.
-		var pid int
-		if err := f.s.Pool.QueryRow(t.Context(), `SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=$1::oid AND granted`, dispatchNamespace).Scan(&pid); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := f.s.Pool.Exec(t.Context(), `SELECT pg_terminate_backend($1)`, pid); err != nil {
-			t.Fatal(err)
-		}
-		if err := f.s.Control(t.Context(), f.team, f.assignment, uuid.New(), "revoke", "lost dispatch session"); !errors.Is(err, ErrUnknown) {
+		if err := f.s.Control(t.Context(), f.team, f.assignment, uuid.New(), "revoke", "dispatch outcome pending"); !errors.Is(err, ErrUnknown) {
 			t.Fatal("uncertain dispatch acknowledged as settled", err)
 		}
 		status, err := f.s.Status(t.Context(), f.team, f.assignment)
@@ -458,7 +433,7 @@ func TestJournalLostLockCannotAcknowledgeCompletedRevocation(t *testing.T) {
 			t.Fatal(status, err)
 		}
 	}
-	if err := f.reconcile(t); !errors.Is(err, ErrUnknown) {
+	if err := f.reconcile(t); !errors.Is(err, ErrRevoked) {
 		t.Fatal(err)
 	}
 	f.a.beforeGuard = nil
@@ -614,6 +589,83 @@ func TestJournalFinalizationRollbackPreservesProviderIdentities(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err = f.reconcile(t); err != nil {
+		t.Fatal(err)
+	}
+	f.assertOnce(t)
+}
+
+func singleConnectionPool(t *testing.T, f *fixture) {
+	t.Helper()
+	cfg := f.s.Pool.Config()
+	cfg.MaxConns = 1
+	cfg.MinConns = 0
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	f.s.Pool, f.a.pool = pool, pool
+}
+
+func TestJournalSingleConnectionPool(t *testing.T) {
+	f := newFixture(t)
+	singleConnectionPool(t, f)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := f.s.Reconcile(ctx, f.team, f.assignment); err != nil {
+		t.Fatal(err)
+	}
+	f.assertOnce(t)
+}
+
+func TestJournalSingleConnectionControlCannotStarveDispatch(t *testing.T) {
+	f := newFixture(t)
+	singleConnectionPool(t, f)
+	f.p.enter, f.p.release = make(chan struct{}), make(chan struct{})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	reconciled := make(chan error, 1)
+	go func() { reconciled <- f.s.Reconcile(ctx, f.team, f.assignment) }()
+	select {
+	case <-f.p.enter:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	// Control must use the sole pool slot while the provider request is in flight.
+	err := f.s.Control(ctx, f.team, f.assignment, uuid.New(), "hold", "test control")
+	close(f.p.release)
+	if !errors.Is(err, ErrUnknown) {
+		t.Fatal("control must persist pending outcome", err)
+	}
+	if err := <-reconciled; !errors.Is(err, ErrHeld) {
+		t.Fatal(err)
+	}
+	if len(f.p.creates) != 1 || f.p.creates[Customer] != 1 {
+		t.Fatal("control allowed later dispatch", f.p.creates)
+	}
+}
+
+func TestJournalConcurrentReconcilersClaimEachDispatchOnce(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	errs := make(chan error, 10)
+	for i := 0; i < cap(errs); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- f.s.Reconcile(ctx, f.team, f.assignment)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil && !errors.Is(err, ErrBusy) && !errors.Is(err, ErrUnknown) {
+			t.Fatal(err)
+		}
+	}
+	if err := f.reconcile(t); err != nil {
 		t.Fatal(err)
 	}
 	f.assertOnce(t)

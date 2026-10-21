@@ -2,7 +2,6 @@ package provisioning
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +10,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type querier interface {
@@ -87,10 +85,9 @@ func (s *Service) guarded(ctx context.Context, o Operation, f func(pgx.Tx) error
 	})
 }
 
-// Reconcile performs at most five writes and one verification. A session lock
-// excludes worker/manual overlap without holding row locks across provider I/O.
-// If the connection dies during a POST, a successor sees dispatched and can only
-// recover read-only; it cannot send a second create even after key retention ends.
+// Reconcile performs at most five writes and one verification. Short transactions
+// serialize saved requests and claim each dispatch exactly once. Concurrent calls
+// may recover the same receipt read-only, but cannot repeat a provider write.
 func (s *Service) Reconcile(ctx context.Context, team, assignment uuid.UUID) (err error) {
 	if !s.available() {
 		return ErrUnavailable
@@ -99,38 +96,11 @@ func (s *Service) Reconcile(ctx context.Context, team, assignment uuid.UUID) (er
 	if err != nil {
 		return err
 	}
-	conn, err := s.Pool.Acquire(ctx)
-	if err != nil {
-		return err
-	}
-	lock := int64(binary.BigEndian.Uint64(o.ID[:8]))
-	var acquired bool
-	if err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, lock).Scan(&acquired); err != nil {
-		conn.Release()
-		return err
-	}
-	if !acquired {
-		conn.Release()
-		return ErrBusy
-	}
-	defer func() {
-		ack, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-		defer cancel()
-		var unlocked bool
-		if e := conn.QueryRow(ack, `SELECT pg_advisory_unlock($1)`, lock).Scan(&unlocked); e != nil || !unlocked {
-			_ = conn.Conn().Close(ack)
-		}
-		conn.Release()
-	}()
 	defer func() {
 		if err != nil {
 			s.recordError(ctx, o.ID, err)
 		}
 	}()
-	o, err = load(ctx, s.Pool, team, assignment)
-	if err != nil {
-		return err
-	}
 	if o.FinalizedAt != nil {
 		return controls(o)
 	}
@@ -155,7 +125,10 @@ func (s *Service) Reconcile(ctx context.Context, team, assignment uuid.UUID) (er
 				return e
 			}
 			err = s.guarded(ctx, o, func(tx pgx.Tx) error {
-				_, e := tx.Exec(ctx, `INSERT INTO billing_offer_provisioning_request(operation_id,step,idempotency_key,request) VALUES($1,$2,$3,$4)`, o.ID, step, key(o.ID, step), raw)
+				tag, e := tx.Exec(ctx, `INSERT INTO billing_offer_provisioning_request(operation_id,step,idempotency_key,request) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, o.ID, step, key(o.ID, step), raw)
+				if e == nil && tag.RowsAffected() != 1 {
+					return ErrBusy
+				}
 				return e
 			})
 			if err != nil {
@@ -165,22 +138,24 @@ func (s *Service) Reconcile(ctx context.Context, team, assignment uuid.UUID) (er
 		}
 		var receipt json.RawMessage
 		if r.State == "prepared" {
-			err = withDispatchLock(ctx, conn, o.ID, func() error {
-				err := s.guarded(ctx, o, func(tx pgx.Tx) error {
-					return tx.QueryRow(ctx, `UPDATE billing_offer_provisioning_request SET state='dispatched',dispatched_at=clock_timestamp() WHERE operation_id=$1 AND step=$2 AND state='prepared' RETURNING dispatched_at`, o.ID, step).Scan(&r.DispatchedAt)
-				})
-				if err != nil {
-					return err
+			err = s.guarded(ctx, o, func(tx pgx.Tx) error {
+				e := tx.QueryRow(ctx, `UPDATE billing_offer_provisioning_request SET state='dispatched',dispatched_at=clock_timestamp() WHERE operation_id=$1 AND step=$2 AND state='prepared' RETURNING dispatched_at`, o.ID, step).Scan(&r.DispatchedAt)
+				if errors.Is(e, pgx.ErrNoRows) {
+					return ErrBusy
 				}
-				r.State = "dispatched"
-				return s.Authority.WithDispatchGuard(ctx, team, assignment, func(current AcceptedOffer) error {
-					if current.validate() != nil || !sameOffer(current, o.Offer) {
-						return ErrConflict
-					}
-					var e error
-					receipt, e = s.Provider.Create(ctx, r)
-					return e
-				})
+				return e
+			})
+			if err != nil {
+				return err
+			}
+			r.State = "dispatched"
+			err = s.Authority.WithDispatchGuard(ctx, team, assignment, func(current AcceptedOffer) error {
+				if current.validate() != nil || !sameOffer(current, o.Offer) {
+					return ErrConflict
+				}
+				var e error
+				receipt, e = s.Provider.Create(ctx, r)
+				return e
 			})
 		} else {
 			// Recovery records already-created effects even when authority was revoked.
@@ -249,7 +224,13 @@ func (s *Service) confirm(ctx context.Context, id uuid.UUID, step Step, receipt 
 		return err
 	}
 	if tag.RowsAffected() != 1 {
-		return ErrConflict
+		var same bool
+		if err = tx.QueryRow(ctx, `SELECT state='confirmed' AND receipt=$3::jsonb FROM billing_offer_provisioning_request WHERE operation_id=$1 AND step=$2`, id, step, receipt).Scan(&same); err != nil {
+			return err
+		}
+		if !same {
+			return ErrConflict
+		}
 	}
 	// Clear only the outstanding-outcome marker, never the desired hold/revoke.
 	if _, err = tx.Exec(ctx, `UPDATE billing_offer_provisioning_operation o SET control_pending=false WHERE id=$1 AND control_pending AND NOT EXISTS(SELECT 1 FROM billing_offer_provisioning_request r WHERE r.operation_id=o.id AND r.state='dispatched')`, id); err != nil {
@@ -288,13 +269,6 @@ func (s *Service) Control(ctx context.Context, team, assignment, actor uuid.UUID
 	defer tx.Rollback(ctx)
 	var id uuid.UUID
 	var revoked, finalized *time.Time
-	if err = tx.QueryRow(ctx, `SELECT id FROM billing_offer_provisioning_operation WHERE team_id=$1 AND assignment_id=$2`, team, assignment).Scan(&id); err != nil {
-		return err
-	}
-	// Fence one external attempt, not the whole multi-step operation.
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1,$2)`, dispatchNamespace, int32(binary.BigEndian.Uint32(id[:4]))); err != nil {
-		return err
-	}
 	err = tx.QueryRow(ctx, `SELECT id,revoked_at,finalized_at FROM billing_offer_provisioning_operation WHERE team_id=$1 AND assignment_id=$2 FOR UPDATE`, team, assignment).Scan(&id, &revoked, &finalized)
 	if err != nil {
 		return err
@@ -323,30 +297,10 @@ func (s *Service) Control(ctx context.Context, team, assignment, actor uuid.UUID
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
-	// A lost advisory session can leave an old POST capable of reaching the
-	// provider. Persist the control now, but never report that dispatch settled.
+	// A marked POST can still reach the provider. Persist the desired control
+	// now, but do not acknowledge a settled outcome until its receipt is known.
 	if pending {
 		return ErrUnknown
 	}
 	return nil
-}
-
-const dispatchNamespace int32 = 0x6f666672
-
-func withDispatchLock(ctx context.Context, conn *pgxpool.Conn, id uuid.UUID, f func() error) (err error) {
-	key := int32(binary.BigEndian.Uint32(id[:4]))
-	if _, err = conn.Exec(ctx, `SELECT pg_advisory_lock($1,$2)`, dispatchNamespace, key); err != nil {
-		return err
-	}
-	defer func() {
-		ack, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-		defer cancel()
-		var unlocked bool
-		e := conn.QueryRow(ack, `SELECT pg_advisory_unlock($1,$2)`, dispatchNamespace, key).Scan(&unlocked)
-		if e != nil || !unlocked {
-			_ = conn.Conn().Close(ack)
-			err = errors.Join(err, ErrUnknown)
-		}
-	}()
-	return f()
 }
