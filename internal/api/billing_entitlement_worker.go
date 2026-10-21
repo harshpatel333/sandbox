@@ -38,24 +38,12 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 	if h.Config != nil && h.Config.BillingEntitlementWorkers >= 2 {
 		workers = min(h.Config.BillingEntitlementWorkers, 32)
 	}
-	for _, retry := range []bool{false, true} {
-		go func() {
-			for ctx.Err() == nil {
-				count, err := h.usageEntitlementBatch(ctx, retry, workers/2)
-				if err != nil {
-					log.Warn().Err(err).Msg("usage entitlement scheduler failed")
-				}
-				wait := time.Second
-				if count == 0 {
-					wait = 5 * time.Second
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(wait):
-				}
-			}
-		}()
+	for lane, retry := range []bool{false, true} {
+		go runEntitlementLane(ctx, workers/2, func(ctx context.Context, limit int) ([]entitlementJob, error) {
+			return h.claimUsageEntitlements(ctx, retry, limit)
+		}, h.runUsageEntitlementJob, func(ctx context.Context) time.Duration {
+			return h.entitlementIdleDelay(ctx, retry, lane)
+		})
 	}
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -79,26 +67,110 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 		}
 	}()
 }
-func (h *Handlers) usageEntitlementBatch(ctx context.Context, retry bool, limit int) (int, error) {
+
+// One dispatcher per lane refills capacity as jobs complete. Empty polling is
+// shared by the lane, so increasing worker capacity does not multiply idle I/O.
+func runEntitlementLane(ctx context.Context, workers int, claim func(context.Context, int) ([]entitlementJob, error), process func(context.Context, entitlementJob), idle func(context.Context) time.Duration) {
+	done := make(chan struct{}, workers)
+	active := 0
+	var pollAt time.Time
+	for ctx.Err() == nil {
+		draining := true
+		for draining {
+			select {
+			case <-done:
+				active--
+			default:
+				draining = false
+			}
+		}
+		if active < workers && !pollAt.After(time.Now()) {
+			available := workers - active
+			jobs, err := claim(ctx, available)
+			if err != nil {
+				log.Warn().Err(err).Msg("usage entitlement scheduler failed")
+				pollAt = time.Now().Add(time.Second)
+			} else {
+				for _, job := range jobs {
+					active++
+					go func() { process(ctx, job); done <- struct{}{} }()
+				}
+				pollAt = time.Time{}
+				if len(jobs) < available {
+					pollAt = time.Now().Add(idle(ctx))
+				}
+			}
+		}
+		if active == workers || pollAt.IsZero() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				active--
+			}
+		} else {
+			timer := time.NewTimer(max(0, time.Until(pollAt)))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-done:
+				timer.Stop()
+				active--
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+func (h *Handlers) entitlementIdleDelay(ctx context.Context, retry bool, slot int) time.Duration {
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	var seconds float64
+	err := h.Pool.QueryRow(ctx, `SELECT COALESCE((SELECT extract(epoch FROM next_check_at-clock_timestamp())::double precision FROM billing_entitlement_work WHERE (failures>0)=$1 AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY next_check_at,contract_id LIMIT 1),1)`, retry).Scan(&seconds)
+	if err != nil {
+		return time.Second
+	}
+	return entitlementPollDelay(time.Duration(max(0.1, min(1, seconds))*float64(time.Second)), slot)
+}
+
+func entitlementPollDelay(until time.Duration, slot int) time.Duration {
+	delay := max(100*time.Millisecond, min(time.Second, until))
+	// Stagger idle lanes without postponing the next due deadline.
+	if delay > 300*time.Millisecond {
+		delay -= time.Duration((slot*37)%200) * time.Millisecond
+	}
+	return delay
+}
+
+func (h *Handlers) claimUsageEntitlements(ctx context.Context, retry bool, limit int) ([]entitlementJob, error) {
 	claim, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	token := uuid.New()
 	rows, err := h.Pool.Query(claim, `WITH due AS (SELECT contract_id FROM billing_entitlement_work WHERE next_check_at<=clock_timestamp() AND (failures>0)=$2 AND (lease_until IS NULL OR lease_until<clock_timestamp()) ORDER BY next_check_at,contract_id FOR UPDATE SKIP LOCKED LIMIT $3)
  UPDATE billing_entitlement_work w SET lease_token=$1,lease_until=clock_timestamp()+interval '1 minute',next_check_at=clock_timestamp()+interval '1 minute' FROM due WHERE w.contract_id=due.contract_id RETURNING w.contract_id`, token, retry, limit)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	var jobs []entitlementJob
 	for rows.Next() {
 		j := entitlementJob{Token: token}
 		if err = rows.Scan(&j.Contract); err != nil {
 			rows.Close()
-			return 0, err
+			return nil, err
 		}
 		jobs = append(jobs, j)
 	}
 	err = rows.Err()
 	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
+func (h *Handlers) usageEntitlementBatch(ctx context.Context, retry bool, limit int) (int, error) {
+	jobs, err := h.claimUsageEntitlements(ctx, retry, limit)
 	if err != nil {
 		return 0, err
 	}
@@ -107,14 +179,18 @@ func (h *Handlers) usageEntitlementBatch(ctx context.Context, retry bool, limit 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			work, cancel := context.WithTimeout(ctx, 45*time.Second)
-			defer cancel()
-			_ = h.processEntitlementJob(work, j)
+			h.runUsageEntitlementJob(ctx, j)
 		}()
 	}
 	wg.Wait()
 	return len(jobs), nil
 }
+func (h *Handlers) runUsageEntitlementJob(ctx context.Context, j entitlementJob) {
+	work, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	_ = h.processEntitlementJob(work, j)
+}
+
 func (h *Handlers) processEntitlementJob(ctx context.Context, j entitlementJob) error {
 	started := time.Now()
 	next, err := h.reconcileUsageEntitlement(ctx, j.Contract)
