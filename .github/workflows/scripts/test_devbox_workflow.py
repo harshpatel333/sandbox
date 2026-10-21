@@ -16,12 +16,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 import devbox_contract as contract
 import devbox_workflow as workflow
 
+ENSURE_UNUSED = workflow.ensure_unused
+
 
 SANDBOX_SHA = "1" * 40
 UI_SHA = "2" * 40
 NEW_SHA = "3" * 40
 PROFILE = {
-    "schema_version": 1, "project": "rayai-dev", "zone": "us-central1-a", "region": "us-central1",
+    "schema_version": 1, "project": "rayai-dev", "region": "us-central1",
     "resource_name_prefix": "devbox-", "labels": {"managed-by": "superserve-devbox"},
     "instance": {"machine_type": "n2-standard-8", "enable_nested_virtualization": True,
                  "image_project": "ubuntu-os-cloud", "image_family": "ubuntu-2404-lts-amd64",
@@ -50,6 +52,8 @@ class FakeCloud:
         self.decoys, self.fail_after_create, self.expire_on_script = decoys, fail_after_create, expire_on_script
         self.deployed_sha = NEW_SHA
         self.disks, self.buckets, self.unlabelled = [], [], set()
+        self.disk_zones, self.deleted, self.stockout = {}, [], {}
+        self.leak_boot_disk, self.created_at, self.vanished = False, {}, set()
         self.relabel_after_checkouts = None
         self.pending_instance = False
         self.fail_disk_create = False
@@ -82,14 +86,37 @@ class FakeCloud:
             return ok("".join(lines)) if lines else fail(2, "")
         assert args[0] == "gcloud", args
         verb = args[1:4]
+        zones = arg(args, "--zones").split(",") if any(a.startswith("--zones=") for a in args) else None
+        in_zones = lambda zone: zones is None or zone.rsplit("/", 1)[-1] in zones
         if verb == ["compute", "instances", "list"]:
             if "--format=json" in args:
-                return ok(json.dumps(list(self.instances.values())))
+                return ok(json.dumps([i for i in self.instances.values() if in_zones(i["zone"])]))
             return ok("".join(f"{name}\tus-central1-a\n" for name in self.existing))
         if verb == ["compute", "disks", "list"]:
+            if re.fullmatch(r"name=\S+", arg(args, "--filter")):
+                wanted = arg(args, "--filter")[len("name="):]
+                users = {d.get("source", "").rsplit("/", 1)[-1] for i in self.instances.values() for d in i["disks"]}
+                return ok(json.dumps([{"name": name, "zone": f"projects/p/zones/{zone}",
+                                       "creationTimestamp": self.created_at.get(name, "2026-01-01T00:00:00.000-07:00"),
+                                       **({} if name in self.unlabelled else {"labels": {"devbox-id": "x"}}),
+                                       **({"users": ["vm"]} if name in users else {})}
+                                      for name, zone in self.disk_zones.items() if name == wanted and in_zones(zone)]))
             if "--format=json" in args:
-                return ok(json.dumps([{"name": name, "zone": "projects/p/zones/us-central1-a"}
-                                      for name in self.disks if name not in self.unlabelled]))
+                return ok(json.dumps([{"name": name, "zone": f"projects/p/zones/{zone}"}
+                                      for name, zone in self.disk_zones.items()
+                                      if name not in self.unlabelled and in_zones(zone)]))
+            return ok()
+        if verb == ["compute", "instances", "delete"]:
+            self.deleted.append(("instance", args[4], arg(args, "--zone")))
+            self.instances.pop(args[4], None)
+            return ok()
+        if verb == ["compute", "disks", "delete"] and args[4] in self.vanished:
+            return fail(1, f"ERROR: (gcloud.compute.disks.delete) The resource '{args[4]}' was not found")
+        if verb == ["compute", "disks", "delete"]:
+            self.deleted.append(("disk", args[4], arg(args, "--zone")))
+            self.disk_zones.pop(args[4], None)
+            if args[4] in self.disks:
+                self.disks.remove(args[4])
             return ok()
         if verb == ["compute", "disks", "add-labels"]:
             self.unlabelled.discard(args[4])
@@ -97,7 +124,10 @@ class FakeCloud:
         if verb == ["compute", "disks", "create"]:
             if self.fail_disk_create:
                 return fail(1, "quota exceeded")
+            if self.stockout.get(arg(args, "--zone")) == "disk":
+                return fail(1, "ERROR: (gcloud.compute.disks.create) ZONE_RESOURCE_POOL_EXHAUSTED")
             self.disks.append(args[4])
+            self.disk_zones[args[4]] = arg(args, "--zone")
             return ok()
         if verb == ["storage", "buckets", "create"]:
             self.buckets.append(args[4])
@@ -107,10 +137,21 @@ class FakeCloud:
         if verb == ["compute", "instances", "create"]:
             labels = dict(pair.split("=") for pair in arg(args, "--labels").split(","))
             manifest = Path(arg(args, "--metadata-from-file").split("=", 1)[1]).read_text()
+            zone = arg(args, "--zone")
+            if self.stockout.get(zone) == "partial":
+                self.materialize(args[4], labels, manifest, zone)
+                return fail(1, "ERROR: (gcloud.compute.instances.create) ZONE_RESOURCE_POOL_EXHAUSTED")
+            if self.stockout.get(zone) == "instance":
+                if self.leak_boot_disk:
+                    self.disk_zones[args[4]] = zone
+                    self.unlabelled.add(args[4])
+                    self.created_at[args[4]] = datetime.now(timezone.utc).isoformat()
+                return fail(1, f"ERROR: (gcloud.compute.instances.create) The zone 'projects/p/zones/{zone}' does "
+                               "not have enough resources available to fulfill the request. reason: stockout")
             if self.pending_instance:
-                self.pending_instance = lambda: self.materialize(args[4], labels, manifest)
+                self.pending_instance = lambda: self.materialize(args[4], labels, manifest, zone)
                 return fail(1, "operation still pending")
-            self.materialize(args[4], labels, manifest)
+            self.materialize(args[4], labels, manifest, zone)
             return fail(1, "operation timed out") if self.fail_after_create else ok()
         if verb == ["compute", "instances", "describe"]:
             instance = self.instances[args[4]]
@@ -127,13 +168,14 @@ class FakeCloud:
             return self.ssh(args, args[args.index("--command") + 1], input, ok, fail)
         return ok()
 
-    def materialize(self, name, labels, manifest):
-        disks = [{"boot": True, "source": f"projects/p/zones/us-central1-a/disks/{name}"},
-                 {"source": f"projects/p/zones/us-central1-a/disks/{name}-data"}]
-        self.instances[name] = {"name": name, "zone": "projects/p/zones/us-central1-a", "labels": labels,
+    def materialize(self, name, labels, manifest, zone="us-central1-a"):
+        disks = [{"boot": True, "source": f"projects/p/zones/{zone}/disks/{name}"},
+                 {"source": f"projects/p/zones/{zone}/disks/{name}-data"}]
+        self.instances[name] = {"name": name, "zone": f"projects/p/zones/{zone}", "labels": labels,
                                 "metadata": {"items": [{"key": "devbox-manifest", "value": manifest}]},
                                 "disks": disks}
         self.disks.append(name)
+        self.disk_zones[name] = zone
         self.unlabelled.add(name)
 
     def ssh(self, args, command, input, ok, fail):
@@ -234,6 +276,20 @@ class PrepareTests(WorkflowCase):
         self.assertEqual([c[:2] for c in cloud.commands if c[0] != "git"], [])
         self.assertIn(NEW_SHA, next(c for c in cloud.commands if "fetch" in c))
 
+    def test_prepare_create_validates_the_zone(self):
+        self.run_with(FakeCloud(), workflow.prepare_create, self.env(INPUT_ZONE="us-central1-b"),
+                      profile_path=self.profile)
+        self.assertEqual(self.outputs()["zone"], "us-central1-b")
+        with self.assertRaises(contract.ContractError):
+            self.run_with(FakeCloud(), workflow.prepare_create, self.env(INPUT_ZONE="us-east1-b"),
+                          profile_path=self.profile)
+
+    def test_create_zone_choices_match_the_contract(self):
+        workflow_file = Path(workflow.__file__).resolve().parents[1] / "devbox-create.yml"
+        options = re.search(r"      zone:\n(?:        .*\n)*?        options:\n((?:          - .*\n)+)",
+                            workflow_file.read_text()).group(1)
+        self.assertEqual(re.findall(r"- (\S+)", options), [contract.AUTO_ZONE, *contract.DEVBOX_ZONES])
+
     def test_prepare_create_refuses_revisions_without_the_box_scripts(self):
         cloud = FakeCloud()
         cloud.repo_scripts.remove("seed-base.sh")
@@ -333,7 +389,7 @@ class CreateTests(WorkflowCase):
         self.assertEqual(json.loads(cloud.box_files["/etc/superserve-devbox/manifest.json"]), final)
         summary = self.summary.read_text()
         self.assertIn("is ready", summary)
-        self.assertIn(contract.forwarding_command("my-box"), summary)
+        self.assertIn(contract.forwarding_command("my-box", "us-central1-a"), summary)
         self.assertIn(workflow.destroy_command("my-box"), summary)
 
     def test_secrets_travel_over_stdin_only(self):
@@ -376,6 +432,92 @@ class CreateTests(WorkflowCase):
         cloud = FakeCloud()
         self.assertEqual(self.create(cloud, DEVBOX_ENGINEER_MEMBERS=""), 0)
         self.assertEqual(len(cloud.gcloud("compute", "instances", "add-iam-policy-binding")), 1)
+
+    def test_auto_zone_moves_on_after_a_stockout_and_cleans_up(self):
+        cloud = FakeCloud()
+        cloud.stockout = {"us-central1-a": "instance", "us-central1-b": "disk"}
+        self.assertEqual(self.create(cloud), 0)
+        final = cloud.metadata_writes[-1]
+        self.assertEqual(final["zone"], "us-central1-c")
+        self.assertEqual({r.get("zone") for r in final["resources"]}, {"us-central1-c", None})
+        self.assertEqual(cloud.deleted, [("disk", "devbox-my-box-data", "us-central1-a")])
+        self.assertEqual(cloud.disk_zones, {"devbox-my-box-data": "us-central1-c", "devbox-my-box": "us-central1-c"})
+        self.assertEqual(len(cloud.gcloud("storage", "buckets", "create")), 1)
+        for args in cloud.gcloud("compute", "ssh") + cloud.gcloud("compute", "instances", "add-iam-policy-binding"):
+            self.assertIn("--zone=us-central1-c", args)
+        summary = self.summary.read_text()
+        self.assertIn("`us-central1-c` (after us-central1-a out of capacity, us-central1-b out of capacity)", summary)
+        self.assertIn(contract.forwarding_command("my-box", "us-central1-c"), summary)
+        self.assertIn("DEVBOX_ZONE=us-central1-c\n", cloud.box_files["/etc/superserve-devbox/devbox.env"])
+
+    def test_a_detached_boot_disk_left_in_an_abandoned_zone_is_removed(self):
+        cloud = FakeCloud()
+        cloud.stockout, cloud.leak_boot_disk = {"us-central1-a": "instance"}, True
+        self.assertEqual(self.create(cloud), 0)
+        self.assertIn(("disk", "devbox-my-box", "us-central1-a"), cloud.deleted)
+        self.assertEqual(cloud.disk_zones, {"devbox-my-box-data": "us-central1-b", "devbox-my-box": "us-central1-b"})
+
+    def test_a_partly_created_vm_and_its_disks_are_removed_before_the_next_zone(self):
+        cloud = FakeCloud()
+        cloud.stockout = {"us-central1-a": "partial"}
+        self.assertEqual(self.create(cloud), 0)
+        self.assertEqual(cloud.deleted[:3], [("instance", "devbox-my-box", "us-central1-a"),
+                                             ("disk", "devbox-my-box", "us-central1-a"),
+                                             ("disk", "devbox-my-box-data", "us-central1-a")])
+        self.assertEqual(cloud.metadata_writes[-1]["zone"], "us-central1-b")
+
+    def test_a_disk_gone_during_cleanup_does_not_stop_the_next_zone(self):
+        cloud = FakeCloud()
+        cloud.stockout, cloud.vanished = {"us-central1-a": "instance"}, {"devbox-my-box-data"}
+        self.assertEqual(self.create(cloud), 0)
+        self.assertEqual(cloud.metadata_writes[-1]["zone"], "us-central1-b")
+
+    def test_an_old_unlabelled_disk_with_the_box_name_is_left_alone(self):
+        cloud = FakeCloud()
+        cloud.stockout = {"us-central1-a": "instance"}
+        cloud.disk_zones["devbox-my-box"] = "us-central1-a"
+        cloud.unlabelled.add("devbox-my-box")
+        workflow.ensure_unused = lambda name, project=contract.PROJECT: None
+        self.addCleanup(setattr, workflow, "ensure_unused", ENSURE_UNUSED)
+        self.assertEqual(self.create(cloud), 0)
+        self.assertNotIn(("disk", "devbox-my-box", "us-central1-a"), cloud.deleted)
+
+    def test_capacity_check_ignores_names_and_case(self):
+        for text, capacity in (("ZONE_RESOURCE_POOL_EXHAUSTED", True), ("ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS", True),
+                               ("reason: stockout", True),
+                               ("The zone does not have enough resources available to fulfill the request.", True),
+                               ("disk 'devbox-stockout-demo' already exists", False),
+                               ("resource_exhausted", False), ("QUOTA_EXCEEDED", False)):
+            with self.subTest(text=text):
+                self.assertEqual(bool(workflow.CAPACITY_ERRORS.search(text)), capacity)
+
+    def test_explicit_zone_is_the_only_zone_tried(self):
+        cloud = FakeCloud()
+        cloud.stockout = {"us-central1-f": "instance"}
+        self.assertEqual(self.create(cloud, ZONE="us-central1-f"), 1)
+        self.assertEqual({arg(c, "--zone") for c in cloud.gcloud("compute", "disks", "create")}, {"us-central1-f"})
+        self.assertEqual(cloud.deleted, [("disk", "devbox-my-box-data", "us-central1-f")])
+        self.assertIn("us-central1-f: ", self.summary.read_text())
+
+    def test_every_zone_out_of_capacity_reports_each_zone(self):
+        attempt = Path(self.directory.name) / "attempt.json"
+        cloud = FakeCloud()
+        cloud.stockout = {zone: "instance" for zone in contract.DEVBOX_ZONES}
+        self.assertEqual(self.create(cloud, DEVBOX_ATTEMPT_FILE=str(attempt)), 1)
+        summary = self.summary.read_text()
+        for zone in contract.DEVBOX_ZONES:
+            self.assertIn(f"- {zone}: ", summary)
+        self.assertEqual(cloud.disk_zones, {})
+        self.assertEqual(cloud.instances, {})
+        self.assertFalse(cloud.gcloud("storage", "buckets", "create"))
+        self.assertTrue(json.loads(attempt.read_text())["reported"])
+
+    def test_other_errors_do_not_try_another_zone(self):
+        cloud = FakeCloud()
+        cloud.fail_disk_create = True
+        self.assertEqual(self.create(cloud), 1)
+        self.assertEqual(len(cloud.gcloud("compute", "disks", "create")), 1)
+        self.assertEqual(cloud.deleted, [])
 
     def test_name_collision_is_refused_without_offering_cleanup(self):
         cloud = FakeCloud(existing=["my-box"])
@@ -492,16 +634,16 @@ class CreateTests(WorkflowCase):
 class DeployTests(WorkflowCase):
     NOW = datetime(2026, 10, 20, 18, 0, tzinfo=timezone.utc)
 
-    def box(self, state="ready", expires_hours=24, runtime=None):
+    def box(self, state="ready", expires_hours=24, runtime=None, zone="us-central1-a", vm_zone=None):
         created = datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc)
         manifest = contract.new_manifest(
             name="my-box", devbox_id="3f9c0a1b2c4d", owner="awille-ai", actor="awille-ai", created_at=created,
-            expires_at=contract.expiry(created, expires_hours),
+            expires_at=contract.expiry(created, expires_hours), zone=zone,
             revisions={"sandbox": {"branch": "main", "sha": SANDBOX_SHA}, "ui": {"branch": "main", "sha": UI_SHA}})
         manifest = {**contract.with_state(manifest, state),
                     "runtime": {"firecracker": "1.10.1"} if runtime is None else runtime}
         labels = contract.labels("my-box", "3f9c0a1b2c4d", "awille-ai", contract.parse_iso(manifest["expires_at"]))
-        return {"devbox-my-box": {"name": "devbox-my-box", "zone": "projects/p/zones/us-central1-a", "labels": labels,
+        return {"devbox-my-box": {"name": "devbox-my-box", "zone": f"projects/p/zones/{vm_zone or zone}", "labels": labels,
                            "metadata": {"items": [{"key": "devbox-manifest", "value": json.dumps(manifest)}]}}}
 
     def deploy(self, cloud, components="all", **values):
@@ -698,6 +840,19 @@ class DeployTests(WorkflowCase):
         cloud.ssh = original
         self.deploy_backstop(cloud, attempt)
         self.assertEqual(cloud.metadata_writes[-1]["components"]["vmd"], {"branch": "feature", "sha": "unknown"})
+
+    def test_deploy_follows_the_box_to_its_zone(self):
+        cloud = FakeCloud(instances=self.box(zone="us-central1-f"))
+        self.assertEqual(self.deploy(cloud, "vmd"), 0)
+        for args in cloud.gcloud("compute", "ssh") + cloud.gcloud("compute", "instances", "add-metadata"):
+            self.assertIn("--zone=us-central1-f", args)
+        self.assertIn(contract.forwarding_command("my-box", "us-central1-f"), self.summary.read_text())
+
+    def test_deploy_refuses_a_box_whose_zone_disagrees_with_its_manifest(self):
+        cloud = FakeCloud(instances=self.box(zone="us-central1-a", vm_zone="us-central1-b"))
+        with self.assertRaisesRegex(workflow.StepError, "manifest says us-central1-a"):
+            self.deploy(cloud, "vmd")
+        self.assertEqual(cloud.metadata_writes, [])
 
     def test_failed_box_can_be_redeployed(self):
         cloud = FakeCloud(instances=self.box(state="failed"))

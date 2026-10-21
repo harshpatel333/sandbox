@@ -8,14 +8,12 @@ TERRAFORM = DEVBOX / "terraform"
 PROFILE = json.loads((DEVBOX / "profile.json").read_text())
 TFVARS = dict(re.findall(r'^(\w+)\s*=\s*"([^"]*)"$', (TERRAFORM / "terraform.tfvars").read_text(), re.M))
 MAIN_TF = (TERRAFORM / "main.tf").read_text()
-ZONES = re.findall(r'"([^"]+)"', re.search(r'^zones\s*=\s*\[(.*)\]$', (TERRAFORM / "terraform.tfvars").read_text(), re.M).group(1))
 
 
 class TerraformAgreementTest(unittest.TestCase):
     def test_names_match_the_iam_conditions(self):
         self.assertEqual(PROFILE["resource_name_prefix"], TFVARS["resource_name_prefix"])
         self.assertEqual(PROFILE["bucket"]["name_prefix"], TFVARS["bucket_name_prefix"])
-        self.assertIn(PROFILE["zone"], ZONES)
         self.assertEqual(PROFILE["project"], TFVARS["project_id"])
 
     def test_instances_land_where_iap_ssh_is_allowed(self):
