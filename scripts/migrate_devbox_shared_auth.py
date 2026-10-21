@@ -1,5 +1,10 @@
 """Initialize reviewed shared Auth migrations on one bound, empty devbox."""
 
+import sys
+
+if __name__ == "__main__" and not sys.flags.isolated:
+    raise SystemExit("Run this initializer with python -I to isolate imports")
+
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -10,12 +15,50 @@ import re
 import shlex
 import stat
 import subprocess
+import types
 from urllib.parse import parse_qsl, unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 import psycopg
 
-import migrate_shared_auth as shared
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("inspect", "apply"))
+    parser.add_argument("--binding", required=True, type=Path)
+    parser.add_argument("--revision", required=True)
+    return parser.parse_args()
+
+
+def pinned_engine(revision):
+    root = Path(__file__).resolve().parents[1]
+    if not re.fullmatch(r"[a-f0-9]{40}", revision):
+        raise ValueError("invalid_revision")
+    if subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip() != revision:
+        raise ValueError("source_revision_mismatch")
+    subprocess.run(["git", "ls-files", "--error-unmatch", "--", "scripts/migrate_devbox_shared_auth.py"],
+                   cwd=root, check=True, capture_output=True)
+    subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "scripts", "supabase/shared-auth-migrations"],
+                   cwd=root, check=True, capture_output=True)
+    # Never add the checkout to sys.path. Load helpers from the selected Git
+    # objects, bypassing untracked modules and executable bytecode caches.
+    for name in ("migrate_database", "migrate_shared_auth"):
+        path = f"scripts/{name}.py"
+        code = subprocess.check_output(["git", "show", f"{revision}:{path}"], cwd=root)
+        module = types.ModuleType(name)
+        module.__file__ = str(root / path)
+        sys.modules[name] = module
+        exec(compile(code, module.__file__, "exec"), module.__dict__)
+    return sys.modules["migrate_shared_auth"]
+
+
+if __name__ == "__main__":
+    CLI_ARGS = arguments()
+    try:
+        shared = pinned_engine(CLI_ARGS.revision)
+    except Exception:
+        raise SystemExit("Pinned initializer source could not be verified")
+else:
+    import migrate_shared_auth as shared
 
 
 CONFIG = Path("/etc/superserve-devbox/devbox.env")
@@ -158,22 +201,11 @@ def initialize(conn, revision, execute=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("inspect", "apply"))
-    parser.add_argument("--binding", required=True, type=Path)
-    parser.add_argument("--revision", required=True)
-    args = parser.parse_args()
+    args = CLI_ARGS
     try:
         require(os.geteuid() == 0, "root_executor_required")
         binding = json.loads(protected_file(args.binding))
         validate_binding(binding)
-        require(re.fullmatch(r"[a-f0-9]{40}", args.revision), "invalid_revision")
-        require(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=shared.ROOT, text=True).strip()
-                == args.revision, "source_revision_mismatch")
-        subprocess.run(["git", "ls-files", "--error-unmatch", "--", "scripts/migrate_devbox_shared_auth.py"],
-                       cwd=shared.ROOT, check=True, capture_output=True)
-        subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "scripts", "supabase/shared-auth-migrations"],
-                       cwd=shared.ROOT, check=True, capture_output=True)
         verify_host(binding)
         params = connection_parameters(os.environ.get("DATABASE_URL", ""))
         with psycopg.connect(autocommit=True, **params) as conn:

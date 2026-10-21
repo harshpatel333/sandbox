@@ -47,19 +47,21 @@ the runtime `promotion_evidence_proxy` connection or print either URL. Unset
 libpq service configuration (`PGSERVICE`, `PGSERVICEFILE`, `PGSYSCONFDIR`).
 
 ```sh
-python scripts/migrate_devbox_shared_auth.py inspect \
+python -I scripts/migrate_devbox_shared_auth.py inspect \
   --binding /etc/superserve-devbox/shared-auth-binding.json \
   --revision TOOL_COMMIT
-python scripts/migrate_devbox_shared_auth.py apply \
+python -I scripts/migrate_devbox_shared_auth.py apply \
   --binding /etc/superserve-devbox/shared-auth-binding.json \
   --revision TOOL_COMMIT
-python scripts/migrate_devbox_shared_auth.py inspect \
+python -I scripts/migrate_devbox_shared_auth.py inspect \
   --binding /etc/superserve-devbox/shared-auth-binding.json \
   --revision TOOL_COMMIT
 ```
 
 Use the literal full tool commit. Save all three JSON results with the candidate
 build and deployment receipts. No output contains connection credentials.
+The `-I` option is required: repository helpers load directly from the selected
+Git commit, while other imports come from the isolated Python environment.
 
 The guard compares Google metadata with the lease binding and installed
 `/var/lib/superserve-devbox/runtime.json`, and checks `DEVBOX_ID` in

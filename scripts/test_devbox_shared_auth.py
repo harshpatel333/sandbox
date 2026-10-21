@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -26,6 +28,39 @@ def binding():
 
 
 class IdentityTest(unittest.TestCase):
+    def test_cli_isolates_shadowing_imports_before_source_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            for name in ("migrate_devbox_shared_auth", "migrate_shared_auth", "migrate_database"):
+                shutil.copyfile(Path(__file__).with_name(name + ".py"), scripts / (name + ".py"))
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=root, stderr=subprocess.DEVNULL, text=True).strip()
+            git("init")
+            git("add", "scripts")
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                "-c", "commit.gpgsign=false", "commit", "-m", "fixture")
+            revision = git("rev-parse", "HEAD")
+            marker = root / "untrusted-import-executed"
+            poison = f"open({str(marker)!r}, 'w').write('executed')\nraise RuntimeError('untrusted import')\n"
+            for name in ("psycopg.py", "argparse.py", "json.py"):
+                (scripts / name).write_text(poison)
+            args = [str(scripts / "migrate_devbox_shared_auth.py"), "inspect", "--revision", revision,
+                    "--binding", str(root / "absent-binding.json")]
+            env = dict(os.environ, PYTHONPATH=str(scripts))
+            plain = subprocess.run([sys.executable, *args], env=env, capture_output=True, text=True)
+            self.assertIn("python -I", plain.stderr)
+            isolated = subprocess.run([sys.executable, "-I", *args], env=env, capture_output=True, text=True)
+            self.assertEqual(isolated.returncode, 1)
+            # Reaching binding/root validation proves the pinned helpers loaded.
+            self.assertIn('"next_step"', isolated.stdout)
+            self.assertFalse(marker.exists())
+            (scripts / "migrate_shared_auth.py").write_text(poison)
+            dirty = subprocess.run([sys.executable, "-I", *args], env=env, capture_output=True, text=True)
+            self.assertIn("Pinned initializer source could not be verified", dirty.stderr)
+            self.assertFalse(marker.exists())
+
     def test_protected_file_reads_verified_descriptor_despite_path_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "binding.json"
