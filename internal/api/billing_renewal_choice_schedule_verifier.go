@@ -60,6 +60,20 @@ func (v *stripeRenewalScheduleVerifier) Inspect(ctx context.Context, k renewalCh
 	if err = (&Handlers{Stripe: v.Client}).VerifyProviderPairTerms(ctx, b.Identity, b.Terms); err != nil {
 		return snapshot, err
 	}
+	if err = validateRenewalTerms(op.Request.Choice, op.Terms); err != nil {
+		return snapshot, err
+	}
+	if op.Request.Choice == "monthly" {
+		target, identity := b.Terms, b.Identity
+		target.FeePriceID, target.FeeProductID, target.FeeAmount, target.FeeMonths = op.Terms.Price, op.Terms.Product, op.Terms.Amount, int32(op.Terms.Months)
+		identity.ProviderTermsDigest, err = target.Digest()
+		if err != nil {
+			return snapshot, err
+		}
+		if err = (&Handlers{Stripe: v.Client}).VerifyProviderPairTerms(ctx, identity, target); err != nil {
+			return snapshot, err
+		}
+	}
 	fee, err := v.Client.invoiceSubscription(ctx, b.FeeSubscriptionID)
 	if err != nil {
 		return snapshot, err
@@ -191,6 +205,22 @@ func (v *stripeRenewalScheduleVerifier) ObserveStep(ctx context.Context, k renew
 	if err != nil || original.Choice == nil {
 		return renewalChoiceStepProof{}, errRenewalPending
 	}
+	if !time.Now().UTC().Before(k.Boundary) {
+		// Only the exact original request event can settle a previously unknown
+		// update. The historical pair then proves what actually began at B.
+		observed := op
+		observed.Steps = append([]renewalChoiceStep(nil), op.Steps...)
+		if len(observed.Steps) > 0 {
+			observed.Steps[len(observed.Steps)-1].Proof = &original
+		}
+		choice, err := v.observeBoundary(ctx, k, observed)
+		if err != nil {
+			return renewalChoiceStepProof{}, err
+		}
+		original.OriginalChoice = original.Choice
+		original.Choice, original.VerifiedAt = &choice, choice.VerifiedAt
+		return original, nil
+	}
 	snapshot, err := v.Inspect(ctx, k, op)
 	if err != nil {
 		return renewalChoiceStepProof{}, err
@@ -285,7 +315,7 @@ func (v *stripeRenewalScheduleVerifier) recoverEvent(ctx context.Context, k rene
 
 func (v *stripeRenewalScheduleVerifier) ObserveChoice(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
 	if !time.Now().UTC().Before(k.Boundary) {
-		return renewalChoiceProof{}, errRenewalPending
+		return v.observeBoundary(ctx, k, op)
 	}
 	if len(op.Steps) != 0 {
 		proof, err := v.ObserveStep(ctx, k, op, op.Steps[len(op.Steps)-1].Request)

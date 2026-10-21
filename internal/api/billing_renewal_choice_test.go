@@ -122,7 +122,7 @@ func (a *fixtureRenewalAuthority) Resolve(_ context.Context, _ pgx.Tx, _ renewal
 	}
 	return &renewalChoiceTerms{Offer: "pro_" + choice, Version: 1, RateCard: "payg", Price: "price_" + choice, Product: "prod_pro", Currency: "usd", Amount: amount, Months: months, Allowances: allowances}, nil
 }
-func (a *fixtureRenewalAuthority) DefaultProof(_ context.Context, _ pgx.Tx, k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+func (a *fixtureRenewalAuthority) DefaultProof(_ context.Context, k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
 	return fixtureRenewalProof(k, op, a.now), nil
 }
 func fixtureRenewalProof(k renewalChoiceKey, op renewalChoiceOperation, now time.Time) renewalChoiceProof {
@@ -855,5 +855,40 @@ func TestRenewalChoiceMonthlyCalendarAdmissionMatchesDispatch(t *testing.T) {
 	}
 	if _, ok := store.requests[req.ID]; ok {
 		t.Fatal("rejected request persisted")
+	}
+}
+
+type observingRenewalDefault struct {
+	*fixtureRenewalAuthority
+	observe func(renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error)
+}
+
+func (a *observingRenewalDefault) DefaultProof(_ context.Context, k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+	return a.observe(k, op)
+}
+func TestRenewalChoiceDefaultObservationReleasesTransactionAndRechecksAuthority(t *testing.T) {
+	for _, revoke := range []bool{false, true} {
+		t.Run(fmt.Sprint(revoke), func(t *testing.T) {
+			_, _, a := newRenewalFixture(t)
+			store := &memoryRenewalStore{now: a.now}
+			authority := &observingRenewalDefault{fixtureRenewalAuthority: a}
+			authority.observe = func(k renewalChoiceKey, op renewalChoiceOperation) (renewalChoiceProof, error) {
+				if !store.mu.TryLock() {
+					t.Fatal("provider observation retained regional transaction")
+				}
+				store.mu.Unlock()
+				a.revoked = revoke
+				return fixtureRenewalProof(k, op, store.now), nil
+			}
+			s := &renewalChoiceService{Enabled: true, Store: store, Authority: authority}
+			err := s.initialize(t.Context(), a.key, a.actor)
+			if revoke {
+				if err == nil || len(store.requests) != 0 || store.journals[a.key].Confirmed != nil {
+					t.Fatal("revoked observation became confirmed", err)
+				}
+			} else if err != nil || store.journals[a.key].Confirmed == nil || len(store.requests) != 1 {
+				t.Fatal("valid observation did not initialize", err)
+			}
+		})
 	}
 }

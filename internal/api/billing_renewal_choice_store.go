@@ -54,7 +54,7 @@ func (s postgresRenewalChoiceStore) Transact(ctx context.Context, key renewalCho
 		return err
 	}
 	if t.revision == 0 {
-		t.journal = renewalChoiceJournal{Key: key, Successor: uuid.NewSHA1(key.Assignment, []byte(key.Team.String()+"/"+key.Boundary.Format(time.RFC3339)))}
+		t.journal = renewalChoiceJournal{Key: key, Successor: renewalSuccessorID(key)}
 	} else if t.journal.Revision != t.revision || t.journal.Key.Team != key.Team || t.journal.Key.Assignment != key.Assignment || !t.journal.Key.Boundary.Equal(key.Boundary) {
 		return fmt.Errorf("invalid renewal journal identity: %w", errRenewalConflict)
 	}

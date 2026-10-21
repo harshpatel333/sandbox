@@ -26,13 +26,14 @@ type renewalChoiceStepRequest struct {
 	Schedule    string    `json:"schedule,omitempty"`
 }
 type renewalChoiceStepProof struct {
-	RequestHash string              `json:"request_hash"`
-	Outcome     string              `json:"outcome"`
-	Schedule    string              `json:"schedule"`
-	BindingHash string              `json:"binding_hash"`
-	VerifiedAt  time.Time           `json:"verified_at"`
-	Evidence    json.RawMessage     `json:"evidence"`
-	Choice      *renewalChoiceProof `json:"choice,omitempty"`
+	RequestHash    string              `json:"request_hash"`
+	Outcome        string              `json:"outcome"`
+	Schedule       string              `json:"schedule"`
+	BindingHash    string              `json:"binding_hash"`
+	VerifiedAt     time.Time           `json:"verified_at"`
+	Evidence       json.RawMessage     `json:"evidence"`
+	Choice         *renewalChoiceProof `json:"choice,omitempty"`
+	OriginalChoice *renewalChoiceProof `json:"original_choice,omitempty"`
 }
 type renewalChoiceStep struct {
 	Request renewalChoiceStepRequest `json:"request"`

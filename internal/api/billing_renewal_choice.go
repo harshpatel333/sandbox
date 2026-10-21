@@ -72,6 +72,8 @@ type renewalChoiceOperation struct {
 // Proofs come only from the registered provider verifier, never a request body.
 // Boundary history includes original write timing and complete invoice inventory.
 type renewalChoiceProof struct {
+	// Fresh typed provider verification is never restored from persisted JSON.
+	successor   *VerifiedProviderPairSuccessor
 	Operation   uuid.UUID       `json:"operation_id"`
 	Boundary    time.Time       `json:"intended_boundary"`
 	BindingHash string          `json:"binding_hash"`
@@ -121,7 +123,7 @@ type renewalChoiceAuthoritySource interface {
 	DispatchGuard(context.Context, renewalChoiceKey, renewalChoiceOperation, func(context.Context) error) error
 	Authorize(context.Context, pgx.Tx, renewalChoiceKey, uuid.UUID) (renewalChoiceAuthority, error)
 	Resolve(context.Context, pgx.Tx, renewalChoiceKey, string) (*renewalChoiceTerms, error)
-	DefaultProof(context.Context, pgx.Tx, renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error)
+	DefaultProof(context.Context, renewalChoiceKey, renewalChoiceOperation) (renewalChoiceProof, error)
 }
 
 // Register only after exact-boundary late-write rejection has been established.
@@ -248,8 +250,8 @@ func (s *renewalChoiceService) status(ctx context.Context, k renewalChoiceKey, a
 	return result, err
 }
 
-// Initialize pins the configured default only from saved verified evidence. A
-// catalog version whose economics differ from the fee cannot become confirmed.
+// Initialization observes the provider outside regional transactions, then
+// rechecks the exact actor, acceptance, binding and terms before confirmation.
 func (s *renewalChoiceService) initialize(ctx context.Context, k renewalChoiceKey, actor uuid.UUID) error {
 	if err := s.available(); err != nil {
 		return err
@@ -257,7 +259,8 @@ func (s *renewalChoiceService) initialize(ctx context.Context, k renewalChoiceKe
 	if !validRenewalKey(k) || actor == uuid.Nil {
 		return errRenewalConflict
 	}
-	return s.admittedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
+	var candidate *renewalChoiceOperation
+	err := s.admittedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
 		a, err := s.Authority.Authorize(ctx, tx.SQL(), k, actor)
 		if err != nil {
 			return err
@@ -276,10 +279,34 @@ func (s *renewalChoiceService) initialize(ctx context.Context, k renewalChoiceKe
 		if err = validateRenewalTerms("annual", terms); err != nil {
 			return err
 		}
-		op := renewalChoiceOperation{ID: uuid.New(), Request: renewalChoiceRequest{ID: uuid.New(), Choice: "annual", ApprovalRevision: a.Revision, Acceptance: a.Acceptance, ChoiceRevision: j.Revision}, Actor: actor, Binding: a.Binding, Terms: terms, State: "confirmed", CreatedAt: tx.Now()}
-		proof, err := s.Authority.DefaultProof(ctx, tx.SQL(), k, op)
+		candidate = &renewalChoiceOperation{ID: uuid.New(), Request: renewalChoiceRequest{ID: uuid.New(), Choice: "annual", ApprovalRevision: a.Revision, Acceptance: a.Acceptance, ChoiceRevision: j.Revision}, Actor: actor, Binding: a.Binding, Terms: terms, State: "confirmed", CreatedAt: tx.Now()}
+		return nil
+	})
+	if err != nil || candidate == nil {
+		return err
+	}
+	op := *candidate
+	proof, err := s.Authority.DefaultProof(ctx, k, op)
+	if err != nil {
+		return err
+	}
+	return s.admittedTransaction(ctx, k, actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
+		if err := s.recheck(ctx, tx, k, op); err != nil {
+			return err
+		}
+		j := tx.Journal()
+		if j.Confirmed != nil {
+			return nil
+		}
+		if j.Revision != op.Request.ChoiceRevision {
+			return errRenewalConflict
+		}
+		terms, err := s.Authority.Resolve(ctx, tx.SQL(), k, "annual")
 		if err != nil {
 			return err
+		}
+		if renewalHash(terms) != renewalHash(op.Terms) {
+			return errRenewalConflict
 		}
 		if err = validateRenewalProof(k, op, proof, tx.Now()); err != nil {
 			return err
