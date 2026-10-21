@@ -7,7 +7,7 @@ import devbox_contract as contract
 import devbox_inventory as inv
 
 PROJECT = contract.PROJECT
-ZONE = contract.ZONE
+ZONE = contract.DEVBOX_ZONES[0]
 NOW = 1_800_000_000
 CREATED = '2027-01-15T06:00:00+00:00'
 
@@ -27,7 +27,7 @@ def labels(name, devbox_id, owner='alice', expires_at=NOW + 3600, **extra):
 def gce(name, devbox_id='3f9c0a1b2c4d'):
     """Return the contract's (instance, boot disk, data disk) names for a box."""
     by_type = {}
-    for resource in contract.resources(name, devbox_id):
+    for resource in contract.resources(name, devbox_id, ZONE):
         by_type.setdefault(resource['type'], []).append(resource['name'])
     [instance], disks = by_type['instance'], by_type['disk']
     return instance, *sorted(disks, key=len)
@@ -47,7 +47,8 @@ class FakeCloud:
                 name=name, devbox_id=devbox_id, owner=tags['owner'], actor=tags['owner'],
                 created_at=at(NOW - 26 * 3600), expires_at=at(int(tags['expires-at'])),
                 revisions={'sandbox': {'branch': 'main', 'sha': 'a' * 40},
-                           'ui': {'branch': 'feature-x', 'sha': 'b' * 40}}, zone=zone), 'ready')
+                           'ui': {'branch': 'feature-x', 'sha': 'b' * 40}},
+                zone=zone if zone in contract.DEVBOX_ZONES else ZONE), 'ready')
         if vm:
             self.instances_.append({'name': instance, 'zone': f'projects/{project}/zones/{zone}', 'status': 'RUNNING',
                                     'labels': dict(tags), 'selfLink': link('instances', instance, project, zone),
