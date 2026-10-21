@@ -24,12 +24,24 @@ func (h *Handlers) startOfferProvisioning(ctx context.Context) {
 		return
 	}
 	go func() {
+		var observedAt time.Time
 		for ctx.Err() == nil {
 			started := time.Now()
 			count, err := service.RunBatch(ctx)
 			currentBillingRecorder().RecordBillingWork(ctx, "offer_provisioning", err != nil, time.Since(started), int64(count))
 			if err != nil {
 				log.Warn().Msg("offer provisioning reconciliation requires recovery")
+			}
+			if time.Since(observedAt) >= time.Minute {
+				observe, cancel := context.WithTimeout(ctx, 2*time.Second)
+				pending, oldest, observeErr := service.PendingDispatches(observe)
+				cancel()
+				observedAt = time.Now()
+				if observeErr != nil {
+					log.Warn().Msg("offer provisioning pending dispatch observation failed")
+				} else if oldest >= 15*time.Minute {
+					log.Warn().Int64("pending_dispatch_count", pending).Dur("oldest_pending_age", oldest).Msg("offer provisioning dispatch requires operator recovery")
+				}
 			}
 			select {
 			case <-ctx.Done():

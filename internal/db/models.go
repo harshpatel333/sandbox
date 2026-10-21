@@ -820,6 +820,28 @@ type BillingMeterReconciliation struct {
 	BucketPasses       []byte         `json:"bucket_passes"`
 }
 
+type BillingOfferFinancialFence struct {
+	ID                   uuid.UUID          `json:"id"`
+	TeamID               uuid.UUID          `json:"team_id"`
+	AssignmentID         uuid.UUID          `json:"assignment_id"`
+	Phase                string             `json:"phase"`
+	TargetID             uuid.UUID          `json:"target_id"`
+	AuthorizationReceipt []byte             `json:"authorization_receipt"`
+	FinalizedAt          pgtype.Timestamptz `json:"finalized_at"`
+	RevokedAt            pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt            time.Time          `json:"created_at"`
+}
+
+type BillingOfferFinancialRevocation struct {
+	ID                uuid.UUID `json:"id"`
+	AcknowledgementID uuid.UUID `json:"acknowledgement_id"`
+	TeamID            uuid.UUID `json:"team_id"`
+	AssignmentID      uuid.UUID `json:"assignment_id"`
+	Phase             string    `json:"phase"`
+	TargetID          uuid.UUID `json:"target_id"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
 type BillingOfferProvisioningAudit struct {
 	ID          int64     `json:"id"`
 	OperationID uuid.UUID `json:"operation_id"`
