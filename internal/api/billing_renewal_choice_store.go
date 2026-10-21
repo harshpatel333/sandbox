@@ -32,6 +32,20 @@ func (s postgresRenewalChoiceStore) Transact(ctx context.Context, key renewalCho
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err = s.WithTx(ctx, tx, key, f); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// Financial finalization already holds account and target-fence locks. Joining
+// that transaction keeps activation and the journal marker atomic.
+func (s postgresRenewalChoiceStore) WithTx(ctx context.Context, tx pgx.Tx, key renewalChoiceKey, f func(renewalChoiceTransaction) error) error {
+	if tx == nil || !validRenewalKey(key) {
+		return errRenewalDisabled
+	}
+	key.Boundary = key.Boundary.UTC()
+	var err error
 	// Account-first ordering matches other billing writers. Authority adapters may
 	// then inspect regional assignment/acceptance rows. Shared dispatch guards
 	// and provider calls run only after this transaction has committed.
@@ -58,10 +72,7 @@ func (s postgresRenewalChoiceStore) Transact(ctx context.Context, key renewalCho
 	} else if t.journal.Revision != t.revision || t.journal.Key.Team != key.Team || t.journal.Key.Assignment != key.Assignment || !t.journal.Key.Boundary.Equal(key.Boundary) {
 		return fmt.Errorf("invalid renewal journal identity: %w", errRenewalConflict)
 	}
-	if err = f(t); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return f(t)
 }
 
 func (t *postgresRenewalChoiceTx) SQL() pgx.Tx                    { return t.tx }

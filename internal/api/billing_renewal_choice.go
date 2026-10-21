@@ -142,6 +142,10 @@ type renewalChoiceSuccessors interface {
 	Reconcile(context.Context, pgx.Tx, renewalChoiceKey, renewalChoiceOperation, uuid.UUID) (string, error)
 }
 
+type renewalChoiceFinancialSuccessors interface {
+	ReconcileFinancial(context.Context, renewalChoiceKey, renewalChoiceOperation, func(context.Context, pgx.Tx, func() (string, error)) error) error
+}
+
 type renewalChoiceTransaction interface {
 	SQL() pgx.Tx
 	Now() time.Time
@@ -513,6 +517,46 @@ func (s *renewalChoiceService) reconcileSuccessor(ctx context.Context, k renewal
 	// Even an initially confirmed default needs actual boundary history. In
 	// particular, an unknown newer write may have changed what took effect.
 	proof, observeErr := s.Provider.Observe(ctx, k, *confirmed)
+	if financial, ok := s.Successors.(renewalChoiceFinancialSuccessors); ok && observeErr == nil && proof.Outcome == "confirmed" && proof.Timing == "boundary_history" && validateRenewalProof(k, *confirmed, proof, time.Now().UTC()) == nil {
+		op := *confirmed
+		op.Proof = &proof
+		return financial.ReconcileFinancial(ctx, k, op, func(ctx context.Context, sql pgx.Tx, apply func() (string, error)) error {
+			finish := func(tx renewalChoiceTransaction) error {
+				j := tx.Journal()
+				if j.Confirmed == nil || j.Confirmed.ID != op.ID || j.Revision != expectedRevision || j.Successor != renewalSuccessorID(k) {
+					return errRenewalConflict
+				}
+				if err := s.recheck(ctx, tx, k, *j.Confirmed); err != nil {
+					return err
+				}
+				if validateRenewalProof(k, *j.Confirmed, proof, tx.Now()) != nil {
+					return errRenewalPending
+				}
+				state, err := apply()
+				if err != nil {
+					return err
+				}
+				if state != "payment_pending" && state != "review_required" && !(state == "active" && op.Request.Choice != "free") && !(state == "free" && op.Request.Choice == "free") {
+					return errRenewalConflict
+				}
+				if (j.SuccessorState == "active" || j.SuccessorState == "free") && state != j.SuccessorState {
+					return errRenewalPending
+				}
+				j.SuccessorState, j.Confirmed.Proof = state, &proof
+				return tx.Save("successor_" + state)
+			}
+			if sql == nil {
+				return s.admittedTransaction(ctx, k, op.Actor, func(_ context.Context, tx renewalChoiceTransaction) error { return finish(tx) })
+			}
+			joined, ok := s.Store.(interface {
+				WithTx(context.Context, pgx.Tx, renewalChoiceKey, func(renewalChoiceTransaction) error) error
+			})
+			if !ok {
+				return errRenewalDisabled
+			}
+			return joined.WithTx(ctx, sql, k, finish)
+		})
+	}
 	return s.admittedTransaction(ctx, k, confirmed.Actor, func(ctx context.Context, tx renewalChoiceTransaction) error {
 		j := tx.Journal()
 		if j.Confirmed == nil || j.Confirmed.ID != confirmed.ID || j.Revision != expectedRevision {
