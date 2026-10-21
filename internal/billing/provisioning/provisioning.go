@@ -50,10 +50,15 @@ type AcceptedOffer struct {
 	Live         bool            `json:"live"`
 	APIVersion   string          `json:"api_version"`
 	Snapshot     json.RawMessage `json:"snapshot"`
+	// ProviderTerms is pinned separately without rewriting the acceptance receipt.
+	ProviderTerms json.RawMessage `json:"provider_terms,omitempty"`
 }
 
 func (a AcceptedOffer) validate() error {
 	if a.AcceptanceID == uuid.Nil || len(a.TermsDigest) != 64 || a.Merchant == "" || a.APIVersion == "" || !object(a.Snapshot) {
+		return ErrConflict
+	}
+	if len(a.ProviderTerms) > 0 && !object(a.ProviderTerms) {
 		return ErrConflict
 	}
 	if _, err := hex.DecodeString(a.TermsDigest); err != nil {

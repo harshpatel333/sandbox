@@ -16,7 +16,9 @@ provider adapters and do not establish provider or runtime readiness.
 `provisioning.Admission` resolves durable acceptance from server storage using only
 team and assignment IDs. Its short transaction rechecks pinned terms, current
 approval, tenant, region, rollout, existing customer/checkout conflicts and operator
-authority. Acceptance never determines the commercial start time.
+authority. Acceptance never determines the commercial start time. Provider price
+terms are frozen separately in `ProviderTerms`; they must not rewrite the opaque
+acceptance snapshot or be remapped from ambient configuration on replay.
 
 Before each create, the service commits the dispatch marker, then obtains a fresh
 shared dispatch guard. That guard rechecks the exact acceptance and holds shared
@@ -29,6 +31,11 @@ fee/usage pair, original calendar, bounded initial waiver and debt/grant invento
 The usage collection hold is a separate journaled write; activation cannot precede
 its confirmed receipt. Verification and recovery must not apply that hold themselves.
 No test-only response is valid production evidence.
+
+The unregistered HTTP transport sends saved bodies without POST replay or redirects,
+checks the pinned account/mode/API version, and bounds response sizes. Its raw
+response is not a confirmed receipt: the concrete adapter still must validate and
+project identity/economics before passing evidence back to the journal.
 
 `provisioning.Activation.Finalize` runs in the guarded regional transaction. The
 adapter must bind verified commercial authority, enroll invoice reconciliation,

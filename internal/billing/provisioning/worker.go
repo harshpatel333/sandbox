@@ -10,9 +10,9 @@ import (
 
 func (s *Service) Available() bool { return s.available() }
 
-// RunBatch reserves bounded capacity before releasing row locks. Advisory locks
-// in Reconcile also serialize operator recovery; reservation expiry alone never
-// authorizes repeating a provider create.
+// RunBatch reserves bounded capacity before releasing row locks. Reconcile uses
+// durable dispatch claims for concurrent operator recovery; reservation expiry
+// alone never authorizes repeating a provider create.
 func (s *Service) RunBatch(ctx context.Context) (int, error) {
 	if !s.available() {
 		return 0, ErrUnavailable

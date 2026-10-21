@@ -670,3 +670,19 @@ func TestJournalConcurrentReconcilersClaimEachDispatchOnce(t *testing.T) {
 	}
 	f.assertOnce(t)
 }
+
+func TestJournalProviderTermsPinnedApartFromAcceptance(t *testing.T) {
+	f := newFixture(t)
+	// The first fixture operation intentionally has no provider terms. Replaying
+	// it with newly resolved ambient prices must conflict, not silently enrich it.
+	f.a.offer.ProviderTerms = json.RawMessage(`{"fee_price_id":"price_other"}`)
+	if _, err := f.s.Enqueue(t.Context(), f.team, f.assignment); !errors.Is(err, ErrConflict) {
+		t.Fatal("replay replaced pinned provider mapping", err)
+	}
+	if err := f.reconcile(t); !errors.Is(err, ErrConflict) {
+		t.Fatal("changed provider terms authorized dispatch", err)
+	}
+	if len(f.p.creates) != 0 {
+		t.Fatal("changed provider terms reached provider")
+	}
+}
