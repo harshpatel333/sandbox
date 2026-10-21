@@ -28,6 +28,7 @@ func YCOfferAcceptanceAuth(operation string) gin.HandlerFunc {
 	key, err := base64.StdEncoding.DecodeString(os.Getenv("PROMOTION_ACCOUNT_PUBLIC_KEY"))
 	configured := err == nil && len(key) == ed25519.PublicKeySize
 	return func(c *gin.Context) {
+		c.Header("Cache-Control", "private, no-store")
 		assertion := c.GetHeader("X-YC-Acceptance-Assertion")
 		c.Request.Header.Del("X-YC-Acceptance-Assertion")
 		c.Request.Header.Del("X-Actor-User-Id")

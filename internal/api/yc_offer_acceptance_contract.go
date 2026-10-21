@@ -6,17 +6,21 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+var ycAcceptedDecimal = regexp.MustCompile(`^[0-9]+([.][0-9]{1,12})?$`)
+
 var errYCAcceptanceUnavailable = errors.New("acceptance adapter unavailable")
 var errYCAcceptanceConflict = errors.New("accepted offer or authority requires review")
 
 type YCAcceptanceAuthority struct {
 	ClaimID          uuid.UUID `json:"claim_id"`
+	ClaimCreatedAt   time.Time `json:"claim_created_at"`
 	UserID           uuid.UUID `json:"user_id"`
 	TeamID           uuid.UUID `json:"team_id"`
 	HomeRegion       string    `json:"home_region"`
@@ -25,6 +29,14 @@ type YCAcceptanceAuthority struct {
 	ApprovalRevision int64     `json:"approval_revision"`
 	OfferKey         string    `json:"offer_key"`
 	OfferVersion     int       `json:"offer_version"`
+}
+
+func (a YCAcceptanceAuthority) equal(b YCAcceptanceAuthority) bool {
+	if !a.ClaimCreatedAt.Equal(b.ClaimCreatedAt) {
+		return false
+	}
+	a.ClaimCreatedAt, b.ClaimCreatedAt = time.Time{}, time.Time{}
+	return a == b
 }
 
 type YCAcceptanceRate struct {
@@ -118,7 +130,7 @@ func (d YCAcceptanceDisclosure) validate(a YCAcceptanceAuthority) error {
 		return errYCAcceptanceConflict
 	}
 	for _, t := range []YCAcceptanceTerms{d.Terms, d.RenewalTerms} {
-		if t.OfferKey == "" || t.OfferVersion < 1 || t.Currency != "usd" || t.TermMonths < 1 || t.TermMonths > 24 || len(t.MonthlyAllowanceCents) != t.TermMonths || t.ChargeAmountCents < 0 || (t.ChargeIntervalMonths != 1 && t.ChargeIntervalMonths != 12) || t.RateCardKey == "" || len(t.ResourceRates) < 3 || t.Rollover || t.Proration || (t.PaymentRequirement != "eligible_credit_or_verified_payment" && t.PaymentRequirement != "verified_payment") || (t.DefaultSuccessorFamily != "pro_annual" && t.DefaultSuccessorFamily != "pro_monthly") {
+		if t.OfferKey == "" || t.OfferVersion < 1 || t.Currency != "usd" || t.TermMonths < 1 || t.TermMonths > 24 || len(t.MonthlyAllowanceCents) != t.TermMonths || t.ChargeAmountCents < 0 || (t.ChargeIntervalMonths != 1 && t.ChargeIntervalMonths != 12) || t.RateCardKey == "" || len(t.ResourceRates) != 3 || t.Rollover || t.Proration || (t.PaymentRequirement != "eligible_credit_or_verified_payment" && t.PaymentRequirement != "verified_payment") || (t.DefaultSuccessorFamily != "pro_annual" && t.DefaultSuccessorFamily != "pro_monthly") {
 			return errYCAcceptanceConflict
 		}
 		for _, amount := range t.MonthlyAllowanceCents {
@@ -127,11 +139,13 @@ func (d YCAcceptanceDisclosure) validate(a YCAcceptanceAuthority) error {
 			}
 		}
 		seen := map[uuid.UUID]bool{}
+		resources := map[string]bool{}
 		for _, rate := range t.ResourceRates {
-			if rate.ID == uuid.Nil || seen[rate.ID] || rate.Resource == "" || rate.Unit == "" || rate.PriceUSD == "" || rate.Currency != "USD" {
+			if rate.ID == uuid.Nil || seen[rate.ID] || (rate.Resource != "vcpu" && rate.Resource != "memory_gib" && rate.Resource != "storage_gib") || resources[rate.Resource] || rate.Unit != "second" || len(rate.PriceUSD) > 32 || !ycAcceptedDecimal.MatchString(rate.PriceUSD) || rate.Currency != "USD" {
 				return errYCAcceptanceConflict
 			}
 			seen[rate.ID] = true
+			resources[rate.Resource] = true
 		}
 	}
 	return nil

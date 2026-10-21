@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/superserve-ai/sandbox/internal/authz"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -64,10 +65,11 @@ func rollbackYCAcceptance(ctx context.Context, tx pgx.Tx) {
 // durable fence against a second checkout while shared confirmation is retried.
 func (s *YCOfferAcceptanceService) lockNewSignup(ctx context.Context, tx pgx.Tx, a YCAcceptanceAuthority) error {
 	var home string
-	if err := tx.QueryRow(ctx, `SELECT home_region FROM team WHERE id=$1 FOR NO KEY UPDATE`, a.TeamID).Scan(&home); err != nil {
+	var created time.Time
+	if err := tx.QueryRow(ctx, `SELECT home_region,created_at FROM team WHERE id=$1 FOR NO KEY UPDATE`, a.TeamID).Scan(&home, &created); err != nil {
 		return err
 	}
-	if home != s.Region || home != a.HomeRegion {
+	if home != s.Region || home != a.HomeRegion || a.ClaimCreatedAt.IsZero() || created.Before(a.ClaimCreatedAt) {
 		return errYCAcceptanceConflict
 	}
 	if _, err := tx.Exec(ctx, `SELECT team_id FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, a.TeamID); err != nil {
@@ -106,7 +108,7 @@ func (s *YCOfferAcceptanceService) Offer(ctx context.Context, user, team, claim 
 	}
 	r, err = loadYCAcceptance(ctx, s.Pool, team, claim)
 	if err == nil {
-		if r.YCAcceptanceAuthority != a {
+		if !r.YCAcceptanceAuthority.equal(a) {
 			return r, errYCAcceptanceConflict
 		}
 		return r, nil
@@ -143,7 +145,7 @@ func (s *YCOfferAcceptanceService) Offer(ctx context.Context, user, team, claim 
 	if err != nil {
 		return r, err
 	}
-	if r.YCAcceptanceAuthority != a {
+	if !r.YCAcceptanceAuthority.equal(a) {
 		return r, errYCAcceptanceConflict
 	}
 	return r, tx.Commit(ctx)
@@ -199,6 +201,25 @@ func (s *YCOfferAcceptanceService) Accept(ctx context.Context, user uuid.UUID, i
 	if r.RequestID == nil || *r.RequestID != in.RequestID {
 		return r, errYCAcceptanceConflict
 	}
+	shared, err := s.Shared.Begin(ctx)
+	if err != nil {
+		return r, err
+	}
+	defer rollbackYCAcceptance(ctx, shared)
+	if _, err = shared.Exec(ctx, "SET LOCAL lock_timeout='1s'; SET LOCAL statement_timeout='3s'"); err != nil {
+		return r, err
+	}
+	raw, err := s.rpc(ctx, shared, "offer", map[string]any{"claim_id": r.ClaimID, "team_id": r.TeamID, "user_id": r.UserID, "home_region": r.HomeRegion})
+	if err != nil {
+		return r, err
+	}
+	var authority YCAcceptanceAuthority
+	if err = json.Unmarshal(raw, &authority); err != nil {
+		return r, err
+	}
+	if !authority.equal(r.YCAcceptanceAuthority) {
+		return r, errYCAcceptanceConflict
+	}
 	return r, tx.Commit(ctx)
 }
 
@@ -206,6 +227,10 @@ func (s *YCOfferAcceptanceService) Accept(ctx context.Context, user uuid.UUID, i
 // rows. A lost connection can leave a remote outcome unknown; it is never proof
 // that the provider performed no operation.
 func (s *YCOfferAcceptanceService) WithGuard(ctx context.Context, r YCAcceptanceRecord, f func(context.Context) error) error {
+	return s.withGuard(ctx, r, "guard", f)
+}
+
+func (s *YCOfferAcceptanceService) withGuard(ctx context.Context, r YCAcceptanceRecord, op string, f func(context.Context) error) error {
 	if !s.available() || r.AcceptedAt == nil || r.RequestID == nil || r.HomeRegion != s.Region {
 		return errYCAcceptanceUnavailable
 	}
@@ -222,7 +247,7 @@ func (s *YCOfferAcceptanceService) WithGuard(ctx context.Context, r YCAcceptance
 	if _, err = tx.Exec(ctx, `SET LOCAL lock_timeout='1s'; SET LOCAL idle_in_transaction_session_timeout='25s'`); err != nil {
 		return err
 	}
-	if _, err = s.rpc(ctx, tx, "guard", ycAcceptanceParameters(r)); err != nil {
+	if _, err = s.rpc(ctx, tx, op, ycAcceptanceParameters(r)); err != nil {
 		return err
 	}
 	if err = ctx.Err(); err != nil {
@@ -233,6 +258,24 @@ func (s *YCOfferAcceptanceService) WithGuard(ctx context.Context, r YCAcceptance
 	}
 	_, err = tx.Exec(ctx, "SELECT 1")
 	return err
+}
+
+// Financial admission uses a current permission read, not the general UI cache.
+func (h *Handlers) authorizeYCAcceptance(ctx context.Context, user, team uuid.UUID) error {
+	if h.Pool == nil || user == uuid.Nil || team == uuid.Nil {
+		return errYCAcceptanceUnavailable
+	}
+	if err := authz.New(h.Pool).RequireTeamPermission(ctx, user, team, "billing:write"); err != nil {
+		return err
+	}
+	var home string
+	if err := h.Pool.QueryRow(ctx, `SELECT home_region FROM public.team WHERE id=$1`, team).Scan(&home); err != nil {
+		return err
+	}
+	if home != ycClaimRegion() {
+		return errYCAcceptanceConflict
+	}
+	return nil
 }
 
 func (h *Handlers) ycOfferHandler(c *gin.Context, operation string) {
@@ -251,7 +294,7 @@ func (h *Handlers) ycOfferHandler(c *gin.Context, operation string) {
 	user := *actorIDFromContext(c)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
 	defer cancel()
-	if _, err := h.ycClaimTeam(ctx, user, in.TeamID); err != nil {
+	if err := h.authorizeYCAcceptance(ctx, user, in.TeamID); err != nil {
 		respondError(c, ErrForbidden)
 		return
 	}
@@ -265,8 +308,14 @@ func (h *Handlers) ycOfferHandler(c *gin.Context, operation string) {
 	switch operation {
 	case "offer":
 		r, err = s.Offer(ctx, user, in.TeamID, in.ClaimID)
+		if err == nil && r.AcceptedAt != nil {
+			r, err = s.Status(ctx, user, in.TeamID, in.ClaimID)
+		}
 	case "accept":
 		r, err = s.Accept(ctx, user, in)
+		if err == nil {
+			r, err = s.Status(ctx, user, in.TeamID, in.ClaimID)
+		}
 	case "status":
 		r, err = s.Status(ctx, user, in.TeamID, in.ClaimID)
 	}

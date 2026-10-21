@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,15 +41,20 @@ func (f *acceptanceCatalogFixture) Assign(context.Context, YCAcceptanceRecord) (
 }
 
 type acceptanceProvisioningFixture struct {
-	operation uuid.UUID
-	calls     int
-	status    YCAcceptanceProvisioningStatus
+	operation           uuid.UUID
+	calls               int
+	loseAcknowledgement bool
+	status              YCAcceptanceProvisioningStatus
 }
 
 func (f *acceptanceProvisioningFixture) Enqueue(context.Context, uuid.UUID, uuid.UUID) (uuid.UUID, error) {
 	f.calls++
 	if f.operation == uuid.Nil {
 		f.operation = uuid.New()
+	}
+	if f.loseAcknowledgement {
+		f.loseAcknowledgement = false
+		return uuid.Nil, errors.New("lost operation acknowledgement")
 	}
 	return f.operation, nil
 }
@@ -348,10 +355,257 @@ func TestYCPreferredReviewBindsExactApprovedRecipient(t *testing.T) {
 	if _, err = s.rpc(ctx, pool, "offer", gin.H{"claim_id": claim.ID, "team_id": team, "user_id": user, "home_region": "use"}); err != nil {
 		t.Fatal("approved preferred identity cannot accept", err)
 	}
+	// Staff approved B explicitly. An unrelated account later using A cannot
+	// revoke that decision, but B and the claim/company authority remain fences.
+	originalUser := uuid.New()
+	for _, change := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO auth.users(id,email,email_confirmed_at) VALUES($1,$2,now())`, []any{originalUser, original}},
+		{`UPDATE auth.users SET email='unrelated@example.test' WHERE id=$1`, []any{originalUser}},
+		{`DELETE FROM auth.users WHERE id=$1`, []any{originalUser}},
+	} {
+		if _, err = pool.Exec(ctx, change.sql, change.args...); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = s.rpc(ctx, pool, "offer", gin.H{"claim_id": claim.ID, "team_id": team, "user_id": user, "home_region": "use"}); err != nil {
+			t.Fatal("original account lifecycle stranded preferred approval", err)
+		}
+	}
+	for _, change := range []struct {
+		sql string
+		id  uuid.UUID
+	}{
+		{`UPDATE auth.users SET deleted_at=now() WHERE id=$1`, user},
+		{`UPDATE yc_claim SET state='revoked' WHERE id=$1`, claim.ID},
+		{`UPDATE yc_company_activation_authority SET revoked_at=now(),revoked_by=approved_by,revision=revision+1 WHERE claim_id=$1`, claim.ID},
+	} {
+		tx, e := pool.Begin(ctx)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if _, e = tx.Exec(ctx, change.sql, change.id); e != nil {
+			rollbackYCAcceptance(ctx, tx)
+			t.Fatal(e)
+		}
+		_, e = s.rpc(ctx, tx, "offer", gin.H{"claim_id": claim.ID, "team_id": team, "user_id": user, "home_region": "use"})
+		rollbackYCAcceptance(ctx, tx)
+		if e == nil {
+			t.Fatal("revoked preferred authority admitted", change.sql)
+		}
+	}
 	if _, err = pool.Exec(ctx, `UPDATE auth.users SET email='changed@example.test' WHERE id=$1`, user); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = s.rpc(ctx, pool, "offer", gin.H{"claim_id": claim.ID, "team_id": team, "user_id": user, "home_region": "use"}); err == nil {
 		t.Fatal("stale preferred identity accepted")
+	}
+}
+
+func TestYCAcceptanceRejectsTemporaryAuthoritySubstitution(t *testing.T) {
+	s, _, r, _, _ := acceptanceFixture(t)
+	ctx := context.Background()
+	tx, err := s.Shared.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollbackYCAcceptance(ctx, tx)
+	for _, table := range []string{"yc_claim", "yc_company_activation_authority", "yc_preferred_identity_review", "yc_claim_decision"} {
+		if _, err = tx.Exec(ctx, "CREATE TEMP TABLE "+table+" AS TABLE public."+table); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = tx.Exec(ctx, "GRANT ALL ON pg_temp."+table+" TO promotion_evidence_proxy"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = tx.Exec(ctx, `UPDATE public.yc_company_activation_authority SET revoked_at=now(),revoked_by=approved_by,revision=revision+1 WHERE claim_id=$1`, r.ClaimID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(ctx, `SET LOCAL ROLE promotion_evidence_proxy`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.rpc(ctx, tx, "offer", gin.H{"claim_id": r.ClaimID, "team_id": r.TeamID, "user_id": r.UserID, "home_region": "use"})
+	if err == nil || !strings.Contains(err.Error(), "approval unavailable") {
+		t.Fatal("temporary stale authority substituted for revoked global authority", err)
+	}
+}
+
+func TestYCAcceptanceRejectsHistoricalTeam(t *testing.T) {
+	s, _, r, _, _ := acceptanceFixture(t)
+	ctx := context.Background()
+	if _, err := s.Pool.Exec(ctx, `UPDATE team SET created_at=created_at-interval '1 day' WHERE id=$1`, r.TeamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Accept(ctx, r.UserID, acceptanceRequest(r)); !errors.Is(err, errYCAcceptanceConflict) {
+		t.Fatal("historical team accepted", err)
+	}
+}
+
+func TestYCAcceptanceLostProvisioningAcknowledgement(t *testing.T) {
+	s, _, r, catalog, provider := acceptanceFixture(t)
+	ctx := context.Background()
+	if _, err := s.Accept(ctx, r.UserID, acceptanceRequest(r)); err != nil {
+		t.Fatal(err)
+	}
+	provider.loseAcknowledgement = true
+	if work, err := s.RunOnce(ctx); !work || err == nil {
+		t.Fatal("lost operation response not surfaced", work, err)
+	}
+	first := provider.operation
+	if _, err := s.Pool.Exec(ctx, `UPDATE yc_offer_acceptance SET next_attempt_at=now() WHERE id=$1`, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if work, err := s.RunOnce(ctx); !work || err != nil {
+		t.Fatal(work, err)
+	}
+	got, err := loadYCAcceptance(ctx, s.Pool, r.TeamID, r.ClaimID)
+	if err != nil || got.OperationID == nil || *got.OperationID != first || provider.calls != 2 || catalog.calls != 1 {
+		t.Fatal("operation retry changed durable identity", got, err)
+	}
+}
+
+func TestYCAcceptanceAuditedHoldRetry(t *testing.T) {
+	s, _, r, _, _ := acceptanceFixture(t)
+	ctx := context.Background()
+	actor := uuid.New()
+	if _, err := s.Accept(ctx, r.UserID, acceptanceRequest(r)); err != nil {
+		t.Fatal(err)
+	}
+	hold := ycAcceptanceControl{RequestID: uuid.New(), AcceptanceID: r.ID, Action: "hold", Reason: "Synthetic investigation"}
+	if err := s.control(ctx, actor, hold); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.control(ctx, actor, hold); err != nil {
+		t.Fatal("exact audited replay", err)
+	}
+	if err := s.control(ctx, uuid.New(), hold); err == nil {
+		t.Fatal("actor changed on audit replay")
+	}
+	if work, err := s.RunOnce(ctx); work || err != nil {
+		t.Fatal("held acceptance dispatched", work, err)
+	}
+	retry := ycAcceptanceControl{RequestID: uuid.New(), AcceptanceID: r.ID, Action: "retry", Reason: "Reviewed synthetic recovery"}
+	if err := s.control(ctx, actor, retry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE yc_offer_acceptance SET lease_id=$2,lease_until=now()+interval '1 minute' WHERE id=$1`, r.ID, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	hold.RequestID = uuid.New()
+	if err := s.control(ctx, actor, hold); err == nil {
+		t.Fatal("control overtook active consumer")
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE yc_offer_acceptance SET lease_id=NULL,lease_until=NULL WHERE id=$1`, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.control(ctx, actor, hold); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Shared.Exec(ctx, `SELECT public.revoke_yc_activation_authority($1,$2,$3)`, r.ApprovalID, r.TeamID, actor); err != nil {
+		t.Fatal(err)
+	}
+	retry.RequestID = uuid.New()
+	if err := s.control(ctx, actor, retry); err == nil {
+		t.Fatal("retry overrode revoked authority")
+	}
+	var n int
+	if err := s.Pool.QueryRow(ctx, `SELECT count(*) FROM yc_offer_acceptance_control WHERE acceptance_id=$1`, r.ID).Scan(&n); err != nil || n != 3 {
+		t.Fatal("audit did not preserve exactly committed actions", n, err)
+	}
+}
+
+func TestYCAcceptanceDependenciesIgnoreTemporaryRelations(t *testing.T) {
+	s, _, r, _, _ := acceptanceFixture(t)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, table, query string
+		args               []any
+		wantError          bool
+		want               string
+	}{
+		{"legacy dispatch fence", "yc_claim", `SELECT public.lock_yc_activation_authority($1,$2,'use')::text`, []any{r.ApprovalID, r.TeamID}, false, "false"},
+		{"nested reservation fence", "yc_claim", `SELECT to_jsonb(public.reserve_yc_activation_authority($1,$2,'use',$3,'operator','synthetic',$4))::text`, []any{r.Company, r.TeamID, uuid.New(), r.ClaimID}, true, "customer acceptance"},
+		{"nested claim read", "yc_claim", `SELECT public.yc_preferred_staff_rpc('operator-get',jsonb_build_object('id',$1::uuid))->>'id'`, []any{r.ClaimID}, false, r.ClaimID.String()},
+		{"nested staff fence", "yc_claim", `SELECT public.yc_preferred_staff_rpc('activation-allowed',jsonb_build_object('team_id',$1::uuid))->>'allowed'`, []any{r.TeamID}, false, "false"},
+		{"nested claim view", "yc_claim_decision", `SELECT public.yc_preferred_staff_rpc('operator-get',jsonb_build_object('id',$1::uuid))->>'approval_method'`, []any{r.ClaimID}, false, "operator"},
+		{"approval mail", "yc_claim_approval_mail", `SELECT public.yc_claim_approval_mail_rpc('lease',jsonb_build_object('lease_id',$1::uuid))->>'claim_id'`, []any{uuid.New()}, false, r.ClaimID.String()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx, err := s.Shared.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rollbackYCAcceptance(ctx, tx)
+			if _, err = tx.Exec(ctx, "CREATE TEMP TABLE "+tc.table+" AS TABLE public."+tc.table+" WITH NO DATA"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(ctx, "GRANT ALL ON pg_temp."+tc.table+" TO promotion_evidence_proxy; SET LOCAL ROLE promotion_evidence_proxy"); err != nil {
+				t.Fatal(err)
+			}
+			var result *string
+			err = tx.QueryRow(ctx, tc.query, tc.args...).Scan(&result)
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatal("temporary relation changed authority fence", result, err)
+				}
+			} else if err != nil || result == nil || *result != tc.want {
+				t.Fatal("temporary relation changed authoritative result", result, err)
+			}
+		})
+	}
+}
+
+func TestYCAcceptanceHTTPResumeAndReplayProjectPublicStatus(t *testing.T) {
+	s, h, r, _, provider := acceptanceFixture(t)
+	ctx := context.Background()
+	h.YCOfferAcceptance = s
+	role, permission := uuid.New(), uuid.New()
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{`INSERT INTO roles VALUES($1,'team')`, []any{role}},
+		{`INSERT INTO permissions VALUES($1,'billing:write')`, []any{permission}},
+		{`INSERT INTO role_permissions VALUES($1,$2)`, []any{role, permission}},
+		{`INSERT INTO user_role_assignments VALUES($1,$2,'team',$3,NULL)`, []any{r.UserID, role, r.TeamID}},
+		{`INSERT INTO team_memberships VALUES($1,$2,'active')`, []any{r.TeamID, r.UserID}},
+	} {
+		if _, err := s.Pool.Exec(ctx, q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	in := acceptanceRequest(r)
+	if _, err := s.Accept(ctx, r.UserID, in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	provider.status = YCAcceptanceProvisioningStatus{OperationID: provider.operation, State: "funding_pending"}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	// Signature boundary is covered separately; this fixture begins after it.
+	router.Use(func(c *gin.Context) { c.Set("actor_id", r.UserID); c.Set("yc_acceptance_verified", true) })
+	router.POST("/offer", h.YCOffer)
+	router.POST("/accept", h.AcceptYCOffer)
+	for _, path := range []string{"/offer", "/accept"} {
+		raw, _ := json.Marshal(in)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest("POST", path, bytes.NewReader(raw)))
+		var got YCAcceptanceRecord
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || w.Code != 200 || got.State != "funding_pending" || got.Ready {
+			t.Fatal("internal dispatch leaked into public resume", path, w.Code, w.Body.String(), err)
+		}
+	}
+	// A permission already read by the UI cache cannot authorize new financial work.
+	if _, err := h.ycClaimTeam(ctx, r.UserID, r.TeamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE user_role_assignments SET revoked_at=now() WHERE user_id=$1`, r.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.authorizeYCAcceptance(ctx, r.UserID, r.TeamID); err == nil {
+		t.Fatal("cached permission survived revocation")
 	}
 }

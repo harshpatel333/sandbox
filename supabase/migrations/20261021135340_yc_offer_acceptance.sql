@@ -1,3 +1,31 @@
+-- Read-lock exact historical prices without granting callers pricing write access.
+CREATE FUNCTION public.lock_yc_accepted_offer_rates(acceptance uuid) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE currency text; rate record; seen integer:=0; card text; rates jsonb; priced_at timestamptz;
+BEGIN
+ SELECT a.terms->>'rate_card_key',a.terms->'resource_rates',a.pricing_at INTO card,rates,priced_at
+ FROM public.yc_offer_acceptance a WHERE a.id=acceptance AND a.accepted_at IS NOT NULL AND a.state NOT IN ('held','revoked');
+ IF NOT FOUND THEN RETURN false; END IF;
+ IF priced_at IS NULL OR jsonb_typeof(rates) IS DISTINCT FROM 'array' THEN RETURN false; END IF;
+ IF jsonb_array_length(rates)<>3 OR EXISTS(SELECT 1 FROM jsonb_array_elements(rates) x WHERE
+  x->>'resource' NOT IN ('vcpu','memory_gib','storage_gib') OR x->>'unit' IS DISTINCT FROM 'second'
+  OR x->>'currency' IS DISTINCT FROM 'USD' OR COALESCE(x->>'price_usd','') !~ '^[0-9]+([.][0-9]{1,12})?$' OR length(x->>'price_usd')>32)
+ OR (SELECT count(DISTINCT value->>'id')<>3 OR count(DISTINCT value->>'resource')<>3 FROM jsonb_array_elements(rates)) THEN RETURN false; END IF;
+ SELECT p.currency INTO currency FROM public.pricing_plan p WHERE p.key=card FOR SHARE;
+ IF NOT FOUND OR currency<>'USD' THEN RETURN false; END IF;
+ FOR rate IN SELECT r.*,x.resource AS wanted_resource,x.unit AS wanted_unit,x.price_usd AS wanted_price,x.currency AS wanted_currency
+  FROM jsonb_to_recordset(rates) AS x(id uuid,resource text,unit text,price_usd numeric,currency text)
+  JOIN public.pricing_rate r ON r.id=x.id ORDER BY r.id FOR SHARE OF r LOOP
+  IF rate.plan_key IS DISTINCT FROM card
+   OR rate.resource IS DISTINCT FROM rate.wanted_resource OR rate.unit IS DISTINCT FROM rate.wanted_unit
+   OR rate.price_usd IS DISTINCT FROM rate.wanted_price OR rate.wanted_currency IS DISTINCT FROM currency
+   OR rate.effective_from>priced_at OR (rate.effective_to IS NOT NULL AND rate.effective_to<=priced_at) THEN RETURN false; END IF;
+  seen:=seen+1;
+ END LOOP;
+ RETURN seen=3 AND (SELECT count(DISTINCT value->>'id')=3 AND count(DISTINCT value->>'resource')=3 FROM jsonb_array_elements(rates));
+END $$;
+REVOKE ALL ON FUNCTION public.lock_yc_accepted_offer_rates(uuid) FROM PUBLIC;
+
 CREATE TABLE public.yc_offer_acceptance (
  id uuid PRIMARY KEY,
  claim_id uuid NOT NULL UNIQUE,
@@ -58,11 +86,13 @@ DO $$ DECLARE role_name text; BEGIN
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=role_name) THEN
    EXECUTE format('REVOKE ALL ON public.yc_offer_acceptance,public.yc_offer_acceptance_control FROM %I',role_name);
    EXECUTE format('REVOKE ALL ON FUNCTION public.yc_offer_acceptance_preserve() FROM %I',role_name);
+   EXECUTE format('REVOKE ALL ON FUNCTION public.lock_yc_accepted_offer_rates(uuid) FROM %I',role_name);
   END IF;
  END LOOP;
  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
   REVOKE ALL ON public.yc_offer_acceptance,public.yc_offer_acceptance_control FROM service_role;
   REVOKE ALL ON FUNCTION public.yc_offer_acceptance_preserve() FROM service_role;
+  GRANT EXECUTE ON FUNCTION public.lock_yc_accepted_offer_rates(uuid) TO service_role;
   GRANT SELECT,INSERT,UPDATE ON public.yc_offer_acceptance TO service_role;
   CREATE POLICY service_access ON public.yc_offer_acceptance TO service_role USING(true) WITH CHECK(true);
   GRANT SELECT,INSERT ON public.yc_offer_acceptance_control TO service_role;

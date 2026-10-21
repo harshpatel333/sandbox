@@ -174,6 +174,11 @@ func (s *YCOfferAcceptanceService) advance(ctx context.Context, r *YCAcceptanceR
 }
 
 func (h *Handlers) StartYCOfferAcceptance(ctx context.Context) {
+	if h.YCOfferAcceptance == nil && h.Pool != nil && h.PromotionAuthPool != nil {
+		service := &YCOfferAcceptanceService{Pool: h.Pool, Shared: h.PromotionAuthPool, Region: ycClaimRegion(), Authorize: h.authorizeYCAcceptance}
+		service.Catalog = ycAcceptedCatalog{h: h, s: service}
+		h.YCOfferAcceptance = service
+	}
 	s := h.YCOfferAcceptance
 	if !s.available() || s.Catalog == nil || s.Provisioning == nil {
 		return

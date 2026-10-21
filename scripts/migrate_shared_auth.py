@@ -56,12 +56,17 @@ APPROVAL_FUNCTIONS = ("public.yc_staff_claim_rpc(text,jsonb)", "public.yc_claim_
 
 ACCEPTANCE_VERSION = "20261021135531"
 ACCEPTANCE_NAME = "yc_offer_acceptance_authority"
-ACCEPTANCE_HASH = "df5065eeef0494e301678dde246c06bc4cb223994a5a2073eefc20eaee09d338"
+ACCEPTANCE_HASH = "b249903f3c0165cfd4414195285522e7313e779077387126c496d620f60f82c4"
 ACCEPTANCE_TABLES = ("public.yc_offer_acceptance_authority", "public.yc_preferred_identity_review")
 ACCEPTANCE_RPCS = ("public.yc_offer_acceptance_rpc(text,jsonb)", "public.yc_preferred_claim_rpc(text,jsonb)",
                    "public.yc_preferred_staff_rpc(text,jsonb)")
 ACCEPTANCE_FUNCTIONS = ACCEPTANCE_RPCS + ("public.yc_offer_acceptance_immutable()",
     "public.yc_preferred_identity_immutable()", "public.yc_preferred_claim_view(public.yc_claim)")
+
+
+ACCEPTANCE_HARDENED_FUNCTIONS = (CLAIM_FUNCTIONS[1], *APPROVAL_FUNCTIONS,
+    CLAIM_FUNCTIONS[0], RPCS[1], RPCS[3])
+ACCEPTANCE_CHANGED_FUNCTIONS = ACCEPTANCE_FUNCTIONS + ACCEPTANCE_HARDENED_FUNCTIONS
 
 
 class SharedMigrationError(Exception):
@@ -140,7 +145,7 @@ def acceptance_objects_present(conn):
 
 def acceptance_catalog(conn):
     return {
-        "tables": {table: catalog(conn, table, ACCEPTANCE_FUNCTIONS if i == 0 else ())
+        "tables": {table: catalog(conn, table, ACCEPTANCE_CHANGED_FUNCTIONS if i == 0 else ())
                    for i, table in enumerate(ACCEPTANCE_TABLES)},
         "indexes": conn.execute("""SELECT jsonb_agg(pg_get_indexdef(i.indexrelid) ORDER BY c.relname)
             FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
@@ -180,6 +185,27 @@ def verify_approval_permissions(conn):
         for role in ROLES:
             allowed = conn.execute("SELECT has_function_privilege(%s,%s,'EXECUTE')", (role, function)).fetchone()[0]
             require(allowed == (role == "promotion_evidence_proxy"), "approval_rpc_privileges_mismatch")
+
+
+def predecessor_acceptance_catalog(current):
+    # Compare prior receipts using only the six exact search_path changes. The
+    # acceptance receipt pins their complete hardened definitions and ACLs.
+    signatures = {f.replace("public.", "") for f in ACCEPTANCE_HARDENED_FUNCTIONS}
+    def visit(value):
+        if isinstance(value, dict):
+            for function in value.get("functions") or ():
+                if function[0] in signatures:
+                    for path in ("'pg_catalog', 'public', 'auth'", "'pg_catalog', 'public'"):
+                        function[1] = function[1].replace(
+                            "SET search_path TO " + path + ", 'pg_temp'\n",
+                            "SET search_path TO " + path + "\n", 1)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    visit(current)
+    return current
 
 
 def predecessor_claim_catalog(conn, recorded):
@@ -381,6 +407,8 @@ def inspect(conn, sql, migration="authority"):
             actual = predecessor_authority_catalog(conn, stored_catalog)
         else:
             actual = snapshot(conn)
+        if ACCEPTANCE_VERSION in versions and version != ACCEPTANCE_VERSION:
+            actual = predecessor_acceptance_catalog(actual)
         require(actual == stored_catalog, "shared_catalog_mismatch")
     for version, definition in definitions.items():
         if version not in versions:
@@ -426,7 +454,7 @@ def verify_changed_permissions(conn, migration, created_ledger=False):
         "authority": ((TABLE,), FUNCTIONS),
         "claims": (CLAIM_TABLES, CLAIM_FUNCTIONS),
         "approvals": (APPROVAL_TABLES + ("public.yc_claim",), APPROVAL_FUNCTIONS + (CLAIM_FUNCTIONS[0], RPCS[1], RPCS[3])),
-        "acceptances": (ACCEPTANCE_TABLES, ACCEPTANCE_FUNCTIONS),
+        "acceptances": (ACCEPTANCE_TABLES, ACCEPTANCE_CHANGED_FUNCTIONS),
     }[migration]
     valid = conn.execute("""
       WITH tables AS (SELECT unnest(%s::text[]) AS name),
