@@ -151,6 +151,7 @@ type HostRegistry interface {
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
+	RenewalChoices                   *renewalChoiceService
 	YCOfferAcceptance                *YCOfferAcceptanceService
 	ProviderPairEntitlementAuthority ProviderPairEntitlementAuthority
 	// MachineCredentials is optional until the compatible machine-identity

@@ -1026,6 +1026,35 @@ type BillingProviderPairWaiver struct {
 	RevokedAt           pgtype.Timestamptz `json:"revoked_at"`
 }
 
+type BillingRenewalChoice struct {
+	TeamID           uuid.UUID `json:"team_id"`
+	AssignmentID     uuid.UUID `json:"assignment_id"`
+	IntendedBoundary time.Time `json:"intended_boundary"`
+	Revision         int64     `json:"revision"`
+	Snapshot         []byte    `json:"snapshot"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type BillingRenewalChoiceEvent struct {
+	TeamID           uuid.UUID `json:"team_id"`
+	AssignmentID     uuid.UUID `json:"assignment_id"`
+	IntendedBoundary time.Time `json:"intended_boundary"`
+	Revision         int64     `json:"revision"`
+	Event            string    `json:"event"`
+	Snapshot         []byte    `json:"snapshot"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+type BillingRenewalChoiceRequest struct {
+	TeamID           uuid.UUID `json:"team_id"`
+	AssignmentID     uuid.UUID `json:"assignment_id"`
+	IntendedBoundary time.Time `json:"intended_boundary"`
+	RequestID        uuid.UUID `json:"request_id"`
+	OperationID      uuid.UUID `json:"operation_id"`
+	Request          []byte    `json:"request"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
 type BillingRollupBackfillState struct {
 	Name          string    `json:"name"`
 	NextHourStart time.Time `json:"next_hour_start"`
