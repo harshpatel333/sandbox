@@ -441,14 +441,23 @@ CREATE TRIGGER yc_financial_decision_writer AFTER INSERT ON public.yc_claim_deci
 
 CREATE FUNCTION public.yc_financial_state(claim uuid,automated boolean DEFAULT false) RETURNS jsonb
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,auth,pg_temp AS $$
-DECLARE c public.yc_claim; r public.yc_offer_acceptance_authority; pending integer; valid boolean; approved_email text; result text;
+DECLARE c public.yc_claim; r public.yc_offer_acceptance_authority; pending integer; valid boolean; approved_email text; result text; accepted boolean;
 BEGIN
  SELECT * INTO c FROM public.yc_claim WHERE id=claim;
  IF NOT FOUND THEN RAISE EXCEPTION 'claim unavailable' USING ERRCODE='P0002'; END IF;
  SELECT * INTO r FROM public.yc_offer_acceptance_authority WHERE claim_id=claim;
- IF NOT FOUND THEN
+ accepted:=FOUND;
+ IF NOT accepted THEN
   IF NOT automated AND NOT c.acceptance_required AND NOT EXISTS(SELECT 1 FROM public.yc_preferred_identity_review WHERE claim_id=claim) THEN RETURN NULL; END IF;
-  RETURN jsonb_build_object('kind','accepted_offer','state',CASE WHEN c.state IN ('revoked','rejected') OR c.lifecycle_changed THEN 'revoked' ELSE 'acceptance_pending' END,'pending_invalidations',0);
+  IF c.state<>'bound' OR c.lifecycle_changed THEN
+   RETURN jsonb_build_object('kind','accepted_offer','state',CASE WHEN c.state IN ('revoked','rejected') OR c.lifecycle_changed THEN 'revoked' ELSE 'acceptance_pending' END,'pending_invalidations',0);
+  END IF;
+  -- A bound claim without shared acceptance can still lose account/company
+  -- authority while its regional offer or confirmation is pending.
+  r.claim_id:=c.id; r.user_id:=c.claimed_user_id; r.team_id:=c.claimed_team_id;
+  r.home_region:=c.home_region; r.company_identity:=c.company_identity; r.approval_id:=c.approval_id;
+  SELECT a.offer_key,a.offer_version INTO r.offer_key,r.offer_version FROM public.yc_company_activation_authority a WHERE a.company_identity=c.company_identity;
+  SELECT revision INTO r.approval_revision FROM public.yc_claim_decision WHERE claim_id=c.id AND decision IN ('operator','verified_claim') ORDER BY revision DESC LIMIT 1;
  END IF;
  SELECT COALESCE((SELECT pr.email FROM public.yc_preferred_identity_review pr WHERE claim_id=c.id AND user_id=r.user_id AND team_id=r.team_id AND ready AND approved_revision IS NOT NULL),c.submitted_email) INTO approved_email;
  SELECT c.state='bound' AND NOT c.lifecycle_changed AND c.claimed_user_id=r.user_id AND c.claimed_team_id=r.team_id
@@ -459,7 +468,7 @@ BEGIN
   AND r.approval_revision=(SELECT revision FROM public.yc_claim_decision WHERE claim_id=c.id AND decision IN ('operator','verified_claim') ORDER BY revision DESC LIMIT 1)
   AND NOT EXISTS(SELECT 1 FROM public.yc_financial_authorization WHERE acceptance_id=r.acceptance_id AND invalidated_at IS NOT NULL) INTO valid;
  SELECT count(*) INTO pending FROM public.yc_financial_invalidation WHERE acceptance_id=r.acceptance_id AND acknowledged_at IS NULL;
- result:=CASE WHEN pending>0 THEN 'revocation_pending' WHEN COALESCE(valid,false) THEN 'valid' ELSE 'revoked' END;
+ result:=CASE WHEN pending>0 THEN 'revocation_pending' WHEN COALESCE(valid,false) THEN CASE WHEN accepted THEN 'valid' ELSE 'acceptance_pending' END ELSE 'revoked' END;
  RETURN jsonb_build_object('kind','accepted_offer','state',result,'pending_invalidations',pending);
 END $$;
 

@@ -506,3 +506,34 @@ func TestYCFinancialSuccessorGuardUsesRequestingActor(t *testing.T) {
 		t.Fatal("successor bypassed original shared authority", err)
 	}
 }
+
+func TestYCFinancialPendingProjectionRechecksAuthority(t *testing.T) {
+	for name, query := range map[string]string{
+		"account": `UPDATE auth.users SET email_confirmed_at=NULL WHERE id=$1`,
+		"company": `UPDATE public.yc_company_activation_authority SET revoked_at=clock_timestamp(),revoked_by=approved_by,revision=revision+1 WHERE team_id=$1`,
+	} {
+		for _, confirming := range []bool{false, true} {
+			t.Run(name+map[bool]string{false: "/offered", true: "/confirming"}[confirming], func(t *testing.T) {
+				s, _, r, _, _ := acceptanceFixture(t)
+				ctx := context.Background()
+				if confirming {
+					if _, err := s.Accept(ctx, r.UserID, acceptanceRequest(r)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				id := r.UserID
+				if name == "company" {
+					id = r.TeamID
+				}
+				if _, err := s.Shared.Exec(ctx, query, id); err != nil {
+					t.Fatal(err)
+				}
+				requireFinancialState(t, s, r, "revoked", 0)
+				status, err := s.Status(ctx, r.UserID, r.TeamID, r.ClaimID)
+				if err != nil || status.Ready || status.State != "review_required" || status.FinancialAuthority == nil || status.FinancialAuthority.State != "revoked" {
+					t.Fatal("invalid pending authority hidden", status, err)
+				}
+			})
+		}
+	}
+}
