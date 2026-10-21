@@ -533,20 +533,22 @@ type BillingEntitlementWithheld struct {
 }
 
 type BillingEntitlementWork struct {
-	ContractID         uuid.UUID          `json:"contract_id"`
-	NextCheckAt        time.Time          `json:"next_check_at"`
-	LeaseToken         pgtype.UUID        `json:"lease_token"`
-	LeaseUntil         pgtype.Timestamptz `json:"lease_until"`
-	Failures           int32              `json:"failures"`
-	ProblemSince       pgtype.Timestamptz `json:"problem_since"`
-	AlertedAt          pgtype.Timestamptz `json:"alerted_at"`
-	LastError          *string            `json:"last_error"`
-	InventoryHead      *string            `json:"inventory_head"`
-	InventoryCursor    *string            `json:"inventory_cursor"`
-	InventoryNewHead   *string            `json:"inventory_new_head"`
-	InventoryCheckedAt pgtype.Timestamptz `json:"inventory_checked_at"`
-	WakeGeneration     int64              `json:"wake_generation"`
-	LeaseGeneration    int64              `json:"lease_generation"`
+	ContractID               uuid.UUID          `json:"contract_id"`
+	NextCheckAt              time.Time          `json:"next_check_at"`
+	LeaseToken               pgtype.UUID        `json:"lease_token"`
+	LeaseUntil               pgtype.Timestamptz `json:"lease_until"`
+	Failures                 int32              `json:"failures"`
+	ProblemSince             pgtype.Timestamptz `json:"problem_since"`
+	AlertedAt                pgtype.Timestamptz `json:"alerted_at"`
+	LastError                *string            `json:"last_error"`
+	InventoryHead            *string            `json:"inventory_head"`
+	InventoryCursor          *string            `json:"inventory_cursor"`
+	InventoryNewHead         *string            `json:"inventory_new_head"`
+	InventoryCheckedAt       pgtype.Timestamptz `json:"inventory_checked_at"`
+	WakeGeneration           int64              `json:"wake_generation"`
+	LeaseGeneration          int64              `json:"lease_generation"`
+	PairedInvoiceCursor      *string            `json:"paired_invoice_cursor"`
+	PairedInvoicePeriodStart pgtype.Timestamptz `json:"paired_invoice_period_start"`
 }
 
 type BillingExportAllocation struct {
