@@ -11,12 +11,14 @@ import (
 )
 
 type renewalFinancialFinalizer func(context.Context, YCAcceptanceRecord, string, uuid.UUID, string, time.Time, func(context.Context, pgx.Tx, YCFinancialAuthorization) error) error
+type renewalBenefitRemoval func(context.Context, YCAcceptanceRecord, uuid.UUID, uuid.UUID, func(context.Context, pgx.Tx) error) error
 
 type acceptedRenewalSuccessors struct {
 	Authority *acceptedRenewalAuthority
 	Handlers  *Handlers
 	Client    *stripeHTTPClient
 	Finalize  renewalFinancialFinalizer
+	Remove    renewalBenefitRemoval
 }
 
 // The legacy transaction-first port cannot acquire shared financial authority.
@@ -25,14 +27,42 @@ func (*acceptedRenewalSuccessors) Reconcile(context.Context, pgx.Tx, renewalChoi
 }
 
 func (a *acceptedRenewalSuccessors) ReconcileFinancial(ctx context.Context, k renewalChoiceKey, op renewalChoiceOperation, commit func(context.Context, pgx.Tx, func() (string, error)) error) error {
-	if a == nil || a.Authority == nil || !a.Authority.ready() || a.Handlers == nil || a.Client == nil || a.Finalize == nil || op.Proof == nil || op.Proof.Timing != "boundary_history" {
+	if a == nil || a.Authority == nil || !a.Authority.ready() || a.Handlers == nil || a.Client == nil || op.Proof == nil || op.Proof.Timing != "boundary_history" {
 		return errRenewalDisabled
 	}
 	pending := func(state string) error {
 		return commit(ctx, nil, func() (string, error) { return state, nil })
 	}
 	if op.Request.Choice == "free" {
-		return pending("review_required")
+		if a.Remove == nil {
+			return pending("review_required")
+		}
+		r, previous, err := a.Authority.accepted(ctx, a.Authority.Admission.Service.Pool, k, op.Actor)
+		if err != nil {
+			return err
+		}
+		return a.Remove(ctx, r, op.Actor, renewalSuccessorID(k), func(ctx context.Context, tx pgx.Tx) error {
+			return commit(ctx, tx, func() (string, error) {
+				if time.Since(op.Proof.VerifiedAt) > time.Minute {
+					return "", errRenewalPending
+				}
+				q := db.New(tx)
+				old, err := q.GetCommercialContract(ctx, db.GetCommercialContractParams{TeamID: k.Team, ContractID: previous.ContractID})
+				if err != nil {
+					return "", err
+				}
+				if !old.EndsAt.Valid || !old.EndsAt.Time.Equal(k.Boundary) {
+					return "", errRenewalConflict
+				}
+				if old.Status != "ended" {
+					_, err = q.EndCommercialContract(ctx, db.EndCommercialContractParams{TeamID: k.Team, ContractID: old.ID, ExpectedRevision: old.Revision})
+				}
+				return "free", err
+			})
+		})
+	}
+	if a.Finalize == nil {
+		return errRenewalDisabled
 	}
 	verified := op.Proof.successor
 	if verified == nil || verified.Binding.ContractID != renewalSuccessorID(k) || verified.Binding.Identity.TermsDigest != renewalTargetDigest(k, op) || validateRenewalTerms(op.Request.Choice, op.Terms) != nil {
