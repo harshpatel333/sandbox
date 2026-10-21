@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import devbox_contract as contract
 import devbox_workflow as workflow
 
+ENSURE_UNUSED = workflow.ensure_unused
+
 
 SANDBOX_SHA = "1" * 40
 UI_SHA = "2" * 40
@@ -51,7 +53,7 @@ class FakeCloud:
         self.deployed_sha = NEW_SHA
         self.disks, self.buckets, self.unlabelled = [], [], set()
         self.disk_zones, self.deleted, self.stockout = {}, [], {}
-        self.leak_boot_disk = False
+        self.leak_boot_disk, self.created_at = False, {}
         self.relabel_after_checkouts = None
         self.pending_instance = False
         self.fail_disk_create = False
@@ -95,6 +97,7 @@ class FakeCloud:
                 wanted = arg(args, "--filter")[len("name="):]
                 users = {d.get("source", "").rsplit("/", 1)[-1] for i in self.instances.values() for d in i["disks"]}
                 return ok(json.dumps([{"name": name, "zone": f"projects/p/zones/{zone}",
+                                       "creationTimestamp": self.created_at.get(name, "2026-01-01T00:00:00.000-07:00"),
                                        **({} if name in self.unlabelled else {"labels": {"devbox-id": "x"}}),
                                        **({"users": ["vm"]} if name in users else {})}
                                       for name, zone in self.disk_zones.items() if name == wanted and in_zones(zone)]))
@@ -133,10 +136,14 @@ class FakeCloud:
             labels = dict(pair.split("=") for pair in arg(args, "--labels").split(","))
             manifest = Path(arg(args, "--metadata-from-file").split("=", 1)[1]).read_text()
             zone = arg(args, "--zone")
+            if self.stockout.get(zone) == "partial":
+                self.materialize(args[4], labels, manifest, zone)
+                return fail(1, "ERROR: (gcloud.compute.instances.create) ZONE_RESOURCE_POOL_EXHAUSTED")
             if self.stockout.get(zone) == "instance":
                 if self.leak_boot_disk:
                     self.disk_zones[args[4]] = zone
                     self.unlabelled.add(args[4])
+                    self.created_at[args[4]] = datetime.now(timezone.utc).isoformat()
                 return fail(1, f"ERROR: (gcloud.compute.instances.create) The zone 'projects/p/zones/{zone}' does "
                                "not have enough resources available to fulfill the request. reason: stockout")
             if self.pending_instance:
@@ -447,6 +454,33 @@ class CreateTests(WorkflowCase):
         self.assertEqual(self.create(cloud), 0)
         self.assertIn(("disk", "devbox-my-box", "us-central1-a"), cloud.deleted)
         self.assertEqual(cloud.disk_zones, {"devbox-my-box-data": "us-central1-b", "devbox-my-box": "us-central1-b"})
+
+    def test_a_partly_created_vm_and_its_disks_are_removed_before_the_next_zone(self):
+        cloud = FakeCloud()
+        cloud.stockout = {"us-central1-a": "partial"}
+        self.assertEqual(self.create(cloud), 0)
+        self.assertEqual(cloud.deleted[:3], [("instance", "devbox-my-box", "us-central1-a"),
+                                             ("disk", "devbox-my-box", "us-central1-a"),
+                                             ("disk", "devbox-my-box-data", "us-central1-a")])
+        self.assertEqual(cloud.metadata_writes[-1]["zone"], "us-central1-b")
+
+    def test_an_old_unlabelled_disk_with_the_box_name_is_left_alone(self):
+        cloud = FakeCloud()
+        cloud.stockout = {"us-central1-a": "instance"}
+        cloud.disk_zones["devbox-my-box"] = "us-central1-a"
+        cloud.unlabelled.add("devbox-my-box")
+        workflow.ensure_unused = lambda name, project=contract.PROJECT: None
+        self.addCleanup(setattr, workflow, "ensure_unused", ENSURE_UNUSED)
+        self.assertEqual(self.create(cloud), 0)
+        self.assertNotIn(("disk", "devbox-my-box", "us-central1-a"), cloud.deleted)
+
+    def test_capacity_check_ignores_names_and_case(self):
+        for text, capacity in (("ZONE_RESOURCE_POOL_EXHAUSTED", True), ("reason: stockout", True),
+                               ("The zone does not have enough resources available to fulfill the request.", True),
+                               ("disk 'devbox-stockout-demo' already exists", False),
+                               ("resource_exhausted", False), ("QUOTA_EXCEEDED", False)):
+            with self.subTest(text=text):
+                self.assertEqual(bool(workflow.CAPACITY_ERRORS.search(text)), capacity)
 
     def test_explicit_zone_is_the_only_zone_tried(self):
         cloud = FakeCloud()
