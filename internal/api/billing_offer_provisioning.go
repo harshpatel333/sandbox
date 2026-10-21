@@ -19,6 +19,21 @@ func (h *Handlers) AcceptedOfferProvisioningStatus(ctx context.Context, team, as
 }
 
 func (h *Handlers) startOfferProvisioning(ctx context.Context) {
+	if h.YCOfferAcceptance.available() {
+		client, configured := h.Stripe.(*stripeHTTPClient)
+		authority := &offerProvisioningAuthority{h: h, admission: &YCAcceptedProvisioningAdmission{Service: h.YCOfferAcceptance, Handlers: h}, client: client}
+		// Revocation delivery must keep running if provider configuration or new
+		// admission flags are disabled. It performs no provider mutations.
+		go authority.runFinancialInvalidations(ctx)
+		if h.OfferProvisioning == nil && configured {
+			h.OfferProvisioning = &provisioning.Service{Pool: h.Pool, Authority: authority, Provider: &offerProvisioningProvider{client: client}}
+		}
+		if h.OfferProvisioning.Available() && h.YCOfferAcceptance.Provisioning == nil {
+			// The earlier acceptance startup initialized its service but could not
+			// start its consumer until the complete provisioning adapter existed.
+			h.StartYCOfferAcceptance(ctx)
+		}
+	}
 	service := h.OfferProvisioning
 	if !service.Available() {
 		return
