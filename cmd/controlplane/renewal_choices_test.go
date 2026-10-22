@@ -10,8 +10,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 )
@@ -201,5 +203,81 @@ func TestRenewalStartupFailureKeepsAPIAvailable(t *testing.T) {
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if w.Code != http.StatusOK {
 		t.Fatal("renewal failure stopped API")
+	}
+}
+
+type blockedRenewalStartup struct {
+	entered    chan struct{}
+	release    chan struct{}
+	configured bool
+	started    bool
+	err        error
+}
+
+func (b *blockedRenewalStartup) ConfigureRenewalChoices(context.Context, api.RenewalChoiceConfig) error {
+	close(b.entered)
+	<-b.release
+	b.configured = b.err == nil
+	return b.err
+}
+func (b *blockedRenewalStartup) StartRenewalChoiceService(context.Context) { b.started = true }
+
+func TestRenewalStartupPreflightDoesNotBlockOtherRoutes(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "failure"}[fail], func(t *testing.T) {
+			cfg, m := renewalLoaderFixture(t)
+			installRenewalFixture(t, cfg, m)
+			b := &blockedRenewalStartup{entered: make(chan struct{}), release: make(chan struct{})}
+			if fail {
+				b.err = errors.New("provider unavailable")
+			}
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasPrefix(r.URL.Path, "/internal/yc/account/renewals/") {
+					// These plain reads deliberately rely on the production publication
+					// barrier, so -race detects a handler exposed before initialization.
+					if b.configured != !fail || b.started != !fail {
+						t.Error("partial initialization exposed")
+					}
+					if fail {
+						w.WriteHeader(http.StatusServiceUnavailable)
+						return
+					}
+				}
+				w.WriteHeader(http.StatusOK)
+			})
+			gate := newRenewalStartupHandler(t.Context(), b, next)
+			<-b.entered
+			for _, path := range []string{"/health", "/unrelated-api"} {
+				w := httptest.NewRecorder()
+				gate.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+				if w.Code != http.StatusOK {
+					t.Fatal("unrelated route blocked", path, w.Code)
+				}
+			}
+			for _, path := range []string{"/internal/yc/account/renewals/status", "/internal/yc/account/renewals/submit"} {
+				w := httptest.NewRecorder()
+				gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+				if w.Code != http.StatusServiceUnavailable || w.Header().Get("Cache-Control") != "no-store" {
+					t.Fatal("pending route exposed", w.Code)
+				}
+			}
+			close(b.release)
+			// Keep issuing requests while publication races with the reader. A gate
+			// response has no-store; the downstream handler must eventually be reached.
+			deadline := time.After(time.Second)
+			for {
+				w := httptest.NewRecorder()
+				gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/internal/yc/account/renewals/status", nil))
+				if w.Header().Get("Cache-Control") == "" {
+					break
+				}
+				select {
+				case <-deadline:
+					t.Fatal("initialization never published")
+				default:
+					runtime.Gosched()
+				}
+			}
+		})
 	}
 }

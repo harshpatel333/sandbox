@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/api"
 )
 
@@ -190,4 +192,31 @@ func startRenewalChoices(ctx context.Context, h renewalStartup) error {
 	}
 	h.StartRenewalChoiceService(ctx)
 	return nil
+}
+
+// Renewal initialization may wait on provider/storage checks. Only renewal
+// routes wait for publication; unrelated requests never read RenewalChoices.
+// Receiving from ready establishes publication before any renewal handler read.
+func newRenewalStartupHandler(ctx context.Context, h renewalStartup, next http.Handler) http.Handler {
+	ready := make(chan struct{})
+	go func() {
+		defer close(ready)
+		if err := startRenewalChoices(ctx, h); err != nil {
+			log.Error().Err(err).Msg("renewal choices unavailable; other services remain active")
+		}
+	}()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/internal/yc/account/renewals/") {
+			select {
+			case <-ready:
+			default:
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Cache-Control", "no-store")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, `{"error":{"code":"renewal_unavailable","message":"Renewal choices are unavailable."}}`)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }

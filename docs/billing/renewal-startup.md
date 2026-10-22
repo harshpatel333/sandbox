@@ -1,10 +1,13 @@
 # Renewal service startup
 
 Renewal choices are disabled by default. The control plane configures the service
-once, after `StartUsageEntitlementService` initializes the existing financial
-and entitlement authority, and before HTTP serving. Only successful configuration
-starts the renewal worker. The existing authenticated status and submit routes
-use that same handler instance.
+once in the background, after `StartUsageEntitlementService` initializes the
+existing financial and entitlement authority. HTTP serving does not wait for
+renewal preflight. Until it finishes, renewal routes return an uncached 503
+without reading the service pointer. A completion channel synchronizes publication
+before those handlers can access it. Only successful configuration starts the
+renewal worker. The existing authenticated status and submit routes use that
+same handler instance.
 
 Set `BILLING_RENEWAL_CHOICES_ENABLED=true` and
 `BILLING_RENEWAL_CHOICES_CONFIG` to an absolute path to reviewed deployment

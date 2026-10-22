@@ -476,9 +476,7 @@ func run() error {
 	handlers.StartStripeCheckoutAssociationMonitor(ctx)
 	handlers.StartProPaymentReconciliation(ctx)
 	handlers.StartUsageEntitlementService(ctx)
-	if err := startRenewalChoices(ctx, handlers); err != nil {
-		log.Error().Err(err).Msg("renewal choices unavailable; other services remain active")
-	}
+	renewalRouter := newRenewalStartupHandler(ctx, handlers, router)
 	handlers.StartFundingObservationService(ctx)
 
 	// Quota watcher: alerts when a team crosses 80% of a resource limit. Fans out
@@ -500,7 +498,7 @@ func run() error {
 	// Start HTTP server.
 	srv := &http.Server{
 		Addr:              net.JoinHostPort(cfg.Host, cfg.Port),
-		Handler:           router,
+		Handler:           renewalRouter,
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      0, // 0 = no timeout; required for streaming exec responses
 		IdleTimeout:       60 * time.Second,
