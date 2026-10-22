@@ -419,6 +419,29 @@ func TestRestoreForResume_SessionRequiresCapability(t *testing.T) {
 	}
 }
 
+// A layered resume replays the trace recorded next to its template base,
+// and only when resume prefetch is on.
+func TestRestoreForResume_ReplaysTemplateTrace(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "mem.snap")
+	trace := filepath.Join(filepath.Dir(base), accessLogFilename)
+	if err := os.WriteFile(trace, []byte("4096\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fc := startSnapshotAPIFake(t, nil)
+	for _, on := range []bool{false, true} {
+		m := resumeManager(t, false)
+		m.cfg.ResumePrefetchEnabled = on
+		if _, _, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem.diff", base, m.resumeAccessLog(base), &network.VMNetInfo{TAPDevice: "tap0"}, nil, nil); err != nil {
+			t.Fatalf("prefetch=%v: %v", on, err)
+		}
+	}
+	bodies := fc.snapshotBodies()
+	want := `"access_log_path":"` + trace + `"`
+	if len(bodies) != 2 || strings.Contains(bodies[0], "access_log_path") || !strings.Contains(bodies[1], want) {
+		t.Fatalf("the trace must reach the load only with prefetch on, got %v", bodies)
+	}
+}
+
 // A rollback under a running daemon: the cached capability says yes, the
 // binary says unknown field. The restore retries unguarded and records no
 // session, and the capability clears so nothing else pays the retry.
