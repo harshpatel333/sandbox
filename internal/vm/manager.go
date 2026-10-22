@@ -619,6 +619,10 @@ type Manager struct {
 	// slot and veth. In-memory only: a restart rebuilds reservations from
 	// scratch and the startup sweep reclaims unprotected namespaces.
 	survivorNS sync.Map
+	// wakeTraces caches template build dir → its recorded access log ("" when
+	// it has none), so a resume finds the trace without touching the disk.
+	// Build dirs are immutable once published; one entry per template seen.
+	wakeTraces sync.Map
 	// orphanScanDone gates the fresh-unit linger skip: it is set only after
 	// startup reattach successfully listed active units and registered the
 	// BoltDB-missing ones as unconfirmed stops. Until then (or forever, if
@@ -2984,15 +2988,28 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath, 
 // template base, or "" when prefetch is off or the template has none. Pause
 // snapshots record no trace of their own; the template's covers the guest
 // kernel's wake path, which every sandbox built from it shares.
+//
+// Resume never waits on the disk for it: an uncached template resumes without
+// prefetch while a background lookup fills the cache for the next one.
 func (m *Manager) resumeAccessLog(basePath string) string {
 	if basePath == "" || !m.cfg.ResumePrefetchEnabled || !m.cfg.ResumeUffdEnabled || !m.cfg.UffdEnabled {
 		return ""
 	}
-	candidate := filepath.Join(filepath.Dir(basePath), accessLogFilename)
-	if fi, err := os.Stat(candidate); err != nil || !fi.Mode().IsRegular() {
-		return ""
+	dir := filepath.Dir(basePath)
+	if v, loaded := m.wakeTraces.LoadOrStore(dir, ""); loaded {
+		return v.(string)
 	}
-	return candidate
+	go m.lookupWakeTrace(dir)
+	return ""
+}
+
+// lookupWakeTrace records whether dir holds a wake trace. A failed stat caches
+// "none", which only forgoes prefetch for that template until vmd restarts.
+func (m *Manager) lookupWakeTrace(dir string) {
+	candidate := filepath.Join(dir, accessLogFilename)
+	if fi, err := os.Stat(candidate); err == nil && fi.Mode().IsRegular() {
+		m.wakeTraces.Store(dir, candidate)
+	}
 }
 
 // newTrackingSessionID mints the random token a dirty-tracking session is
@@ -4172,6 +4189,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				if _, err := os.Stat(candidate); err == nil {
 					accessLogPath = candidate
 				}
+				m.wakeTraces.Store(filepath.Dir(memPath), accessLogPath)
 			}
 			// Decide the layered base for this UFFD restore. An overlay (mem.diff) needs
 			// its base reconstructed from the sidecar (else refuse — loading it

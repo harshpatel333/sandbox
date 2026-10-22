@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -431,6 +432,7 @@ func TestRestoreForResume_ReplaysTemplateTrace(t *testing.T) {
 	for _, on := range []bool{false, true} {
 		m := resumeManager(t, false)
 		m.cfg.ResumePrefetchEnabled = on
+		m.lookupWakeTrace(filepath.Dir(base))
 		if _, _, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem.diff", base, m.resumeAccessLog(base), &network.VMNetInfo{TAPDevice: "tap0"}, nil, nil); err != nil {
 			t.Fatalf("prefetch=%v: %v", on, err)
 		}
@@ -439,6 +441,28 @@ func TestRestoreForResume_ReplaysTemplateTrace(t *testing.T) {
 	want := `"access_log_path":"` + trace + `"`
 	if len(bodies) != 2 || strings.Contains(bodies[0], "access_log_path") || !strings.Contains(bodies[1], want) {
 		t.Fatalf("the trace must reach the load only with prefetch on, got %v", bodies)
+	}
+}
+
+// An uncached template resumes without prefetch rather than waiting on the
+// disk; the background lookup it starts serves the next resume.
+func TestResumeAccessLog_FillsCacheOffTheResumePath(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "mem.snap")
+	trace := filepath.Join(filepath.Dir(base), accessLogFilename)
+	if err := os.WriteFile(trace, []byte("4096\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := resumeManager(t, false)
+	m.cfg.ResumePrefetchEnabled = true
+	if got := m.resumeAccessLog(base); got != "" {
+		t.Fatalf("an uncached template must resume without prefetch, got %q", got)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for m.resumeAccessLog(base) != trace {
+		if time.Now().After(deadline) {
+			t.Fatal("the background lookup never cached the trace")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
