@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import shutil
 import time
 from unittest.mock import patch
 import unittest
@@ -11,6 +12,7 @@ import psycopg
 import migrate_database as regional
 import migrate_shared_auth as shared
 import test_migration_cli as cli_test
+import test_yc_claim_mail_migration as mail_test
 
 
 class MeasuredConnection:
@@ -33,6 +35,102 @@ class MeasuredConnection:
     def transaction(self):
         self.transactions += 1
         return self.conn.transaction()
+
+
+class ClaimMailMigrationTest(mail_test.ClaimMailMigrationTest, cli_test.MigrationCLITest):
+    test_fresh_database = None
+
+    @classmethod
+    def setUpClass(cls):
+        cli_test.MigrationCLITest.setUpClass.__func__(cls)
+        cls.dsn = f"postgresql://postgres@127.0.0.1:{cls.port}/postgres?sslmode=disable"
+
+
+class DevboxClaimMailMigrationTest(cli_test.MigrationCLITest):
+    test_fresh_database = None
+
+    def test_installed_baseline_inspect_apply_inspect_replay_and_drift(self):
+        # Reproduce the installer's actual CLI-written ordered history, including
+        # the regional migrations. A single aggregate string is a different ledger.
+        self.sql("CREATE SCHEMA auth; CREATE TABLE auth.users(id uuid PRIMARY KEY,created_at timestamptz,"
+                 "email text,email_confirmed_at timestamptz,deleted_at timestamptz);")
+        for role in shared.ROLES[:-1]:
+            self.sql(f"CREATE ROLE {role}")
+        regional.verified_aggregate(cli_test.ROOT)
+        self.copy_migrations()
+        for source in (cli_test.ROOT / "supabase/shared-auth-history").glob("*.sql"):
+            shutil.copyfile(source, self.migrations / source.name)
+        self.assertEqual(cli_test.run(cli_test.CLI, "--version").stdout.splitlines()[0], regional.CLI_VERSION)
+        self.push()
+        url = f"postgresql://postgres@127.0.0.1:{self.port}/{self.database}?sslmode=disable"
+        with psycopg.connect(url, autocommit=True, options=shared.OPTIONS) as conn:
+            fixture = mail_test.ClaimMailMigrationTest()
+            fixture.conn, fixture.revision = conn, "a" * 40
+            fixture.apply("authority", shared.source())
+            fixture.apply("claims", shared.claim_source())
+            fixture.later_migrations()
+            conn.execute("INSERT INTO auth.users(id,email) VALUES(gen_random_uuid(),'existing@example.test')")
+            users = conn.execute("SELECT * FROM auth.users").fetchall()
+            before = shared.ordinary_history(conn)
+            original = fixture.history()
+            self.assertEqual(len(next(r[2] for r in before if r[0] == regional.VERSION)), 23)
+            system, oid, port = conn.execute("SELECT system_identifier::text, "
+                "(SELECT oid::text FROM pg_database WHERE datname=current_database()),inet_server_port() "
+                "FROM pg_control_system()").fetchone()
+            binding = dict(system_identifier=system, database_oid=oid, server_port=port, database_name=self.database)
+            def run(execute=False):
+                return shared.apply_bound_devbox_claim_mail(conn, fixture.revision, **binding, execute=execute)
+            def assert_drift_rejected():
+                for mutation in ("statements[2:cardinality(statements)]",
+                                 "ARRAY(SELECT s FROM unnest(statements) WITH ORDINALITY AS t(s,n) ORDER BY n DESC)",
+                                 "array_append(statements, 'SELECT 1')"):
+                    conn.execute(f"UPDATE supabase_migrations.schema_migrations SET statements={mutation} WHERE version=%s",
+                                 (regional.VERSION,))
+                    for execute in (False, True):
+                        with self.assertRaisesRegex(shared.SharedMigrationError, "historical_aggregate_mismatch"):
+                            run(execute)
+                    self.assertEqual(fixture.history(), receipts)
+                    conn.execute("UPDATE supabase_migrations.schema_migrations SET statements=%s WHERE version=%s",
+                                 (next(r[2] for r in before if r[0] == regional.VERSION), regional.VERSION))
+            receipts = original
+            assert_drift_rejected()
+            with self.assertRaisesRegex(shared.SharedMigrationError, "unexpected_historical_aggregate"):
+                shared.prerequisites(conn, "staging")
+            with self.assertRaisesRegex(shared.SharedMigrationError, "historical_aggregate_mismatch"):
+                shared.prerequisites(conn, "use4")
+            self.assertEqual(run()["state"], "pending")
+            # A second executor can change history after the unlocked precheck.
+            # The writer must reject that new baseline after acquiring its lock.
+            rpc_before = shared.mail_lease_catalog(conn)
+            real_prerequisites = shared.prerequisites
+            prechecked = False
+            with psycopg.connect(url, autocommit=True) as other:
+                def change_after_precheck(connection, target):
+                    nonlocal prechecked
+                    result = real_prerequisites(connection, target)
+                    if not prechecked:
+                        prechecked = True
+                        other.execute("UPDATE supabase_migrations.schema_migrations "
+                                      "SET statements=array_append(statements, 'SELECT 1') WHERE version=%s",
+                                      (regional.VERSION,))
+                    return result
+                with patch.object(shared, "prerequisites", side_effect=change_after_precheck):
+                    with self.assertRaisesRegex(shared.SharedMigrationError, "historical_aggregate_mismatch"):
+                        run(True)
+            self.assertTrue(prechecked)
+            self.assertEqual(fixture.history(), original)
+            self.assertEqual(shared.mail_lease_catalog(conn), rpc_before)
+            conn.execute("UPDATE supabase_migrations.schema_migrations SET statements=%s WHERE version=%s",
+                         (next(r[2] for r in before if r[0] == regional.VERSION), regional.VERSION))
+            self.assertEqual(run(True)["state"], "applied")
+            self.assertEqual(run()["state"], "applied")
+            receipts = fixture.history()
+            self.assertEqual(run(True)["state"], "applied")
+            self.assertEqual(fixture.history(), receipts)
+            assert_drift_rejected()
+            self.assertEqual([r for r in receipts if r[0] != shared.MAIL_LEASE_VERSION], original)
+            self.assertEqual(shared.ordinary_history(conn), before)
+            self.assertEqual(conn.execute("SELECT * FROM auth.users").fetchall(), users)
 
 
 class SharedAuthMigrationTest(cli_test.MigrationCLITest):
@@ -508,13 +606,71 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
         self.assertFalse(shared.objects_present(self.conn))
 
     def test_shared_version_in_regional_history_blocks_pending_apply(self):
-        for version in (shared.VERSION, shared.CLAIM_VERSION, shared.APPROVAL_VERSION):
+        for version in (shared.VERSION, shared.CLAIM_VERSION, shared.APPROVAL_VERSION, shared.ACCEPTANCE_VERSION):
             with self.conn.transaction(force_rollback=True):
                 self.conn.execute("INSERT INTO supabase_migrations.schema_migrations(version,name,statements) VALUES(%s,'unexpected',ARRAY[]::text[])",
                                   (version,))
                 with self.assertRaisesRegex(shared.SharedMigrationError, "shared_version_in_regional_history"):
                     self.apply()
                 self.assertFalse(shared.receipt_ledger_exists(self.conn))
+
+    def install_acceptance_fixture(self):
+        self.apply()
+        self.apply_claims()
+        self.apply_approvals()
+        sql = shared.acceptance_source()
+        executed = shared.acceptance_execution(sql)
+        with self.conn.transaction():
+            self.conn.execute(executed)
+            shared.verify_acceptance_permissions(self.conn)
+            self.conn.execute(f"INSERT INTO {shared.LEDGER} "
+                "(version,name,source_sql,applied_sql,source_sha256,catalog,revision) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                (shared.ACCEPTANCE_VERSION, shared.ACCEPTANCE_NAME, sql, executed, shared.ACCEPTANCE_HASH,
+                 shared.Jsonb(shared.acceptance_catalog(self.conn)), self.revision))
+
+    def test_optional_acceptance_receipt_preserves_deployment_and_inspection(self):
+        self.apply()
+        self.apply_claims()
+        self.apply_approvals()
+        self.assertNotIn(shared.ACCEPTANCE_VERSION, shared.receipt_versions(self.conn))
+        self.assertFalse(shared.acceptance_objects_present(self.conn))
+        with self.assertRaisesRegex(shared.SharedMigrationError, "unsupported_shared_migration"):
+            shared.apply(self.conn, "use4", self.revision, shared.acceptance_source(), True, "acceptances")
+        self.install_acceptance_fixture()
+        prior = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
+        history = self.history()
+        for migration, source in (("authority", shared.source), ("claims", shared.claim_source),
+                                  ("approvals", shared.approval_source)):
+            measured = MeasuredConnection(self.conn)
+            self.assertEqual(shared.apply(measured, "use4", self.revision, source(), True, migration)["state"], "applied")
+            self.assertEqual(measured.calls, 2)
+            self.assertEqual(measured.transactions, 0)
+            self.assertEqual(shared.apply(self.conn, "use4", self.revision, source(), False, migration)["state"], "applied")
+        self.assertEqual(self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version"), prior)
+        self.assertEqual(self.history(), history)
+
+    def test_optional_acceptance_receipt_rejects_tampering_and_missing_predecessor(self):
+        self.install_acceptance_fixture()
+        for column, value in (("name", "unexpected"), ("source_sql", "changed"),
+                              ("applied_sql", "changed"), ("source_sha256", "0" * 64), ("revision", "main")):
+            with self.subTest(column=column), self.conn.transaction(force_rollback=True):
+                self.conn.execute(f"UPDATE {shared.LEDGER} SET {column}=%s WHERE version=%s", (value, shared.ACCEPTANCE_VERSION))
+                with self.assertRaisesRegex(shared.SharedMigrationError, "shared_history_mismatch"):
+                    self.apply()
+        with self.conn.transaction(force_rollback=True):
+            self.conn.execute(f"DELETE FROM {shared.LEDGER} WHERE version=%s", (shared.APPROVAL_VERSION,))
+            with self.assertRaisesRegex(shared.SharedMigrationError, "acceptance_approval_history_missing"):
+                self.apply()
+
+    def test_optional_acceptance_inspection_rejects_schema_drift(self):
+        self.install_acceptance_fixture()
+        for sql in ("ALTER TABLE auth.users DISABLE TRIGGER yc_financial_auth_writer",
+                    "GRANT EXECUTE ON FUNCTION public.yc_offer_acceptance_rpc(text,jsonb) TO authenticated",
+                    "ALTER FUNCTION public.yc_claim_rpc(text,jsonb) SET search_path TO public"):
+            with self.subTest(sql=sql), self.conn.transaction(force_rollback=True):
+                self.conn.execute(sql)
+                with self.assertRaises(shared.SharedMigrationError):
+                    self.apply(False)
 
     def test_commit_acknowledgement_loss_requires_inspection(self):
         class LostAcknowledgement(MeasuredConnection):

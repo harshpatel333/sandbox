@@ -203,6 +203,10 @@ module "api" {
     VMD_GRPC_ADDRESS          = format("%s:50051", local.active_vmd_ip)
     KMS_KEY_RESOURCE          = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
 
+    # X-Forwarded-For hops ClientIP skips: Cloud Run's front end plus the load
+    # balancer IPs behind the public API hostnames (same list in both cells).
+    TRUSTED_PROXY_CIDRS = "169.254.0.0/16,34.49.216.194/32,136.68.212.233/32"
+
     # Control-plane OTLP metrics export, matching us-east4. The host-local
     # superserve-otel-collector receives OTLP on :4318 and forwards to Google
     # Managed Prometheus; the usw2 firewall admits the Cloud Run sender range
@@ -354,8 +358,8 @@ resource "google_compute_disk" "sandbox_data_b" {
 # instance-creation-time disk means GCP does not auto-delete it, and
 # prevent_destroy on the disk stops Terraform from deleting the disk
 # itself. Deliberately NOT prevent_destroy on the attachment: it is keyed
-# on the instance's self link, so the documented host-recreation flow
-# (host-dr-runbook.md) replaces it whenever the instance is rebuilt.
+# on the instance's self link, so replacing the instance also replaces
+# its attachment while preserving the disk.
 resource "google_compute_attached_disk" "sandbox_data_b" {
   project     = local.project_id
   zone        = local.zone
