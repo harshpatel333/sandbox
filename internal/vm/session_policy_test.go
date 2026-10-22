@@ -405,7 +405,7 @@ func TestRestoreForResume_SessionRequiresCapability(t *testing.T) {
 	net := &network.VMNetInfo{TAPDevice: "tap0"}
 	for _, capable := range []bool{false, true} {
 		m := resumeManager(t, capable)
-		tracked, armed, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", net, nil, nil)
+		tracked, armed, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", "", net, nil, nil)
 		if err != nil || !tracked {
 			t.Fatalf("capable=%v: restore failed or untracked: %v", capable, err)
 		}
@@ -430,7 +430,7 @@ func TestRestoreForResume_UnknownSessionFieldFallsBack(t *testing.T) {
 		return http.StatusNoContent, ""
 	})
 	m := resumeManager(t, true)
-	tracked, armed, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", &network.VMNetInfo{TAPDevice: "tap0"}, nil, nil)
+	tracked, armed, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", "", &network.VMNetInfo{TAPDevice: "tap0"}, nil, nil)
 	if err != nil {
 		t.Fatalf("the unguarded retry must succeed: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestRestoreForResume_DoubleRollbackRetriesEachFieldOnce(t *testing.T) {
 	m := resumeManager(t, true)
 	m.clockRealtimeCapable.Store(true)
 	freeze := false
-	_, armed, usedClock, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, nil)
+	_, armed, usedClock, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, nil)
 	if err != nil || armed != "" || usedClock {
 		t.Fatalf("the bare retry must succeed with nothing armed, got err=%v armed=%q clock=%v", err, armed, usedClock)
 	}
@@ -643,7 +643,7 @@ func TestRestoreForResume_RunsTheHookBeforeTheLegacyRetry(t *testing.T) {
 	freeze := false
 	requestsAtHook := -1
 	hook := func() error { requestsAtHook = len(fc.snapshotBodies()); return nil }
-	_, _, usedClock, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, hook)
+	_, _, usedClock, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, hook)
 	if err != nil || usedClock {
 		t.Fatalf("err=%v usedClock=%v; want a legacy success", err, usedClock)
 	}
@@ -657,7 +657,7 @@ func TestRestoreForResume_RunsTheHookBeforeTheLegacyRetry(t *testing.T) {
 	fc2 := startSnapshotAPIFake(t, refuseClock)
 	m2 := resumeManager(t, true)
 	m2.clockRealtimeCapable.Store(true)
-	_, _, _, err = m2.restoreForResume(fc2.socketPath, "/tmp/snap", "/tmp/mem", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, func() error { return io.ErrUnexpectedEOF })
+	_, _, _, err = m2.restoreForResume(fc2.socketPath, "/tmp/snap", "/tmp/mem", "", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, func() error { return io.ErrUnexpectedEOF })
 	if err == nil || !strings.Contains(err.Error(), io.ErrUnexpectedEOF.Error()) {
 		t.Fatalf("err=%v, want the hook's error", err)
 	}
