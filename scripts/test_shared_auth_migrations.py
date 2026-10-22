@@ -208,6 +208,41 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
                 with self.assertRaisesRegex(shared.SharedMigrationError, "privileges_mismatch"):
                     self.apply_acceptances(False)
 
+    def assert_acceptance_mail_order(self, mail_first):
+        self.apply()
+        self.apply_claims()
+        self.apply_approvals()
+        history = self.history()
+        def mail(execute=True):
+            return shared.apply(self.conn, "use4", self.revision, shared.mail_lease_source(), execute, "claim-mail")
+        first, second = (mail, self.apply_acceptances) if mail_first else (self.apply_acceptances, mail)
+        first()
+        prior = self.conn.execute(f"SELECT * FROM {shared.LEDGER} ORDER BY version").fetchall()
+        second()
+        versions = [row[0] for row in prior]
+        self.assertEqual(self.conn.execute(f"SELECT * FROM {shared.LEDGER} WHERE version=ANY(%s) ORDER BY version", (versions,)).fetchall(), prior)
+        for migration, source in (("authority", shared.source), ("claims", shared.claim_source),
+                                  ("approvals", shared.approval_source), ("acceptances", shared.acceptance_source),
+                                  ("claim-mail", shared.mail_lease_source)):
+            self.assertEqual(shared.apply(self.conn, "use4", self.revision, source(), False, migration)["state"], "applied")
+            measured = MeasuredConnection(self.conn)
+            self.assertEqual(shared.apply(measured, "use4", self.revision, source(), True, migration)["state"], "applied")
+            self.assertEqual(measured.calls, 2)
+            self.assertEqual(measured.transactions, 0)
+        self.assertEqual(self.history(), history)
+        # Both receipts must audit the final hardened and repaired function.
+        with self.conn.transaction(force_rollback=True):
+            self.conn.execute("ALTER FUNCTION public.yc_claim_rpc(text,jsonb) SET search_path=public")
+            for migration, source in (("acceptances", shared.acceptance_source), ("claim-mail", shared.mail_lease_source)):
+                with self.assertRaises(shared.SharedMigrationError):
+                    shared.apply(self.conn, "use4", self.revision, source(), False, migration)
+
+    def test_acceptance_apply_after_mail_repair_preserves_receipts(self):
+        self.assert_acceptance_mail_order(True)
+
+    def test_mail_repair_after_acceptance_apply_preserves_receipts(self):
+        self.assert_acceptance_mail_order(False)
+
     def test_acceptance_hardening_preserves_exact_predecessor_receipts(self):
         self.apply()
         self.apply_claims()
@@ -634,8 +669,7 @@ class SharedAuthMigrationTest(cli_test.MigrationCLITest):
         self.apply_approvals()
         self.assertNotIn(shared.ACCEPTANCE_VERSION, shared.receipt_versions(self.conn))
         self.assertFalse(shared.acceptance_objects_present(self.conn))
-        with self.assertRaisesRegex(shared.SharedMigrationError, "unsupported_shared_migration"):
-            shared.apply(self.conn, "use4", self.revision, shared.acceptance_source(), True, "acceptances")
+        self.assertEqual(self.apply_acceptances(False)["state"], "pending")
         self.install_acceptance_fixture()
         prior = self.sql(f"SELECT row_to_json(m) FROM {shared.LEDGER} m ORDER BY version")
         history = self.history()
