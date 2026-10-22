@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -84,6 +85,7 @@ func (p *offerProvisioningProvider) Prepare(_ context.Context, o provisioning.Op
 		form.Set("duration", "once")
 		form.Set("percent_off", "100")
 		form.Set("applies_to[products][0]", input.Terms.FeeProductID)
+		form.Set("expand[]", "applies_to")
 	case provisioning.Fee, provisioning.Usage:
 		if input.CustomerID == "" {
 			return provisioning.Request{}, provisioning.ErrConflict
@@ -193,14 +195,18 @@ func projectOfferProviderReceipt(r provisioning.SavedRequest, raw json.RawMessag
 		}
 	case provisioning.Waiver:
 		var coupon struct {
-			Duration string `json:"duration"`
-			Percent  int64  `json:"percent_off"`
-			Amount   *int64 `json:"amount_off"`
+			Duration string          `json:"duration"`
+			Percent  json.RawMessage `json:"percent_off"`
+			Amount   *int64          `json:"amount_off"`
 			Applies  struct {
 				Products []string `json:"products"`
 			} `json:"applies_to"`
 		}
-		if json.Unmarshal(raw, &coupon) != nil || obj.ID != form.Get("id") || coupon.Duration != "once" || coupon.Percent != 100 || coupon.Amount != nil || len(coupon.Applies.Products) != 1 || coupon.Applies.Products[0] != input.Terms.FeeProductID {
+		if json.Unmarshal(raw, &coupon) != nil {
+			return nil, provisioning.ErrUnknown
+		}
+		percent, err := meterDecimal(string(coupon.Percent))
+		if err != nil || percent.Cmp(big.NewRat(100, 1)) != 0 || obj.ID != form.Get("id") || coupon.Duration != "once" || coupon.Amount != nil || len(coupon.Applies.Products) != 1 || coupon.Applies.Products[0] != input.Terms.FeeProductID {
 			return nil, provisioning.ErrUnknown
 		}
 	case provisioning.Fee, provisioning.Usage, provisioning.UsageHold:
@@ -252,7 +258,8 @@ func (p *offerProvisioningProvider) Recover(ctx context.Context, r provisioning.
 	path := ""
 	switch r.Step {
 	case provisioning.Waiver:
-		path = "/v1/coupons/" + url.PathEscape(form.Get("id"))
+		// Scope is omitted by default. Read it without changing the saved POST.
+		path = "/v1/coupons/" + url.PathEscape(form.Get("id")) + "?" + url.Values{"expand[]": {"applies_to"}}.Encode()
 	case provisioning.UsageHold:
 		path = r.Request.Path
 	}
