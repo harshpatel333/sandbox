@@ -88,6 +88,11 @@ func run() error {
 
 	resolver := proxy.NewVMDResolver(vmdAddr)
 	proxyHandler := proxy.NewHandler(domains, resolver, log)
+	trusted, err := proxy.ParseTrustedProxies(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if err != nil {
+		log.Fatal().Err(err).Msg("invalid TRUSTED_PROXY_CIDRS")
+	}
+	proxyHandler.WithTrustedProxies(trusted)
 	// The scheme browsers reach the proxy on; TLS normally terminates in front
 	// of it. Plain http is for a proxy served on loopback hosts.
 	switch scheme := envOrDefault("PROXY_PUBLIC_SCHEME", "https"); scheme {
