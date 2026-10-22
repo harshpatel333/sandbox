@@ -308,6 +308,54 @@ the test does not remove the flags, revoke credentials or stop workloads.
 General customer rollout still requires the original readiness obligations or
 its own explicit disposition.
 
+#### Explicit commissioning input
+
+The example `infra/envs/production/us-east4/qm-machine-commissioning.tfvars`
+is not auto-loaded. Ordinary PR plans and Terraform CD omit it and retain the
+default-null record. Do not rename it to `terraform.tfvars` or `*.auto.tfvars`,
+or inject it through shared workflow environment variables. Its true values
+are hypothetical until the commissioning approval and receipts above exist.
+
+For a separately authorized plan-only inspection, use the reviewed source
+revision, existing production credentials/backend and the same reviewed root
+inputs as the East deployment job, then explicitly select the file:
+
+```sh
+cd infra/envs/production/us-east4
+terraform init -input=false
+terraform plan -input=false -lock-timeout=5m \
+  -var-file=qm-machine-commissioning.tfvars -out=commissioning.tfplan
+terraform show commissioning.tfplan
+```
+
+Keep the saved plan protected; it can contain sensitive state. This inspection
+does not apply, pin traffic or prove readiness. Review all root effects, not
+only the six machine fields. Default CI plans do not verify this explicit
+enabled input against production state.
+
+Applying requires a separate released operation. The release coordinator must
+bind the source, input, target and current readiness receipts, coordinate the
+East deployment window, and preserve the existing East migration receipt,
+serving-revision pin, host-logging, host-migration, control-plane identity and
+proxy-frontend plan guards from `terraform-cd.yml`. After the approved traffic
+pin, create a fresh plan with the explicit `-var-file` above, run those guards,
+and obtain approval of that exact saved plan before `terraform apply
+-input=false commissioning.tfplan`. Verify the new revision's identity and image
+before promotion. Then promote it and verify that revision serves 100% of
+traffic, followed by the existing health and regional smoke checks. Checking
+the public endpoint while traffic remains pinned only tests the old revision.
+Do not dispatch ordinary Terraform CD as an activation substitute.
+
+The manually supplied record is not persisted as a default source input.
+A later ordinary CD apply removes its fields and disables new issuance; it
+does not revoke credentials or stop workloads. The commissioning release must
+bind that subsequent-deployment behavior and its explicit removal/containment
+plan. Coordinate only the affected East runs during the bounded test, not a
+global CI/CD hold, and verify activation before issuance. Unexpected disablement
+stops test progression while preserving cleanup; do not silently re-enable or
+reissue. Continuing activation across ordinary deployments requires a separately
+reviewed configuration release, but is not a prerequisite for this bounded test.
+
 ## Restoring the source after the coordinated-rollout revert
 
 PR #683 reverted PR #660 before its migration or deployments ran. The restored
