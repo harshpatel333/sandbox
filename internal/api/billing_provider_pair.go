@@ -217,7 +217,7 @@ func (c *stripeHTTPClient) verifyInitialProviderPair(ctx context.Context, p Prov
 			Products []string `json:"products"`
 		} `json:"applies_to"`
 	}
-	if err = c.doForm(ctx, http.MethodGet, "/v1/coupons/"+url.PathEscape(p.WaiverCouponID), nil, &coupon, ""); err != nil {
+	if err = c.doForm(ctx, http.MethodGet, "/v1/coupons/"+url.PathEscape(p.WaiverCouponID)+"?expand[]=applies_to", nil, &coupon, ""); err != nil {
 		return result, err
 	}
 	if coupon.ID != p.WaiverCouponID || coupon.Duration != "once" || coupon.PercentOff != 100 || coupon.AmountOff != nil || coupon.Live != p.Identity.Live || !reflect.DeepEqual(coupon.AppliesTo.Products, []string{p.Terms.FeeProductID}) {

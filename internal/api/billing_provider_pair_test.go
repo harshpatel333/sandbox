@@ -19,6 +19,7 @@ type pairFixture struct {
 	truncated      bool
 	merchant       string
 	couponDuration string
+	couponProducts []string
 	pending        bool
 	extraInvoice   bool
 	requests       []string
@@ -33,6 +34,7 @@ func newPairFixture(t *testing.T) *pairFixture {
 		Terms:      ProviderPairTerms{FeePriceID: "price_fee", FeeProductID: "example_annual_product", FeeAmount: 1200000, Currency: "usd", FeeMonths: 12},
 		CustomerID: "cus_example", FeeSubscriptionID: "sub_fee", UsageSubscriptionID: "sub_usage", FeeItemID: "si_fee", WaiverCouponID: "waiver_example", WaiverInvoiceID: "in_initial", Anchor: time.Date(2028, 1, 31, 14, 23, 45, 0, time.UTC),
 	}
+	f.couponProducts = []string{f.p.Terms.FeeProductID}
 	for _, r := range []string{"vcpu", "memory_gib", "storage_gib"} {
 		f.p.Terms.Resources = append(f.p.Terms.Resources, StripeCheckoutResourceTerms{ResourceKey: r, PriceID: "price_" + r, MeterID: "mtr_" + r, EventName: r, UnitAmountDecimal: "1"})
 	}
@@ -140,7 +142,13 @@ func (f *pairFixture) client(t *testing.T) *stripeHTTPClient {
 			}
 			value = map[string]any{"data": meters}
 		case "/v1/coupons/waiver_example":
-			value = map[string]any{"id": f.p.WaiverCouponID, "duration": f.couponDuration, "percent_off": 100, "livemode": f.p.Identity.Live, "metadata": pairMetadata(f.p.Identity, "waiver"), "applies_to": map[string]any{"products": []string{f.p.Terms.FeeProductID}}}
+			coupon := map[string]any{"id": f.p.WaiverCouponID, "duration": f.couponDuration, "percent_off": json.RawMessage(`100.0`), "livemode": f.p.Identity.Live, "metadata": pairMetadata(f.p.Identity, "waiver")}
+			for _, field := range r.URL.Query()["expand[]"] {
+				if field == "applies_to" {
+					coupon["applies_to"] = map[string]any{"products": f.couponProducts}
+				}
+			}
+			value = coupon
 		case "/v1/invoices/" + f.p.WaiverInvoiceID:
 			value = f.invoice
 		case "/v1/invoiceitems":
@@ -259,6 +267,9 @@ func TestProviderPairVerification(t *testing.T) {
 		{"incomplete inventory", func(f *pairFixture) { f.truncated = true }},
 		{"changed resource price", func(f *pairFixture) { f.usage.Items.Data[0].Price.UnitAmountDecimal = "2" }},
 		{"fee consumes metered credits", func(f *pairFixture) { f.fee.Items.Data[0].Price.Recurring.Meter = "mtr_fee" }},
+		{"missing coupon restriction", func(f *pairFixture) { f.couponProducts = nil }},
+		{"wrong coupon product", func(f *pairFixture) { f.couponProducts = []string{"prod_other"} }},
+		{"extra coupon product", func(f *pairFixture) { f.couponProducts = append(f.couponProducts, "prod_other") }},
 		{"repeat waiver", func(f *pairFixture) { f.couponDuration = "forever" }},
 		{"replacement recurring discount", func(f *pairFixture) { f.fee.Discounts = []string{"di_forever"} }},
 		{"manual tax", func(f *pairFixture) { f.fee.DefaultTaxRates = []json.RawMessage{json.RawMessage(`"txr_tax"`)} }},
