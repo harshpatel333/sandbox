@@ -156,6 +156,10 @@ def main() -> int:
                                    for c in raw_trusted.split(",") if c.strip())
     except ValueError:
         trusted_proxies = ""
+    # ipaddress keeps IPv6 zones ("%eth0"), which Go rejects and the legacy
+    # heredoc would expand; allow only plain CIDR characters.
+    if not re.fullmatch(r"[0-9A-Fa-f.:/,]*", trusted_proxies):
+        trusted_proxies = ""
     if raw_trusted.strip() and not trusted_proxies:
         print("ERROR: TRUSTED_PROXY_CIDRS must be a comma-separated CIDR list", file=sys.stderr)
         return 1

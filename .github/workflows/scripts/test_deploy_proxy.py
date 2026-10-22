@@ -106,10 +106,11 @@ class DeployProxyTests(unittest.TestCase):
 
     def test_invalid_trusted_proxy_cidrs_stop_before_any_host_is_touched(self):
         # The proxy refuses to start on a bad value, so it must never reach a host.
-        for value in ('not-a-cidr', ' , '):
+        for value in ('not-a-cidr', ' , ', 'fe80::1%eth0/128', 'fe80::1%$(printf probe)/128'):
             with self.subTest(value=value):
                 self.assertEqual(self.deploy(TRUSTED_PROXY_CIDRS=value), 1)
                 self.assertEqual(self.requests, [])
+                self.assertFalse([c for c in self.commands if any('ssh' in str(p) or 'scp' in str(p) for p in c)])
 
     def test_replacement_ci_run_preserves_explicit_retry_identity(self):
         self.assertEqual(self.deploy(GITHUB_RUN_ID='replacement-run'), 0)

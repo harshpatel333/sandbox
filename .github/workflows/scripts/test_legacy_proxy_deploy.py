@@ -110,11 +110,12 @@ class LegacyProxyTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('TRUSTED_PROXY_CIDRS=35.191.0.0/16,127.0.0.0/8', sent)
         # The proxy refuses to start on a bad value, so it must never reach a host.
-        for value in ('not-a-cidr', ' , '):
+        for value in ('not-a-cidr', ' , ', 'fe80::1%eth0/128', 'fe80::1%$(printf probe)/128'):
             with self.subTest(value=value):
                 code, sent = deploy_with(value)
                 self.assertEqual(code, 1)
-                self.assertNotIn('proxy.env', sent)
+                self.assertNotIn('ssh', sent)
+                self.assertNotIn('scp', sent)
 
     def test_retry_mode_controls_manifest_loading_and_production_gate(self):
         workflow = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
