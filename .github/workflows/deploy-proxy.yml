@@ -258,6 +258,7 @@ jobs:
           OTEL_ENVIRONMENT: staging
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_STAGING }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
+          TRUSTED_PROXY_CIDRS: ${{ vars.TRUSTED_PROXY_CIDRS_STAGING }}
           # Bootstrap owns each host's identity and certificate paths.
           # Host 1 retains its legacy peer configuration.
           # Require bootstrap only after this cell's operator-run migration.
@@ -360,6 +361,7 @@ jobs:
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          TRUSTED_PROXY_CIDRS: ${{ vars.TRUSTED_PROXY_CIDRS_PROD }}
           # Outbound routing does not require this host to accept peer ingress.
           PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_INGRESS_ENABLED_PROD == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
@@ -428,6 +430,7 @@ jobs:
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          TRUSTED_PROXY_CIDRS: ${{ vars.TRUSTED_PROXY_CIDRS_PROD }}
           # Outbound routing does not require this host to accept peer ingress.
           PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_INGRESS_ENABLED_USW == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"

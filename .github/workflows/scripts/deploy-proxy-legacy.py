@@ -20,6 +20,7 @@ This compatibility path retains socket-activated legacy listeners and never chan
   PROXY_DATABASE_URL        required when routing is enabled — dedicated read-only connection
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
+  TRUSTED_PROXY_CIDRS        optional — comma-separated CIDRs of our own forwarding hops
   PEER_PROXY_TARGET_ADDR     optional — loopback address for peer ingress
   PEER_PROXY_SPIFFE_URI      required — authorized peer certificate URI
   SENTRY_DSN                 optional — Sentry DSN URL for error reporting
@@ -35,6 +36,7 @@ This compatibility path retains socket-activated legacy listeners and never chan
   Peer identity and certificate paths are supplied by host bootstrap.
 """
 
+import ipaddress
 import os
 import re
 import shlex
@@ -109,6 +111,21 @@ def main() -> int:
     require_data_plane = os.environ.get("REQUIRE_DATA_PLANE", "")
     if require_data_plane not in ("", "0", "1"):
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
+        return 1
+    # The proxy refuses to start on a bad value, so reject it before any host
+    # is touched. Separators alone would trust no hop, so they are invalid too.
+    raw_trusted = os.environ.get("TRUSTED_PROXY_CIDRS", "")
+    try:
+        trusted_proxies = ",".join(str(ipaddress.ip_network(c.strip(), strict=False))
+                                   for c in raw_trusted.split(",") if c.strip())
+    except ValueError:
+        trusted_proxies = ""
+    # ipaddress keeps IPv6 zones ("%eth0"), which Go rejects and the legacy
+    # heredoc would expand; allow only plain CIDR characters.
+    if not re.fullmatch(r"[0-9A-Fa-f.:/,]*", trusted_proxies):
+        trusted_proxies = ""
+    if raw_trusted.strip() and not trusted_proxies:
+        print("ERROR: TRUSTED_PROXY_CIDRS must be a comma-separated CIDR list", file=sys.stderr)
         return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     peer_identity_hosts = set(filter(None, (host.strip() for host in
@@ -406,6 +423,7 @@ def main() -> int:
             SANDBOX_ACCESS_TOKEN_SEED={access_seed}
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
+            TRUSTED_PROXY_CIDRS={trusted_proxies}
             SENTRY_DSN={sentry_dsn}
             PEER_PROXY_LISTEN_ADDR=$peer_listen_addr
             PEER_PROXY_TARGET_ADDR={peer_env['PEER_PROXY_TARGET_ADDR']}

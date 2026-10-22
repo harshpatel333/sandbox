@@ -94,6 +94,29 @@ class LegacyProxyTests(unittest.TestCase):
         self.assertIn('InvocationID', inner)
 
 
+    def test_trusted_proxy_cidrs_are_validated_before_the_env_file_is_written(self):
+        def deploy_with(value):
+            commands = []
+            def run(args, **kwargs):
+                commands.append(args)
+                output = 'example-host,us-central1-a\n' if args[:4] == ['gcloud', 'compute', 'instances', 'list'] else ''
+                return subprocess.CompletedProcess(args, 0, output, '')
+            env = dict(GCP_PROJECT='example-project', GCP_REGION='us-central1', SHA='12345678',
+                       PROXY_DOMAIN='sandbox.example.test', TRUSTED_PROXY_CIDRS=value)
+            with patch.dict(os.environ, env, clear=True), patch.object(deploy.subprocess, 'run', side_effect=run), \
+                    patch.object(deploy.os.path, 'exists', return_value=True):
+                return deploy.main(), ' '.join(str(part) for command in commands for part in command)
+        code, sent = deploy_with(' 35.191.0.0/16, 127.0.0.1/8 ')
+        self.assertEqual(code, 0)
+        self.assertIn('TRUSTED_PROXY_CIDRS=35.191.0.0/16,127.0.0.0/8', sent)
+        # The proxy refuses to start on a bad value, so it must never reach a host.
+        for value in ('not-a-cidr', ' , ', 'fe80::1%eth0/128', 'fe80::1%$(printf probe)/128'):
+            with self.subTest(value=value):
+                code, sent = deploy_with(value)
+                self.assertEqual(code, 1)
+                self.assertNotIn('ssh', sent)
+                self.assertNotIn('scp', sent)
+
     def test_retry_mode_controls_manifest_loading_and_production_gate(self):
         workflow = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
         selector = re.search(r'^  PROXY_DEPLOYMENT_MODE: \$\{\{ (.+) \}\}$', workflow, re.M)[1]

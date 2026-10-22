@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -70,7 +71,11 @@ type Handler struct {
 	sandboxConns       *connLimiter
 	ipConns            *connLimiter
 	authenticatedConns *connLimiter
-	log                zerolog.Logger
+	// trustedProxies are the hops whose X-Forwarded-For entries clientAddr
+	// skips. Nil keeps the legacy leftmost-entry behavior. Set via
+	// WithTrustedProxies.
+	trustedProxies []netip.Prefix
+	log            zerolog.Logger
 	// recorder receives per-exec latency phases; nil (the default) records
 	// nothing. Set via WithTelemetry.
 	recorder telemetry.Recorder
@@ -165,6 +170,37 @@ func (h *Handler) originAllowed(origin string) bool {
 func (h *Handler) WithTelemetry(r telemetry.Recorder) *Handler {
 	h.recorder = r
 	return h
+}
+
+// WithTrustedProxies makes clientAddr key on the address our own front ends
+// recorded rather than on caller-supplied X-Forwarded-For entries.
+func (h *Handler) WithTrustedProxies(p []netip.Prefix) *Handler {
+	h.trustedProxies = p
+	return h
+}
+
+// ParseTrustedProxies parses a comma-separated CIDR list. Empty means unset;
+// a list of only separators is an error so a typo can't silently trust no hop
+// and put every caller behind the load balancer into one bucket.
+func ParseTrustedProxies(raw string) ([]netip.Prefix, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []netip.Prefix
+	for _, c := range strings.Split(raw, ",") {
+		if c = strings.TrimSpace(c); c == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(c)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p.Masked())
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no CIDRs in %q", raw)
+	}
+	return out, nil
 }
 
 func NewHandler(domains []string, resolver Resolver, log zerolog.Logger) *Handler {
@@ -335,7 +371,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer h.sandboxConns.release(instanceID)
 
 	// Enforce per-IP connection limit.
-	clientIP := clientAddr(r)
+	clientIP := h.clientAddr(r)
 	if !h.ipConns.acquire(clientIP) {
 		http.Error(w, "too many connections from this IP", http.StatusTooManyRequests)
 		return
@@ -551,11 +587,33 @@ func retryDial(maxAttempts int, timeout time.Duration) func(ctx context.Context,
 }
 
 // clientAddr extracts the client IP from the request.
-// Behind GCP HTTPS LB, RemoteAddr is the LB's egress IP, not the client's.
-// GCP sets X-Forwarded-For to: "<client>, <lb>" — we take the first entry.
+// Behind GCP HTTPS LB, RemoteAddr is the LB's egress IP, not the client's,
+// and the LB appends "<client>, <lb>" to any X-Forwarded-For the caller sent.
 // We read XFF before the director strips it (director runs later in ServeHTTP).
 // Falls back to RemoteAddr if XFF is missing (direct access, tests).
-func clientAddr(r *http.Request) string {
+func (h *Handler) clientAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if h.trustedProxies != nil {
+		// Walk from the right past our own hops; peer-forwarded requests
+		// arrive over loopback with the origin cell's header intact.
+		if ra, err := netip.ParseAddr(host); err != nil || !h.isTrustedProxy(ra) {
+			return host
+		}
+		entries := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+		for i := len(entries) - 1; i >= 0; i-- {
+			a, err := netip.ParseAddr(strings.TrimSpace(entries[i]))
+			if err != nil {
+				break
+			}
+			if a = a.Unmap(); i == 0 || !h.isTrustedProxy(a) {
+				return a.String()
+			}
+		}
+		return host
+	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		// XFF may contain: "client, proxy1, proxy2" — first is the client.
 		if i := strings.Index(xff, ","); i != -1 {
@@ -563,11 +621,17 @@ func clientAddr(r *http.Request) string {
 		}
 		return strings.TrimSpace(xff)
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
 	return host
+}
+
+func (h *Handler) isTrustedProxy(a netip.Addr) bool {
+	a = a.Unmap()
+	for _, p := range h.trustedProxies {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------

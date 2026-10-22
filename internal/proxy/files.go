@@ -75,7 +75,7 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 	}
 	defer h.sandboxConns.release(instanceID)
 
-	clientIP := clientAddr(r)
+	clientIP := h.clientAddr(r)
 	limiter := h.ipConns
 	if h.canRouteBoxdRequest(r, instanceID) {
 		limiter = h.authenticatedConns
