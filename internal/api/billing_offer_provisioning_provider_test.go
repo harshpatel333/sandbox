@@ -243,3 +243,130 @@ func TestOfferProviderRejectsReceiptScopeAndChangedCalendar(t *testing.T) {
 		t.Fatal("missing acceptance binding accepted")
 	}
 }
+
+func TestOfferWaiverRequiresExactPercentAndProductScope(t *testing.T) {
+	o, _, responses := offerProviderFixture(t)
+	r := saveOfferTestRequest(t, &offerProvisioningProvider{}, &o, provisioning.Waiver)
+	for _, tc := range []struct {
+		name, percent, applies, duration, amount string
+		valid                                    bool
+	}{
+		{name: "integer", percent: "100", valid: true},
+		{name: "provider float", percent: "100.0", valid: true},
+		{name: "exponent", percent: "1e2", valid: true},
+		{name: "fractional discount", percent: "99.5"},
+		{name: "rounded below hundred", percent: "99.99999999999999999999"},
+		{name: "rounded above hundred", percent: "100.00000000000000000001"},
+		{name: "null percent", percent: "null"},
+		{name: "string percent", percent: `"100.0"`},
+		{name: "unbounded exponent", percent: "1e99999999"},
+		{name: "unexpanded scope", percent: "100.0", applies: "null"},
+		{name: "empty scope", percent: "100.0", applies: `{"products":[]}`},
+		{name: "wrong product", percent: "100.0", applies: `{"products":["prod_other"]}`},
+		{name: "multiple products", percent: "100.0", applies: `{"products":["prod_other","prod_extra"]}`},
+		{name: "recurring waiver", percent: "100.0", duration: `"forever"`},
+		{name: "amount discount", percent: "100.0", amount: "100"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var coupon map[string]json.RawMessage
+			if err := json.Unmarshal(responses[provisioning.Waiver], &coupon); err != nil {
+				t.Fatal(err)
+			}
+			coupon["percent_off"] = json.RawMessage(tc.percent)
+			for field, value := range map[string]string{"applies_to": tc.applies, "duration": tc.duration, "amount_off": tc.amount} {
+				if value != "" {
+					coupon[field] = json.RawMessage(value)
+				}
+			}
+			raw, err := json.Marshal(coupon)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt, err := projectOfferProviderReceipt(r, raw)
+			if tc.valid {
+				var got offerProviderReceipt
+				if err != nil || json.Unmarshal(receipt, &got) != nil || got.ID != "offer_"+o.ID.String() {
+					t.Fatalf("valid waiver rejected: %s %v", receipt, err)
+				}
+			} else if !errors.Is(err, provisioning.ErrUnknown) || len(receipt) != 0 {
+				t.Fatalf("unproven waiver accepted: %s %v", receipt, err)
+			}
+		})
+	}
+}
+
+func TestOfferWaiverExpandedCreateAndImmutableDispatchRecovery(t *testing.T) {
+	for _, recoverExisting := range []bool{false, true} {
+		t.Run(fmt.Sprintf("recover=%t", recoverExisting), func(t *testing.T) {
+			o, _, responses := offerProviderFixture(t)
+			p := &offerProvisioningProvider{}
+			r := saveOfferTestRequest(t, p, &o, provisioning.Waiver)
+			if recoverExisting {
+				// Model a dispatch persisted before response expansion was requested.
+				form, _ := url.ParseQuery(r.Request.Payload)
+				form.Del("expand[]")
+				r.Request = provisioning.NewRequest(r.Request.Path, form.Encode())
+			}
+			original := r
+			var coupon map[string]json.RawMessage
+			if err := json.Unmarshal(responses[provisioning.Waiver], &coupon); err != nil {
+				t.Fatal(err)
+			}
+			coupon["percent_off"] = json.RawMessage("100.0")
+			couponCalls, posts := 0, 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Header.Get("Stripe-Version") != o.Offer.APIVersion {
+					t.Error("request lost frozen API version")
+				}
+				if req.Method == http.MethodPost {
+					posts++
+				}
+				switch req.URL.Path {
+				case "/v1/account":
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": o.Offer.Merchant})
+				case "/v1/balance":
+					_ = json.NewEncoder(w).Encode(map[string]any{"livemode": o.Offer.Live})
+				case "/v1/coupons", "/v1/coupons/offer_" + o.ID.String():
+					couponCalls++
+					if recoverExisting {
+						if req.Method != http.MethodGet || req.URL.Path != "/v1/coupons/offer_"+o.ID.String() {
+							t.Error("recovery did not read the original coupon")
+						}
+					} else if req.Method != http.MethodPost || req.URL.Path != "/v1/coupons" || req.Header.Get("Idempotency-Key") != r.Key {
+						t.Error("new waiver changed dispatch identity")
+					}
+					if err := req.ParseForm(); err != nil {
+						t.Error(err)
+					}
+					if req.Form.Get("expand[]") != "applies_to" {
+						delete(coupon, "applies_to")
+					}
+					_ = json.NewEncoder(w).Encode(coupon)
+				default:
+					t.Error("unexpected provider request")
+					http.NotFound(w, req)
+				}
+			}))
+			defer server.Close()
+			p.client = &stripeHTTPClient{baseURL: server.URL, secretKey: "local-synthetic", apiVersion: o.Offer.APIVersion, httpClient: server.Client()}
+			var receipt json.RawMessage
+			var err error
+			if recoverExisting {
+				receipt, err = p.Recover(t.Context(), r)
+			} else {
+				receipt, err = p.Create(t.Context(), r)
+			}
+			var got offerProviderReceipt
+			if err != nil || json.Unmarshal(receipt, &got) != nil || got.ID != "offer_"+o.ID.String() {
+				t.Fatalf("expanded waiver was not confirmed: %s %v", receipt, err)
+			}
+			wantPosts := 1
+			if recoverExisting {
+				wantPosts = 0
+			}
+			if couponCalls != 1 || posts != wantPosts || !reflect.DeepEqual(r, original) {
+				t.Fatalf("dispatch changed or replayed: coupon calls=%d POSTs=%d", couponCalls, posts)
+			}
+		})
+	}
+}
