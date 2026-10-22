@@ -241,6 +241,39 @@ authority-refresh failure, restore/rotation, sandbox recreation, and safe
 attribution remain required pre-production gates; this local checkpoint does
 not claim those measurements passed.
 
+## Production East configuration
+
+The `infra/envs/production/us-east4` root accepts the nullable
+`qm_machine_identity_activation` object. Its default is `null`, which emits no
+`QM_MACHINE_AUTH_*` fields and keeps issuance disabled. Deploying this source
+with the default does not activate machine credentials.
+
+The object requires `contract_revision = "machine-identity-v1"`,
+`environment = "production"`, and explicit `ownership_ready`, `verifier_ready`,
+and `operator_ready` booleans. Each boolean requires the corresponding deployed
+ownership, verifier, and operator/staging evidence described above. False
+predicates remain false and keep issuance disabled. The configured environment
+is derived independently from the root's environment; a non-null record is
+rejected outside the production project and East region. The API additionally
+checks authority schema readiness at startup; there is no schema-ready input
+that bypasses that check.
+
+Before supplying an activation record, bind compatible API/schema/VMD receipts,
+probe every serving proxy, and collect the operator lifecycle, revocation and
+recovery evidence above. An operator-token secret reference or an ordinary
+health check alone is insufficient. Team creation, private template readiness
+and normal billing eligibility are separate prerequisites.
+
+Review the production plan through the existing deployment process. Activation
+changes the regional API revision and enables issuance for all authorized
+operators in that region, not just one tenant. The intended change is the six
+API environment fields; unexpected changes require reconciliation. Source
+changes may still run the normal shared deployment workflow even with null
+input. After an approved release, verify serving traffic, all six fields and
+fresh proxy readiness before the bounded operator invocation. Removing the
+record disables new issuance; it does not revoke credentials or stop workloads.
+Use the existing revoke/disable and containment procedures for those actions.
+
 ## Restoring the source after the coordinated-rollout revert
 
 PR #683 reverted PR #660 before its migration or deployments ran. The restored

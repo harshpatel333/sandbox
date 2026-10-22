@@ -150,6 +150,17 @@ resource "google_project_iam_member" "cd_certificatemanager" {
   member  = "serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"
 }
 
+locals {
+  qm_machine_identity_env = var.qm_machine_identity_activation == null ? {} : {
+    QM_MACHINE_AUTH_CONTRACT_REVISION      = var.qm_machine_identity_activation.contract_revision
+    QM_MACHINE_AUTH_ENVIRONMENT            = var.qm_machine_identity_activation.environment
+    QM_MACHINE_AUTH_CONFIGURED_ENVIRONMENT = local.environment
+    QM_MACHINE_AUTH_OWNERSHIP_READY        = tostring(var.qm_machine_identity_activation.ownership_ready)
+    QM_MACHINE_AUTH_VERIFIER_READY         = tostring(var.qm_machine_identity_activation.verifier_ready)
+    QM_MACHINE_AUTH_OPERATOR_READY         = tostring(var.qm_machine_identity_activation.operator_ready)
+  }
+}
+
 # The use-cell control plane retains its shared secrets and KMS key.
 # Runtime IAM is owned here for its dedicated control-plane identity.
 module "api" {
@@ -186,7 +197,7 @@ module "api" {
   # In-process billing workers must run between requests.
   cpu_idle = false
 
-  env = {
+  env = merge({
     BILLING_USAGE_ENTITLEMENTS_ENABLED = "true"
 
     YC_CONSOLE_URL                = var.yc_claim_console_url
@@ -238,7 +249,7 @@ module "api" {
     # identity the runtime impersonates to delete from it.
 
     BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
-  }
+  }, local.qm_machine_identity_env)
 
   secrets        = local.controlplane_secrets
   secret_volumes = local.controlplane_secret_volumes
