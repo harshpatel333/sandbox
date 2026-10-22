@@ -20,6 +20,7 @@ Env vars:
   PROXY_DATABASE_URL        required when routing is enabled — dedicated read-only connection
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
+  TRUSTED_PROXY_CIDRS        optional — comma-separated CIDRs of our own forwarding hops
   PEER_PROXY_TARGET_ADDR     optional — loopback address for peer ingress
   SENTRY_DSN                 optional — Sentry DSN URL for error reporting
   PEER_IDENTITY_HOSTS        optional — comma-separated hosts requiring identity bootstrap
@@ -32,6 +33,7 @@ Env vars:
 import json
 import tempfile
 import uuid
+import ipaddress
 import os
 import re
 import shlex
@@ -145,6 +147,17 @@ def main() -> int:
     require_data_plane = os.environ.get("REQUIRE_DATA_PLANE", "")
     if require_data_plane not in ("", "0", "1"):
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
+        return 1
+    # The proxy refuses to start on a bad value, so reject it before any host
+    # is touched. Separators alone would trust no hop, so they are invalid too.
+    raw_trusted = os.environ.get("TRUSTED_PROXY_CIDRS", "")
+    try:
+        trusted_proxies = ",".join(str(ipaddress.ip_network(c.strip(), strict=False))
+                                   for c in raw_trusted.split(",") if c.strip())
+    except ValueError:
+        trusted_proxies = ""
+    if raw_trusted.strip() and not trusted_proxies:
+        print("ERROR: TRUSTED_PROXY_CIDRS must be a comma-separated CIDR list", file=sys.stderr)
         return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     peer_identity_hosts = set(filter(None, (host.strip() for host in
@@ -317,6 +330,7 @@ def main() -> int:
                 "PROXY_DOMAIN": proxy_domain, "PROXY_DOMAINS": proxy_domains,
                 "SANDBOX_ACCESS_TOKEN_SEED": access_seed, "PROXY_ALLOWED_ORIGINS": terminal_origins,
                 "REQUIRE_DATA_PLANE": require_data_plane, "SENTRY_DSN": sentry_dsn,
+                "TRUSTED_PROXY_CIDRS": trusted_proxies,
                 "PEER_ROUTING_ENABLED": peer_routing, "PEER_PROXY_MAX_STREAMS": peer_max_streams,
                 "PROXY_DATABASE_URL": database_url if peer_routing == "1" else "", "HOST_REGION": host_region,
                 "OTEL_ENVIRONMENT": otel_environment,

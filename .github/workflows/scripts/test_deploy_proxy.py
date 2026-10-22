@@ -100,6 +100,17 @@ class DeployProxyTests(unittest.TestCase):
             DISCOVERED_INSTANCES='example-host,us-central1-a,RUNNING,192.0.2.10\n'), 1)
         self.assertEqual(len(self.commands), 1)
 
+    def test_trusted_proxy_cidrs_reach_the_host_env_normalized(self):
+        self.assertEqual(self.deploy(TRUSTED_PROXY_CIDRS=' 35.191.0.0/16, 127.0.0.1/8 '), 0)
+        self.assertEqual(self.requests[0]['env']['TRUSTED_PROXY_CIDRS'], '35.191.0.0/16,127.0.0.0/8')
+
+    def test_invalid_trusted_proxy_cidrs_stop_before_any_host_is_touched(self):
+        # The proxy refuses to start on a bad value, so it must never reach a host.
+        for value in ('not-a-cidr', ' , '):
+            with self.subTest(value=value):
+                self.assertEqual(self.deploy(TRUSTED_PROXY_CIDRS=value), 1)
+                self.assertEqual(self.requests, [])
+
     def test_replacement_ci_run_preserves_explicit_retry_identity(self):
         self.assertEqual(self.deploy(GITHUB_RUN_ID='replacement-run'), 0)
         self.assertEqual(self.requests[0]['rollout'], 'run-1')
