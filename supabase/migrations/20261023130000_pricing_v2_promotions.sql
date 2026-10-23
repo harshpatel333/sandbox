@@ -105,7 +105,7 @@ END $$;
 -- retries stay idempotent.
 ALTER FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean)
     RENAME TO reserve_stripe_promotion_before_pricing_v2;
-CREATE FUNCTION reserve_stripe_promotion_with_device(p_team_id uuid, p_user_id uuid,
+CREATE OR REPLACE FUNCTION reserve_stripe_promotion_with_device(p_team_id uuid, p_user_id uuid,
     p_event_id text, p_subscription_id text, p_checkout_generation timestamptz,
     p_has_checkout_generation boolean)
 RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
@@ -129,7 +129,7 @@ ALTER TABLE stripe_promotion_outcome ADD CONSTRAINT stripe_promotion_outcome_rea
 
 -- The signup eligibility preview reports the trial as unavailable under v2.
 ALTER FUNCTION evaluate_signup_promotion_snapshot(uuid) RENAME TO evaluate_signup_promotion_snapshot_before_pricing_v2;
-CREATE FUNCTION evaluate_signup_promotion_snapshot(p_user_id uuid)
+CREATE OR REPLACE FUNCTION evaluate_signup_promotion_snapshot(p_user_id uuid)
 RETURNS TABLE(ownership text, device_decision text, eligibility text, reason text)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, extensions AS $$
 BEGIN
