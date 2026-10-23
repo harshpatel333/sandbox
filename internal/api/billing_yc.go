@@ -244,7 +244,7 @@ func (h *Handlers) ycPreflight(ctx context.Context, team uuid.UUID, in ycApprova
 		return params, sub, err
 	}
 	offer := legacyProOffers["pro_annual"]
-	offer.Price = h.Config.PlanPriceID("pro_annual")
+	offer.Price = h.Config.StripeProAnnualPriceID
 	if offer.Price == "" {
 		return params, sub, errors.New("Pro annual price is not configured")
 	}

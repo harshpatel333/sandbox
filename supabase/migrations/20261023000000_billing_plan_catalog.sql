@@ -92,6 +92,9 @@ CREATE TRIGGER billing_plan_contract_guard
     ON billing_commercial_contract
     FOR EACH ROW EXECUTE FUNCTION guard_billing_plan_contract();
 REVOKE ALL ON FUNCTION billing_plan_offer(text), guard_billing_plan_identity(), guard_billing_signup_offer(), guard_billing_plan_contract() FROM PUBLIC;
+-- Security-invoker guards and eligibility checks call the predicate as the
+-- backend role.
+DO $$ BEGIN IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN GRANT EXECUTE ON FUNCTION billing_plan_offer(text) TO service_role; END IF; END $$;
 
 DROP INDEX billing_signup_recovery;
 CREATE INDEX billing_signup_recovery ON billing_signup_choice(next_check_at,team_id) WHERE offer_key <> 'free';
