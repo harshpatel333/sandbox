@@ -628,11 +628,13 @@ type BillingFundingAccount struct {
 	CreditCheckedAt    pgtype.Timestamptz `json:"credit_checked_at"`
 	LastError          *string            `json:"last_error"`
 	Failures           int32              `json:"failures"`
+	Prepaid            bool               `json:"prepaid"`
 }
 
 type BillingFundingPolicy struct {
 	Singleton        bool  `json:"singleton"`
 	MaxObservedTeams int32 `json:"max_observed_teams"`
+	BatchSize        int32 `json:"batch_size"`
 }
 
 type BillingIncrementalPeriod struct {
@@ -855,6 +857,52 @@ type BillingPlanRelease struct {
 	ProviderStatus   string      `json:"provider_status"`
 	ProviderEvidence []byte      `json:"provider_evidence"`
 	ReleasedAt       time.Time   `json:"released_at"`
+}
+
+type BillingPrepaidAutoRecharge struct {
+	TeamID         uuid.UUID          `json:"team_id"`
+	Enabled        bool               `json:"enabled"`
+	ThresholdCents *int64             `json:"threshold_cents"`
+	AmountCents    *int64             `json:"amount_cents"`
+	UpdatedBy      pgtype.UUID        `json:"updated_by"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+	DisabledReason *string            `json:"disabled_reason"`
+	DisabledAt     pgtype.Timestamptz `json:"disabled_at"`
+	DisabledBy     pgtype.UUID        `json:"disabled_by"`
+	NotifiedAt     pgtype.Timestamptz `json:"notified_at"`
+}
+
+type BillingPrepaidPurchase struct {
+	ID                     uuid.UUID          `json:"id"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	CustomerID             string             `json:"customer_id"`
+	Source                 string             `json:"source"`
+	AmountCents            int64              `json:"amount_cents"`
+	ActorID                pgtype.UUID        `json:"actor_id"`
+	PaymentState           string             `json:"payment_state"`
+	PaymentIdempotencyKey  string             `json:"payment_idempotency_key"`
+	PaymentRequest         []byte             `json:"payment_request"`
+	PaymentFirstAttemptAt  pgtype.Timestamptz `json:"payment_first_attempt_at"`
+	CheckoutSessionID      *string            `json:"checkout_session_id"`
+	PaymentIntentID        *string            `json:"payment_intent_id"`
+	InvoiceID              *string            `json:"invoice_id"`
+	PaymentEvidence        []byte             `json:"payment_evidence"`
+	PaidAt                 pgtype.Timestamptz `json:"paid_at"`
+	FailureCode            *string            `json:"failure_code"`
+	FailureReason          *string            `json:"failure_reason"`
+	CreditState            string             `json:"credit_state"`
+	CreditIdempotencyKey   string             `json:"credit_idempotency_key"`
+	CreditRequest          []byte             `json:"credit_request"`
+	CreditFirstAttemptAt   pgtype.Timestamptz `json:"credit_first_attempt_at"`
+	StripeCreditGrantID    *string            `json:"stripe_credit_grant_id"`
+	CreditEvidence         []byte             `json:"credit_evidence"`
+	CreditedAt             pgtype.Timestamptz `json:"credited_at"`
+	CreditVoidedAt         pgtype.Timestamptz `json:"credit_voided_at"`
+	NextAttemptAt          time.Time          `json:"next_attempt_at"`
+	Failures               int32              `json:"failures"`
+	LastError              *string            `json:"last_error"`
+	CreatedAt              time.Time          `json:"created_at"`
+	CreditBalanceCheckedAt pgtype.Timestamptz `json:"credit_balance_checked_at"`
 }
 
 type BillingProClosedPurchase struct {
