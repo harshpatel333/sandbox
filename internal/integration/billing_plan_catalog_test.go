@@ -351,6 +351,15 @@ func TestIntegration_BillingCatalogStaffAPI(t *testing.T) {
 		t.Fatalf("write with the internal token = %d %s", w.Code, w.Body)
 	}
 	previous := currentPlanVersion(t, "enterprise")
+	for _, limits := range []string{`{"max_memory_mib":255}`, `{"max_disk_mib":1023}`} {
+		body := strings.Replace(draftBody, `"display_only":true`, `"display_only":true,"limits":`+limits, 1)
+		if w := do(http.MethodPost, "/internal/billing/catalog/plans", admin, body); w.Code != http.StatusBadRequest {
+			t.Fatalf("unusable template limit accepted: %d %s", w.Code, w.Body)
+		}
+	}
+	if w := do(http.MethodPost, "/internal/billing/catalog/plans", admin, strings.Replace(draftBody, `{"family"`, `{"id":"00000000-0000-0000-0000-000000000000","family"`, 1)); w.Code != http.StatusBadRequest {
+		t.Fatalf("nil version id accepted: %d %s", w.Code, w.Body)
+	}
 	w := do(http.MethodPost, "/internal/billing/catalog/plans", admin, draftBody)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("create draft = %d %s", w.Code, w.Body)

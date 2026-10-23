@@ -179,7 +179,7 @@ func (r planDraftRequest) version() planVersion {
 
 func bindPlanDraft(c *gin.Context) (planDraftRequest, planVersion, string, bool) {
 	var req planDraftRequest
-	if err := c.ShouldBindJSON(&req); err != nil || (req.Version != nil && *req.Version < 1) {
+	if err := c.ShouldBindJSON(&req); err != nil || (req.Version != nil && *req.Version < 1) || (req.ID != nil && *req.ID == uuid.Nil) {
 		respondErrorMsg(c, "bad_request", "invalid plan draft", http.StatusBadRequest)
 		return req, planVersion{}, "", false
 	}
