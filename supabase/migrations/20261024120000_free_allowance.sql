@@ -4,17 +4,15 @@
 
 CREATE OR REPLACE FUNCTION billing_free_plan(p_team uuid)
 RETURNS TABLE(free_since timestamptz, allowance_usd numeric, max_vcpu int, max_memory_mib int, max_disk_mib int)
-LANGUAGE plpgsql STABLE AS $$
-BEGIN
- RETURN QUERY
- SELECT p.effective_from,
-        (p.terms->'allowance'->>'amount_usd')::numeric,
-        (p.terms->'limits'->>'max_vcpu')::int,
-        (p.terms->'limits'->>'max_memory_mib')::int,
-        (p.terms->'limits'->>'max_disk_mib')::int
- FROM team_current_plan(p_team) p
- WHERE p.kind = 'free';
-END $$;
+LANGUAGE sql STABLE AS $$
+ SELECT a.effective_from,
+        (a.terms->'allowance'->>'amount_usd')::numeric,
+        (a.limits->>'max_template_vcpu')::int,
+        (a.limits->>'max_template_memory_mib')::int,
+        (a.limits->>'max_template_disk_mib')::int
+ FROM team_plan_assignment a
+ WHERE a.team_id = p_team AND a.effective_to IS NULL AND a.kind = 'free';
+$$;
 
 CREATE OR REPLACE FUNCTION billing_compute_rates(p_team uuid)
 RETURNS TABLE(vcpu_usd numeric, memory_gib_usd numeric)
@@ -208,7 +206,7 @@ BEGIN
  SELECT CASE WHEN x.reason IS NULL THEN x.target WHEN x.reason = 'already_assigned' THEN 'assigned' ELSE 'skipped' END, x.reason
  FROM (
   SELECT CASE
-    WHEN EXISTS(SELECT 1 FROM team_current_plan(p_team)) THEN 'already_assigned'
+    WHEN EXISTS(SELECT 1 FROM team_plan_assignment pa WHERE pa.team_id = p_team AND pa.effective_to IS NULL) THEN 'already_assigned'
     WHEN qm_team_managed_billing(p_team) THEN 'qm_managed_billing'
     WHEN EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id = p_team AND c.status <> 'ended') THEN 'commercial_contract'
     WHEN EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.team_id = p_team AND o.state <> 'ended') THEN 'yc_operation'

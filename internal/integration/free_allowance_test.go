@@ -16,25 +16,12 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-func installPlanReader(t *testing.T) {
-	t.Helper()
-	if _, err := testPool.Exec(context.Background(), `
-		CREATE TABLE IF NOT EXISTS test_team_plan (team_id uuid PRIMARY KEY, kind text NOT NULL, terms jsonb NOT NULL, effective_from timestamptz NOT NULL);
-		CREATE OR REPLACE FUNCTION team_current_plan(p_team uuid)
-		RETURNS TABLE(kind text, plan_key text, version_id uuid, terms jsonb, effective_from timestamptz)
-		LANGUAGE sql STABLE AS $$
-		 SELECT p.kind, p.kind, NULL::uuid, p.terms, p.effective_from FROM test_team_plan p WHERE p.team_id = p_team
-		$$;`); err != nil {
-		t.Fatalf("install plan reader: %v", err)
-	}
-}
-
 func assignFreePlan(t *testing.T, teamID uuid.UUID, since time.Time) {
 	t.Helper()
-	installPlanReader(t)
 	if _, err := testPool.Exec(context.Background(), `
-		INSERT INTO test_team_plan (team_id, kind, terms, effective_from)
-		VALUES ($1, 'free', '{"allowance":{"amount_usd":0.1332},"limits":{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096}}', $2)`, teamID, since); err != nil {
+		INSERT INTO team_plan_assignment (team_id, plan_key, kind, terms, limits, effective_from, source, reason)
+		VALUES ($1, 'free', 'free', '{"allowance":{"amount_usd":0.1332}}',
+		        '{"max_sandboxes":1,"max_template_vcpu":1,"max_template_memory_mib":1024,"max_template_disk_mib":4096}', $2, 'migration', 'test')`, teamID, since); err != nil {
 		t.Fatalf("assign free plan: %v", err)
 	}
 }
@@ -76,7 +63,6 @@ func cents(t *testing.T, row db.GetFreeAllowanceRow) (allowance, used float64) {
 
 func TestIntegration_FreeAllowance_UnassignedTeamKeepsLegacyRules(t *testing.T) {
 	ctx := context.Background()
-	installPlanReader(t)
 	trial, _ := seedTeamAndKey(t)
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, expires_at)
@@ -229,7 +215,6 @@ func TestIntegration_FreeAllowance_UsageBeforeFreeIsNotCounted(t *testing.T) {
 
 func TestIntegration_TeamPauseAll_PausesSandboxesRunningAtEffect(t *testing.T) {
 	ctx := context.Background()
-	installPlanReader(t)
 	team, _ := seedTeamAndKey(t)
 	now := time.Now()
 	before := seedActiveSandbox(t, team, "pause-all-before")
@@ -285,7 +270,6 @@ func activationBucket(t *testing.T, teamID uuid.UUID) (string, string) {
 
 func TestIntegration_PricingV2Activation_Buckets(t *testing.T) {
 	ctx := context.Background()
-	installPlanReader(t)
 	exec := func(sql string, args ...any) {
 		t.Helper()
 		if _, err := testPool.Exec(ctx, sql, args...); err != nil {
@@ -330,7 +314,6 @@ func TestIntegration_PricingV2Activation_Buckets(t *testing.T) {
 
 func TestIntegration_FreeShape_AdmissionCarriesLimitsAndResumeRefusesLarger(t *testing.T) {
 	ctx := context.Background()
-	installPlanReader(t)
 	unassigned, _ := seedTeamAndKey(t)
 	if row, err := testQueries.GetTeamSandboxAdmission(ctx, unassigned); err != nil || row.ShapeLimited {
 		t.Fatalf("unassigned admission = %+v, %v; want no shape limit", row, err)
@@ -363,6 +346,9 @@ func TestIntegration_FreeShape_AdmissionCarriesLimitsAndResumeRefusesLarger(t *t
 	}
 	if c, err := claim(fits); err != nil || c.Sandbox.Status != db.SandboxStatusResuming {
 		t.Fatalf("claim of a sandbox within the Free shape = %+v, %v", c, err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'paused' WHERE id = $1`, fits); err != nil {
+		t.Fatal(err)
 	}
 	if c, err := testQueries.ClaimResume(ctx, db.ClaimResumeParams{ID: large, TeamID: team, LockKey: large.String()}); err != nil || c.Sandbox.Status != db.SandboxStatusResuming {
 		t.Fatalf("claim without plan limits = %+v, %v; want the legacy claim unchanged", c, err)
