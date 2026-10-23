@@ -129,10 +129,11 @@ const mrrContractGroupsQuery = `SELECT c.offer_key,c.charge_kind,c.charge_amount
  count(*)
 FROM billing_commercial_contract c JOIN team t ON t.id=c.team_id
 WHERE c.status='active' AND c.starts_at<=$1 AND (c.ends_at IS NULL OR c.ends_at>$1) AND t.home_region=$2
+ AND t.id IS DISTINCT FROM NULLIF($3,'')::uuid
 GROUP BY 1,2,3,4,5`
 
 func (h *Handlers) loadMRROverview(ctx context.Context, q db.DBTX, now time.Time, region, systemTeam string) (mrrOverview, error) {
-	rows, err := q.Query(ctx, mrrContractGroupsQuery, now, region)
+	rows, err := q.Query(ctx, mrrContractGroupsQuery, now, region, systemTeam)
 	if err != nil {
 		return mrrOverview{}, err
 	}

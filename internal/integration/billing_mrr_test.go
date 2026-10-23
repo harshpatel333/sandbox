@@ -192,6 +192,7 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 	notStarted.starts = future
 	insert(newTeam("use"), notStarted)
 	insert(newTeam("usw"), proMonthly)
+	insert(testSystemTeamID, proMonthly)
 
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
