@@ -3458,8 +3458,8 @@ components:
           type: integer
           format: int64
           description: >-
-            Usage charges so far this period, in cents. Present only when the
-            included period is the current billing period.
+            Usage charges so far this period, in cents. Present only once the
+            included usage is issued and covers the current billing period.
         remaining_cents:
           type: integer
           format: int64

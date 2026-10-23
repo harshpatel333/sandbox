@@ -222,7 +222,7 @@ func (h *Handlers) reconcileProCheckout(ctx context.Context, team uuid.UUID, res
 		return "", err
 	}
 	if offer.PricingV2 {
-		if offer.Promotion, err = contractPromotion(ctx, h.Pool, sub.ID); err != nil {
+		if offer.Promotion, err = subscriptionPromotion(ctx, h.Pool, sub.ID); err != nil {
 			return "", err
 		}
 	}

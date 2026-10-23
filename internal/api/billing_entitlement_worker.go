@@ -381,7 +381,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		if err = h.Pool.QueryRow(ctx, `SELECT invoice_id FROM billing_contract_payment WHERE contract_id=$1 AND service_period_start<=$2 AND service_period_end>=$3 ORDER BY service_period_start DESC,invoice_id LIMIT 1`, id, start, end).Scan(&paymentInvoice); err != nil {
 			return next, err
 		}
-		promotion, err := contractPromotion(ctx, h.Pool, c.SubscriptionID)
+		promotion, err := contractPromotion(ctx, h.Pool, id)
 		if err != nil {
 			return next, err
 		}

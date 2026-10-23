@@ -57,6 +57,7 @@ type proProviderFixture struct {
 	discount, renewalDiscount                         int64
 	subDiscount                                       bool
 	discountCleared                                   int
+	promotionCodes                                    bool
 }
 
 func newProFixture(t *testing.T, offer string) (*proProviderFixture, *gin.Engine, string) {
@@ -197,6 +198,7 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Checkout does not support prices with different billing intervals", 400)
 			return
 		}
+		f.promotionCodes = r.Form.Get("allow_promotion_codes") == "true"
 		f.metadata = map[string]string{}
 		for _, k := range []string{"checkout_generation", "activation_user_id", "commercial_offer"} {
 			f.metadata[k] = r.Form.Get("metadata[" + k + "]")

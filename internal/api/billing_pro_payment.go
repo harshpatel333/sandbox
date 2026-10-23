@@ -564,63 +564,79 @@ func proMeteredPeriod(sub invoiceSubscription, offer proOffer) (int64, int64, er
 	return start, end, nil
 }
 
+// paidPlanAssigner puts a team on the plan a paid purchase activated, in the
+// activation transaction. Team plan assignment provides it; a pricing v2
+// purchase stays pending rather than activate without its plan.
+var paidPlanAssigner func(ctx context.Context, tx pgx.Tx, team, actor, contract uuid.UUID, terms planTerms) error
+
 // assignCheckoutPlan puts a team that paid for a pricing v2 plan on it from
 // activation, with the terms and limits frozen at checkout. It reads nothing
 // that can change after payment, so a catalog edit cannot block activation.
 func assignCheckoutPlan(ctx context.Context, tx pgx.Tx, choice proChoice, offer proOffer, contract uuid.UUID) error {
+	if paidPlanAssigner == nil {
+		return errors.New("pricing v2 activation needs team plan assignment")
+	}
 	terms := planTerms{OfferKey: choice.Offer, DisplayName: offer.DisplayName, FeeCents: offer.Amount, IntervalMonths: offer.Months, MonthlyCreditCents: offer.Credit,
-		VersionID: offer.VersionID, Version: offer.Version, Family: offer.Family, Matching: offer.Matching, Limits: *offer.Limits}
-	_, err := assignTeamPlan(ctx, tx, planAssignment{Team: choice.Team, Terms: terms, Kind: planKindSubscription, Source: planSourceCheckout, Actor: &choice.Actor, Reason: "paid checkout", ContractID: &contract, Key: "checkout:" + contract.String()})
-	return err
+		VersionID: offer.VersionID, Version: offer.Version, PricingVersion: "v2", Family: offer.Family, Kind: "subscription", Matching: offer.Matching, Limits: *offer.Limits}
+	return paidPlanAssigner(ctx, tx, choice.Team, choice.Actor, contract, terms)
 }
 
-// recordPaymentPromotion records the promotion a receipt's invoice carried:
-// the contract's promotion from its checkout invoice, and the part of each
-// invoice's licensed fee it covered.
+// recordPaymentPromotion records the promotion a contract's checkout invoice
+// carried, and how much of its licensed fee the promotion covered. It runs
+// before the receipt, whose cash check reads it.
 func recordPaymentPromotion(ctx context.Context, tx pgx.Tx, team, contract uuid.UUID, receipt proPaymentEvidence) error {
 	d := receipt.Discount
 	if d == nil {
 		return nil
 	}
-	if receipt.Invoice.BillingReason == "subscription_create" {
-		var percent *float64
-		if d.AmountOffCents == nil {
-			percent = &d.PercentOff
-		}
-		tag, err := tx.Exec(ctx, `INSERT INTO billing_contract_promotion(contract_id,team_id,discount_id,promotion_code,coupon_id,coupon_duration,amount_off_cents,percent_off,checkout_invoice_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (contract_id) DO NOTHING`, contract, team, d.ID, d.PromotionCode, d.Coupon, d.Duration, d.AmountOffCents, percent, receipt.Invoice.ID)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			var same bool
-			if err = tx.QueryRow(ctx, `SELECT discount_id=$2 AND checkout_invoice_id=$3 FROM billing_contract_promotion WHERE contract_id=$1`, contract, d.ID, receipt.Invoice.ID).Scan(&same); err != nil {
-				return err
-			}
-			if !same {
-				return errors.New("contract already has a different promotion")
-			}
-		}
+	if receipt.Invoice.BillingReason != "subscription_create" {
+		return errors.New("only a checkout invoice may carry a promotion")
 	}
-	if d.DiscountedCents == 0 {
-		return nil
+	var percent *float64
+	if d.AmountOffCents == nil {
+		percent = &d.PercentOff
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO billing_contract_payment_discount(invoice_id,contract_id,discounted_cents) SELECT $1,contract_id,$3 FROM billing_contract_promotion WHERE contract_id=$2 AND discount_id=$4 ON CONFLICT (invoice_id) DO NOTHING`, receipt.Invoice.ID, contract, d.DiscountedCents, d.ID)
-	return err
+	tag, err := tx.Exec(ctx, `INSERT INTO billing_contract_promotion(contract_id,team_id,discount_id,promotion_code,coupon_id,coupon_duration,amount_off_cents,percent_off,checkout_invoice_id,discounted_cents) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (contract_id) DO NOTHING`, contract, team, d.ID, d.PromotionCode, d.Coupon, d.Duration, d.AmountOffCents, percent, receipt.Invoice.ID, d.DiscountedCents)
+	if err != nil || tag.RowsAffected() == 1 {
+		return err
+	}
+	var same bool
+	if err = tx.QueryRow(ctx, `SELECT discount_id=$2 AND checkout_invoice_id=$3 AND discounted_cents=$4 FROM billing_contract_promotion WHERE contract_id=$1`, contract, d.ID, receipt.Invoice.ID, d.DiscountedCents).Scan(&same); err != nil {
+		return err
+	}
+	if !same {
+		return errors.New("contract already has a different promotion")
+	}
+	return nil
 }
 
-// contractPromotion returns the promotion recorded for a subscription's
-// contract, if any.
-func contractPromotion(ctx context.Context, q db.DBTX, subscription string) (*proInvoiceDiscount, error) {
+// contractPromotion returns the promotion recorded for a contract, if any.
+func contractPromotion(ctx context.Context, q db.DBTX, contract uuid.UUID) (*proInvoiceDiscount, error) {
+	return scanContractPromotion(q.QueryRow(ctx, `SELECT `+contractPromotionColumns+` FROM billing_contract_promotion WHERE contract_id=$1`, contract))
+}
+
+// subscriptionPromotion returns the promotion recorded for the newest contract
+// on a subscription, for paths that know the subscription but not its contract.
+func subscriptionPromotion(ctx context.Context, q db.DBTX, subscription string) (*proInvoiceDiscount, error) {
+	return scanContractPromotion(q.QueryRow(ctx, `SELECT `+contractPromotionColumns+` FROM billing_contract_promotion p JOIN billing_commercial_contract c ON c.id=p.contract_id WHERE c.subscription_id=$1 ORDER BY c.created_at DESC LIMIT 1`, subscription))
+}
+
+const contractPromotionColumns = `discount_id,promotion_code,coupon_id,coupon_duration,amount_off_cents,percent_off::float8,discounted_cents`
+
+func scanContractPromotion(row pgx.Row) (*proInvoiceDiscount, error) {
 	var d proInvoiceDiscount
 	var percent *float64
-	err := q.QueryRow(ctx, `SELECT p.discount_id,p.promotion_code,p.coupon_id,p.coupon_duration,p.amount_off_cents,p.percent_off::float8 FROM billing_contract_promotion p JOIN billing_commercial_contract c ON c.id=p.contract_id WHERE c.subscription_id=$1 ORDER BY c.created_at DESC LIMIT 1`, subscription).Scan(&d.ID, &d.PromotionCode, &d.Coupon, &d.Duration, &d.AmountOffCents, &percent)
+	err := row.Scan(&d.ID, &d.PromotionCode, &d.Coupon, &d.Duration, &d.AmountOffCents, &percent, &d.DiscountedCents)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	if percent != nil {
 		d.PercentOff = *percent
 	}
-	return &d, err
+	return &d, nil
 }
 
 // clearProCheckoutDiscount removes the checkout promotion from the
@@ -630,17 +646,17 @@ func (h *Handlers) clearProCheckoutDiscount(ctx context.Context, client *stripeH
 	if len(sub.Discounts) == 0 {
 		return sub, nil
 	}
-	promotion, err := contractPromotion(ctx, h.Pool, sub.ID)
+	promotion, err := subscriptionPromotion(ctx, h.Pool, sub.ID)
 	if err != nil {
 		return sub, err
 	}
 	if promotion == nil {
-		return sub, errors.New("promotion code stays until the paid checkout invoice is recorded")
+		return sub, errors.New("subscription has a discount but no recorded checkout promotion; operator review required if the checkout invoice is already recorded")
 	}
 	if len(sub.Discounts) != 1 || sub.Discounts[0] != promotion.ID {
 		return sub, errors.New("subscription discount differs from the checkout promotion code; operator review required")
 	}
-	if err = client.doForm(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(sub.ID), url.Values{"discounts": {""}, "proration_behavior": {"none"}}, nil, "pro-discount-consumed:"+sub.ID); err != nil {
+	if err = client.doForm(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(sub.ID), url.Values{"discounts": {""}, "proration_behavior": {"none"}}, nil, ""); err != nil {
 		return sub, err
 	}
 	return client.invoiceSubscription(ctx, sub.ID)

@@ -31,7 +31,6 @@ type proOffer struct {
 	// team's plan when they activate.
 	PricingV2   bool
 	Family      string
-	Version     int32
 	DisplayName string
 	// Promotion is the discount the contract was sold with, if any.
 	Promotion *proInvoiceDiscount
@@ -61,7 +60,7 @@ func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, error) {
 	if err != nil {
 		return proOffer{Key: key}, err
 	}
-	return proOffer{Key: key, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Pricing: t.PricingVersion, Matching: t.Matching, Limits: &t.Limits, Price: h.Config.PlanPriceID(key)}, nil
+	return proOffer{Key: key, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Pricing: t.PricingVersion, Matching: t.Matching, Limits: &t.Limits, Price: h.Config.PlanPriceID(key), Family: t.Family, DisplayName: t.DisplayName}, nil
 }
 
 // checkoutOffer returns the frozen terms of the team's pending purchase of key,
@@ -92,10 +91,14 @@ func frozenProOffer(key string, payload StripeCreateCheckoutSessionParams) (proO
 	if t.Amount <= 0 || t.Credit <= 0 || (t.Months != 1 && t.Months != 12) {
 		return proOffer{}, errors.New("invalid frozen plan terms")
 	}
-	if payload.AllowPromotionCodes != t.PricingV2 || (t.PricingV2 && (t.Months != 1 || t.VersionID == uuid.Nil || t.Limits == nil || t.Limits.MaxSandboxes == nil || t.Family == "" || t.Version <= 0)) {
+	if payload.AllowPromotionCodes != t.PricingV2 || (t.PricingV2 && (t.Months != 1 || t.VersionID == uuid.Nil || t.Limits == nil || t.Limits.MaxConcurrent == nil || t.Family == "" || t.Version <= 0)) {
 		return proOffer{}, errors.New("invalid frozen pricing v2 terms")
 	}
-	return proOffer{Key: key, Amount: t.Amount, Months: t.Months, Credit: t.Credit, VersionID: t.VersionID, Matching: t.Matching, Limits: t.Limits, PricingV2: t.PricingV2, Family: t.Family, Version: t.Version, DisplayName: t.DisplayName}, nil
+	o := proOffer{Key: key, Amount: t.Amount, Months: t.Months, Credit: t.Credit, VersionID: t.VersionID, Matching: t.Matching, Limits: t.Limits, PricingV2: t.PricingV2, Family: t.Family, Version: t.Version, DisplayName: t.DisplayName}
+	if t.PricingV2 {
+		o.Pricing = "v2"
+	}
+	return o, nil
 }
 
 func (c proChoice) frozenOffer() (proOffer, error) {
@@ -207,6 +210,17 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 	}
 	params := StripeCreateCheckoutSessionParams{CustomerID: customer, SuccessURL: success, CancelURL: cancelURL, ClientReferenceID: team.String(), PriceIDs: prices, BasePriceID: offer.Price, Flexible: true, ResourceTerms: terms,
 		PlanTerms: &StripeCheckoutPlanTerms{Amount: offer.Amount, Months: offer.Months, Credit: offer.Credit, VersionID: offer.VersionID, Matching: offer.Matching, Limits: offer.Limits}}
+	// A pricing v2 sale offers promotion codes and assigns the plan when it
+	// activates, so it is refused until plan assignment is available.
+	v2 := offer.Pricing == "v2"
+	if v2 && !resuming {
+		params.AllowPromotionCodes = true
+		params.PlanTerms.PricingV2, params.PlanTerms.Family, params.PlanTerms.Version, params.PlanTerms.DisplayName = true, offer.Family, offer.Version, offer.DisplayName
+		if _, err = frozenProOffer(offer.Key, params); err != nil || paidPlanAssigner == nil {
+			respondErrorMsg(c, "service_unavailable", "Pro plan configuration requires verification", 503)
+			return
+		}
+	}
 	if offer.Months == 12 {
 		// Checkout cannot mix annual fees with monthly usage. Keep the actual
 		// request frozen so older replicas also replay the base-only session.
@@ -237,13 +251,16 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
-	if state == "committed" || (selected != nil && *selected != offer.Key) || account.StripeSubscriptionID != nil || account.TrialEndedAt.Valid || account.StripeActivationCreditReservedAt.Valid || account.StripeActivationCreditGrantID != nil {
+	// Under pricing v2 a Free team, including one that committed Free before,
+	// buys Pro from scratch; trial history no longer applies.
+	freeUpgrade := v2 && state == "committed" && selected != nil && *selected == "free" && !resuming
+	if (state == "committed" && !freeUpgrade) || (selected != nil && *selected != offer.Key && !freeUpgrade) || account.StripeSubscriptionID != nil || (account.TrialEndedAt.Valid && !v2) || account.StripeActivationCreditReservedAt.Valid || account.StripeActivationCreditGrantID != nil {
 		proConflict(c)
 		return
 	}
 	attempt := uuid.New()
 	var choice proChoice
-	if state == "selecting" {
+	if state == "selecting" || freeUpgrade {
 		if resuming || account.CheckoutInitializingAt.Valid || account.CheckoutCompletedAt.Valid {
 			proConflict(c)
 			return

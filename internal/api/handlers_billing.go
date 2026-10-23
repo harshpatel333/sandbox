@@ -145,8 +145,9 @@ type billingSummaryIncludedUsage struct {
 	PeriodStart time.Time `json:"period_start"`
 	PeriodEnd   time.Time `json:"period_end"`
 	Status      string    `json:"status"`
-	// Usage against the allowance, set when the allowance covers exactly the
-	// current billing period. Credit carried from other plans is not counted.
+	// Usage against the allowance, set once it is issued and when it covers
+	// exactly the current billing period. Credit carried from other plans is
+	// not counted.
 	AmountCents    int64  `json:"amount_cents"`
 	UsedCents      *int64 `json:"used_cents,omitempty"`
 	RemainingCents *int64 `json:"remaining_cents,omitempty"`
@@ -155,7 +156,7 @@ type billingSummaryIncludedUsage struct {
 
 // measure fills in usage against the allowance for the billing period.
 func (u *billingSummaryIncludedUsage) measure(periodStart, periodEnd time.Time, chargesUSD float64) {
-	if u == nil || !u.PeriodStart.Equal(periodStart) || !u.PeriodEnd.Equal(periodEnd) {
+	if u == nil || u.Status != "issued" || !u.PeriodStart.Equal(periodStart) || !u.PeriodEnd.Equal(periodEnd) {
 		return
 	}
 	used := int64(math.Round(math.Max(chargesUSD, 0) * 100))
