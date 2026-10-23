@@ -265,6 +265,8 @@ LANGUAGE sql STABLE AS $$
     WHEN qm_team_managed_billing(p_team) THEN 'qm_managed_billing'
     WHEN EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id = p_team AND c.status='active') THEN 'active_contract'
     WHEN EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id = p_team AND c.status='pending') THEN 'pending_contract'
+    WHEN a.checkout_initializing_at IS NOT NULL OR a.checkout_may_exist
+      OR EXISTS(SELECT 1 FROM billing_signup_choice c WHERE c.team_id=p_team AND c.state='pending' AND c.offer_key<>'free') THEN 'checkout_pending'
     WHEN EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.team_id = p_team AND o.state <> 'ended') THEN 'yc_operation'
     WHEN EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.team_id = p_team AND o.state NOT IN ('revoked','expired')) THEN 'sponsored_operation'
     WHEN EXISTS(SELECT 1 FROM abuse_restrictions r WHERE r.subject_team_id = p_team AND r.released_at IS NULL

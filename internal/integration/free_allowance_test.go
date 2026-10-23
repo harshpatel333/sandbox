@@ -340,6 +340,14 @@ func TestIntegration_PricingV2Activation_Buckets(t *testing.T) {
 	exec(`INSERT INTO abuse_restrictions (subject_type, subject_value, subject_team_id, action, source, reason)
 		VALUES ('team', $1::text, $1::uuid, 'create', 'test', 'test')`, blocked)
 
+	checkoutLease, _ := seedTeamAndKey(t)
+	exec(`INSERT INTO team_billing_account(team_id,checkout_initializing_at) VALUES($1,clock_timestamp())`, checkoutLease)
+	checkoutPossible, _ := seedTeamAndKey(t)
+	exec(`INSERT INTO team_billing_account(team_id,checkout_may_exist) VALUES($1,true)`, checkoutPossible)
+	paidChoice, _ := seedTeamAndKey(t)
+	exec(`INSERT INTO billing_signup_choice(team_id,state,offer_key,generation,actor_id,base_price_id,request_payload)
+        VALUES($1,'pending','pro_monthly',clock_timestamp(),$2,'price_test','{}')
+        ON CONFLICT(team_id) DO UPDATE SET state='pending',offer_key='pro_monthly',generation=clock_timestamp(),actor_id=$2,base_price_id='price_test',request_payload='{}'`, paidChoice, uuid.New())
 	for _, tc := range []struct {
 		name   string
 		team   uuid.UUID
@@ -352,6 +360,9 @@ func TestIntegration_PricingV2Activation_Buckets(t *testing.T) {
 		{"no card with granted credit", granted, "free", ""},
 		{"abuse blocked with a card", blocked, "blocked", "abuse_blocked"},
 		{"already assigned", assigned, "assigned", "already_assigned"},
+		{"checkout lease", checkoutLease, "skipped", "checkout_pending"},
+		{"checkout may exist", checkoutPossible, "skipped", "checkout_pending"},
+		{"pending paid choice", paidChoice, "skipped", "checkout_pending"},
 	} {
 		if bucket, reason := activationBucket(t, tc.team); bucket != tc.bucket || reason != tc.reason {
 			t.Errorf("%s: bucket %q reason %q, want %q %q", tc.name, bucket, reason, tc.bucket, tc.reason)
@@ -537,6 +548,11 @@ func TestIntegration_PricingV2Activation_ApplyAssignsEveryBucketOnce(t *testing.
 		return id
 	}
 	payg, lapsedCredit, lapsedSpent, noCard, blocked := team(), team(), team(), team(), team()
+	pendingCheckout := team()
+	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,$2)`, pendingCheckout, "cus_"+pendingCheckout.String())
+	exec(`INSERT INTO billing_signup_choice(team_id,state,offer_key,generation,actor_id,base_price_id,request_payload)
+        VALUES($1,'pending','pro_monthly',clock_timestamp(),$2,'price_test','{}')
+        ON CONFLICT(team_id) DO UPDATE SET state='pending',offer_key='pro_monthly',generation=clock_timestamp(),actor_id=$2,base_price_id='price_test',request_payload='{}'`, pendingCheckout, uuid.New())
 	exec(`INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status) VALUES ($1, $2, $3, 'active')`, payg, "cus_"+payg.String(), "sub_"+payg.String())
 	exec(`INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status) VALUES ($1, $2, $3, 'canceled')`, lapsedCredit, "cus_"+lapsedCredit.String(), "sub_"+lapsedCredit.String())
 	exec(`INSERT INTO team_billing_account (team_id, stripe_customer_id) VALUES ($1, $2)`, lapsedSpent, "cus_"+lapsedSpent.String())
@@ -552,7 +568,7 @@ func TestIntegration_PricingV2Activation_ApplyAssignsEveryBucketOnce(t *testing.
 		return slices.ContainsFunc(teams, func(a api.ActivationTeam) bool { return a.TeamID == id })
 	}
 	if report.PricingVersion != "legacy" || !listed(report.BlockedToFree, blocked) || !listed(report.LapsedWithCredit, lapsedCredit) ||
-		!listed(report.LapsedNoCredit, lapsedSpent) || report.Pending < 5 {
+		!listed(report.LapsedNoCredit, lapsedSpent) || report.Pending < 5 || !listed(report.Skipped, pendingCheckout) {
 		t.Fatalf("report = %+v", report)
 	}
 	if _, err := activation.ApplyBatch(ctx, "operator@example.com", "pricing v2 launch", 500); !errors.Is(err, api.ErrPricingV2Off) {
@@ -599,6 +615,10 @@ func TestIntegration_PricingV2Activation_ApplyAssignsEveryBucketOnce(t *testing.
 		t.Fatalf("switch-off admission = %+v, %v; want the existing Free shape enforced", row, err)
 	}
 	exec(`UPDATE billing_pricing_switch SET pricing_version = 'v2'`)
+	var checkoutAssigned bool
+	if err := testPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1)`, pendingCheckout).Scan(&checkoutAssigned); err != nil || checkoutAssigned {
+		t.Fatalf("in-flight paid checkout assigned = %v, %v", checkoutAssigned, err)
+	}
 	if eligible(t, blocked) {
 		t.Fatal("activation lifted an abuse block")
 	}
