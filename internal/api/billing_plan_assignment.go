@@ -67,6 +67,7 @@ func freezePlanTerms(t planTerms) frozenPlanTerms {
 	if allowance != nil && allowance.Compute != nil {
 		basis := *allowance
 		basis.AmountCents = 0
+		basis.AmountUSD = ""
 		allowance = &basis
 	}
 	grants := t.Grants
@@ -412,7 +413,7 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	terms, err := h.planTerms(ctx, target)
+	terms, err := h.planTermsForPricingVersion(ctx, target, "v2")
 	if errors.Is(err, errUnknownPlan) {
 		respondErrorMsg(c, "invalid_plan", "this plan is not available", http.StatusBadRequest)
 		return
