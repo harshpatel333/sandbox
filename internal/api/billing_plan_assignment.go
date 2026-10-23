@@ -450,6 +450,17 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 			preview.Timing, preview.Blocked = "", "new plans are not available yet"
 		}
 	}
+	if preview.Blocked == "" && kind == planKindFree {
+		ready, err := planChangePausesReady(ctx, h.Pool)
+		if err != nil {
+			log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		if !ready {
+			preview.Blocked = planChangePausesUnavailable
+		}
+	}
 	if preview.Blocked == "" {
 		preview.PausesRunning = kind == planKindFree
 		at := h.nowUTC()

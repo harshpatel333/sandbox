@@ -79,7 +79,7 @@ func (c teamPlanChange) Undoable(now time.Time) bool {
 // needsRenewal reports whether an undone change told Stripe not to renew a
 // subscription that had been renewing, so renewal must be turned back on.
 func (c teamPlanChange) needsRenewal() bool {
-	return c.State == "undone" && c.CancelRequestedAt != nil && !c.CancelPreexisting && c.ProviderRenewedAt == nil
+	return c.State == "undone" && c.CancelRequestedAt != nil && c.ProviderRenewedAt == nil
 }
 
 const teamPlanChangeColumns = `id,team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,subscription_id,
@@ -167,11 +167,31 @@ func (h *Handlers) scheduleTeamPlanChange(ctx context.Context, req teamPlanChang
 	if prior, err := replayTeamPlanChange(ctx, h.Pool, req); !errors.Is(err, pgx.ErrNoRows) {
 		return prior, err
 	}
+	if req.Target == "free" {
+		ready, err := planChangePausesReady(ctx, h.Pool)
+		if err != nil {
+			return teamPlanChange{}, err
+		}
+		if !ready {
+			return teamPlanChange{}, teamPlanChangeConflict(planChangePausesUnavailable)
+		}
+	}
 	terms, err := h.planTermsForPricingVersion(ctx, req.Target, "v2")
 	if err != nil {
 		return teamPlanChange{}, err
 	}
 	return h.scheduleTeamPlanChangeTo(ctx, req, terms)
+}
+
+const planChangePausesUnavailable = "moves to Free are temporarily unavailable until pause support is deployed"
+
+func planChangePausesReady(ctx context.Context, q db.DBTX) (bool, error) {
+	var ready bool
+	err := q.QueryRow(ctx, `SELECT to_regprocedure('request_team_pause_all(uuid,text)') IS NOT NULL
+        AND to_regclass('billing_team_pause_target') IS NOT NULL
+        AND CASE WHEN to_regclass('billing_team_pause_target') IS NULL THEN false
+        ELSE to_regprocedure('billing_pause_target_settled(billing_team_pause_target)') IS NOT NULL END`).Scan(&ready)
+	return ready, err
 }
 
 func replayTeamPlanChange(ctx context.Context, q db.DBTX, req teamPlanChangeRequest) (teamPlanChange, error) {
@@ -227,7 +247,7 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 	}
 	var pending bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=$1 AND
-        (state='scheduled' OR (state='undone' AND provider_cancel_requested_at IS NOT NULL AND NOT provider_cancel_preexisting AND provider_renewed_at IS NULL)))`, req.Team).Scan(&pending); err != nil || pending {
+        (state='scheduled' OR (state='undone' AND provider_cancel_requested_at IS NOT NULL AND provider_renewed_at IS NULL)))`, req.Team).Scan(&pending); err != nil || pending {
 		if err == nil {
 			err = teamPlanChangeConflict("the team already has a pending plan change; wait for it to finish or undo it")
 		}
@@ -328,7 +348,11 @@ func (h *Handlers) planChangeSubscription(ctx context.Context, team, contract uu
 	if subscriptionEnded(sub) {
 		return nil, time.Time{}, teamPlanChangeConflict("the team's subscription has already ended")
 	}
-	return &subscription, subscriptionPeriodEnd(sub), nil
+	end := subscriptionPeriodEnd(sub)
+	if sub.CancelAt != 0 && time.Unix(sub.CancelAt, 0).After(end) {
+		return nil, time.Time{}, teamPlanChangeConflict("the subscription cancellation is later than this billing period; confirm its cancellation date before changing plans")
+	}
+	return &subscription, end, nil
 }
 
 // planChangePeriodEnd is the end of the team's billing period, or of the next
@@ -354,7 +378,7 @@ func (h *Handlers) undoTeamPlanChange(ctx context.Context, team, id, actor uuid.
 		return c, nil
 	}
 	tag, err := h.Pool.Exec(ctx, `UPDATE team_plan_change SET state='undone',undone_at=clock_timestamp(),undone_by=$2,undo_reason=$4,
-        next_check_at=CASE WHEN provider_cancel_requested_at IS NOT NULL AND NOT provider_cancel_preexisting THEN clock_timestamp() ELSE 'infinity'::timestamptz END
+        next_check_at=CASE WHEN provider_cancel_requested_at IS NOT NULL THEN clock_timestamp() ELSE 'infinity'::timestamptz END
         WHERE id=$1 AND state='scheduled' AND effective_at>clock_timestamp()+$3::interval AND (lease_until IS NULL OR lease_until<clock_timestamp())`,
 		c.ID, actor, planChangeUndoCutoff.String(), reason)
 	if err != nil {
@@ -376,17 +400,21 @@ func (h *Handlers) undoTeamPlanChange(ctx context.Context, team, id, actor uuid.
 // of its current period, and checks that it took. Setting the flag is
 // naturally repeatable, so each attempt is a fresh request: a cached failure
 // can never be replayed in place of the real state.
-func (h *Handlers) setSubscriptionRenewal(ctx context.Context, subscription string, renew bool) error {
+func (h *Handlers) setSubscriptionRenewal(ctx context.Context, subscription string, change uuid.UUID, renew bool) error {
 	client, ok := h.Stripe.(*stripeHTTPClient)
 	if !ok {
 		return errors.New("plan changes require the Stripe provider")
 	}
 	var sub invoiceSubscription
-	form := url.Values{"cancel_at_period_end": {fmt.Sprint(!renew)}, "proration_behavior": {"none"}}
+	owner := change.String()
+	if renew {
+		owner = ""
+	}
+	form := url.Values{"cancel_at_period_end": {fmt.Sprint(!renew)}, "proration_behavior": {"none"}, "metadata[plan_change_cancellation]": {owner}}
 	if err := client.doForm(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(subscription), form, &sub, ""); err != nil {
 		return err
 	}
-	if sub.ID != subscription || sub.CancelAtPeriodEnd == renew || renew && sub.CancelAt != 0 {
+	if sub.ID != subscription || sub.CancelAtPeriodEnd == renew || renew && sub.CancelAt != 0 || sub.Metadata["plan_change_cancellation"] != owner {
 		return errors.New("subscription renewal did not change as requested")
 	}
 	return nil
@@ -408,6 +436,16 @@ func subscriptionWillEnd(sub invoiceSubscription) bool {
 	return subscriptionEnded(sub) || sub.CancelAtPeriodEnd || sub.CancelAt != 0
 }
 
+func subscriptionStopsBy(sub invoiceSubscription, boundary time.Time) bool {
+	if subscriptionEnded(sub) {
+		return true
+	}
+	if sub.CancelAt != 0 {
+		return !time.Unix(sub.CancelAt, 0).After(boundary)
+	}
+	return sub.CancelAtPeriodEnd && !subscriptionPeriodEnd(sub).After(boundary)
+}
+
 const teamPlanChangeReviewFailures = 6
 
 func teamPlanChangeRetryDelay(failures int) time.Duration {
@@ -425,7 +463,7 @@ func (h *Handlers) teamPlanChangeTick(ctx context.Context) (bool, error) {
 func (h *Handlers) runDueTeamPlanChange(ctx context.Context, team uuid.UUID) (bool, error) {
 	token := uuid.New()
 	c, err := scanTeamPlanChange(h.Pool.QueryRow(ctx, `WITH due AS (SELECT id AS due_id FROM team_plan_change WHERE next_check_at<=clock_timestamp()
-        AND (state IN ('scheduled','applied') OR (state='undone' AND provider_cancel_requested_at IS NOT NULL AND NOT provider_cancel_preexisting AND provider_renewed_at IS NULL))
+        AND (state IN ('scheduled','applied') OR (state='undone' AND provider_cancel_requested_at IS NOT NULL AND provider_renewed_at IS NULL))
         AND (lease_until IS NULL OR lease_until<clock_timestamp()) AND ($2::uuid=$3::uuid OR team_id=$2::uuid)
         ORDER BY next_check_at,id FOR UPDATE SKIP LOCKED LIMIT 1)
         UPDATE team_plan_change p SET lease_token=$1,lease_until=clock_timestamp()+interval '3 minutes' FROM due WHERE p.id=due.due_id
@@ -453,7 +491,7 @@ func (h *Handlers) runDueTeamPlanChange(ctx context.Context, team uuid.UUID) (bo
 	ack, cancelAck := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancelAck()
 	_, err = h.Pool.Exec(ack, `UPDATE team_plan_change SET lease_token=NULL,lease_until=NULL,
-        next_check_at=CASE WHEN state='completed' OR (state='undone' AND (provider_cancel_requested_at IS NULL OR provider_cancel_preexisting OR provider_renewed_at IS NOT NULL))
+        next_check_at=CASE WHEN state='completed' OR (state='undone' AND (provider_cancel_requested_at IS NULL OR provider_renewed_at IS NOT NULL))
          THEN 'infinity'::timestamptz ELSE $3::timestamptz END,
         failures=CASE WHEN $4='' THEN 0 ELSE failures+1 END,last_error=NULLIF($4,'') WHERE id=$1 AND lease_token=$2`, c.ID, token, next, msg)
 	return true, err
@@ -545,8 +583,11 @@ func (h *Handlers) stopPlanChangeRenewal(ctx context.Context, c teamPlanChange, 
 			return now, errors.New("subscription period does not end when the plan change takes effect")
 		}
 	}
+	if subscriptionWillEnd(sub) && !subscriptionStopsBy(sub, c.EffectiveAt) {
+		return now, errors.New("the subscription cancellation is later than the confirmed plan change")
+	}
 	if !subscriptionWillEnd(sub) {
-		if err = h.setSubscriptionRenewal(ctx, *c.Subscription, false); err != nil {
+		if err = h.setSubscriptionRenewal(ctx, *c.Subscription, c.ID, false); err != nil {
 			return now, err
 		}
 	}
@@ -562,6 +603,9 @@ func (h *Handlers) stopPlanChangeRenewal(ctx context.Context, c teamPlanChange, 
 			return now, err
 		}
 		c.EffectiveAt = end
+	}
+	if !subscriptionStopsBy(sub, c.EffectiveAt) {
+		return now, errors.New("the subscription would continue beyond the confirmed plan change")
 	}
 	if err = fencedPlanChangeUpdate(ctx, tx, c, `provider_cancel_at=clock_timestamp()`); err != nil {
 		return now, err
@@ -596,8 +640,9 @@ func (h *Handlers) restorePlanChangeRenewal(ctx context.Context, c teamPlanChang
 		if err != nil {
 			return err
 		}
-		if !subscriptionEnded(sub) && subscriptionWillEnd(sub) {
-			if err = h.setSubscriptionRenewal(ctx, *c.Subscription, true); err != nil {
+		if !subscriptionEnded(sub) && sub.CancelAtPeriodEnd && sub.Metadata["plan_change_cancellation"] == c.ID.String() &&
+			(sub.CancelAt == 0 || sub.CancelAt == subscriptionPeriodEnd(sub).Unix()) {
+			if err = h.setSubscriptionRenewal(ctx, *c.Subscription, c.ID, true); err != nil {
 				return err
 			}
 		}
@@ -627,6 +672,9 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 		}
 		if end := subscriptionPeriodEnd(sub); !subscriptionEnded(sub) && end.After(c.EffectiveAt) {
 			return end, fencedPlanChangeUpdate(ctx, h.Pool, c, `effective_at=$3`, end)
+		}
+		if !subscriptionStopsBy(sub, c.EffectiveAt) {
+			return now, errors.New("the subscription cancellation is later than the confirmed plan change")
 		}
 	}
 	tx, err := h.Pool.Begin(ctx)

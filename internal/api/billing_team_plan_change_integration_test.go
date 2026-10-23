@@ -21,15 +21,21 @@ import (
 )
 
 type renewalStripe struct {
-	t            *testing.T
-	mu           sync.Mutex
-	sub          string
-	periodEnd    time.Time
-	status       string
-	cancel       bool
-	writes       []string
-	failWrite    bool
-	renewOnWrite bool
+	t              *testing.T
+	mu             sync.Mutex
+	sub            string
+	periodEnd      time.Time
+	status         string
+	cancel         bool
+	writes         []string
+	failWrite      bool
+	renewOnWrite   bool
+	cancelAt       int64
+	owner          string
+	reads          int
+	cancelOnRead   int
+	renewOnRead    int
+	failAfterWrite bool
 }
 
 func (s *renewalStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -39,6 +45,17 @@ func (s *renewalStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.t.Errorf("unexpected provider request %s %s", r.Method, r.URL)
 		http.Error(w, "unexpected", 500)
 		return
+	}
+	if r.Method == http.MethodGet {
+		s.reads++
+		if s.reads == s.renewOnRead {
+			s.cancel = false
+			s.owner = ""
+		}
+		if s.reads == s.cancelOnRead {
+			s.cancel = true
+			s.owner = ""
+		}
 	}
 	if r.Method == http.MethodPost {
 		if s.failWrite {
@@ -51,9 +68,15 @@ func (s *renewalStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = r.ParseForm()
 		s.cancel = r.PostForm.Get("cancel_at_period_end") == "true"
+		s.owner = r.PostForm.Get("metadata[plan_change_cancellation]")
 		s.writes = append(s.writes, "cancel_at_period_end="+r.PostForm.Get("cancel_at_period_end"))
+		if s.failAfterWrite {
+			s.failAfterWrite = false
+			http.Error(w, "lost response", 503)
+			return
+		}
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"id": s.sub, "customer": "cus_x", "status": s.status, "cancel_at_period_end": s.cancel,
+	_ = json.NewEncoder(w).Encode(map[string]any{"id": s.sub, "customer": "cus_x", "status": s.status, "cancel_at_period_end": s.cancel, "cancel_at": s.cancelAt, "metadata": map[string]string{"plan_change_cancellation": s.owner},
 		"items": map[string]any{"data": []map[string]any{{"id": "si_x", "current_period_start": s.periodEnd.AddDate(0, -1, 0).Unix(), "current_period_end": s.periodEnd.Unix()}}}})
 }
 
@@ -322,7 +345,7 @@ func TestTeamPlanChangeUndoAfterUnconfirmedRequestRestoresRenewal(t *testing.T) 
 	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE team_plan_change SET provider_cancel_requested_at=clock_timestamp() WHERE id=$1`, c.ID); err != nil {
 		t.Fatal(err)
 	}
-	f.stripe.set(func(s *renewalStripe) { s.cancel = true })
+	f.stripe.set(func(s *renewalStripe) { s.cancel = true; s.owner = c.ID.String() })
 	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind"); err != nil {
 		t.Fatal(err)
 	}
@@ -472,11 +495,11 @@ func TestTeamPlanChangeExitAndUndoContinueWhilePricingV2IsOff(t *testing.T) {
 	if err != nil || on {
 		t.Fatalf("fixture must have entry switched off: %v %v", on, err)
 	}
-	terms, err := f.h.planTermsForPricingVersion(t.Context(), "free", "v2")
+	terms, err := f.h.planTermsForPricingVersion(t.Context(), "starter", "v2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := f.h.scheduleTeamPlanChange(t.Context(), f.intent(t, "free", "exit", terms))
+	c, err := f.h.scheduleTeamPlanChange(t.Context(), f.intent(t, "starter", "exit", terms))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -722,5 +745,102 @@ func TestTeamPlanChangeHistorySurvivesTeamDeletionWithoutRestoringRenewal(t *tes
 				t.Fatal("accepted new work for a deleted team")
 			}
 		})
+	}
+}
+
+func TestTeamPlanChangeCancellationOwnershipSurvivesRetries(t *testing.T) {
+	for _, scenario := range []string{"between_reads", "intent_before_write", "lost_write_response", "cancel_removed_between_reads"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newPlanChangeV2Fixture(t, planKindSubscription)
+			c, err := f.request(t, "starter", "ownership")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "between_reads" {
+				f.stripe.set(func(s *renewalStripe) { s.reads = 0; s.cancelOnRead = 2 })
+			}
+			if scenario == "cancel_removed_between_reads" {
+				f.stripe.set(func(s *renewalStripe) { s.cancel = true; s.reads = 0; s.renewOnRead = 2 })
+			}
+			if scenario == "intent_before_write" {
+				if _, err = f.h.Pool.Exec(t.Context(), `UPDATE team_plan_change SET provider_cancel_requested_at=clock_timestamp() WHERE id=$1`, c.ID); err != nil {
+					t.Fatal(err)
+				}
+				f.stripe.set(func(s *renewalStripe) { s.cancel = true })
+			}
+			if scenario == "lost_write_response" {
+				f.stripe.set(func(s *renewalStripe) { s.failAfterWrite = true })
+			}
+			f.tick(t)
+			f.tick(t)
+			if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan"); err != nil {
+				t.Fatal(err)
+			}
+			f.tick(t)
+			shouldRemainCancelled := scenario != "lost_write_response" && scenario != "cancel_removed_between_reads"
+			if f.stripe.cancel != shouldRemainCancelled || f.reload(t, c.ID).needsRenewal() {
+				t.Fatalf("renewed independent cancellation or failed to restore owned cancellation: %+v %+v", f.stripe, f.reload(t, c.ID))
+			}
+		})
+	}
+}
+
+func TestTeamPlanChangeExplicitCancellationCannotOutliveDowngrade(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindSubscription)
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = s.periodEnd.Add(24 * time.Hour).Unix() })
+	if _, _, err := f.h.planChangeBoundary(t.Context(), f.team, f.plan(t), time.Now()); !errors.Is(err, errTeamPlanChangeConflict) {
+		t.Fatalf("accepted later explicit cancellation: %v", err)
+	}
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = 0 })
+	c, err := f.request(t, "starter", "scheduled-before-cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = s.periodEnd.Add(24 * time.Hour).Unix() })
+	f.tick(t)
+	if c = f.reload(t, c.ID); c.ProviderCancelAt != nil || c.State != "scheduled" || len(f.stripe.writes) != 0 {
+		t.Fatalf("confirmed later cancellation: %+v", c)
+	}
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = 0 })
+	f.tick(t)
+	f.reachEffective(t, c.ID)
+	f.stripe.set(func(s *renewalStripe) {
+		s.periodEnd = time.Now().Add(-time.Minute)
+		s.cancelAt = time.Now().Add(24 * time.Hour).Unix()
+		s.cancel = false
+	})
+	f.tick(t)
+	if c = f.reload(t, c.ID); c.State != "scheduled" || f.plan(t).PlanKey != "pro_monthly" {
+		t.Fatalf("downgraded before explicit cancellation: %+v", c)
+	}
+}
+
+func TestTeamPlanChangeFreeEntryRequiresDeployedPauseSupport(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindCustom)
+	ready, err := planChangePausesReady(t.Context(), f.h.Pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready {
+		t.Skip("missing-prerequisite regression requires baseline schema")
+	}
+	req := f.intent(t, "free", "no-pause-support", testPlanTerms("free", planKindFree, 1, nil))
+	if _, err = f.h.scheduleTeamPlanChange(t.Context(), req); !errors.Is(err, errTeamPlanChangeConflict) {
+		t.Fatalf("accepted Free before deployment: %v", err)
+	}
+	var count int
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM team_plan_change WHERE team_id=$1`, f.team).Scan(&count); err != nil || count != 0 || len(f.stripe.writes) != 0 {
+		t.Fatalf("unavailable Free created work: %d %v", count, err)
+	}
+	c, err := f.request(t, "free", "committed-before-rollback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Key = "committed-before-rollback"
+	if replay, err := f.h.scheduleTeamPlanChange(t.Context(), req); err != nil || replay.ID != c.ID {
+		t.Fatalf("readiness blocked committed replay: %+v %v", replay, err)
+	}
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan"); err != nil {
+		t.Fatalf("readiness blocked undo: %v", err)
 	}
 }

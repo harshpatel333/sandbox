@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -82,7 +83,16 @@ func TestIntegration_BillingPlanUnderPricingV2(t *testing.T) {
 		Timing  string `json:"timing"`
 		Blocked string `json:"blocked"`
 	}
-	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &preview) != nil || preview.Blocked != "" || preview.Timing != "immediate" {
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &preview) != nil {
+		t.Fatalf("preview: %d %s", w.Code, w.Body)
+	}
+	if !planChangePauseSupportAvailable(t) {
+		if preview.Blocked == "" || preview.Timing != "" {
+			t.Fatalf("Free offered before pause deployment: %s", w.Body)
+		}
+		return
+	}
+	if preview.Blocked != "" || preview.Timing != "immediate" {
 		t.Fatalf("starter team's upgrade preview: %d %s", w.Code, w.Body.String())
 	}
 }
@@ -119,8 +129,9 @@ func TestIntegration_BillingPlanChangeStaffPendingAndUndoReason(t *testing.T) {
 	previewResponse := do(newRouter(t), http.MethodGet, "/billing/plan-change-preview?target_plan=free", key, "")
 	var preview struct {
 		EffectiveAt time.Time `json:"effective_at"`
+		Blocked     string    `json:"blocked"`
 	}
-	if previewResponse.Code != http.StatusOK || json.Unmarshal(previewResponse.Body.Bytes(), &preview) != nil || !preview.EffectiveAt.After(time.Now().Add(24*time.Hour)) {
+	if previewResponse.Code != http.StatusOK || json.Unmarshal(previewResponse.Body.Bytes(), &preview) != nil || preview.Blocked == "" && !preview.EffectiveAt.After(time.Now().Add(24*time.Hour)) {
 		t.Fatalf("preview ignored minimum notice: %d %s", previewResponse.Code, previewResponse.Body)
 	}
 	staff := seedPlatformAdminProfile(t).String()
@@ -131,11 +142,22 @@ func TestIntegration_BillingPlanChangeStaffPendingAndUndoReason(t *testing.T) {
 		ID          string    `json:"id"`
 		EffectiveAt time.Time `json:"effective_at"`
 	}
-	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &change) != nil || change.ID == "" {
-		t.Fatalf("staff exit while entry off: %d %s", w.Code, w.Body)
-	}
-	if !change.EffectiveAt.Equal(preview.EffectiveAt) {
-		t.Fatalf("preview and scheduling disagree: %s != %s", preview.EffectiveAt, change.EffectiveAt)
+	if !planChangePauseSupportAvailable(t) {
+		if preview.Blocked == "" || w.Code != http.StatusConflict {
+			t.Fatalf("staff Free accepted before pause deployment: %d %s", w.Code, w.Body)
+		}
+		if err := testPool.QueryRow(t.Context(), `INSERT INTO team_plan_change(team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,requested_by,requested_via,reason,idempotency_key)
+            SELECT team_id,id,'free','free','{}','{"max_concurrent":1}',clock_timestamp()+interval '2 days',true,$2,'staff','committed exit','staff-exit'
+            FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL RETURNING id::text,effective_at`, team, staff).Scan(&change.ID, &change.EffectiveAt); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &change) != nil || change.ID == "" {
+			t.Fatalf("staff exit while entry off: %d %s", w.Code, w.Body)
+		}
+		if !change.EffectiveAt.Equal(preview.EffectiveAt) {
+			t.Fatalf("preview and scheduling disagree: %s != %s", preview.EffectiveAt, change.EffectiveAt)
+		}
 	}
 	for _, response := range []*httptest.ResponseRecorder{
 		doInternal(router, http.MethodGet, "/internal/teams/"+team.String()+"/billing/plan-assignments", staff, ""),
@@ -183,6 +205,21 @@ func TestIntegration_BillingPlanChangeCustomerConsent(t *testing.T) {
 	var preview struct {
 		Token       string    `json:"preview_token"`
 		EffectiveAt time.Time `json:"effective_at"`
+		Blocked     string    `json:"blocked"`
+	}
+	if !planChangePauseSupportAvailable(t) {
+		if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &preview) != nil || preview.Blocked == "" || preview.Token != "" {
+			t.Fatalf("Free preview not blocked before deployment: %d %s", w.Code, w.Body)
+		}
+		body := `{"target_plan":"free","idempotency_key":"unavailable","preview_token":"` + strings.Repeat("a", 64) + `","expected_effective_at":"` + time.Now().Add(48*time.Hour).Format(time.RFC3339Nano) + `","confirm_pauses_running":true}`
+		if w := do(r, http.MethodPost, "/billing/plan-changes", key, body); w.Code != http.StatusConflict {
+			t.Fatalf("customer Free accepted before deployment: %d %s", w.Code, w.Body)
+		}
+		var count int
+		if err := testPool.QueryRow(t.Context(), `SELECT count(*) FROM team_plan_change WHERE team_id=$1`, team).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("unavailable Free created work: %d %v", count, err)
+		}
+		return
 	}
 	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &preview) != nil || len(preview.Token) != 64 {
 		t.Fatalf("exit preview missing consent token with entry off: %d %s", w.Code, w.Body)
@@ -226,4 +263,13 @@ func TestIntegration_BillingPlanChangeCustomerConsent(t *testing.T) {
 	if w = do(r, http.MethodPost, "/billing/plan-changes/"+change.ID+"/undo", key, ""); w.Code != http.StatusOK {
 		t.Fatalf("undo refused with entry off: %d %s", w.Code, w.Body)
 	}
+}
+
+func planChangePauseSupportAvailable(t *testing.T) bool {
+	t.Helper()
+	var available bool
+	if err := testPool.QueryRow(t.Context(), `SELECT to_regprocedure('request_team_pause_all(uuid,text)') IS NOT NULL`).Scan(&available); err != nil {
+		t.Fatal(err)
+	}
+	return available
 }
