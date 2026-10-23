@@ -244,6 +244,7 @@ func TestPrepaidEnforcementSkipsTeamsWithoutIssuedPurchases(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.exec(`INSERT INTO billing_funding_account(team_id,observe,customer_id,subscription_id,credit_usd,credit_valid_until,credit_checked_at,observed_generation) VALUES($1,true,'cus_dormant','sub_dormant',5,clock_timestamp()+interval '1 minute',clock_timestamp(),1) ON CONFLICT(team_id) DO UPDATE SET observe=true,customer_id=EXCLUDED.customer_id,subscription_id=EXCLUDED.subscription_id,credit_usd=EXCLUDED.credit_usd,credit_valid_until=EXCLUDED.credit_valid_until,credit_checked_at=EXCLUDED.credit_checked_at,observed_generation=billing_funding_account.generation`, id)
+		f.exec(`UPDATE billing_funding_account SET observed_generation=generation WHERE team_id=$1`, id)
 	}
 	if err = f.h.startPrepaidEnforcement(t.Context()); err != nil {
 		t.Fatal(err)
