@@ -50,6 +50,13 @@ func TestMatchingUsageCountsBalanceCarryAsPaidWhereUsageHappened(t *testing.T) {
 	if u, err := matchingInvoiceUsage(collecting, matchingPayment{AmountPaid: 70}, []string{"price_cpu"}); err != nil || u.UsageCents-u.UnpaidCents != 30 {
 		t.Fatalf("carried balance was matched again on the collecting invoice: %+v %v", u, err)
 	}
+	var credited StripeInvoiceAmounts
+	if err := json.Unmarshal([]byte(`{"starting_balance":-100,"ending_balance":-30,"lines":{"data":[{"amount":70,"currency":"usd","pricing":{"price_details":{"price":"price_cpu"}}}]}}`), &credited); err != nil {
+		t.Fatal(err)
+	}
+	if u, err := matchingInvoiceUsage(credited, matchingPayment{}, []string{"price_cpu"}); err != nil || u.UnpaidCents != 70 {
+		t.Fatalf("usage settled from a credit balance was matched as paid: %+v %v", u, err)
+	}
 }
 
 func TestMatchingGrantFormRejectsExpiringOrScopedRequests(t *testing.T) {

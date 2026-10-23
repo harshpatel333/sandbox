@@ -55,11 +55,12 @@ type matchingPayment struct {
 
 // Stripe settles an invoice below its minimum charge by carrying the amount
 // onto the customer balance; that usage is paid where it happened, and the
-// later invoice collecting the carry matches only its own usage.
+// later invoice collecting the carry matches only its own usage. Spending a
+// credit balance is not customer payment, so only growth in owed balance counts.
 func (p matchingPayment) settled(inv StripeInvoiceAmounts) int64 {
 	carried := int64(0)
 	if inv.EndingBalance != nil {
-		carried = max(*inv.EndingBalance-inv.StartingBalance, 0)
+		carried = max(max(*inv.EndingBalance, 0)-max(inv.StartingBalance, 0), 0)
 	}
 	return p.AmountPaid + carried
 }
@@ -278,7 +279,7 @@ func (h *Handlers) issueDueMatchingCredits(ctx context.Context, client *stripeHT
 			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET failures=0,last_error=NULL WHERE id=$1`, id)
 		case errors.Is(issueErr, errMatchingDeferred) || errors.Is(issueErr, errCreditInventoryPending):
 			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET last_error=$2,
- next_attempt_at=clock_timestamp()+CASE WHEN created_at<clock_timestamp()-interval '1 day' THEN interval '1 hour' ELSE interval '30 seconds' END WHERE id=$1`, id, issueErr.Error())
+ next_attempt_at=clock_timestamp()+CASE WHEN $3 AND created_at<clock_timestamp()-interval '1 day' THEN interval '1 hour' ELSE interval '30 seconds' END WHERE id=$1`, id, issueErr.Error(), errors.Is(issueErr, errMatchingDeferred))
 			issueErr = nil
 		default:
 			log.Error().Err(issueErr).Str("matching_credit_id", id.String()).Msg("matching credit issuance failed; inspect before replaying")
