@@ -269,8 +269,14 @@ func TestStaffCreditGrantWaitsForPeriodClose(t *testing.T) {
 	if _, err := h.Pool.Exec(t.Context(), `DELETE FROM team_billing_period WHERE team_id=$1 AND period_end>clock_timestamp()`, team); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k2", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
+		t.Fatalf("credit granted while an old usage-ledger period was unreleased: %v", err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan,state) SELECT team_id,period_start,period_end,'in_staff_credit_'||team_id,'{}'::jsonb,'released' FROM team_billing_period WHERE team_id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k2", AmountCents: 100, Reason: "r"}); err != nil || s.creates != 1 {
-		t.Fatalf("an old unreleased period blocked staff credit: %v", err)
+		t.Fatalf("credit could not resume after the old period was released: %v", err)
 	}
 }
 

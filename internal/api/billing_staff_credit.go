@@ -95,12 +95,12 @@ func (h *Handlers) CreateStaffCreditGrant(c *gin.Context) {
 }
 
 // usageLedgerPeriodClosing reports a period ending within the attempt window or
-// recently ended and still being closed through the usage-only credit ledger,
+// ended and still being closed through the usage-only credit ledger,
 // which cannot place credit that became effective after the period ended into
 // that period's held invoice.
 func (h *Handlers) usageLedgerPeriodClosing(ctx context.Context, team uuid.UUID, reader db.DBTX) (bool, error) {
 	rows, err := reader.Query(ctx, `SELECT p.period_start,p.period_end FROM team_billing_period p JOIN billing_invoice_account i USING(team_id)
-        WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp()+interval '5 minutes' AND p.period_end>clock_timestamp()-interval '7 days'
+        WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp()+interval '5 minutes'
         AND NOT EXISTS(SELECT 1 FROM billing_invoice_close c WHERE c.team_id=p.team_id AND c.period_start=p.period_start AND c.period_end=p.period_end AND c.state='released')`, team)
 	if err != nil {
 		return false, err
