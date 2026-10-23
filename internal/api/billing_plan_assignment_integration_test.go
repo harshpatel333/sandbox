@@ -5,10 +5,13 @@ package api
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -158,5 +161,25 @@ func TestPlanAssignmentHistoryIsImmutable(t *testing.T) {
 	}
 	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE id=$1`, p.ID); err == nil {
 		t.Fatal("a closed assignment was closed again")
+	}
+}
+
+func TestPlanAssignmentStaffViewRequiresStaff(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	for _, actor := range []struct {
+		header string
+		want   int
+	}{{"", http.StatusUnauthorized}, {uuid.NewString(), http.StatusForbidden}} {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+		if actor.header != "" {
+			c.Request.Header.Set(internalActorHeader, actor.header)
+		}
+		c.Params = gin.Params{{Key: "team_id", Value: team.String()}}
+		h.GetTeamPlanAssignments(c)
+		if w.Code != actor.want {
+			t.Fatalf("plan assignments with actor %q: got %d want %d", actor.header, w.Code, actor.want)
+		}
 	}
 }

@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -176,4 +179,26 @@ func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan,
 	return scanTeamPlan(tx.QueryRow(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,contract_id,source,assigned_by,reason,idempotency_key)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING `+teamPlanColumns,
 		a.Team, a.Terms.OfferKey, a.Kind, version, terms, limits, now, a.ContractID, a.Source, a.Actor, a.Reason, key))
+}
+
+// GetTeamPlanAssignments shows staff the plan a team is on and its history.
+func (h *Handlers) GetTeamPlanAssignments(c *gin.Context) {
+	team, ok := ycTeam(c)
+	if !ok {
+		return
+	}
+	if _, ok = h.requirePlatformBilling(c, platformBillingReadPermission); !ok {
+		return
+	}
+	history, err := teamPlanHistory(c.Request.Context(), h.Pool, team, 50)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("list plan assignments failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	var current *teamPlan
+	if len(history) > 0 && history[0].EffectiveTo == nil {
+		current = &history[0]
+	}
+	c.JSON(http.StatusOK, gin.H{"current": current, "history": history})
 }
