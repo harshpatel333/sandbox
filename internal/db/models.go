@@ -971,7 +971,6 @@ type BillingStaffCreditGrant struct {
 	IdempotencyKey      string             `json:"idempotency_key"`
 	CustomerID          string             `json:"customer_id"`
 	AmountCents         int64              `json:"amount_cents"`
-	ExpiresAt           pgtype.Timestamptz `json:"expires_at"`
 	Reason              string             `json:"reason"`
 	RequestedBy         uuid.UUID          `json:"requested_by"`
 	RequestedAt         time.Time          `json:"requested_at"`
