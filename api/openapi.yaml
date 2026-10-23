@@ -5064,7 +5064,7 @@ components:
         allowance:
           type: object
           nullable: true
-          required: [amount_cents, period, on_exhausted, summary]
+          required: [amount_cents, amount_usd, period, on_exhausted, summary]
           description: Usage included in the plan.
           properties:
             amount_cents:
