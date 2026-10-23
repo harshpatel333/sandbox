@@ -67,6 +67,7 @@ func freezePlanTerms(t planTerms) frozenPlanTerms {
 	if allowance != nil && allowance.Compute != nil {
 		basis := *allowance
 		basis.AmountCents = 0
+		basis.AmountUSD = ""
 		allowance = &basis
 	}
 	grants := t.Grants
