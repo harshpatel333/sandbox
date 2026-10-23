@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -556,5 +557,28 @@ func TestTeamPlanChangeStaffViewReportsPendingAndUndo(t *testing.T) {
 	}
 	if pending := view(); pending != nil {
 		t.Fatalf("undone change still pending: %+v", pending)
+	}
+}
+
+func TestTeamPlanChangeCustomWithoutBillingAccountUsesOneConnection(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
+	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("custom_example", planKindCustom, 100, nil), Source: planSourceStaff, Reason: "agreement"}); err != nil {
+		t.Fatal(err)
+	}
+	setPricingVersion(t, h, "legacy")
+	cfg := h.Pool.Config()
+	cfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	h = &Handlers{Pool: pool, DB: db.New(pool)}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	c, err := h.scheduleTeamPlanChangeTo(ctx, teamPlanChangeRequest{Team: team, Target: "free", Key: "custom-exit", Actor: uuid.New(), Via: "staff", Reason: "end agreement"}, testPlanTerms("free", planKindFree, 1, nil))
+	if err != nil || c.State != "scheduled" || !c.EffectiveAt.After(time.Now()) {
+		t.Fatalf("custom exit without billing account: %+v %v", c, err)
 	}
 }
