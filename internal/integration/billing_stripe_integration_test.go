@@ -132,7 +132,7 @@ func (f *fakeStripeClient) CreateBillingCreditGrant(_ context.Context, params ap
 	return api.StripeBillingCreditGrant{ID: "credgrant_test_123"}, nil
 }
 
-func (f *fakeStripeClient) RevokeActivationCredit(_ context.Context, _ uuid.UUID, _ string, grantID string) (string, error) {
+func (f *fakeStripeClient) RevokeActivationCredit(_ context.Context, _ uuid.UUID, _ string, grantID string, _ int64) (string, error) {
 	if grantID == "" {
 		grantID = "credgrant_test_123"
 	}

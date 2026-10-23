@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // StripeCreditRequest uses the caller's authenticated, version-pinned transport.
@@ -37,11 +38,25 @@ type StripeActivationGrant struct {
 	VoidedAt  *int64            `json:"voided_at"`
 }
 
-func (g StripeActivationGrant) verify(teamID uuid.UUID, customerID, grantID string) error {
+// LegacyActivationCreditCents is the card bonus every grant created before
+// amounts were recorded carries.
+const LegacyActivationCreditCents int64 = 9500
+
+// ActivationCreditCents returns the card bonus recorded when a team's
+// activation grant was first attempted.
+func ActivationCreditCents(ctx context.Context, q interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, teamID uuid.UUID) (int64, error) {
+	var cents int64
+	err := q.QueryRow(ctx, `SELECT COALESCE(stripe_activation_credit_amount_cents,$2) FROM team_billing_account WHERE team_id=$1`, teamID, LegacyActivationCreditCents).Scan(&cents)
+	return cents, err
+}
+
+func (g StripeActivationGrant) verify(teamID uuid.UUID, customerID, grantID string, amountCents int64) error {
 	identity := "stripe-activation-credit-" + teamID.String()
 	metadata := strings.TrimSpace(g.Metadata["activation_identity"])
 	if g.ID == "" || g.Customer != customerID || g.Category != "promotional" ||
-		g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != 9500 ||
+		g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != amountCents || amountCents <= 0 ||
 		g.ApplicabilityConfig.Scope.PriceType != "metered" ||
 		(grantID != "" && g.ID != grantID) || (grantID == "" && metadata != identity) ||
 		(metadata != "" && metadata != identity) {
@@ -53,7 +68,8 @@ func (g StripeActivationGrant) verify(teamID uuid.UUID, customerID, grantID stri
 // FindStripeActivationGrant never falls back to an amount-only match. Historical
 // grants without metadata require their persisted ID; missing IDs require a
 // unique identity match across every page, including expired and voided grants.
-func FindStripeActivationGrant(ctx context.Context, request StripeCreditRequest, teamID uuid.UUID, customerID, grantID string) (StripeActivationGrant, error) {
+// amountCents is the card bonus recorded for the team when the grant was made.
+func FindStripeActivationGrant(ctx context.Context, request StripeCreditRequest, teamID uuid.UUID, customerID, grantID string, amountCents int64) (StripeActivationGrant, error) {
 	if teamID == uuid.Nil || strings.TrimSpace(customerID) == "" {
 		return StripeActivationGrant{}, errors.New("Stripe activation ownership is missing")
 	}
@@ -62,7 +78,7 @@ func FindStripeActivationGrant(ctx context.Context, request StripeCreditRequest,
 		if err := request(ctx, http.MethodGet, "/v1/billing/credit_grants/"+url.PathEscape(grantID), nil, &grant, ""); err != nil {
 			return grant, err
 		}
-		return grant, grant.verify(teamID, customerID, grantID)
+		return grant, grant.verify(teamID, customerID, grantID, amountCents)
 	}
 	var match StripeActivationGrant
 	seen := map[string]bool{}
@@ -83,7 +99,7 @@ func FindStripeActivationGrant(ctx context.Context, request StripeCreditRequest,
 			if grant.Metadata["activation_identity"] != "stripe-activation-credit-"+teamID.String() {
 				continue
 			}
-			if err := grant.verify(teamID, customerID, ""); err != nil {
+			if err := grant.verify(teamID, customerID, "", amountCents); err != nil {
 				return match, err
 			}
 			if match.ID != "" {
@@ -150,8 +166,8 @@ func stripeActivationGrantBalance(ctx context.Context, request StripeCreditReque
 	return balance.Available.Monetary.Value, balance.Ledger.Monetary.Value, nil
 }
 
-func RevokeStripeActivationGrant(ctx context.Context, request StripeCreditRequest, teamID uuid.UUID, customerID, grantID string) (string, error) {
-	grant, err := FindStripeActivationGrant(ctx, request, teamID, customerID, grantID)
+func RevokeStripeActivationGrant(ctx context.Context, request StripeCreditRequest, teamID uuid.UUID, customerID, grantID string, amountCents int64) (string, error) {
+	grant, err := FindStripeActivationGrant(ctx, request, teamID, customerID, grantID, amountCents)
 	if err != nil {
 		return "", err
 	}
@@ -167,14 +183,14 @@ func RevokeStripeActivationGrant(ctx context.Context, request StripeCreditReques
 		return "", err
 	}
 	if ledger < grant.Amount.Monetary.Value {
-		return expireStripeActivationGrant(ctx, request, teamID, customerID, grant)
+		return expireStripeActivationGrant(ctx, request, teamID, customerID, grant, amountCents)
 	}
 	var voided StripeActivationGrant
 	// Stripe caches failed idempotent responses too. A fresh attempt key lets a
 	// later webhook retry recover; the terminal grant state prevents re-voiding.
 	err = request(ctx, http.MethodPost, "/v1/billing/credit_grants/"+url.PathEscape(grant.ID)+"/void", url.Values{}, &voided, "stripe-activation-void-"+uuid.NewString())
 	if err == nil {
-		if verifyErr := voided.verify(teamID, customerID, grant.ID); verifyErr != nil {
+		if verifyErr := voided.verify(teamID, customerID, grant.ID, amountCents); verifyErr != nil {
 			return "", verifyErr
 		}
 		if voided.VoidedAt == nil || *voided.VoidedAt <= 0 {
@@ -184,7 +200,7 @@ func RevokeStripeActivationGrant(ctx context.Context, request StripeCreditReques
 	}
 	// A timeout or concurrent void may have succeeded. Only authoritative
 	// terminal/consumed evidence can convert that failure into completion.
-	current, readErr := FindStripeActivationGrant(ctx, request, teamID, customerID, grant.ID)
+	current, readErr := FindStripeActivationGrant(ctx, request, teamID, customerID, grant.ID, amountCents)
 	if readErr == nil {
 		if done, checkErr := stripeActivationGrantReconciled(ctx, request, current); checkErr == nil && done {
 			return grant.ID, nil
@@ -194,7 +210,7 @@ func RevokeStripeActivationGrant(ctx context.Context, request StripeCreditReques
 		// the terminal operation that prevents the restored credit from being
 		// spendable again.
 		if strings.Contains(strings.ToLower(err.Error()), "invoice") || strings.Contains(strings.ToLower(err.Error()), "applied") {
-			if expiredID, expireErr := expireStripeActivationGrant(ctx, request, teamID, customerID, current); expireErr == nil {
+			if expiredID, expireErr := expireStripeActivationGrant(ctx, request, teamID, customerID, current, amountCents); expireErr == nil {
 				return expiredID, nil
 			}
 		}
@@ -202,11 +218,11 @@ func RevokeStripeActivationGrant(ctx context.Context, request StripeCreditReques
 	return "", fmt.Errorf("void Stripe activation grant: %w", err)
 }
 
-func expireStripeActivationGrant(ctx context.Context, request StripeCreditRequest, teamID uuid.UUID, customerID string, grant StripeActivationGrant) (string, error) {
+func expireStripeActivationGrant(ctx context.Context, request StripeCreditRequest, teamID uuid.UUID, customerID string, grant StripeActivationGrant, amountCents int64) (string, error) {
 	var expired StripeActivationGrant
 	err := request(ctx, http.MethodPost, "/v1/billing/credit_grants/"+url.PathEscape(grant.ID)+"/expire", url.Values{}, &expired, "stripe-activation-expire-"+uuid.NewString())
 	if err == nil {
-		if verifyErr := expired.verify(teamID, customerID, grant.ID); verifyErr != nil {
+		if verifyErr := expired.verify(teamID, customerID, grant.ID, amountCents); verifyErr != nil {
 			return "", verifyErr
 		}
 		if expired.ExpiresAt == nil || *expired.ExpiresAt <= 0 {
@@ -221,7 +237,7 @@ func expireStripeActivationGrant(ctx context.Context, request StripeCreditReques
 		}
 		return grant.ID, nil
 	}
-	current, readErr := FindStripeActivationGrant(ctx, request, teamID, customerID, grant.ID)
+	current, readErr := FindStripeActivationGrant(ctx, request, teamID, customerID, grant.ID, amountCents)
 	if readErr == nil {
 		if done, checkErr := stripeActivationGrantReconciled(ctx, request, current); checkErr == nil && done {
 			return grant.ID, nil

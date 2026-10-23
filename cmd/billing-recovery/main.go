@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"io"
 	"net/http"
 	"net/url"
@@ -42,6 +43,14 @@ type billingAccount struct {
 	ActivationAttempted          bool
 	ActivationUserID             pgtype.UUID
 	ActivationReservationEventID *string
+	ActivationCreditCents        *int64
+}
+
+func (a billingAccount) activationCredit() int64 {
+	if a.ActivationCreditCents != nil {
+		return *a.ActivationCreditCents
+	}
+	return billing.LegacyActivationCreditCents
 }
 
 type stripeSubscription struct {
@@ -364,7 +373,8 @@ func loadAccounts(ctx context.Context, pool *pgxpool.Pool, target, after *uuid.U
 	query := `SELECT team_id, stripe_customer_id, stripe_subscription_id,
         stripe_subscription_status, stripe_subscription_event_at,
         stripe_activation_credit_grant_id, trial_ended_at,
-        checkout_initializing_at, checkout_session_id, ` + recoveryUserPromotionSQL + `
+        checkout_initializing_at, checkout_session_id, ` + recoveryUserPromotionSQL + `,
+        stripe_activation_credit_amount_cents
  FROM team_billing_account
 	 WHERE (($1::uuid IS NOT NULL AND team_id = $1)
 	    OR ($1::uuid IS NULL
@@ -382,7 +392,7 @@ func loadAccounts(ctx context.Context, pool *pgxpool.Pool, target, after *uuid.U
 	var accounts []billingAccount
 	for rows.Next() {
 		var a billingAccount
-		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.EventAt, &a.GrantID, &a.TrialEndedAt, &a.CheckoutAt, &a.CheckoutSessionID, &a.UserPromotion); err != nil {
+		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.EventAt, &a.GrantID, &a.TrialEndedAt, &a.CheckoutAt, &a.CheckoutSessionID, &a.UserPromotion, &a.ActivationCreditCents); err != nil {
 			return nil, err
 		}
 		accounts = append(accounts, a)
@@ -391,6 +401,14 @@ func loadAccounts(ctx context.Context, pool *pgxpool.Pool, target, after *uuid.U
 }
 
 func auditAccount(ctx context.Context, pool *pgxpool.Pool, stripe stripeClient, account billingAccount, excluded *uuid.UUID, apply bool) map[string]any {
+	// A grant attempted after amounts were recorded is checked against that
+	// amount; an explicit flag must agree with it.
+	if recorded := account.ActivationCreditCents; recorded != nil {
+		if stripe.activationCreditCents() != billing.LegacyActivationCreditCents && stripe.activationCreditCents() != *recorded {
+			return map[string]any{"team_id": account.TeamID.String(), "outcome": "unresolved", "reason": "activation_credit_flag_differs_from_recorded_amount"}
+		}
+		stripe.grantAmountCents = *recorded
+	}
 	out := map[string]any{"team_id": account.TeamID.String(), "mode": "dry-run", "activation_credit_cents": stripe.activationCreditCents()}
 	if apply {
 		out["mode"] = "apply"

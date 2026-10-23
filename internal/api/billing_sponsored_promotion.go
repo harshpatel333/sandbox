@@ -84,6 +84,10 @@ func (h *Handlers) recoverSponsoredPromotion(ctx context.Context, team, sponsor 
 	if err != nil {
 		return err
 	}
+	activationAmount, err := billing.ActivationCreditCents(ctx, tx, team)
+	if err != nil {
+		return err
+	}
 	var valid bool
 	if h.Config == nil {
 		return errors.New("home billing region unavailable")
@@ -117,7 +121,7 @@ func (h *Handlers) recoverSponsoredPromotion(ctx context.Context, team, sponsor 
 			return err
 		}
 		if grantID != "" || a.StripeActivationCreditGrantedAt.Valid || attempted {
-			grant, e := billing.FindStripeActivationGrant(ctx, client.doForm, team, r.Customer, grantID)
+			grant, e := billing.FindStripeActivationGrant(ctx, client.doForm, team, r.Customer, grantID, activationAmount)
 			if e != nil {
 				return e
 			}
@@ -128,7 +132,7 @@ func (h *Handlers) recoverSponsoredPromotion(ctx context.Context, team, sponsor 
 				return e
 			}
 			grantID = grant.ID
-			before, _ = json.Marshal(gin.H{"grant": grant, "available_cents": 9500, "ledger_cents": 9500})
+			before, _ = json.Marshal(gin.H{"grant": grant, "available_cents": activationAmount, "ledger_cents": activationAmount})
 		} else if !a.StripeActivationCreditReservedAt.Valid || r.Grant != "" {
 			return errors.New("no complete unattempted reservation to recover")
 		}
@@ -200,7 +204,7 @@ func (h *Handlers) recoverSponsoredPromotion(ctx context.Context, team, sponsor 
 			return tx.Commit(ctx)
 		}
 	}
-	grant, err := billing.FindStripeActivationGrant(ctx, client.doForm, team, r.Customer, grantID)
+	grant, err := billing.FindStripeActivationGrant(ctx, client.doForm, team, r.Customer, grantID, activationAmount)
 	if err != nil {
 		return err
 	}
@@ -211,7 +215,7 @@ func (h *Handlers) recoverSponsoredPromotion(ctx context.Context, team, sponsor 
 		return errors.New("unused activation evidence is missing")
 	}
 
-	voided, err := billing.VoidUnusedStripeActivationGrant(ctx, client.doForm, team, r.Customer, grant.ID)
+	voided, err := billing.VoidUnusedStripeActivationGrant(ctx, client.doForm, team, r.Customer, grant.ID, activationAmount)
 	if err != nil {
 		return err
 	}

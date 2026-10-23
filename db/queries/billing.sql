@@ -1441,6 +1441,14 @@ WHERE u.user_id = sqlc.arg(user_id)
   )
 RETURNING u.stripe_redemption_attempted_at;
 
+-- name: FreezeStripeActivationCreditAmount :one
+-- An attempt made before amounts were recorded sent the historical $95.
+UPDATE team_billing_account
+SET stripe_activation_credit_amount_cents = COALESCE(stripe_activation_credit_amount_cents,
+    CASE WHEN sqlc.arg(previously_attempted)::boolean THEN 9500 ELSE billing_signup_promotion_cents('card_bonus') END)
+WHERE team_id = sqlc.arg(team_id)
+RETURNING stripe_activation_credit_amount_cents::bigint;
+
 -- name: ClaimStripeWebhookProcessingLease :one
 INSERT INTO stripe_webhook_processing_lease(customer_id, token, expires_at)
 VALUES(sqlc.arg(customer_id), sqlc.arg(token), now() + interval '1 minute')

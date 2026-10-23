@@ -96,7 +96,7 @@ type ambiguousPromotionClient struct {
 	revokedGrantID string
 }
 
-func (s *ambiguousPromotionClient) RevokeActivationCredit(_ context.Context, teamID uuid.UUID, customerID, grantID string) (string, error) {
+func (s *ambiguousPromotionClient) RevokeActivationCredit(_ context.Context, teamID uuid.UUID, customerID, grantID string, _ int64) (string, error) {
 	if s.revocationErr != nil {
 		return "", s.revocationErr
 	}
@@ -274,6 +274,57 @@ func TestIntegration_StripeReservationDistinguishesUserRedemption(t *testing.T) 
 			if err := tx.QueryRow(t.Context(), `SELECT stripe_activation_credit_reserved_at IS NOT NULL FROM team_billing_account WHERE team_id=$1`, team).
 				Scan(&reserved); err != nil || reserved {
 				t.Fatalf("denial reserved credit: %t %v", reserved, err)
+			}
+		})
+	}
+}
+
+func TestIntegration_PromotionRetryKeepsAmountRecordedAtFirstAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		legacy bool
+		want   int64
+	}{{"catalog_change", false, 10000}, {"attempt_before_amounts", true, 9500}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			teamID, _, userID := seedTeamAndKeyWithRole(t, "team_owner")
+			if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status)
+				VALUES($1,$2,$3,'incomplete')`, teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+				t.Fatal(err)
+			}
+			publishSignupPromotion(t, "card_bonus", 10000)
+			t.Cleanup(func() { publishSignupPromotion(t, "card_bonus", 9500) })
+			stripe := &ambiguousPromotionClient{fakeStripeClient: &fakeStripeClient{}, t: t, userID: userID, teamID: teamID, accepted: make(map[string]string)}
+			router := newBillingRouter(t, stripe)
+			now := time.Now().UTC().Truncate(time.Second)
+			eventID := "evt_amount_" + teamID.String()
+			if w := sendStripeActivationWebhook(t, router, eventID, teamID, userID, now); w.Code != http.StatusInternalServerError {
+				t.Fatalf("ambiguous delivery: %d %s", w.Code, w.Body.String())
+			}
+			if tc.legacy {
+				// An older binary marked the attempt without recording an amount.
+				if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET stripe_activation_credit_amount_cents=NULL WHERE team_id=$1`, teamID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			publishSignupPromotion(t, "card_bonus", 12000)
+			if w := sendStripeActivationWebhook(t, router, eventID, teamID, userID, now); w.Code != http.StatusOK {
+				t.Fatalf("retry: %d %s", w.Code, w.Body.String())
+			}
+			if len(stripe.creditGrantCalls) != 2 {
+				t.Fatalf("grant calls=%+v", stripe.creditGrantCalls)
+			}
+			if retry := stripe.creditGrantCalls[1]; retry.AmountCents != tc.want || retry.IdempotencyKey != stripe.creditGrantCalls[0].IdempotencyKey {
+				t.Fatalf("grant calls=%+v want retry of %d", stripe.creditGrantCalls, tc.want)
+			}
+			var ledger float64
+			var recorded int64
+			if err := testPool.QueryRow(ctx, `SELECT g.amount_usd::float8,a.stripe_activation_credit_amount_cents FROM team_credit_grant g JOIN team_billing_account a USING(team_id)
+				WHERE g.team_id=$1 AND g.reason='stripe promotional credit'`, teamID).Scan(&ledger, &recorded); err != nil {
+				t.Fatal(err)
+			}
+			if ledger*100 != float64(tc.want) || recorded != tc.want {
+				t.Fatalf("ledger=%v recorded=%d want %d", ledger, recorded, tc.want)
 			}
 		})
 	}

@@ -804,6 +804,35 @@ type BillingPlanRelease struct {
 	ReleasedAt       time.Time   `json:"released_at"`
 }
 
+type BillingPlanVersion struct {
+	ID                   uuid.UUID          `json:"id"`
+	Family               string             `json:"family"`
+	Version              int32              `json:"version"`
+	State                string             `json:"state"`
+	DisplayName          string             `json:"display_name"`
+	Tagline              string             `json:"tagline"`
+	Features             []string           `json:"features"`
+	SortOrder            int32              `json:"sort_order"`
+	DisplayOnly          bool               `json:"display_only"`
+	SelfServe            bool               `json:"self_serve"`
+	MonthlyFeeCents      *int64             `json:"monthly_fee_cents"`
+	AnnualFeeCents       *int64             `json:"annual_fee_cents"`
+	CreditSchedule       []byte             `json:"credit_schedule"`
+	MatchingPercent      *int32             `json:"matching_percent"`
+	MatchingCapCents     *int64             `json:"matching_cap_cents"`
+	MaxSandboxes         *int32             `json:"max_sandboxes"`
+	MaxTemplateVcpu      *int32             `json:"max_template_vcpu"`
+	MaxTemplateMemoryMib *int32             `json:"max_template_memory_mib"`
+	MaxTemplateDiskMib   *int32             `json:"max_template_disk_mib"`
+	CreatedBy            pgtype.UUID        `json:"created_by"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+	PublishedBy          pgtype.UUID        `json:"published_by"`
+	PublishedAt          pgtype.Timestamptz `json:"published_at"`
+	RetiredBy            pgtype.UUID        `json:"retired_by"`
+	RetiredAt            pgtype.Timestamptz `json:"retired_at"`
+}
+
 type BillingProClosedPurchase struct {
 	TeamID         uuid.UUID `json:"team_id"`
 	Generation     time.Time `json:"generation"`
@@ -886,6 +915,21 @@ type BillingSignupChoice struct {
 	PaidObservedAt    pgtype.Timestamptz `json:"paid_observed_at"`
 	PaidObservedUntil pgtype.Timestamptz `json:"paid_observed_until"`
 	Revision          int64              `json:"revision"`
+}
+
+type BillingSignupPromotionVersion struct {
+	ID          uuid.UUID          `json:"id"`
+	Promotion   string             `json:"promotion"`
+	Version     int32              `json:"version"`
+	State       string             `json:"state"`
+	AmountCents int64              `json:"amount_cents"`
+	CreatedBy   pgtype.UUID        `json:"created_by"`
+	CreatedAt   time.Time          `json:"created_at"`
+	UpdatedAt   time.Time          `json:"updated_at"`
+	PublishedBy pgtype.UUID        `json:"published_by"`
+	PublishedAt pgtype.Timestamptz `json:"published_at"`
+	RetiredBy   pgtype.UUID        `json:"retired_by"`
+	RetiredAt   pgtype.Timestamptz `json:"retired_at"`
 }
 
 type BillingSponsoredAnnualAuthority struct {
@@ -1875,6 +1919,7 @@ type TeamBillingAccount struct {
 	StripeActivationIdentityKey              *string            `json:"stripe_activation_identity_key"`
 	StripeCheckoutIdentityEvidenceVersion    pgtype.UUID        `json:"stripe_checkout_identity_evidence_version"`
 	StripeActivationIdentityEvidenceVersion  pgtype.UUID        `json:"stripe_activation_identity_evidence_version"`
+	StripeActivationCreditAmountCents        *int64             `json:"stripe_activation_credit_amount_cents"`
 }
 
 type TeamBillingPeriod struct {

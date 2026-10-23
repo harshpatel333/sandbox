@@ -4,7 +4,6 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
 )
 
@@ -25,39 +24,110 @@ type billingPlan struct {
 	Limits             billingPlanLimits `json:"limits"`
 }
 
-// GetPublicBillingPlans lists the plans new customers can buy in this
-// environment. Like public pricing it is unauthenticated so signup pages
-// render from the catalog.
+type billingPlanPrice struct {
+	OfferKey               string `json:"offer_key"`
+	PriceCents             int64  `json:"price_cents"`
+	MonthlyEquivalentCents int64  `json:"monthly_equivalent_cents"`
+	Available              bool   `json:"available"`
+}
+
+type billingPlanCard struct {
+	Family             string            `json:"family"`
+	Version            int32             `json:"version"`
+	Name               string            `json:"name"`
+	Tagline            string            `json:"tagline"`
+	Features           []string          `json:"features"`
+	DisplayOnly        bool              `json:"display_only"`
+	Monthly            *billingPlanPrice `json:"monthly"`
+	Annual             *billingPlanPrice `json:"annual"`
+	CreditSummary      string            `json:"credit_summary"`
+	MonthlyCreditCents *int64            `json:"monthly_credit_cents"`
+	CreditSchedule     []planGrant       `json:"credit_schedule"`
+	Matching           *planMatching     `json:"matching"`
+	Limits             planLimits        `json:"limits"`
+}
+
+type signupCredits struct {
+	TrialCreditCents int64 `json:"trial_credit_cents"`
+	CardBonusCents   int64 `json:"card_bonus_cents"`
+}
+
+func planCard(v planVersion) billingPlanCard {
+	card := billingPlanCard{Family: v.Family, Version: v.Version, Name: v.DisplayName, Tagline: v.Tagline, Features: v.Features, DisplayOnly: v.DisplayOnly,
+		CreditSummary: planCreditSummary(v.CreditSchedule), CreditSchedule: v.CreditSchedule, Matching: v.Matching, Limits: v.Limits}
+	if credit, uniform := uniformMonthlyCredit(v.CreditSchedule); uniform {
+		card.MonthlyCreditCents = &credit
+	}
+	if v.MonthlyFeeCents != nil {
+		card.Monthly = &billingPlanPrice{OfferKey: v.Family + "_monthly", PriceCents: *v.MonthlyFeeCents, MonthlyEquivalentCents: *v.MonthlyFeeCents, Available: v.sellable()}
+	}
+	if v.AnnualFeeCents != nil {
+		card.Annual = &billingPlanPrice{OfferKey: v.Family + "_annual", PriceCents: *v.AnnualFeeCents, MonthlyEquivalentCents: *v.AnnualFeeCents / 12, Available: v.sellable()}
+	}
+	if card.CreditSchedule == nil {
+		card.CreditSchedule = []planGrant{}
+	}
+	return card
+}
+
+// purchasablePlans lists the offers new customers can check out, in the shape
+// the plan catalog first published.
+func purchasablePlans(cards []billingPlanCard) []billingPlan {
+	plans := []billingPlan{}
+	for _, card := range cards {
+		for _, price := range []*billingPlanPrice{card.Monthly, card.Annual} {
+			if price == nil || !price.Available || card.MonthlyCreditCents == nil || card.Limits.MaxSandboxes == nil {
+				continue
+			}
+			months := int32(1)
+			if price == card.Annual {
+				months = 12
+			}
+			plans = append(plans, billingPlan{Key: price.OfferKey, Family: card.Family, Name: card.Name, IntervalMonths: months, PriceCents: price.PriceCents,
+				MonthlyCreditCents: *card.MonthlyCreditCents, Limits: billingPlanLimits{MaxSandboxes: *card.Limits.MaxSandboxes, MaxTemplateVCPU: card.Limits.MaxTemplateVCPU,
+					MaxTemplateMemoryMiB: card.Limits.MaxTemplateMemoryMiB, MaxTemplateDiskMiB: card.Limits.MaxTemplateDiskMiB}})
+		}
+	}
+	return plans
+}
+
+// GetPublicBillingPlans returns the published public plan cards and signup
+// credit amounts. Like public pricing it is unauthenticated so signup pages render
+// from the catalog.
 func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
 	if h.Pool == nil {
 		respondErrorMsg(c, "service_unavailable", "plans are not available", http.StatusServiceUnavailable)
 		return
 	}
-	rows, err := h.Pool.Query(c.Request.Context(), `SELECT p.offer_key,p.family,p.display_name,p.charge_interval_months,p.charge_amount_cents,p.monthly_credit_cents,
- l.max_sandboxes,l.max_template_vcpu,l.max_template_memory_mib,l.max_template_disk_mib
- FROM billing_plan p JOIN plan_limits l USING(offer_key) WHERE p.available ORDER BY p.sort_order,p.offer_key`)
+	ctx := c.Request.Context()
+	rows, err := h.Pool.Query(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE state='published' AND public ORDER BY sort_order,family`)
 	if err != nil {
 		log.Error().Err(err).Msg("list billing plans failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	all, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (billingPlan, error) {
-		var p billingPlan
-		err := row.Scan(&p.Key, &p.Family, &p.Name, &p.IntervalMonths, &p.PriceCents, &p.MonthlyCreditCents,
-			&p.Limits.MaxSandboxes, &p.Limits.MaxTemplateVCPU, &p.Limits.MaxTemplateMemoryMiB, &p.Limits.MaxTemplateDiskMiB)
-		return p, err
-	})
-	if err != nil {
-		log.Error().Err(err).Msg("list billing plans failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	plans := []billingPlan{}
-	for _, p := range all {
-		if h.Config != nil && h.Config.PlanPriceID(p.Key) != "" {
-			plans = append(plans, p)
+	cards := []billingPlanCard{}
+	for rows.Next() {
+		v, err := scanPlanVersion(rows)
+		if err != nil {
+			rows.Close()
+			log.Error().Err(err).Msg("list billing plans failed")
+			respondError(c, ErrInternal)
+			return
 		}
+		cards = append(cards, planCard(v))
+	}
+	if err = rows.Err(); err != nil {
+		log.Error().Err(err).Msg("list billing plans failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	var signup signupCredits
+	if err = h.Pool.QueryRow(ctx, `SELECT billing_signup_promotion_cents('trial'),billing_signup_promotion_cents('card_bonus')`).Scan(&signup.TrialCreditCents, &signup.CardBonusCents); err != nil {
+		log.Error().Err(err).Msg("read signup credits failed")
+		respondError(c, ErrInternal)
+		return
 	}
 	c.Header("Cache-Control", publicPricingCacheControl)
-	c.JSON(http.StatusOK, gin.H{"plans": plans})
+	c.JSON(http.StatusOK, gin.H{"cards": cards, "plans": purchasablePlans(cards), "signup": signup})
 }

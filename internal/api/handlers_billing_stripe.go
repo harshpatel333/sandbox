@@ -67,11 +67,11 @@ type StripeCreditBalance struct {
 }
 
 type stripeActivationCreditRevoker interface {
-	RevokeActivationCredit(context.Context, uuid.UUID, string, string) (string, error)
+	RevokeActivationCredit(context.Context, uuid.UUID, string, string, int64) (string, error)
 }
 
-func (c *stripeHTTPClient) RevokeActivationCredit(ctx context.Context, teamID uuid.UUID, customerID, grantID string) (string, error) {
-	return billing.RevokeStripeActivationGrant(ctx, c.doForm, teamID, customerID, grantID)
+func (c *stripeHTTPClient) RevokeActivationCredit(ctx context.Context, teamID uuid.UUID, customerID, grantID string, amountCents int64) (string, error) {
+	return billing.RevokeStripeActivationGrant(ctx, c.doForm, teamID, customerID, grantID, amountCents)
 }
 
 type stripeCreditBalanceReader interface {
@@ -166,9 +166,12 @@ type StripeCreateCheckoutSessionParams struct {
 // StripeCheckoutPlanTerms freezes the catalog terms a purchase started with.
 // It is recorded with the request and never sent to Stripe.
 type StripeCheckoutPlanTerms struct {
-	Amount int64
-	Months int32
-	Credit int64
+	Amount    int64
+	Months    int32
+	Credit    int64
+	VersionID uuid.UUID
+	Matching  *planMatching `json:",omitempty"`
+	Limits    *planLimits   `json:",omitempty"`
 }
 
 type StripeCheckoutSession struct {
@@ -404,7 +407,7 @@ func (c *stripeHTTPClient) CreateBillingCreditGrant(ctx context.Context, params 
 	form.Set("amount[monetary][currency]", "usd")
 	form.Set("amount[monetary][value]", strconv.FormatInt(params.AmountCents, 10))
 	form.Set("applicability_config[scope][price_type]", "metered")
-	if params.AmountCents == 9500 && strings.TrimSpace(params.IdempotencyKey) != "" {
+	if strings.TrimSpace(params.IdempotencyKey) != "" {
 		form.Set("metadata[activation_identity]", params.IdempotencyKey)
 	}
 	var resp struct {
@@ -2254,7 +2257,11 @@ func (h *Handlers) reconcileStripeActivationRevocation(ctx context.Context, conn
 			if !ok {
 				return errors.New("Stripe activation credit revocation is not configured")
 			}
-			grantID, err = revoker.RevokeActivationCredit(ctx, pending.TeamID, pending.StripeCustomerID, derefString(pending.ActivationGrantID))
+			amount, amountErr := billing.ActivationCreditCents(ctx, conn, pending.TeamID)
+			if amountErr != nil {
+				return amountErr
+			}
+			grantID, err = revoker.RevokeActivationCredit(ctx, pending.TeamID, pending.StripeCustomerID, derefString(pending.ActivationGrantID), amount)
 			if err != nil {
 				return err
 			}
@@ -3076,6 +3083,7 @@ type stripePromotionPendingGrant struct {
 	CustomerID          string
 	PreviouslyAttempted bool
 	FirstAttemptAt      time.Time
+	AmountCents         int64
 }
 
 func (*stripePromotionPendingGrant) Error() string { return "Stripe promotion grant is ready" }
@@ -3111,7 +3119,11 @@ func prepareStripePromotionGrant(ctx context.Context, tx pgx.Tx, teamID, userID 
 	if err := stripePromotionReplayWindowError(attemptedAt.Time, time.Now().UTC()); err != nil {
 		return wrapStripePromotionGrantFinalizationError(err, teamID, userID)
 	}
-	return &stripePromotionPendingGrant{TeamID: teamID, UserID: userID, CustomerID: customerID, PreviouslyAttempted: previouslyAttempted, FirstAttemptAt: attemptedAt.Time}
+	amount, err := q.FreezeStripeActivationCreditAmount(ctx, db.FreezeStripeActivationCreditAmountParams{TeamID: teamID, PreviouslyAttempted: previouslyAttempted})
+	if err != nil {
+		return err
+	}
+	return &stripePromotionPendingGrant{TeamID: teamID, UserID: userID, CustomerID: customerID, PreviouslyAttempted: previouslyAttempted, FirstAttemptAt: attemptedAt.Time, AmountCents: amount}
 }
 
 func stripePromotionReplayWindowError(firstAttemptAt, now time.Time) error {
@@ -3159,7 +3171,7 @@ func (h *Handlers) createReservedStripePromotion(ctx context.Context, pending *s
 		return StripeBillingCreditGrant{}, wrapStripePromotionGrantFinalizationError(err, teamID, userID)
 	}
 	grant, err := h.Stripe.CreateBillingCreditGrant(ctx, StripeCreateBillingCreditGrantParams{
-		CustomerID: pending.CustomerID, AmountCents: 9500, IdempotencyKey: "stripe-activation-credit-" + teamID.String(),
+		CustomerID: pending.CustomerID, AmountCents: pending.AmountCents, IdempotencyKey: "stripe-activation-credit-" + teamID.String(),
 	})
 	if err == nil && strings.TrimSpace(grant.ID) == "" {
 		err = errors.New("Stripe credit grant response did not include an ID")

@@ -20,7 +20,7 @@ func VerifyUnusedStripeActivationGrant(ctx context.Context, request StripeCredit
 	if err != nil {
 		return err
 	}
-	if available != 9500 || ledger != 9500 {
+	if amount := grant.Amount.Monetary.Value; amount <= 0 || available != amount || ledger != amount {
 		return errors.New("activation grant is not fully unused and available; explicit financial reconciliation required")
 	}
 	return nil
@@ -28,8 +28,8 @@ func VerifyUnusedStripeActivationGrant(ctx context.Context, request StripeCredit
 
 // VoidUnusedStripeActivationGrant is called only after durable recovery intent
 // and unused evidence have been saved. A terminal read recovers a lost response.
-func VoidUnusedStripeActivationGrant(ctx context.Context, request StripeCreditRequest, team uuid.UUID, customer, grantID string) (StripeActivationGrant, error) {
-	grant, err := FindStripeActivationGrant(ctx, request, team, customer, grantID)
+func VoidUnusedStripeActivationGrant(ctx context.Context, request StripeCreditRequest, team uuid.UUID, customer, grantID string, amountCents int64) (StripeActivationGrant, error) {
+	grant, err := FindStripeActivationGrant(ctx, request, team, customer, grantID, amountCents)
 	if err != nil {
 		return grant, err
 	}
@@ -42,13 +42,13 @@ func VoidUnusedStripeActivationGrant(ctx context.Context, request StripeCreditRe
 	var result StripeActivationGrant
 	err = request(ctx, http.MethodPost, "/v1/billing/credit_grants/"+url.PathEscape(grant.ID)+"/void", url.Values{}, &result, "sponsored-activation-void-"+uuid.NewString())
 	if err != nil {
-		current, readErr := FindStripeActivationGrant(ctx, request, team, customer, grant.ID)
+		current, readErr := FindStripeActivationGrant(ctx, request, team, customer, grant.ID, amountCents)
 		if readErr == nil && current.VoidedAt != nil && *current.VoidedAt > 0 {
 			return current, nil
 		}
 		return result, err
 	}
-	if err = result.verify(team, customer, grant.ID); err != nil {
+	if err = result.verify(team, customer, grant.ID, amountCents); err != nil {
 		return result, err
 	}
 	if result.VoidedAt == nil || *result.VoidedAt <= 0 {
