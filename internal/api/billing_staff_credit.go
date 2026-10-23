@@ -15,21 +15,24 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-var errStaffCreditConflict = errors.New("staff credit conflicts with an earlier request")
+var (
+	errStaffCreditConflict   = errors.New("staff credit conflicts with an earlier request")
+	errStaffCreditNoCustomer = errors.New("team has no billing customer")
+	errStaffCreditReview     = errors.New("the Stripe credit grant for this request does not match it; operator review required")
+)
 
 type staffCreditRequest struct {
-	Key         string     `json:"idempotency_key"`
-	AmountCents int64      `json:"amount_cents"`
-	Reason      string     `json:"reason"`
-	ExpiresAt   *time.Time `json:"expires_at"`
+	Key         string `json:"idempotency_key"`
+	AmountCents int64  `json:"amount_cents"`
+	Reason      string `json:"reason"`
 }
 
 type staffCredit struct {
 	ID          uuid.UUID  `json:"id"`
 	AmountCents int64      `json:"amount_cents"`
-	ExpiresAt   *time.Time `json:"expires_at"`
 	Reason      string     `json:"reason"`
 	RequestedBy uuid.UUID  `json:"requested_by"`
 	RequestedAt time.Time  `json:"requested_at"`
@@ -40,11 +43,11 @@ type staffCredit struct {
 	customer    string
 }
 
-const staffCreditColumns = `id,amount_cents,expires_at,reason,requested_by,requested_at,state,stripe_credit_grant_id,issued_at,last_error,customer_id`
+const staffCreditColumns = `id,amount_cents,reason,requested_by,requested_at,state,stripe_credit_grant_id,issued_at,last_error,customer_id`
 
 func scanStaffCredit(row pgx.Row) (staffCredit, error) {
 	var s staffCredit
-	err := row.Scan(&s.ID, &s.AmountCents, &s.ExpiresAt, &s.Reason, &s.RequestedBy, &s.RequestedAt, &s.State, &s.GrantID, &s.IssuedAt, &s.LastError, &s.customer)
+	err := row.Scan(&s.ID, &s.AmountCents, &s.Reason, &s.RequestedBy, &s.RequestedAt, &s.State, &s.GrantID, &s.IssuedAt, &s.LastError, &s.customer)
 	return s, err
 }
 
@@ -69,13 +72,9 @@ func (h *Handlers) CreateStaffCreditGrant(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "idempotency_key, amount_cents (1 to 100000000) and reason are required", http.StatusBadRequest)
 		return
 	}
-	if req.ExpiresAt != nil && (!req.ExpiresAt.After(time.Now().Add(time.Hour)) || req.ExpiresAt.After(time.Now().AddDate(5, 0, 0))) {
-		respondErrorMsg(c, "bad_request", "expires_at must be between one hour and five years away", http.StatusBadRequest)
-		return
-	}
 	credit, err := h.grantStaffCredit(c.Request.Context(), team, actor, req)
 	switch {
-	case errors.Is(err, errStaffCreditConflict):
+	case errors.Is(err, errStaffCreditConflict), errors.Is(err, errStaffCreditNoCustomer), errors.Is(err, errStaffCreditReview):
 		respondErrorMsg(c, "conflict", err.Error(), http.StatusConflict)
 		return
 	case err != nil && credit.ID != uuid.Nil:
@@ -124,25 +123,27 @@ func (h *Handlers) grantStaffCredit(ctx context.Context, team, actor uuid.UUID, 
 	var customer *string
 	err := h.Pool.QueryRow(ctx, `SELECT stripe_customer_id FROM team_billing_account WHERE team_id=$1`, team).Scan(&customer)
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && customer == nil {
-		return staffCredit{}, errors.Join(errStaffCreditConflict, errors.New("team has no billing customer"))
+		return staffCredit{}, errStaffCreditNoCustomer
 	}
 	if err != nil {
 		return staffCredit{}, err
 	}
-	if _, err = h.Pool.Exec(ctx, `INSERT INTO billing_staff_credit_grant(team_id,idempotency_key,customer_id,amount_cents,expires_at,reason,requested_by)
-        VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(team_id,idempotency_key) DO NOTHING`, team, req.Key, *customer, req.AmountCents, req.ExpiresAt, req.Reason, actor); err != nil {
+	if _, err = h.Pool.Exec(ctx, `INSERT INTO billing_staff_credit_grant(team_id,idempotency_key,customer_id,amount_cents,reason,requested_by)
+        VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(team_id,idempotency_key) DO NOTHING`, team, req.Key, *customer, req.AmountCents, req.Reason, actor); err != nil {
 		return staffCredit{}, err
 	}
 	credit, err := scanStaffCredit(h.Pool.QueryRow(ctx, `SELECT `+staffCreditColumns+` FROM billing_staff_credit_grant WHERE team_id=$1 AND idempotency_key=$2`, team, req.Key))
 	if err != nil {
 		return staffCredit{}, err
 	}
-	sameExpiry := (credit.ExpiresAt == nil) == (req.ExpiresAt == nil) && (credit.ExpiresAt == nil || credit.ExpiresAt.Equal(*req.ExpiresAt))
-	if credit.AmountCents != req.AmountCents || !sameExpiry {
+	if credit.AmountCents != req.AmountCents {
 		return staffCredit{}, errors.Join(errStaffCreditConflict, errors.New("idempotency key was used for a different credit"))
 	}
 	if credit.State == "issued" {
 		return credit, nil
+	}
+	if credit.customer != *customer {
+		return credit, errors.Join(errStaffCreditConflict, errors.New("team's billing customer changed since the credit was requested"))
 	}
 	grant, err := client.issueStaffCredit(ctx, credit, func() error {
 		_, e := h.Pool.Exec(ctx, `UPDATE billing_staff_credit_grant SET attempts=attempts+1 WHERE id=$1 AND state='pending'`, credit.ID)
@@ -184,9 +185,6 @@ func (c *stripeHTTPClient) issueStaffCredit(ctx context.Context, credit staffCre
 		"priority":                     {"50"},
 		"metadata[staff_credit_grant]": {credit.ID.String()},
 	}
-	if credit.ExpiresAt != nil {
-		form.Set("expires_at", strconv.FormatInt(credit.ExpiresAt.Unix(), 10))
-	}
 	if err = c.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, "staff-credit:"+credit.ID.String()); err != nil {
 		return grant, err
 	}
@@ -221,14 +219,29 @@ func (c *stripeHTTPClient) findStaffCreditGrant(ctx context.Context, credit staf
 }
 
 func validStaffCreditGrant(g entitlementGrant, credit staffCredit) error {
-	expires := int64(0)
-	if credit.ExpiresAt != nil {
-		expires = credit.ExpiresAt.Unix()
-	}
 	if g.ID == "" || g.Customer != credit.customer || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != credit.AmountCents ||
-		g.VoidedAt != 0 || g.Priority != 50 || g.ExpiresAt != expires || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 ||
+		g.VoidedAt != 0 || g.Priority != 50 || g.ExpiresAt != 0 || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 ||
 		g.Metadata["staff_credit_grant"] != credit.ID.String() {
-		return fmt.Errorf("Stripe credit grant %s does not match the staff credit; operator review required", g.ID)
+		return fmt.Errorf("%w: grant %s", errStaffCreditReview, g.ID)
 	}
 	return nil
+}
+
+// issuedStaffCredits lists the Stripe grants issued as staff credit for a
+// customer; code that treats unknown live grants as conflicts recognizes them.
+func (h *Handlers) issuedStaffCredits(ctx context.Context, reader db.DBTX, customer string) (map[string]bool, error) {
+	rows, err := reader.Query(ctx, `SELECT stripe_credit_grant_id FROM billing_staff_credit_grant WHERE customer_id=$1 AND state='issued'`, customer)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	staff := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		staff[id] = true
+	}
+	return staff, err
+}
+
+func isStaffCredit(g entitlementGrant, staff map[string]bool) bool {
+	return staff[g.ID] && g.Metadata["staff_credit_grant"] != "" && g.Applicability.Scope.PriceType == "metered" && len(g.Applicability.Scope.Prices) == 0
 }

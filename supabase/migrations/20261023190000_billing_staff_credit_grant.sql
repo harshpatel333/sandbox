@@ -1,5 +1,6 @@
 -- One-off usage credit granted by staff, for example to correct a billing
--- mistake. Each row is the durable intent behind exactly one Stripe credit
+-- mistake. It never expires: usage-only invoice reconciliation supports only
+-- non-expiring metered credit. Each row is the durable intent behind exactly one Stripe credit
 -- grant: the grant carries this row's id so a retry after a lost response
 -- adopts it instead of granting twice.
 CREATE TABLE billing_staff_credit_grant (
@@ -8,7 +9,6 @@ CREATE TABLE billing_staff_credit_grant (
  idempotency_key text NOT NULL CHECK(length(idempotency_key) BETWEEN 1 AND 200),
  customer_id text NOT NULL CHECK(btrim(customer_id)<>''),
  amount_cents bigint NOT NULL CHECK(amount_cents BETWEEN 1 AND 100000000),
- expires_at timestamptz CHECK(expires_at IS NULL OR isfinite(expires_at)),
  reason text NOT NULL CHECK(length(btrim(reason)) BETWEEN 1 AND 2000),
  requested_by uuid NOT NULL,
  requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -19,7 +19,6 @@ CREATE TABLE billing_staff_credit_grant (
  attempts integer NOT NULL DEFAULT 0 CHECK(attempts>=0),
  last_error text,
  UNIQUE(team_id,idempotency_key),
- CHECK(expires_at IS NULL OR expires_at>requested_at),
  CHECK((state='issued')=(stripe_credit_grant_id IS NOT NULL) AND (state='issued')=(issued_at IS NOT NULL) AND (state='issued')=(issuance_evidence IS NOT NULL))
 );
 CREATE INDEX billing_staff_credit_grant_team ON billing_staff_credit_grant(team_id,requested_at DESC);
@@ -43,6 +42,7 @@ BEGIN
   RETURN NEW;
  END IF;
  IF OLD.state='issued' THEN RAISE EXCEPTION 'issued staff credit is immutable'; END IF;
+ IF NEW.attempts<OLD.attempts THEN RAISE EXCEPTION 'staff credit attempts only grow'; END IF;
  IF (to_jsonb(NEW)-ARRAY['state','stripe_credit_grant_id','issued_at','issuance_evidence','attempts','last_error'])
   IS DISTINCT FROM (to_jsonb(OLD)-ARRAY['state','stripe_credit_grant_id','issued_at','issuance_evidence','attempts','last_error']) THEN
   RAISE EXCEPTION 'staff credit request is immutable';
@@ -50,7 +50,12 @@ BEGIN
  IF NEW.state='issued' AND (NEW.issuance_evidence->>'id' IS DISTINCT FROM NEW.stripe_credit_grant_id
   OR NEW.issuance_evidence->>'customer' IS DISTINCT FROM NEW.customer_id
   OR (NEW.issuance_evidence#>>'{amount,monetary,value}')::bigint IS DISTINCT FROM NEW.amount_cents
-  OR NEW.issuance_evidence#>>'{metadata,staff_credit_grant}' IS DISTINCT FROM NEW.id::text) THEN
+  OR NEW.issuance_evidence#>>'{metadata,staff_credit_grant}' IS DISTINCT FROM NEW.id::text
+  OR NEW.issuance_evidence#>>'{applicability_config,scope,price_type}' IS DISTINCT FROM 'metered'
+  OR NEW.issuance_evidence#>'{applicability_config,scope,prices}' IS NOT NULL AND jsonb_array_length(NEW.issuance_evidence#>'{applicability_config,scope,prices}')<>0
+  OR COALESCE((NEW.issuance_evidence->>'priority')::bigint,0)<>50
+  OR COALESCE((NEW.issuance_evidence->>'expires_at')::bigint,0)<>0
+  OR COALESCE((NEW.issuance_evidence->>'voided_at')::bigint,0)<>0) THEN
   RAISE EXCEPTION 'issued grant does not match the staff credit';
  END IF;
  RETURN NEW;

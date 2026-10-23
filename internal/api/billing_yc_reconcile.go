@@ -219,7 +219,11 @@ func (h *Handlers) reconcileYC(ctx context.Context, team uuid.UUID) error {
 			return err
 		}
 	}
-	if err = client.ycGrantPreflight(ctx, o.Customer, o.Contract.String(), o.currentApprovedGrant()); err != nil {
+	staff, err := h.issuedStaffCredits(ctx, h.Pool, o.Customer)
+	if err != nil {
+		return err
+	}
+	if err = client.ycGrantPreflight(ctx, o.Customer, o.Contract.String(), o.currentApprovedGrant(), staff); err != nil {
 		return err
 	}
 	sub, err = h.ensureYCResources(ctx, o, sub, client)

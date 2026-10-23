@@ -106,14 +106,13 @@ func newStaffCreditFixture(t *testing.T, withCustomer bool) (*Handlers, uuid.UUI
 func TestStaffCreditGrantIssuesOnce(t *testing.T) {
 	h, team, s := newStaffCreditFixture(t, true)
 	actor := uuid.New()
-	expires := time.Now().Add(90 * 24 * time.Hour).Truncate(time.Second)
-	req := staffCreditRequest{Key: "goodwill-1", AmountCents: 25000, Reason: "Usage billed during an outage", ExpiresAt: &expires}
+	req := staffCreditRequest{Key: "goodwill-1", AmountCents: 25000, Reason: "Usage billed during an outage"}
 	credit, err := h.grantStaffCredit(t.Context(), team, actor, req)
 	if err != nil || credit.State != "issued" || credit.GrantID == nil || credit.RequestedBy != actor {
 		t.Fatalf("credit not issued: %+v %v", credit, err)
 	}
 	g := s.grants[0]
-	if g.Amount.Monetary.Value != 25000 || g.Applicability.Scope.PriceType != "metered" || g.Priority != 50 || g.ExpiresAt != expires.Unix() || g.Category != "promotional" {
+	if g.Amount.Monetary.Value != 25000 || g.Applicability.Scope.PriceType != "metered" || g.Priority != 50 || g.ExpiresAt != 0 || g.Category != "promotional" {
 		t.Fatalf("grant is not a metered-only credit with the requested terms: %+v", g)
 	}
 	if err = creditScope(g, s.customer, time.Now().Unix(), nil); err != nil {
@@ -145,23 +144,64 @@ func TestStaffCreditGrantAdoptsLostResponse(t *testing.T) {
 	if err != nil || credit.State != "issued" || s.creates != 1 || *credit.GrantID != s.grants[0].ID {
 		t.Fatalf("retry did not adopt the existing grant: creates=%d %+v %v", s.creates, credit, err)
 	}
-	if s.grants[0].ExpiresAt != 0 {
-		t.Fatal("credit without an expiry was given one")
-	}
 }
 
 func TestStaffCreditGrantRejectsMismatchedProviderGrant(t *testing.T) {
 	h, team, s := newStaffCreditFixture(t, true)
 	s.tamper = true
 	credit, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k", AmountCents: 100, Reason: "r"})
-	if err == nil || credit.State != "pending" {
+	if !errors.Is(err, errStaffCreditReview) || credit.State != "pending" {
 		t.Fatalf("mismatched grant recorded as issued: %+v %v", credit, err)
+	}
+	s.mu.Lock()
+	s.tamper = false
+	s.grants[0].Amount.Monetary.Value = 100
+	s.grants[0].VoidedAt = time.Now().Unix()
+	s.mu.Unlock()
+	if credit, err = h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditReview) || s.creates != 1 {
+		t.Fatalf("a voided grant was replaced by a second grant: creates=%d %v", s.creates, err)
+	}
+}
+
+func TestStaffCreditGrantFollowsCurrentCustomer(t *testing.T) {
+	h, team, s := newStaffCreditFixture(t, true)
+	s.lose = true
+	req := staffCreditRequest{Key: "k", AmountCents: 100, Reason: "r"}
+	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req); err == nil {
+		t.Fatal("lost response treated as issued")
+	}
+	s.mu.Lock()
+	s.grants = nil
+	s.mu.Unlock()
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_customer_id='cus_replacement' WHERE team_id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req); !errors.Is(err, errStaffCreditConflict) || s.creates != 1 {
+		t.Fatalf("pending credit issued to the previous customer: creates=%d %v", s.creates, err)
+	}
+}
+
+func TestStaffCreditIsRecognizedByAllowanceChecks(t *testing.T) {
+	h, team, s := newStaffCreditFixture(t, true)
+	credit, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k", AmountCents: 100, Reason: "r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staff, err := h.issuedStaffCredits(t.Context(), h.Pool, s.customer)
+	if err != nil || !staff[*credit.GrantID] {
+		t.Fatalf("issued staff credit not listed: %v %v", staff, err)
+	}
+	if err = h.Stripe.(*stripeHTTPClient).ycGrantPreflight(t.Context(), s.customer, "", "", staff); err != nil {
+		t.Fatalf("staff credit blocks YC grant preflight: %v", err)
+	}
+	if err = h.Stripe.(*stripeHTTPClient).ycGrantPreflight(t.Context(), s.customer, "", "", nil); err == nil {
+		t.Fatal("unknown live grant no longer conflicts with YC approval")
 	}
 }
 
 func TestStaffCreditGrantRequiresCustomerAndStaff(t *testing.T) {
 	h, team, _ := newStaffCreditFixture(t, false)
-	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditConflict) {
+	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditNoCustomer) {
 		t.Fatalf("credit granted without a billing customer: %v", err)
 	}
 	for _, call := range []struct {
