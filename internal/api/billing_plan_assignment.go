@@ -350,10 +350,19 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 		plan = &customerPlan{PlanKey: current.PlanKey, Kind: current.Kind, DisplayName: current.Terms.DisplayName, EffectiveFrom: current.EffectiveFrom,
 			Limits: planLimits{MaxConcurrent: &limits.MaxConcurrent, MaxVCPU: &limits.MaxVCPU, MaxMemoryMiB: &limits.MaxMemoryMiB, MaxDiskMiB: &limits.MaxDiskMiB, MaxTemplates: &limits.MaxTemplates}}
 	}
+	var pending *customerPendingPlanChange
+	if change, ok, err := pendingTeamPlanChange(ctx, h.Pool, team); err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("load pending plan change failed")
+		respondError(c, ErrInternal)
+		return
+	} else if ok {
+		pending = &customerPendingPlanChange{ID: change.ID, TargetPlanKey: change.TargetPlanKey, TargetDisplayName: change.TargetTerms.DisplayName,
+			EffectiveAt: change.EffectiveAt, Undoable: change.Undoable(time.Now()), PausesRunning: change.PausesRunning}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"plan":           plan,
 		"period":         customerBillingPeriod{Start: start, End: end},
-		"pending_change": (*customerPendingPlanChange)(nil),
+		"pending_change": pending,
 	})
 }
 

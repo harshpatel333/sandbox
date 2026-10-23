@@ -85,3 +85,22 @@ func TestIntegration_BillingPlanUnderPricingV2(t *testing.T) {
 		t.Fatalf("starter team's upgrade preview: %d %s", w.Code, w.Body.String())
 	}
 }
+
+func TestIntegration_BillingPlanChangeWrites(t *testing.T) {
+	teamID, key := seedTeamAndKey(t)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	r := newRouter(t)
+	body := `{"target_plan":"free","idempotency_key":"k1"}`
+	if w := do(r, "POST", "/billing/plan-changes", viewerKey, body); w.Code != http.StatusForbidden {
+		t.Fatalf("viewer scheduled a plan change: %d %s", w.Code, w.Body.String())
+	}
+	if w := do(r, "POST", "/billing/plan-changes", key, `{"target_plan":"free","idempotency_key":"k1","expires_at":"x"}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown field accepted: %d", w.Code)
+	}
+	if w := do(r, "POST", "/billing/plan-changes", key, body); w.Code != http.StatusBadRequest && w.Code != http.StatusConflict {
+		t.Fatalf("team without a plan changed plans: %d %s", w.Code, w.Body.String())
+	}
+	if w := do(r, "POST", "/billing/plan-changes/"+teamID.String()+"/undo", key, ""); w.Code != http.StatusNotFound {
+		t.Fatalf("undo of an unknown change: %d %s", w.Code, w.Body.String())
+	}
+}
