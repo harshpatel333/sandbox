@@ -6,7 +6,7 @@ CREATE OR REPLACE FUNCTION billing_free_plan(p_team uuid)
 RETURNS TABLE(free_since timestamptz, allowance_usd numeric, max_vcpu int, max_memory_mib int, max_disk_mib int)
 LANGUAGE sql STABLE AS $$
  SELECT a.effective_from,
-        (a.terms->'allowance'->>'amount_usd')::numeric,
+        COALESCE((a.terms->'allowance'->>'amount_usd')::numeric, 0),
         (a.limits->>'max_template_vcpu')::int,
         (a.limits->>'max_template_memory_mib')::int,
         (a.limits->>'max_template_disk_mib')::int
@@ -163,8 +163,8 @@ CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS
  SELECT CASE
  WHEN EXISTS(SELECT 1 FROM abuse_restrictions r WHERE r.subject_team_id=p_team_id AND r.released_at IS NULL
  AND (r.expires_at IS NULL OR r.expires_at>now()) AND r.action IN ('create','resume')) THEN false
- WHEN EXISTS(SELECT 1 FROM billing_free_plan(p_team_id)) THEN NOT billing_free_allowance_blocked(p_team_id)
  WHEN qm_team_managed_billing(p_team_id) THEN true
+ WHEN EXISTS(SELECT 1 FROM billing_free_plan(p_team_id)) THEN NOT billing_free_allowance_blocked(p_team_id)
  WHEN NOT COALESCE(f.enforce,false) THEN team_sandbox_billing_eligible_legacy(p_team_id)
  WHEN f.observed_generation IS DISTINCT FROM f.generation
  OR (f.customer_id,f.subscription_id) IS DISTINCT FROM (a.stripe_customer_id,a.stripe_subscription_id) THEN false

@@ -354,3 +354,18 @@ func TestIntegration_FreeShape_AdmissionCarriesLimitsAndResumeRefusesLarger(t *t
 		t.Fatalf("claim without plan limits = %+v, %v; want the legacy claim unchanged", c, err)
 	}
 }
+
+func TestIntegration_FreeAllowance_MissingAllowanceCapsAtOnce(t *testing.T) {
+	ctx := context.Background()
+	team, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_plan_assignment (team_id, plan_key, kind, terms, limits, effective_from, source, reason)
+		VALUES ($1, 'free', 'free', '{}', '{"max_sandboxes":1}', now() - interval '1 hour', 'migration', 'test')`, team); err != nil {
+		t.Fatal(err)
+	}
+	sbx := seedActiveSandbox(t, team, "free-no-allowance")
+	seedComputeInterval(t, team, sbx, 1, 1024, time.Now().Add(-time.Minute), nil)
+	if blocked, err := testQueries.RefreshFreeAllowance(ctx, team); err != nil || !blocked {
+		t.Fatalf("refresh with no frozen allowance = %v, %v; want capped rather than unlimited", blocked, err)
+	}
+}
