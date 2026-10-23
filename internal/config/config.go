@@ -395,8 +395,8 @@ func planPriceIDs(raw string) (map[string]string, error) {
 
 // PlanPriceID returns the Stripe base price for checking out a catalog plan.
 // The Pro variables predate STRIPE_PLAN_PRICE_IDS and apply when it has no
-// entry, so a repriced Pro plan can get its own price while YC and sponsored
-// annual keep STRIPE_PRO_ANNUAL_PRICE_ID at the fixed YC amount.
+// entry, so a repriced Pro plan can get its own price while YC keeps
+// STRIPE_PRO_ANNUAL_PRICE_ID at the fixed YC amount.
 func (c *Config) PlanPriceID(offer string) string {
 	if id := c.StripePlanPriceIDs[offer]; id != "" {
 		return id
