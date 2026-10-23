@@ -169,21 +169,8 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 	}
 	var subscription *string
 	var periodEnd time.Time
-	if assigned && current.Kind == planKindSubscription && current.ContractID != nil {
-		if subscription, periodEnd, err = h.planChangeSubscription(ctx, req.Team, *current.ContractID); err != nil {
-			return teamPlanChange{}, err
-		}
-	}
-	if assigned && (current.Kind == planKindCustom || current.Kind == planKindSubscription && periodEnd.Sub(time.Now()) < planChangeMinNotice) {
-		var anchor pgtype.Timestamptz
-		if err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, req.Team).Scan(&anchor); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return teamPlanChange{}, err
-		}
-		from := time.Now()
-		if current.Kind == planKindSubscription {
-			from = periodEnd.Add(time.Second)
-		}
-		if periodEnd, err = h.planChangePeriodEnd(ctx, req.Team, anchor, from); err != nil {
+	if assigned && (current.Kind == planKindSubscription || current.Kind == planKindCustom) {
+		if subscription, periodEnd, err = h.planChangeBoundary(ctx, req.Team, current, time.Now()); err != nil {
 			return teamPlanChange{}, err
 		}
 	}
@@ -250,6 +237,34 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 		return teamPlanChange{}, err
 	}
 	return c, tx.Commit(ctx)
+}
+
+func (h *Handlers) planChangeBoundary(ctx context.Context, team uuid.UUID, current teamPlan, now time.Time) (*string, time.Time, error) {
+	var err error
+	var subscription *string
+	var periodEnd time.Time
+	if current.Kind == planKindSubscription && current.ContractID != nil {
+		if subscription, periodEnd, err = h.planChangeSubscription(ctx, team, *current.ContractID); err != nil {
+			return nil, time.Time{}, err
+		}
+	}
+	if current.Kind == planKindCustom || current.Kind == planKindSubscription && periodEnd.Sub(now) < planChangeMinNotice {
+		var anchor pgtype.Timestamptz
+		if err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, time.Time{}, err
+		}
+		from := now
+		if current.Kind == planKindSubscription {
+			from = periodEnd.Add(time.Second)
+		}
+		if periodEnd, err = h.planChangePeriodEnd(ctx, team, anchor, from); err != nil {
+			return nil, time.Time{}, err
+		}
+	}
+	if current.Kind == planKindSubscription && subscription == nil {
+		return nil, time.Time{}, teamPlanChangeConflict("the team's subscription could not be found")
+	}
+	return subscription, periodEnd, nil
 }
 
 // planChangeSubscription is the live Stripe subscription billing a team's

@@ -118,15 +118,30 @@ func TestIntegration_BillingPlanChangeStaffPendingAndUndoReason(t *testing.T) {
 	if _, err := testPool.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
 		t.Fatal(err)
 	}
+	anchor := time.Now().UTC().AddDate(0, -1, 0).Add(30 * time.Minute).Truncate(time.Second)
+	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,commercial_billing_anchor) VALUES($1,$2)`, team, anchor); err != nil {
+		t.Fatal(err)
+	}
+	previewResponse := do(newRouter(t), http.MethodGet, "/billing/plan-change-preview?target_plan=free", key, "")
+	var preview struct {
+		EffectiveAt time.Time `json:"effective_at"`
+	}
+	if previewResponse.Code != http.StatusOK || json.Unmarshal(previewResponse.Body.Bytes(), &preview) != nil || !preview.EffectiveAt.After(time.Now().Add(24*time.Hour)) {
+		t.Fatalf("preview ignored minimum notice: %d %s", previewResponse.Code, previewResponse.Body)
+	}
 	staff := seedPlatformAdminProfile(t).String()
 	router := newInternalRouter(t)
 	path := "/internal/teams/" + team.String() + "/billing/plan-changes"
 	w := operatorRequest(router, http.MethodPost, path, staff, `{"target_plan":"free","idempotency_key":"staff-exit","reason":"end agreement"}`)
 	var change struct {
-		ID string `json:"id"`
+		ID          string    `json:"id"`
+		EffectiveAt time.Time `json:"effective_at"`
 	}
 	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &change) != nil || change.ID == "" {
 		t.Fatalf("staff exit while entry off: %d %s", w.Code, w.Body)
+	}
+	if !change.EffectiveAt.Equal(preview.EffectiveAt) {
+		t.Fatalf("preview and scheduling disagree: %s != %s", preview.EffectiveAt, change.EffectiveAt)
 	}
 	for _, response := range []*httptest.ResponseRecorder{
 		doInternal(router, http.MethodGet, "/internal/teams/"+team.String()+"/billing/plan-assignments", staff, ""),

@@ -172,6 +172,10 @@ func (f planChangeV2Fixture) reachEffective(t *testing.T, id uuid.UUID) {
 
 func TestTeamPlanChangeStarterToFreeAppliesNow(t *testing.T) {
 	f := newPlanChangeV2Fixture(t, planKindPrepaid)
+	sandbox := uuid.New()
+	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO sandbox(id,team_id,name,host_id,status,created_at) VALUES($1,$2,'example-running','default','active',clock_timestamp())`, sandbox, f.team); err != nil {
+		t.Fatal(err)
+	}
 	c, err := f.request(t, "free", "k1")
 	if err != nil || !c.PausesRunning || c.Subscription != nil || time.Since(c.EffectiveAt) > time.Minute {
 		t.Fatalf("starter to free: %+v %v", c, err)
@@ -194,6 +198,17 @@ func TestTeamPlanChangeStarterToFreeAppliesNow(t *testing.T) {
 	}
 	if max, _ := limitsOf(t, f.h, f.team); max != 1 {
 		t.Fatalf("free limits not applied: %d", max)
+	}
+	f.tick(t)
+	if c = f.reload(t, c.ID); c.State != "applied" {
+		t.Fatalf("change completed with a running sandbox: %+v", c)
+	}
+	var targets int
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_team_pause_target WHERE sandbox_id=$1 AND done_at IS NULL`, sandbox).Scan(&targets); err != nil || targets != 1 {
+		t.Fatalf("running sandbox was not durably queued: %d %v", targets, err)
+	}
+	if _, err := f.h.Pool.Exec(t.Context(), `UPDATE sandbox SET status='paused' WHERE id=$1`, sandbox); err != nil {
+		t.Fatal(err)
 	}
 	f.tick(t)
 	if c = f.reload(t, c.ID); c.State != "completed" {

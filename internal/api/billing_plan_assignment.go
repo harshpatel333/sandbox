@@ -453,15 +453,14 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		preview.PausesRunning = kind == planKindFree
 		at := h.nowUTC()
 		if preview.Timing == planChangeEndOfPeriod {
-			var anchor pgtype.Timestamptz
-			err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
-			if errors.Is(err, pgx.ErrNoRows) {
-				err = nil
-			}
-			if err == nil {
-				_, at, err = h.currentBillingPeriod(ctx, team, anchor, at)
-			}
+			_, at, err = h.planChangeBoundary(ctx, team, current, at)
 			if err != nil {
+				var conflict teamPlanChangeConflictError
+				if errors.As(err, &conflict) {
+					preview.Timing, preview.Blocked = "", conflict.reason
+					c.JSON(http.StatusOK, preview)
+					return
+				}
 				log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
 				respondError(c, ErrInternal)
 				return
