@@ -53,6 +53,17 @@ type matchingPayment struct {
 	PaidOutOfBand bool  `json:"paid_out_of_band"`
 }
 
+// Stripe settles an invoice below its minimum charge by carrying the amount
+// onto the customer balance; that usage is paid where it happened, and the
+// later invoice collecting the carry matches only its own usage.
+func (p matchingPayment) settled(inv StripeInvoiceAmounts) int64 {
+	carried := int64(0)
+	if inv.EndingBalance != nil {
+		carried = max(*inv.EndingBalance-inv.StartingBalance, 0)
+	}
+	return p.AmountPaid + carried
+}
+
 // Only usage-priced lines are matchable: the plan fee and anything else on the
 // invoice fall outside the frozen close plan's credit prices. Every applied
 // credit grant is subtracted, including earlier matching credit. Cash is
@@ -108,7 +119,7 @@ func matchingInvoiceUsage(inv StripeInvoiceAmounts, paid matchingPayment, prices
 		}
 	}
 	net := u.UsageCents - u.CreditCents - u.DiscountCents
-	u.UnpaidCents = max(net-max(paid.AmountPaid-max(other, 0), 0), 0)
+	u.UnpaidCents = max(net-max(paid.settled(inv)-max(other, 0), 0), 0)
 	return u, nil
 }
 
@@ -169,8 +180,9 @@ func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *strip
 			rows.Close()
 			return err
 		}
-		if json.Unmarshal(raw, &m.Plan) != nil {
-			m.Plan = billing.InvoiceClosePlan{}
+		if err := json.Unmarshal(raw, &m.Plan); err != nil {
+			log.Error().Err(err).Str("invoice_id", m.Invoice).Msg("matching skipped an unreadable close plan this pass")
+			continue
 		}
 		candidates = append(candidates, m)
 	}
@@ -265,7 +277,8 @@ func (h *Handlers) issueDueMatchingCredits(ctx context.Context, client *stripeHT
 		case issueErr == nil:
 			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET failures=0,last_error=NULL WHERE id=$1`, id)
 		case errors.Is(issueErr, errMatchingDeferred) || errors.Is(issueErr, errCreditInventoryPending):
-			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET next_attempt_at=clock_timestamp()+interval '30 seconds',last_error=$2 WHERE id=$1`, id, issueErr.Error())
+			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET last_error=$2,
+ next_attempt_at=clock_timestamp()+CASE WHEN created_at<clock_timestamp()-interval '1 day' THEN interval '1 hour' ELSE interval '30 seconds' END WHERE id=$1`, id, issueErr.Error())
 			issueErr = nil
 		default:
 			log.Error().Err(issueErr).Str("matching_credit_id", id.String()).Msg("matching credit issuance failed; inspect before replaying")
@@ -411,25 +424,22 @@ func matchingGrantForm(raw []byte) (url.Values, error) {
 // Refunds and credit notes after a match are surfaced for staff; matched
 // credit is never clawed back automatically.
 func (h *Handlers) reviewMatchedInvoices(ctx context.Context, client *stripeHTTPClient) error {
-	if _, err := h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET review_checked_at='infinity' WHERE id IN (SELECT id FROM billing_matching_credit
- WHERE amount_cents>0 AND flagged_at IS NULL AND (review_checked_at IS NULL OR review_checked_at<clock_timestamp()-interval '1 day') AND created_at<=clock_timestamp()-interval '120 days'
- ORDER BY review_checked_at NULLS FIRST LIMIT 100)`); err != nil {
-		return err
-	}
-	rows, err := h.Pool.Query(ctx, `SELECT id,invoice_id,customer_id FROM billing_matching_credit
- WHERE amount_cents>0 AND flagged_at IS NULL AND (review_checked_at IS NULL OR review_checked_at<clock_timestamp()-interval '1 day')
- ORDER BY review_checked_at NULLS FIRST,id LIMIT 10`)
+	rows, err := h.Pool.Query(ctx, `SELECT id,invoice_id,customer_id,created_at<now()-interval '120 days' FROM billing_matching_credit
+ WHERE amount_cents>0 AND flagged_at IS NULL AND review_checked_at IS DISTINCT FROM 'infinity'::timestamptz
+  AND COALESCE(review_checked_at,'-infinity'::timestamptz)<now()-interval '1 day'
+ ORDER BY COALESCE(review_checked_at,'-infinity'::timestamptz) LIMIT 10`)
 	if err != nil {
 		return err
 	}
 	type matched struct {
 		ID                uuid.UUID
 		Invoice, Customer string
+		Expired           bool
 	}
 	var due []matched
 	for rows.Next() {
 		var m matched
-		if err = rows.Scan(&m.ID, &m.Invoice, &m.Customer); err != nil {
+		if err = rows.Scan(&m.ID, &m.Invoice, &m.Customer, &m.Expired); err != nil {
 			rows.Close()
 			return err
 		}
@@ -441,6 +451,11 @@ func (h *Handlers) reviewMatchedInvoices(ctx context.Context, client *stripeHTTP
 	}
 	var errs []error
 	for _, m := range due {
+		if m.Expired {
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET review_checked_at='infinity' WHERE id=$1`, m.ID)
+			errs = append(errs, err)
+			continue
+		}
 		reason, evidence, err := client.matchedInvoiceReversal(ctx, m.Invoice, m.Customer)
 		if err != nil {
 			errs = append(errs, err)

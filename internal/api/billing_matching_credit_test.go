@@ -36,6 +36,22 @@ func TestMatchingUsageExcludesFeeDiscountsAndCredits(t *testing.T) {
 	}
 }
 
+func TestMatchingUsageCountsBalanceCarryAsPaidWhereUsageHappened(t *testing.T) {
+	var carried, collecting StripeInvoiceAmounts
+	if err := json.Unmarshal([]byte(`{"starting_balance":0,"ending_balance":40,"lines":{"data":[{"amount":40,"currency":"usd","pricing":{"price_details":{"price":"price_cpu"}}}]}}`), &carried); err != nil {
+		t.Fatal(err)
+	}
+	if u, err := matchingInvoiceUsage(carried, matchingPayment{}, []string{"price_cpu"}); err != nil || u.UnpaidCents != 0 || u.UsageCents != 40 {
+		t.Fatalf("usage carried onto the balance was not matched where it happened: %+v %v", u, err)
+	}
+	if err := json.Unmarshal([]byte(`{"starting_balance":40,"ending_balance":0,"lines":{"data":[{"amount":30,"currency":"usd","pricing":{"price_details":{"price":"price_cpu"}}}]}}`), &collecting); err != nil {
+		t.Fatal(err)
+	}
+	if u, err := matchingInvoiceUsage(collecting, matchingPayment{AmountPaid: 70}, []string{"price_cpu"}); err != nil || u.UsageCents-u.UnpaidCents != 30 {
+		t.Fatalf("carried balance was matched again on the collecting invoice: %+v %v", u, err)
+	}
+}
+
 func TestMatchingGrantFormRejectsExpiringOrScopedRequests(t *testing.T) {
 	valid := `{"customer":"cus_example","category":"promotional","name":"Matching credit","priority":50,"amount":{"type":"monetary","monetary":{"currency":"usd","value":100}},"applicability_config":{"scope":{"price_type":"metered"}},"metadata":{"matching_credit_id":"m","invoice_id":"in_example"}}`
 	form, err := matchingGrantForm([]byte(valid))

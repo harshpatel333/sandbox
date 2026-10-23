@@ -72,8 +72,8 @@ CREATE TABLE billing_matching_credit (
 );
 CREATE INDEX billing_matching_credit_contract ON billing_matching_credit(contract_id, created_at);
 CREATE INDEX billing_matching_credit_due ON billing_matching_credit(next_attempt_at) WHERE state IN ('pending', 'uncertain');
-CREATE INDEX billing_matching_credit_review ON billing_matching_credit(review_checked_at NULLS FIRST)
-    WHERE amount_cents > 0 AND flagged_at IS NULL;
+CREATE INDEX billing_matching_credit_review ON billing_matching_credit((COALESCE(review_checked_at, '-infinity'::timestamptz)))
+    WHERE amount_cents > 0 AND flagged_at IS NULL AND review_checked_at IS DISTINCT FROM 'infinity'::timestamptz;
 CREATE INDEX billing_matching_credit_flagged ON billing_matching_credit(flagged_at) WHERE acknowledged_at IS NULL;
 
 CREATE FUNCTION guard_billing_contract_matching_rule() RETURNS trigger LANGUAGE plpgsql AS $$
