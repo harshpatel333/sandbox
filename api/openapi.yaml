@@ -458,7 +458,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/BillingSessionResponse"
         "202":
-          description: Provider outcome is uncertain; use Pro recovery before another purchase or plan selection.
+          description: Provider outcome is uncertain; use plan purchase recovery before another purchase or plan selection.
         "409":
           description: Plan already committed or a purchase is awaiting confirmation.
         "400":
@@ -565,7 +565,7 @@ paths:
       operationId: commitFreeSignupPlan
       tags: [Billing]
       summary: Commit Free onboarding
-      description: Requires billing:write. Commits Free access without requiring a payment method. A pending or committed Pro purchase returns 409 and retains its payment and benefits. Enterprise sales onboarding also uses this Free access decision.
+      description: Requires billing:write. Commits Free access without requiring a payment method. A pending or committed plan purchase returns 409 and retains its payment and benefits. Enterprise sales onboarding also uses this Free access decision.
       security:
         - apiKey: []
       requestBody:
@@ -589,7 +589,7 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "409":
-          description: A Pro purchase is pending or committed
+          description: A plan purchase is pending or committed
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -597,7 +597,7 @@ paths:
     post:
       operationId: recoverProCheckout
       tags: [Billing]
-      summary: Reconcile the original Pro purchase
+      summary: Reconcile the original plan purchase
       description: Requires billing:write. Retrieves the original Checkout and verifies subscription and cash payment evidence. Restart closes an open unpaid session before allowing a new plan selection. Uncertain outcomes retain the billing fence; account access remains available.
       security:
         - apiKey: []
@@ -3396,7 +3396,7 @@ components:
       properties:
         key:
           type: string
-          description: free or a plan catalog offer key, such as pro_annual.
+          description: free, a plan catalog offer key such as pro_annual, or a managed offer such as yc_2026.
           example: pro_annual
         name:
           type: string
