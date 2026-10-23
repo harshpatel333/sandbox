@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -62,7 +63,7 @@ func (h *Handlers) startPrepaidCredits(ctx context.Context, client *stripeHTTPCl
 func (h *Handlers) prepaidTick(ctx context.Context, client *stripeHTTPClient) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
-	return errors.Join(h.recordAutoRecharges(ctx), h.settleDuePrepaidPurchases(ctx, client), h.startPrepaidEnforcement(ctx), h.voidSpentPrepaidGrants(ctx, client), h.notifyDisabledAutoRecharges(ctx))
+	return errors.Join(h.recordAutoRecharges(ctx), h.settleDuePrepaidPurchases(ctx, client), h.retryPrepaidEnrolment(ctx), h.startPrepaidEnforcement(ctx), h.voidSpentPrepaidGrants(ctx, client), h.notifyDisabledAutoRecharges(ctx))
 }
 
 // A charge is created only from a balance observed after the team's latest
@@ -121,7 +122,18 @@ func (h *Handlers) settleDuePrepaidPurchases(ctx context.Context, client *stripe
 		case workErr == nil:
 			_, err = h.Pool.Exec(ack, `UPDATE billing_prepaid_purchase SET failures=0,last_error=NULL WHERE id=$1`, id)
 		case errors.Is(workErr, errCreditIssuanceDeferred) || errors.Is(workErr, errPrepaidPaymentPending):
-			_, err = h.Pool.Exec(ack, `UPDATE billing_prepaid_purchase SET last_error=$2,next_attempt_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, id, workErr.Error())
+			var seconds int64
+			_ = h.Pool.QueryRow(ack, `SELECT extract(epoch FROM clock_timestamp()-created_at)::bigint FROM billing_prepaid_purchase WHERE id=$1`, id).Scan(&seconds)
+			age := time.Duration(seconds) * time.Second
+			delay := 30 * time.Second
+			if age > time.Hour {
+				delay = 10 * time.Minute
+			}
+			if age > 72*time.Hour {
+				delay = time.Hour
+				log.Error().Str("prepaid_purchase_id", id.String()).Err(workErr).Msg("prepaid purchase has been unsettled for days; operator review required")
+			}
+			_, err = h.Pool.Exec(ack, `UPDATE billing_prepaid_purchase SET last_error=$2,next_attempt_at=clock_timestamp()+$3::interval WHERE id=$1`, id, workErr.Error(), delay.String())
 			workErr = nil
 		default:
 			log.Error().Err(workErr).Str("prepaid_purchase_id", id.String()).Msg("prepaid purchase settlement failed")
@@ -217,7 +229,7 @@ func (h *Handlers) chargeAutoRecharge(ctx context.Context, client *stripeHTTPCli
 		}
 		err = client.doForm(ctx, http.MethodPost, "/v1/payment_intents", form, &pi, key)
 		var se *stripeRequestError
-		if errors.As(err, &se) && (se.Status == http.StatusPaymentRequired || definitiveStripeRejection(err)) {
+		if errors.As(err, &se) && (se.Status == http.StatusPaymentRequired || definitiveStripeRejection(err)) && !strings.Contains(se.Message, "idempotency_error") {
 			return h.failPrepaidPayment(ctx, id, "card_error", "the saved card was declined or needs authentication", true)
 		}
 	}

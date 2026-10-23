@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"net/http"
@@ -9,7 +10,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 )
 
@@ -127,52 +130,144 @@ func (h *Handlers) prepaidCapacityAvailable(ctx context.Context, team uuid.UUID)
 	return ok, err
 }
 
-// Prepaid teams accumulate one grant per purchase, so their balance is read
-// once for the customer's metered credit instead of once per grant. Any grant
-// the aggregate cannot describe (price-scoped, expiring, not yet effective)
-// sends the team back to the per-grant observation.
+// Prepaid teams accumulate one grant per purchase, so their non-expiring
+// metered grants are read as one customer balance. Grants of any other shape
+// (for example allowances after a plan change) are read one by one under the
+// same bound as the per-grant observation. Finalized periods have already
+// debited the ledger, so the reconciliation window starts no earlier than the
+// last one.
 func (h *Handlers) aggregateFundingGrants(ctx context.Context, client *stripeHTTPClient, team uuid.UUID, customer string, at time.Time) (fundingGrantSnapshot, bool, error) {
 	if h.Pool == nil {
 		return fundingGrantSnapshot{}, false, nil
 	}
 	var prepaid bool
-	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE team_id=$1 AND customer_id=$2 AND credit_state='issued')`, team, customer).Scan(&prepaid); err != nil || !prepaid {
+	var floor *time.Time
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE team_id=$1 AND customer_id=$2 AND credit_state='issued'),
+ (SELECT max(p.period_end) FROM team_billing_period p JOIN billing_invoice_close j USING(team_id,period_start,period_end) WHERE p.team_id=$1 AND p.finalized_at IS NOT NULL AND j.state='released')`, team, customer).Scan(&prepaid, &floor); err != nil || !prepaid {
 		return fundingGrantSnapshot{}, false, err
 	}
-	head, start, active, ok, err := client.meteredGrantInventory(ctx, customer, at)
-	if err != nil || !ok {
-		return fundingGrantSnapshot{}, false, err
-	}
-	before, err := client.meteredCreditBalance(ctx, customer)
+	inv, err := client.meteredGrantInventory(ctx, customer, at)
 	if err != nil {
 		return fundingGrantSnapshot{}, false, err
 	}
+	if len(inv.Others) > 8 {
+		return fundingGrantSnapshot{}, false, errors.New("active funding credit inventory exceeds observation bound")
+	}
+	metered := fundingGrantBalance{}
+	if inv.Metered > 0 {
+		if metered, err = client.meteredCreditBalance(ctx, customer); err != nil {
+			return fundingGrantSnapshot{}, false, err
+		}
+	}
+	start := at
+	if inv.Metered > 0 && inv.MeteredStart.Before(start) {
+		start = inv.MeteredStart
+	}
+	var expiry pgtype.Timestamptz
+	var required []string
+	others := map[string]fundingGrantBalance{}
+	total := metered.Ledger
+	for _, g := range inv.Others {
+		if g.Applicability.Scope.PriceType != "metered" && required == nil {
+			if required, err = h.fundingCreditResourcePrices(ctx, team, customer); err != nil {
+				return fundingGrantSnapshot{}, false, err
+			}
+		}
+		if !fundingGrantCoversResources(g, required) {
+			return fundingGrantSnapshot{}, false, errors.New("funding credit applicability is unknown")
+		}
+		balance, err := fundingProviderGrantBalance(ctx, client, customer, g.ID)
+		if err != nil {
+			return fundingGrantSnapshot{}, false, err
+		}
+		if balance.Ledger == 0 {
+			continue
+		}
+		if balance.Ledger > g.Amount.Monetary.Value || total > int64(^uint64(0)>>1)-balance.Ledger {
+			return fundingGrantSnapshot{}, false, errors.New("invalid funding credit ledger total")
+		}
+		others[g.ID] = balance
+		total += balance.Ledger
+		effective := g.EffectiveAt
+		if effective == 0 {
+			effective = g.Created
+		}
+		if effective <= 0 {
+			return fundingGrantSnapshot{}, false, errors.New("funding credit has no effective boundary")
+		}
+		if time.Unix(effective, 0).Before(start) {
+			start = time.Unix(effective, 0)
+		}
+		if g.ExpiresAt > 0 && (!expiry.Valid || time.Unix(g.ExpiresAt, 0).Before(expiry.Time)) {
+			expiry = pgtype.Timestamptz{Valid: true, Time: time.Unix(g.ExpiresAt, 0)}
+		}
+	}
+	if floor != nil && start.Before(*floor) {
+		start = *floor
+	}
+	grants := map[string]entitlementGrant{}
+	for _, g := range inv.Others {
+		grants[g.ID] = g
+	}
 	return fundingGrantSnapshot{
-		Total: before.Ledger, Start: start,
-		Evidence: map[string]any{"metered_ledger_cents": before.Ledger, "metered_available_cents": before.Available, "active_grants": active},
-		Reserved: func() *big.Int { return big.NewInt(before.Ledger - before.Available) },
+		Total: total, Start: start, Expiry: expiry,
+		Evidence: map[string]any{"metered_ledger_cents": metered.Ledger, "metered_available_cents": metered.Available, "metered_grants": inv.Metered, "other_grants": others},
+		Reserved: func() *big.Int {
+			reserved := big.NewInt(metered.Ledger - metered.Available)
+			for _, b := range others {
+				reserved.Add(reserved, big.NewInt(b.Ledger-b.Available))
+			}
+			return reserved
+		},
 		Stable: func(ctx context.Context) error {
-			after, err := client.meteredCreditBalance(ctx, customer)
+			current, err := client.meteredGrantInventory(ctx, customer, at)
 			if err != nil {
 				return err
 			}
-			if after != before {
-				return errors.New("funding credit ledger changed during observation")
-			}
-			current, _, _, ok, err := client.meteredGrantInventory(ctx, customer, at)
-			if err != nil {
-				return err
-			}
-			if !ok || current != head {
+			if current.Head != inv.Head || current.Metered != inv.Metered || len(current.Others) != len(inv.Others) {
 				return errors.New("funding credit grants changed during observation")
+			}
+			if inv.Metered > 0 {
+				after, err := client.meteredCreditBalance(ctx, customer)
+				if err != nil {
+					return err
+				}
+				if after != metered {
+					return errors.New("funding credit ledger changed during observation")
+				}
+			}
+			for id, before := range others {
+				after, err := fundingProviderGrantBalance(ctx, client, customer, id)
+				if err != nil {
+					return err
+				}
+				if after != before {
+					return errors.New("funding credit ledger changed during observation")
+				}
+				grant, err := client.retrieveEntitlementGrant(ctx, id)
+				if err != nil {
+					return err
+				}
+				a, _ := json.Marshal(grant)
+				b, _ := json.Marshal(grants[id])
+				if string(a) != string(b) {
+					return errors.New("funding credit grant changed during observation")
+				}
 			}
 			return nil
 		},
 	}, true, nil
 }
 
-func (c *stripeHTTPClient) meteredGrantInventory(ctx context.Context, customer string, at time.Time) (string, time.Time, int, bool, error) {
-	start, head, active := at, "", 0
+type meteredInventory struct {
+	Head         string
+	Metered      int
+	MeteredStart time.Time
+	Others       []entitlementGrant
+}
+
+func (c *stripeHTTPClient) meteredGrantInventory(ctx context.Context, customer string, at time.Time) (meteredInventory, error) {
+	inv := meteredInventory{MeteredStart: at}
 	cursor := ""
 	for page := 0; page < 20; page++ {
 		q := url.Values{"customer": {customer}, "limit": {"100"}}
@@ -184,42 +279,43 @@ func (c *stripeHTTPClient) meteredGrantInventory(ctx context.Context, customer s
 			HasMore bool               `json:"has_more"`
 		}
 		if err := c.doForm(ctx, http.MethodGet, "/v1/billing/credit_grants?"+q.Encode(), nil, &list, ""); err != nil {
-			return "", at, 0, false, err
+			return inv, err
 		}
 		for _, g := range list.Data {
 			if g.ID == "" || g.Customer != customer {
-				return "", at, 0, false, errors.New("funding credit customer mismatch")
+				return inv, errors.New("funding credit customer mismatch")
 			}
-			if head == "" {
-				head = g.ID
+			if inv.Head == "" {
+				inv.Head = g.ID
 			}
-			if g.VoidedAt != 0 || (g.ExpiresAt != 0 && g.ExpiresAt <= at.Unix()) {
+			if g.VoidedAt != 0 || g.EffectiveAt > at.Unix() || (g.ExpiresAt != 0 && g.ExpiresAt <= at.Unix()) {
 				continue
 			}
-			if g.EffectiveAt > at.Unix() || g.ExpiresAt != 0 || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Amount.Monetary.Currency != "usd" {
-				return "", at, 0, false, nil
+			if g.ExpiresAt != 0 || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Amount.Monetary.Currency != "usd" {
+				inv.Others = append(inv.Others, g)
+				continue
 			}
-			active++
+			inv.Metered++
 			effective := g.EffectiveAt
 			if effective == 0 {
 				effective = g.Created
 			}
 			if effective <= 0 {
-				return "", at, 0, false, errors.New("funding credit has no effective boundary")
+				return inv, errors.New("funding credit has no effective boundary")
 			}
-			if time.Unix(effective, 0).Before(start) {
-				start = time.Unix(effective, 0)
+			if time.Unix(effective, 0).Before(inv.MeteredStart) {
+				inv.MeteredStart = time.Unix(effective, 0)
 			}
 		}
 		if !list.HasMore {
-			return head, start, active, true, nil
+			return inv, nil
 		}
 		if len(list.Data) == 0 {
-			return "", at, 0, false, errors.New("empty incomplete credit grant page")
+			return inv, errors.New("empty incomplete credit grant page")
 		}
 		cursor = list.Data[len(list.Data)-1].ID
 	}
-	return "", at, 0, false, errors.New("funding credit inventory exceeds the observation bound")
+	return inv, errors.New("funding credit inventory exceeds the observation bound")
 }
 
 func (c *stripeHTTPClient) meteredCreditBalance(ctx context.Context, customer string) (fundingGrantBalance, error) {
@@ -239,6 +335,9 @@ func (c *stripeHTTPClient) meteredCreditBalance(ctx context.Context, customer st
 	if err := c.doForm(ctx, http.MethodGet, "/v1/billing/credit_balance_summary?"+q.Encode(), nil, &summary, ""); err != nil {
 		return fundingGrantBalance{}, err
 	}
+	if len(summary.Balances) == 0 {
+		return fundingGrantBalance{}, nil
+	}
 	if len(summary.Balances) != 1 || summary.Balances[0].Ledger.Monetary == nil || summary.Balances[0].Available.Monetary == nil {
 		return fundingGrantBalance{}, errors.New("metered credit balance evidence incomplete")
 	}
@@ -247,4 +346,32 @@ func (c *stripeHTTPClient) meteredCreditBalance(ctx context.Context, customer st
 		return fundingGrantBalance{}, errors.New("metered credit balance evidence invalid")
 	}
 	return fundingGrantBalance{Ledger: l.Value, Available: a.Value}, nil
+}
+
+// A paid prepaid team must be observed for its balance to count and for
+// auto-recharge to work; enrolment that failed after payment is retried here.
+func (h *Handlers) retryPrepaidEnrolment(ctx context.Context) error {
+	rows, err := h.Pool.Query(ctx, `SELECT DISTINCT p.team_id FROM billing_prepaid_purchase p
+ LEFT JOIN billing_funding_account f USING(team_id)
+ WHERE p.credit_state='issued' AND NOT COALESCE(f.observe,false) LIMIT 20`)
+	if err != nil {
+		return err
+	}
+	teams, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, team := range teams {
+		allowed, err := prepaidPlanAllowsPurchase(ctx, h, team)
+		if err != nil || !allowed {
+			errs = append(errs, err)
+			continue
+		}
+		if err = h.enrolPrepaidObservation(ctx, team); err != nil {
+			log.Error().Err(err).Str("team_id", team.String()).Msg("paid prepaid team is not observed; its balance and auto-recharge wait for an observation slot")
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }

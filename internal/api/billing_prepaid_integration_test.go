@@ -76,7 +76,7 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 	f.observe(1000, true)
 	enabled, allowed, assign := prepaidPricingV2Enabled, prepaidPlanAllowsPurchase, assignStarterAfterPurchase
 	prepaidPricingV2Enabled = func(context.Context, *Handlers) (bool, error) { return true, nil }
-	prepaidPlanAllowsPurchase = func(context.Context, *Handlers, uuid.UUID) (bool, error) { return true, nil }
+	prepaidPlanAllowsPurchase = func(_ context.Context, _ *Handlers, team uuid.UUID) (bool, error) { return team == f.team, nil }
 	assignStarterAfterPurchase = func(_ context.Context, _ *Handlers, _ uuid.UUID, purchase uuid.UUID) error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -682,5 +682,73 @@ func TestPrepaidSummaryFlagsLowBalanceOnlyWithoutAutoRecharge(t *testing.T) {
 	f.observe(2500, true)
 	if low() {
 		t.Fatal("a $25 balance was flagged low")
+	}
+}
+
+func TestPrepaidObservationIgnoresSpentHistoryBeforeTheLastClose(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(5000, 500)
+	f.observe(0, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	var old entitlementGrant
+	for _, g := range f.grants {
+		old = g
+	}
+	old.ID = "credgr_" + uuid.NewString()
+	old.Category = "promotional"
+	old.Created = time.Now().Add(-500 * 24 * time.Hour).Unix()
+	old.EffectiveAt = old.Created
+	f.grants[old.ID] = old
+	f.balances[old.ID] = 0
+	f.mu.Unlock()
+	closed := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	f.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),0,0,0)`, f.team, closed.Add(-24*time.Hour), closed)
+	f.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'released',clock_timestamp(),'{}','{}')`, f.team, closed.Add(-24*time.Hour), closed, "in_"+strings.ReplaceAll(uuid.NewString(), "-", ""))
+	_, start, _, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start.Before(closed) {
+		t.Fatalf("reconciliation window reaches back to %s, before the last close %s", start, closed)
+	}
+}
+
+func TestPrepaidObservationWithEveryGrantVoided(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(5000, 500)
+	f.observe(0, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	for id, g := range f.grants {
+		g.VoidedAt = time.Now().Unix()
+		f.grants[id] = g
+	}
+	f.mu.Unlock()
+	reads := f.aggregateReads
+	total, _, _, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+	if err != nil || total != 0 || f.aggregateReads != reads {
+		t.Fatal("a prepaid team with only voided grants could not be observed as $0", total, err)
+	}
+}
+
+func TestPrepaidEnrolmentIsRetriedAfterPayment(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(5000, 500)
+	f.observe(0, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`UPDATE billing_funding_account SET observe=false WHERE team_id=$1`, f.team)
+	if err := f.h.retryPrepaidEnrolment(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var observed bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT observe FROM billing_funding_account WHERE team_id=$1`, f.team).Scan(&observed); err != nil || !observed {
+		t.Fatal("a paid team that lost its observation slot was not enrolled again", err)
 	}
 }
