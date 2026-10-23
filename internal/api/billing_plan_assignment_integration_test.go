@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -37,8 +39,8 @@ func newPlanAssignmentFixture(t *testing.T) (*Handlers, uuid.UUID) {
 	return h, team.ID
 }
 
-func testPlanTerms(key string, maxSandboxes int32, vcpu *int32) planTerms {
-	return planTerms{OfferKey: key, DisplayName: key, Limits: planLimits{MaxSandboxes: &maxSandboxes, MaxTemplateVCPU: vcpu}}
+func testPlanTerms(key, kind string, maxConcurrent int32, vcpu *int32) planTerms {
+	return planTerms{OfferKey: key, DisplayName: key, Kind: kind, Limits: planLimits{MaxConcurrent: &maxConcurrent, MaxVCPU: vcpu}}
 }
 
 func assignInTx(t *testing.T, h *Handlers, a planAssignment) (teamPlan, error) {
@@ -55,7 +57,7 @@ func assignInTx(t *testing.T, h *Handlers, a planAssignment) (teamPlan, error) {
 	return p, tx.Commit(t.Context())
 }
 
-func teamLimits(t *testing.T, h *Handlers, team uuid.UUID) (int32, *int32) {
+func limitsOf(t *testing.T, h *Handlers, team uuid.UUID) (int32, *int32) {
 	t.Helper()
 	var max int32
 	var vcpu *int32
@@ -71,19 +73,19 @@ func TestPlanAssignmentMovesTeamAndAppliesLimits(t *testing.T) {
 		t.Fatalf("new team already has a plan: %v %v", ok, err)
 	}
 	actor := uuid.New()
-	free, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceSignup, Reason: "signed up"})
+	free, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceSignup, Reason: "signed up"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if max, vcpu := teamLimits(t, h, team); max != 1 || vcpu != nil {
+	if max, vcpu := limitsOf(t, h, team); max != 1 || vcpu != nil {
 		t.Fatalf("free limits not applied: %d %v", max, vcpu)
 	}
 	eight := int32(8)
-	pro, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("pro_monthly", 1000, &eight), Kind: planKindSubscription, Source: planSourceCheckout, Actor: &actor, Reason: "paid"})
+	pro, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("pro_monthly", planKindSubscription, 1000, &eight), Source: planSourceCheckout, Actor: &actor, Reason: "paid"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if max, vcpu := teamLimits(t, h, team); max != 1000 || vcpu == nil || *vcpu != 8 {
+	if max, vcpu := limitsOf(t, h, team); max != 1000 || vcpu == nil || *vcpu != 8 {
 		t.Fatalf("pro limits not applied: %d %v", max, vcpu)
 	}
 	current, ok, err := currentTeamPlan(t.Context(), h.Pool, team)
@@ -101,22 +103,22 @@ func TestPlanAssignmentKeepsCustomizedLimits(t *testing.T) {
 	if _, err := h.Pool.Exec(t.Context(), `UPDATE team SET max_sandboxes=77 WHERE id=$1`, team); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceMigration, Reason: "migration"}); err != nil {
+	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceMigration, Reason: "migration"}); err != nil {
 		t.Fatal(err)
 	}
-	if max, _ := teamLimits(t, h, team); max != 77 {
+	if max, _ := limitsOf(t, h, team); max != 77 {
 		t.Fatalf("hand-set limits were overwritten: %d", max)
 	}
 }
 
 func TestPlanAssignmentRefusesRetiredAndReusedKeys(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
-	retired := testPlanTerms("custom_example", 50, nil)
+	retired := testPlanTerms("custom_example", planKindCustom, 50, nil)
 	retired.Retired = true
-	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: retired, Kind: planKindCustom, Source: planSourceStaff, Reason: "r"}); !errors.Is(err, errPlanRetired) {
+	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: retired, Source: planSourceStaff, Reason: "r"}); !errors.Is(err, errPlanRetired) {
 		t.Fatalf("retired plan assigned: %v", err)
 	}
-	a := planAssignment{Team: team, Terms: testPlanTerms("custom_example", 50, nil), Kind: planKindCustom, Source: planSourceStaff, Reason: "r", Key: "assign-1"}
+	a := planAssignment{Team: team, Terms: testPlanTerms("custom_example", planKindCustom, 50, nil), Source: planSourceStaff, Reason: "r", Key: "assign-1"}
 	first, err := assignInTx(t, h, a)
 	if err != nil {
 		t.Fatal(err)
@@ -126,8 +128,7 @@ func TestPlanAssignmentRefusesRetiredAndReusedKeys(t *testing.T) {
 		t.Fatalf("repeated request assigned again: %+v %v", again, err)
 	}
 	other := a
-	other.Terms = testPlanTerms("free", 1, nil)
-	other.Kind = planKindFree
+	other.Terms = testPlanTerms("free", planKindFree, 1, nil)
 	if _, err = assignInTx(t, h, other); !errors.Is(err, errPlanAssignmentReused) {
 		t.Fatalf("idempotency key reused for another plan: %v", err)
 	}
@@ -135,7 +136,7 @@ func TestPlanAssignmentRefusesRetiredAndReusedKeys(t *testing.T) {
 
 func TestPlanAssignmentHistoryIsImmutable(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
-	p, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceSignup, Reason: "signed up"})
+	p, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceSignup, Reason: "signed up"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +144,7 @@ func TestPlanAssignmentHistoryIsImmutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = h.Pool.Exec(t.Context(), `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free','{}','{"max_sandboxes":1}',clock_timestamp()+interval '1 day','staff','r')`, other.ID); err == nil {
+	if _, err = h.Pool.Exec(t.Context(), `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free','{}','{"max_concurrent":1}',clock_timestamp()+interval '1 day','staff','r')`, other.ID); err == nil {
 		t.Error("future assignment was allowed")
 	}
 	for name, stmt := range map[string]string{
@@ -187,7 +188,7 @@ func TestPlanAssignmentStaffViewRequiresStaff(t *testing.T) {
 
 func TestPlanAssignmentInitialBackfill(t *testing.T) {
 	h, assigned := newPlanAssignmentFixture(t)
-	if _, err := assignInTx(t, h, planAssignment{Team: assigned, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceSignup, Reason: "signed up"}); err != nil {
+	if _, err := assignInTx(t, h, planAssignment{Team: assigned, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceSignup, Reason: "signed up"}); err != nil {
 		t.Fatal(err)
 	}
 	var fresh []uuid.UUID
@@ -207,10 +208,10 @@ func TestPlanAssignmentInitialBackfill(t *testing.T) {
 		t.Fatal(err)
 	}
 	batch := []planAssignment{
-		{Team: assigned, Terms: testPlanTerms("legacy_payg", 20, nil), Kind: planKindLegacyPAYG, Source: planSourceMigration, Reason: "pricing v2"},
-		{Team: fresh[0], Terms: testPlanTerms("legacy_payg", 20, nil), Kind: planKindLegacyPAYG, Source: planSourceMigration, Reason: "pricing v2"},
-		{Team: fresh[1], Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceMigration, Reason: "pricing v2"},
-		{Team: busy, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceMigration, Reason: "pricing v2"},
+		{Team: assigned, Terms: testPlanTerms("legacy_payg", planKindLegacyPAYG, 20, nil), Source: planSourceMigration, Reason: "pricing v2"},
+		{Team: fresh[0], Terms: testPlanTerms("legacy_payg", planKindLegacyPAYG, 20, nil), Source: planSourceMigration, Reason: "pricing v2"},
+		{Team: fresh[1], Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceMigration, Reason: "pricing v2"},
+		{Team: busy, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceMigration, Reason: "pricing v2"},
 	}
 	run := func() []uuid.UUID {
 		tx, err := h.Pool.Begin(t.Context())
@@ -234,7 +235,7 @@ func TestPlanAssignmentInitialBackfill(t *testing.T) {
 	if p, _, _ := currentTeamPlan(t.Context(), h.Pool, assigned); p.Kind != planKindFree {
 		t.Fatalf("backfill replaced an existing plan: %+v", p)
 	}
-	if max, _ := teamLimits(t, h, fresh[1]); max != 1 {
+	if max, _ := limitsOf(t, h, fresh[1]); max != 1 {
 		t.Fatalf("backfilled limits not applied: %d", max)
 	}
 	if err = locker.Rollback(t.Context()); err != nil {
@@ -274,47 +275,152 @@ func TestStaffPlanAssignmentRefusedWhilePricingV2IsOff(t *testing.T) {
 	}
 }
 
-func TestPlanAssignmentLimitsRestoreWhenPricingV2TurnsOff(t *testing.T) {
-	h, team := newPlanAssignmentFixture(t)
-	eight := int32(8)
-	if _, err := h.Pool.Exec(t.Context(), `UPDATE team SET max_sandboxes=20,max_template_vcpu=NULL,limits_customized=false WHERE id=$1`, team); err != nil {
+func setPricingVersion(t *testing.T, h *Handlers, version string) {
+	t.Helper()
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version=$1`, version); err != nil {
 		t.Fatal(err)
 	}
-	for _, a := range []planAssignment{
-		{Team: team, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceMigration, Reason: "pricing v2"},
-		{Team: team, Terms: testPlanTerms("pro_monthly", 1000, &eight), Kind: planKindSubscription, Source: planSourceCheckout, Reason: "paid"},
-	} {
-		if _, err := assignInTx(t, h, a); err != nil {
-			t.Fatal(err)
+	forgetPricingVersion()
+	t.Cleanup(func() {
+		if _, err := h.Pool.Exec(context.WithoutCancel(t.Context()), `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
+			t.Error(err)
 		}
+		forgetPricingVersion()
+	})
+}
+
+func TestPlanAssignmentNewTeamStartsOnFreeOnlyUnderV2(t *testing.T) {
+	h, legacyTeam := newPlanAssignmentFixture(t)
+	if _, ok, err := currentTeamPlan(t.Context(), h.Pool, legacyTeam); err != nil || ok {
+		t.Fatalf("team created with pricing v2 off got a plan: %v %v", ok, err)
 	}
-	customized, err := h.DB.CreateTeam(t.Context(), "plan-restore-"+uuid.NewString())
+	setPricingVersion(t, h, "v2")
+	team, err := h.DB.CreateTeam(t.Context(), "plan-v2-"+uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = assignInTx(t, h, planAssignment{Team: customized.ID, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceMigration, Reason: "pricing v2"}); err != nil {
+	plan, ok, err := currentTeamPlan(t.Context(), h.Pool, team.ID)
+	if err != nil || !ok || plan.Kind != planKindFree || plan.Source != planSourceSignup {
+		t.Fatalf("new team under v2 is not on Free: %+v %v", plan, err)
+	}
+	free, err := h.planTerms(t.Context(), "free")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = h.Pool.Exec(t.Context(), `UPDATE team SET max_sandboxes=55 WHERE id=$1`, customized.ID); err != nil {
+	if !reflect.DeepEqual(plan.Terms, freezePlanTerms(free)) || !reflect.DeepEqual(plan.Limits, free.Limits) {
+		t.Fatalf("terms frozen at signup differ from the backend's:\n%+v\n%+v\n%+v\n%+v", plan.Terms, freezePlanTerms(free), plan.Limits, free.Limits)
+	}
+	if max, _ := limitsOf(t, h, team.ID); max != *free.Limits.MaxConcurrent {
+		t.Fatalf("Free limits not applied to the new team: %d", max)
+	}
+}
+
+func TestPlanAssignmentOwnsLimitsUnderV2AndRestoresLegacyLimits(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("starter", planKindPrepaid, 5, nil), Source: planSourceCreditPurchase, Reason: "bought credit"}); err != nil {
 		t.Fatal(err)
 	}
+	var legacyFree int32
+	if err := h.Pool.QueryRow(t.Context(), `SELECT max_sandboxes FROM plan_limits WHERE offer_key='free'`).Scan(&legacyFree); err != nil {
+		t.Fatal(err)
+	}
+	setPricingVersion(t, h, "v2")
+	if _, err := h.Pool.Exec(t.Context(), `SELECT apply_plan_limits($1,'free')`, team); err != nil {
+		t.Fatal(err)
+	}
+	if max, _ := limitsOf(t, h, team); max != 5 {
+		t.Fatalf("legacy limits overwrote the assignment's under v2: %d", max)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `SELECT restore_legacy_team_limits('00000000-0000-0000-0000-000000000000',10)`); err == nil {
+		t.Fatal("legacy limits restored while pricing v2 is on")
+	}
+	setPricingVersion(t, h, "legacy")
+	var after uuid.UUID
 	for {
-		var n int
-		if err = h.Pool.QueryRow(t.Context(), `SELECT restore_pre_assignment_limits(500)`).Scan(&n); err != nil {
+		var next *uuid.UUID
+		if err := h.Pool.QueryRow(t.Context(), `SELECT restore_legacy_team_limits($1,500)`, after).Scan(&next); err != nil {
 			t.Fatal(err)
 		}
-		if n == 0 {
+		if next == nil {
 			break
 		}
+		after = *next
 	}
-	if max, vcpu := teamLimits(t, h, team); max != 20 || vcpu != nil {
-		t.Fatalf("limits before pricing v2 not restored: %d %v", max, vcpu)
+	if max, _ := limitsOf(t, h, team); max != legacyFree {
+		t.Fatalf("legacy limits not restored after turning pricing v2 off: %d want %d", max, legacyFree)
 	}
-	var customizedFlag bool
-	if err = h.Pool.QueryRow(t.Context(), `SELECT limits_customized FROM team WHERE id=$1`, team).Scan(&customizedFlag); err != nil || customizedFlag {
-		t.Fatalf("restoring marked the team's limits as hand-set: %v %v", customizedFlag, err)
+	var customized bool
+	if err := h.Pool.QueryRow(t.Context(), `SELECT limits_customized FROM team WHERE id=$1`, team).Scan(&customized); err != nil || customized {
+		t.Fatalf("restoring marked limits as hand-set: %v %v", customized, err)
 	}
-	if max, _ := teamLimits(t, h, customized.ID); max != 55 {
-		t.Fatalf("hand-set limits were overwritten on restore: %d", max)
+}
+
+func TestPlanAssignmentConcurrentSameKeyReturnsOneAssignment(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	a := planAssignment{Team: team, Terms: testPlanTerms("custom_example", planKindCustom, 50, nil), Source: planSourceStaff, Reason: "r", Key: "same"}
+	first, err := h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Rollback(context.WithoutCancel(t.Context()))
+	p1, err := assignTeamPlan(t.Context(), first, a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := make(chan teamPlan, 1)
+	failed := make(chan error, 1)
+	go func() {
+		p, err := assignInTx(t, h, a)
+		if err != nil {
+			failed <- err
+			return
+		}
+		second <- p
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if err = first.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p2 := <-second:
+		if p2.ID != p1.ID {
+			t.Fatalf("concurrent retry made a second assignment: %s %s", p1.ID, p2.ID)
+		}
+	case err = <-failed:
+		t.Fatalf("concurrent retry failed instead of returning the assignment: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("concurrent retry did not finish")
+	}
+}
+
+func TestStaffPlanAssignmentUnderV2(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	var version uuid.UUID
+	if err := h.Pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version(pricing_version,family,version,kind,display_name,max_sandboxes)
+        VALUES('v2','custom_'||substr(md5(random()::text),1,8),1,'custom','Example deal',250) RETURNING id`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `SELECT publish_billing_plan_version($1,$2)`, version, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	setPricingVersion(t, h, "v2")
+	actor := uuid.New()
+	body := staffPlanAssignmentBody{Key: "enterprise-approval:1", VersionID: version, Reason: "enterprise approval"}
+	plan, err := h.assignStaffPlan(t.Context(), team, actor, body)
+	if err != nil || plan.Kind != planKindCustom || plan.Source != planSourceStaff || *plan.AssignedBy != actor || *plan.VersionID != version {
+		t.Fatalf("staff assignment: %+v %v", plan, err)
+	}
+	if again, err := h.assignStaffPlan(t.Context(), team, actor, body); err != nil || again.ID != plan.ID {
+		t.Fatalf("replayed staff assignment: %+v %v", again, err)
+	}
+	if max, _ := limitsOf(t, h, team); max != 250 {
+		t.Fatalf("custom limits not applied: %d", max)
+	}
+	free, err := h.planTerms(t.Context(), "free")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.assignStaffPlan(t.Context(), team, actor, staffPlanAssignmentBody{Key: "k2", VersionID: free.VersionID, Reason: "r"}); !errors.Is(err, errUnknownPlan) {
+		t.Fatalf("staff assigned a non-custom plan: %v", err)
 	}
 }

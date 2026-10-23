@@ -5242,24 +5242,6 @@ components:
             max_template_disk_mib:
               type: integer
               nullable: true
-    BillingPlanLimits:
-      type: object
-      required: [max_concurrent, max_vcpu, max_memory_mib, max_disk_mib, max_templates]
-      properties:
-        max_concurrent:
-          type: integer
-        max_vcpu:
-          type: integer
-          nullable: true
-        max_memory_mib:
-          type: integer
-          nullable: true
-        max_disk_mib:
-          type: integer
-          nullable: true
-        max_templates:
-          type: integer
-          nullable: true
     BillingPlanResponse:
       type: object
       required: [plan, period, pending_change]

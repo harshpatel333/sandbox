@@ -45,28 +45,43 @@ var (
 // frozenPlanTerms is the copy of a plan's terms an assignment keeps, so later
 // catalog versions never change what a team was given.
 type frozenPlanTerms struct {
-	OfferKey           string        `json:"offer_key"`
-	DisplayName        string        `json:"display_name"`
-	FeeCents           int64         `json:"fee_cents"`
-	IntervalMonths     int32         `json:"interval_months"`
-	MonthlyCreditCents int64         `json:"monthly_credit_cents"`
-	VersionID          uuid.UUID     `json:"version_id"`
-	Version            int32         `json:"version"`
-	Family             string        `json:"family"`
-	Grants             []planGrant   `json:"grants"`
-	Matching           *planMatching `json:"matching"`
+	OfferKey           string         `json:"offer_key"`
+	DisplayName        string         `json:"display_name"`
+	FeeCents           int64          `json:"fee_cents"`
+	IntervalMonths     int32          `json:"interval_months"`
+	MonthlyCreditCents int64          `json:"monthly_credit_cents"`
+	VersionID          uuid.UUID      `json:"version_id"`
+	Version            int32          `json:"version"`
+	Family             string         `json:"family"`
+	PricingVersion     string         `json:"pricing_version"`
+	Kind               string         `json:"kind"`
+	Grants             []planGrant    `json:"grants"`
+	Matching           *planMatching  `json:"matching"`
+	Allowance          *planAllowance `json:"allowance"`
 }
 
+// freezePlanTerms keeps a compute allowance as its compute basis, not as an
+// amount priced at today's rate card.
 func freezePlanTerms(t planTerms) frozenPlanTerms {
+	allowance := t.Allowance
+	if allowance != nil && allowance.Compute != nil {
+		basis := *allowance
+		basis.AmountCents = 0
+		allowance = &basis
+	}
+	grants := t.Grants
+	if grants == nil {
+		grants = []planGrant{}
+	}
 	return frozenPlanTerms{OfferKey: t.OfferKey, DisplayName: t.DisplayName, FeeCents: t.FeeCents, IntervalMonths: t.IntervalMonths,
-		MonthlyCreditCents: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Family: t.Family, Grants: t.Grants, Matching: t.Matching}
+		MonthlyCreditCents: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Family: t.Family, PricingVersion: t.PricingVersion, Kind: t.Kind,
+		Grants: grants, Matching: t.Matching, Allowance: allowance}
 }
 
 // planAssignment asks for a team to be on a plan from now on.
 type planAssignment struct {
 	Team       uuid.UUID
 	Terms      planTerms
-	Kind       string
 	Source     string
 	Actor      *uuid.UUID
 	Reason     string
@@ -140,7 +155,7 @@ func (a planAssignment) validate() error {
 	if a.Terms.Retired {
 		return errPlanRetired
 	}
-	if !validPlanKind(a.Kind) || a.Terms.OfferKey == "" || a.Terms.Limits.MaxSandboxes == nil || a.Reason == "" {
+	if !validPlanKind(a.Terms.Kind) || a.Terms.OfferKey == "" || a.Terms.Limits.MaxConcurrent == nil || a.Reason == "" {
 		return errors.New("plan assignment needs a plan, kind, limits and reason")
 	}
 	return nil
@@ -198,11 +213,12 @@ func assignInitialTeamPlans(ctx context.Context, tx pgx.Tx, as []planAssignment)
 			return nil, err
 		}
 		versions, contracts, actors = append(versions, v), append(contracts, a.ContractID), append(actors, a.Actor)
-		keys, kinds, sources, reasons = append(keys, a.Terms.OfferKey), append(kinds, a.Kind), append(sources, a.Source), append(reasons, a.Reason)
+		keys, kinds, sources, reasons = append(keys, a.Terms.OfferKey), append(kinds, a.Terms.Kind), append(sources, a.Source), append(reasons, a.Reason)
 		terms, limits = append(terms, t), append(limits, l)
 	}
 	rows, err = tx.Query(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,contract_id,source,assigned_by,reason)
         SELECT t,k,kd,v,tm,l,clock_timestamp(),c,s,a,r FROM unnest($1::uuid[],$2::text[],$3::text[],$4::uuid[],$5::jsonb[],$6::jsonb[],$7::uuid[],$8::text[],$9::uuid[],$10::text[]) AS x(t,k,kd,v,tm,l,c,s,a,r)
+        WHERE NOT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=x.t)
         RETURNING team_id`, free, keys, kinds, versions, terms, limits, contracts, sources, actors, reasons)
 	if err != nil {
 		return nil, err
@@ -218,12 +234,16 @@ func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan,
 	if err := a.validate(); err != nil {
 		return teamPlan{}, err
 	}
+	var now time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp() FROM team WHERE id=$1 FOR NO KEY UPDATE`, a.Team).Scan(&now); err != nil {
+		return teamPlan{}, err
+	}
 	var key *string
 	if a.Key != "" {
 		key = &a.Key
 		prior, err := scanTeamPlan(tx.QueryRow(ctx, `SELECT `+teamPlanColumns+` FROM team_plan_assignment WHERE team_id=$1 AND idempotency_key=$2`, a.Team, a.Key))
 		if err == nil {
-			if prior.PlanKey != a.Terms.OfferKey || prior.Terms.VersionID != a.Terms.VersionID || prior.Kind != a.Kind {
+			if prior.PlanKey != a.Terms.OfferKey || prior.Terms.VersionID != a.Terms.VersionID || prior.Kind != a.Terms.Kind {
 				return teamPlan{}, errPlanAssignmentReused
 			}
 			return prior, nil
@@ -231,10 +251,6 @@ func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan,
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return teamPlan{}, err
 		}
-	}
-	var now time.Time
-	if err := tx.QueryRow(ctx, `SELECT clock_timestamp() FROM team WHERE id=$1 FOR NO KEY UPDATE`, a.Team).Scan(&now); err != nil {
-		return teamPlan{}, err
 	}
 	terms, limits, version, err := a.frozen()
 	if err != nil {
@@ -245,7 +261,7 @@ func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan,
 	}
 	return scanTeamPlan(tx.QueryRow(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,contract_id,source,assigned_by,reason,idempotency_key)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING `+teamPlanColumns,
-		a.Team, a.Terms.OfferKey, a.Kind, version, terms, limits, now, a.ContractID, a.Source, a.Actor, a.Reason, key))
+		a.Team, a.Terms.OfferKey, a.Terms.Kind, version, terms, limits, now, a.ContractID, a.Source, a.Actor, a.Reason, key))
 }
 
 // GetTeamPlanAssignments shows staff the plan a team is on and its history.
@@ -270,21 +286,12 @@ func (h *Handlers) GetTeamPlanAssignments(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"current": current, "history": history})
 }
 
-// customerPlanLimits are a plan's limits in the names customers see.
-type customerPlanLimits struct {
-	MaxConcurrent int32  `json:"max_concurrent"`
-	MaxVCPU       *int32 `json:"max_vcpu"`
-	MaxMemoryMiB  *int32 `json:"max_memory_mib"`
-	MaxDiskMiB    *int32 `json:"max_disk_mib"`
-	MaxTemplates  *int32 `json:"max_templates"`
-}
-
 type customerPlan struct {
-	PlanKey       string             `json:"plan_key"`
-	Kind          string             `json:"kind"`
-	DisplayName   string             `json:"display_name"`
-	Limits        customerPlanLimits `json:"limits"`
-	EffectiveFrom time.Time          `json:"effective_from"`
+	PlanKey       string     `json:"plan_key"`
+	Kind          string     `json:"kind"`
+	DisplayName   string     `json:"display_name"`
+	Limits        planLimits `json:"limits"`
+	EffectiveFrom time.Time  `json:"effective_from"`
 }
 
 type customerPendingPlanChange struct {
@@ -312,9 +319,13 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	ctx := c.Request.Context()
 	var current teamPlan
 	assigned := false
-	on, err := h.pricingV2Active(ctx)
+	on, err := h.pricingV2Enabled(ctx)
 	if err == nil && on {
 		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
+	}
+	var limits teamLimits
+	if err == nil && assigned {
+		limits, err = h.teamEffectiveLimits(ctx, team)
 	}
 	var anchor pgtype.Timestamptz
 	if err == nil {
@@ -335,7 +346,7 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	var plan *customerPlan
 	if assigned {
 		plan = &customerPlan{PlanKey: current.PlanKey, Kind: current.Kind, DisplayName: current.Terms.DisplayName, EffectiveFrom: current.EffectiveFrom,
-			Limits: customerLimits(current.Limits)}
+			Limits: planLimits{MaxConcurrent: &limits.MaxConcurrent, MaxVCPU: &limits.MaxVCPU, MaxMemoryMiB: &limits.MaxMemoryMiB, MaxDiskMiB: &limits.MaxDiskMiB, MaxTemplates: &limits.MaxTemplates}}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"plan":           plan,
@@ -351,18 +362,8 @@ const (
 	planChangeAfterPurchase = "after_purchase"
 )
 
-// planKindOfOffer is the kind of a self-serve plan by key.
-func planKindOfOffer(offer string) string {
-	switch offer {
-	case "free":
-		return planKindFree
-	case "starter":
-		return planKindPrepaid
-	case "pro_monthly":
-		return planKindSubscription
-	}
-	return ""
-}
+// selfServePlans are the plans a team can choose for itself.
+var selfServePlans = map[string]bool{"free": true, "starter": true, "pro_monthly": true}
 
 // planChangeRule says when a customer's move from one kind of plan to another
 // takes effect, or why it is not self-serve. Upgrades wait only for payment;
@@ -387,22 +388,14 @@ func planChangeRule(from, to string) (string, string) {
 }
 
 type customerPlanChangePreview struct {
-	TargetPlanKey     string             `json:"target_plan_key"`
-	TargetDisplayName string             `json:"target_display_name"`
-	TargetKind        string             `json:"target_kind"`
-	Timing            string             `json:"timing,omitempty"`
-	EffectiveAt       *time.Time         `json:"effective_at,omitempty"`
-	PausesRunning     bool               `json:"pauses_running"`
-	Limits            customerPlanLimits `json:"limits"`
-	Blocked           string             `json:"blocked,omitempty"`
-}
-
-func customerLimits(l planLimits) customerPlanLimits {
-	max := int32(0)
-	if l.MaxSandboxes != nil {
-		max = *l.MaxSandboxes
-	}
-	return customerPlanLimits{MaxConcurrent: max, MaxVCPU: l.MaxTemplateVCPU, MaxMemoryMiB: l.MaxTemplateMemoryMiB, MaxDiskMiB: l.MaxTemplateDiskMiB}
+	TargetPlanKey     string     `json:"target_plan_key"`
+	TargetDisplayName string     `json:"target_display_name"`
+	TargetKind        string     `json:"target_kind"`
+	Timing            string     `json:"timing,omitempty"`
+	EffectiveAt       *time.Time `json:"effective_at,omitempty"`
+	PausesRunning     bool       `json:"pauses_running"`
+	Limits            planLimits `json:"limits"`
+	Blocked           string     `json:"blocked,omitempty"`
 }
 
 // GetBillingPlanChangePreview tells a team when a move to a plan would take
@@ -413,8 +406,7 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		return
 	}
 	target := c.Query("target_plan")
-	kind := planKindOfOffer(target)
-	if kind == "" {
+	if !selfServePlans[target] {
 		respondErrorMsg(c, "invalid_plan", "target_plan must be free, starter or pro_monthly", http.StatusBadRequest)
 		return
 	}
@@ -427,7 +419,7 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 	var current teamPlan
 	var assigned, on bool
 	if err == nil {
-		on, err = h.pricingV2Active(ctx)
+		on, err = h.pricingV2Enabled(ctx)
 	}
 	if err == nil && on {
 		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
@@ -437,7 +429,8 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	preview := customerPlanChangePreview{TargetPlanKey: target, TargetDisplayName: terms.DisplayName, TargetKind: kind, Limits: customerLimits(terms.Limits)}
+	kind := terms.Kind
+	preview := customerPlanChangePreview{TargetPlanKey: target, TargetDisplayName: terms.DisplayName, TargetKind: kind, Limits: terms.Limits}
 	switch {
 	case !assigned:
 		preview.Blocked = "plan changes are not available for this team yet"
@@ -471,12 +464,6 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		preview.Timing = ""
 	}
 	c.JSON(http.StatusOK, preview)
-}
-
-// pricingV2Active reports whether the pricing v2 switch is on. Until the
-// switch exists every v2 write is refused.
-func (h *Handlers) pricingV2Active(ctx context.Context) (bool, error) {
-	return false, nil
 }
 
 type staffPlanAssignmentBody struct {
@@ -516,7 +503,7 @@ func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 	case errors.Is(err, errPricingV2Off):
 		respondErrorMsg(c, "conflict", "plan assignment is not available yet", http.StatusConflict)
 	case errors.Is(err, errUnknownPlan):
-		respondErrorMsg(c, "invalid_plan", "version_id must be a published plan version without fees", http.StatusBadRequest)
+		respondErrorMsg(c, "invalid_plan", "version_id must be a published custom plan version without fees", http.StatusBadRequest)
 	case errors.Is(err, errPlanRetired):
 		respondErrorMsg(c, "conflict", "this plan version is retired", http.StatusConflict)
 	case errors.Is(err, errPlanAssignmentReused):
@@ -534,7 +521,7 @@ func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 var errPricingV2Off = errors.New("pricing v2 is off")
 
 func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, body staffPlanAssignmentBody) (teamPlan, error) {
-	on, err := h.pricingV2Active(ctx)
+	on, err := h.pricingV2Enabled(ctx)
 	if err != nil {
 		return teamPlan{}, err
 	}
@@ -545,7 +532,7 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 	if err != nil {
 		return teamPlan{}, err
 	}
-	if terms.Limits.MaxSandboxes == nil {
+	if terms.Kind != planKindCustom || terms.Limits.MaxConcurrent == nil {
 		return teamPlan{}, errUnknownPlan
 	}
 	tx, err := h.Pool.Begin(ctx)
@@ -553,7 +540,7 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 		return teamPlan{}, err
 	}
 	defer tx.Rollback(ctx)
-	plan, err := assignTeamPlan(ctx, tx, planAssignment{Team: team, Terms: terms, Kind: planKindCustom, Source: planSourceStaff, Actor: &actor, Reason: body.Reason, Key: body.Key})
+	plan, err := assignTeamPlan(ctx, tx, planAssignment{Team: team, Terms: terms, Source: planSourceStaff, Actor: &actor, Reason: body.Reason, Key: body.Key})
 	if err != nil {
 		return plan, err
 	}
