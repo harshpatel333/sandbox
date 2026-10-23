@@ -16,15 +16,22 @@ func TestMatchingUsageExcludesFeeDiscountsAndCredits(t *testing.T) {
  {"amount":7,"currency":"usd","pricing":{"price_details":{"price":"price_round"}}}]}}`), &inv); err != nil {
 		t.Fatal(err)
 	}
-	u, err := matchingInvoiceUsage(inv, []string{"price_cpu", "price_round"})
-	if err != nil || u.SkipReason != "" || u.UsageCents != 50007 || u.CreditCents != 25000 || u.DiscountCents != 3 {
+	prices := []string{"price_cpu", "price_round"}
+	u, err := matchingInvoiceUsage(inv, matchingPayment{AmountPaid: 125004}, prices)
+	if err != nil || u.SkipReason != "" || u.UsageCents != 50007 || u.CreditCents != 25000 || u.DiscountCents != 3 || u.UnpaidCents != 0 {
 		t.Fatalf("unexpected matchable usage: %+v %v", u, err)
 	}
+	if u, err = matchingInvoiceUsage(inv, matchingPayment{AmountPaid: 110000}, prices); err != nil || u.UnpaidCents != 15004 {
+		t.Fatalf("usage the customer did not pay was matchable: %+v %v", u, err)
+	}
+	if u, err = matchingInvoiceUsage(inv, matchingPayment{AmountPaid: 125004, PaidOutOfBand: true}, prices); err != nil || u.SkipReason == "" {
+		t.Fatal("invoice marked paid out of band was matched automatically")
+	}
 	inv.Taxes = []json.RawMessage{json.RawMessage(`{"amount":1}`)}
-	if u, err = matchingInvoiceUsage(inv, []string{"price_cpu"}); err != nil || u.SkipReason == "" {
+	if u, err = matchingInvoiceUsage(inv, matchingPayment{AmountPaid: 125004}, prices); err != nil || u.SkipReason == "" {
 		t.Fatal("taxed invoice was matched automatically")
 	}
-	if u, err = matchingInvoiceUsage(StripeInvoiceAmounts{}, nil); err != nil || u.SkipReason == "" {
+	if u, err = matchingInvoiceUsage(StripeInvoiceAmounts{}, matchingPayment{}, nil); err != nil || u.SkipReason == "" {
 		t.Fatal("invoice without usage price identification was matched")
 	}
 }

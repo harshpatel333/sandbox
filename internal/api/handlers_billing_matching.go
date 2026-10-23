@@ -120,12 +120,16 @@ func (h *Handlers) AttachTeamMatchingRule(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "contract is not managed by the entitlement worker", http.StatusConflict)
 		return
 	}
-	effective, _, ok := billing.AnniversaryPeriod(anchor, h.nowUTC())
-	if req.EffectiveFrom != nil {
-		effective, ok = req.EffectiveFrom.UTC().Truncate(time.Second), true
-	}
+	current, _, ok := billing.AnniversaryPeriod(anchor, h.nowUTC())
 	if !ok {
-		respondErrorMsg(c, "bad_request", "effective_from is required before the contract anniversary", http.StatusBadRequest)
+		current = anchor
+	}
+	effective := current
+	if req.EffectiveFrom != nil {
+		effective = req.EffectiveFrom.UTC().Truncate(time.Second)
+	}
+	if effective.Before(current) {
+		respondErrorMsg(c, "bad_request", "effective_from cannot precede the current billing period; past usage is never matched retroactively", http.StatusBadRequest)
 		return
 	}
 	err = insertContractMatchingRule(ctx, tx, matchingRule{ContractID: contract, TeamID: team, Terms: matchingTerms{MatchingBps: req.MatchingBps, CapCents: req.CapCents}, PriorMatchedCents: req.PriorMatchedCents, EffectiveFrom: effective, Source: "staff", Actor: &actor, Reason: new(strings.TrimSpace(req.Reason))})

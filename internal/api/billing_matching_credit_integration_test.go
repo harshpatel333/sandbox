@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/superserve-ai/sandbox/internal/billing"
 )
 
 type matchingFixture struct {
@@ -30,12 +31,13 @@ type matchingFixture struct {
 	lose      int
 	refunded  bool
 	unpaid    map[string]bool
+	paid      map[string]int64
 	periodEnd time.Time
 }
 
 func newMatchingFixture(t *testing.T, matchingBps int32, capCents, prior int64) *matchingFixture {
 	t.Helper()
-	m := &matchingFixture{t: t, f: newEntitlementFixture(t), invoices: map[string]StripeInvoiceAmounts{}, grants: map[string]entitlementGrant{}, byKey: map[string]string{}, unpaid: map[string]bool{}}
+	m := &matchingFixture{t: t, f: newEntitlementFixture(t), invoices: map[string]StripeInvoiceAmounts{}, grants: map[string]entitlementGrant{}, byKey: map[string]string{}, unpaid: map[string]bool{}, paid: map[string]int64{}}
 	m.periodEnd = m.f.start
 	srv := httptest.NewServer(http.HandlerFunc(m.serve))
 	t.Cleanup(srv.Close)
@@ -90,7 +92,21 @@ func (m *matchingFixture) serve(w http.ResponseWriter, r *http.Request) {
 			remaining := int64(100)
 			inv.AmountRemaining = &remaining
 		}
-		json.NewEncoder(w).Encode(inv)
+		raw, _ := json.Marshal(inv)
+		var doc map[string]any
+		_ = json.Unmarshal(raw, &doc)
+		paid := int64(0)
+		for _, line := range inv.Lines.Data {
+			paid += line.Amount
+			for _, credit := range line.PretaxCredits {
+				paid -= credit.Amount
+			}
+		}
+		if v, ok := m.paid[inv.ID]; ok {
+			paid = v
+		}
+		doc["amount_paid"] = paid
+		json.NewEncoder(w).Encode(doc)
 	case r.URL.Path == "/v1/billing/credit_grants" && r.Method == http.MethodPost:
 		if err := r.ParseForm(); err != nil {
 			m.t.Error(err)
@@ -240,6 +256,10 @@ func TestMatchingCreditProWorkedExample(t *testing.T) {
 		t.Fatal("matched credit must not expire and must cover all metered usage", form)
 	}
 	g := m.grants[r.Grant]
+	kept, err := m.f.h.withoutMatchingGrants(t.Context(), []billing.InvoiceCreditGrant{{ID: g.ID}, {ID: "credgr_other"}})
+	if err != nil || len(kept) != 1 || kept[0].ID != "credgr_other" {
+		t.Fatal("matching grant offered for adoption by another flow", kept, err)
+	}
 	if err := m.f.h.verifyOwnedEntitlementGrant(t.Context(), g); err != nil {
 		t.Fatal("issued matching grant rejected by invoice credit ownership check", err)
 	}
@@ -370,22 +390,68 @@ func TestMatchingCreditCapAcrossOutOfOrderInvoices(t *testing.T) {
 	}
 }
 
-func TestMatchingCreditWaitsForInvoiceClose(t *testing.T) {
+func TestMatchingCreditWaitsForEndedPeriodsToRelease(t *testing.T) {
 	m := newMatchingFixture(t, 10000, 8_000_000, 0)
 	invoice := m.paidInvoice("paid", usageLine("price_cpu", 70000))
-	closing := m.invoiceFor(m.periodEnd, m.periodEnd.AddDate(0, 1, 0), "prepared", "pending")
+	prior, ended := m.f.start.AddDate(0, -2, 0), m.f.start.AddDate(0, -1, 0)
+	m.exec(`UPDATE billing_invoice_account SET enrolled_at=$2 WHERE team_id=$1`, m.f.c.TeamID, prior)
+	m.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),0,0,0)`, m.f.c.TeamID, ended, m.f.start)
 	if err := m.tick(); err != nil {
 		t.Fatal(err)
 	}
 	if r := m.row(invoice); r.State != "pending" || len(m.posts) != 0 {
-		t.Fatalf("grant issued during an invoice close: %+v", r)
+		t.Fatalf("grant issued while an ended period has no close: %+v", r)
+	}
+	closing := "in_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	m.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'verified',clock_timestamp(),'{}','{}')`, m.f.c.TeamID, ended, m.f.start, closing)
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := m.row(invoice); r.State != "pending" || len(m.posts) != 0 {
+		t.Fatalf("grant issued before the ended period was released: %+v", r)
 	}
 	m.exec(`UPDATE billing_invoice_close SET state='released' WHERE invoice_id=$1`, closing)
 	if err := m.tick(); err != nil {
 		t.Fatal(err)
 	}
 	if r := m.row(invoice); r.State != "issued" {
-		t.Fatalf("grant not issued after close released: %+v", r)
+		t.Fatalf("grant not issued after every ended period was released: %+v", r)
+	}
+}
+
+func TestMatchingCreditConcurrentInsertsShareTheCap(t *testing.T) {
+	m := newMatchingFixture(t, 10000, 1000, 0)
+	first := m.paidInvoice("paid", usageLine("price_cpu", 800))
+	second := m.paidInvoice("paid", usageLine("price_cpu", 800))
+	insert := `INSERT INTO billing_matching_credit(team_id,contract_id,invoice_id,customer_id,period_start,period_end,usage_cents,credit_applied_cents,discount_cents,unpaid_cents,matchable_cents,amount_cents,invoice_evidence,state,idempotency_key)
+ SELECT team_id,$2,invoice_id,$3,period_start,period_end,800,0,0,0,0,0,'{}','skipped','' FROM billing_invoice_close WHERE invoice_id=$1`
+	ctx := t.Context()
+	tx, err := m.f.h.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, insert, first, m.f.c.ID, m.f.c.CustomerID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.f.h.Pool.Exec(ctx, insert, second, m.f.c.ID, m.f.c.CustomerID)
+		done <- err
+	}()
+	select {
+	case err = <-done:
+		t.Fatalf("second insert did not wait for the rule lock: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+	if a, b := m.row(first).Paid, m.row(second).Paid; a != 800 || b != 200 {
+		t.Fatalf("concurrent matches overshot the cap: %d + %d", a, b)
 	}
 }
 
@@ -477,8 +543,8 @@ func TestMatchingCreditLedgerIsImmutable(t *testing.T) {
 		}
 	}
 	unpaid := m.invoiceFor(m.periodEnd, m.periodEnd.AddDate(0, 1, 0), "released", "processing", usageLine("price_cpu", 1))
-	if _, err := m.f.h.Pool.Exec(t.Context(), `INSERT INTO billing_matching_credit(team_id,contract_id,invoice_id,customer_id,period_start,period_end,usage_cents,credit_applied_cents,discount_cents,matchable_cents,amount_cents,invoice_evidence,state,idempotency_key)
- SELECT team_id,$2,invoice_id,$3,period_start,period_end,1,0,0,0,0,'{}','skipped','' FROM billing_invoice_close WHERE invoice_id=$1`, unpaid, m.f.c.ID, m.f.c.CustomerID); err == nil {
+	if _, err := m.f.h.Pool.Exec(t.Context(), `INSERT INTO billing_matching_credit(team_id,contract_id,invoice_id,customer_id,period_start,period_end,usage_cents,credit_applied_cents,discount_cents,unpaid_cents,matchable_cents,amount_cents,invoice_evidence,state,idempotency_key)
+ SELECT team_id,$2,invoice_id,$3,period_start,period_end,1,0,0,0,0,0,'{}','skipped','' FROM billing_invoice_close WHERE invoice_id=$1`, unpaid, m.f.c.ID, m.f.c.CustomerID); err == nil {
 		t.Fatal("ledger accepted an unpaid invoice")
 	}
 }

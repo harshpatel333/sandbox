@@ -745,6 +745,7 @@ type BillingMatchingCredit struct {
 	UsageCents            int64              `json:"usage_cents"`
 	CreditAppliedCents    int64              `json:"credit_applied_cents"`
 	DiscountCents         int64              `json:"discount_cents"`
+	UnpaidCents           int64              `json:"unpaid_cents"`
 	MatchableCents        int64              `json:"matchable_cents"`
 	AmountCents           int64              `json:"amount_cents"`
 	SkipReason            *string            `json:"skip_reason"`

@@ -36,6 +36,8 @@ CREATE TABLE billing_matching_credit (
     usage_cents bigint NOT NULL CHECK (usage_cents >= 0),
     credit_applied_cents bigint NOT NULL CHECK (credit_applied_cents >= 0),
     discount_cents bigint NOT NULL CHECK (discount_cents >= 0),
+    -- Usage left unpaid after cash is attributed to the fee first.
+    unpaid_cents bigint NOT NULL CHECK (unpaid_cents >= 0),
     matchable_cents bigint NOT NULL CHECK (matchable_cents >= 0),
     amount_cents bigint NOT NULL CHECK (amount_cents >= 0),
     skip_reason text CHECK (btrim(skip_reason) <> ''),
@@ -110,7 +112,7 @@ BEGIN
             RAISE EXCEPTION 'matching requires a released and fully paid usage invoice';
         END IF;
         SELECT COALESCE(sum(amount_cents), 0) INTO used FROM billing_matching_credit WHERE contract_id = NEW.contract_id;
-        NEW.matchable_cents := greatest(NEW.usage_cents - NEW.credit_applied_cents - NEW.discount_cents, 0);
+        NEW.matchable_cents := greatest(NEW.usage_cents - NEW.credit_applied_cents - NEW.discount_cents - NEW.unpaid_cents, 0);
         earned := floor(NEW.matchable_cents::numeric * r.matching_bps / 10000)::bigint;
         NEW.amount_cents := CASE WHEN NEW.skip_reason IS NOT NULL THEN 0
             ELSE greatest(least(earned, r.cap_cents - r.prior_matched_cents - used), 0) END;

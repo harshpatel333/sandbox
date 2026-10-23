@@ -44,17 +44,27 @@ func insertContractMatchingRule(ctx context.Context, q db.DBTX, r matchingRule) 
 }
 
 type matchingUsage struct {
-	UsageCents, CreditCents, DiscountCents int64
-	SkipReason                             string
+	UsageCents, CreditCents, DiscountCents, UnpaidCents int64
+	SkipReason                                          string
+}
+
+type matchingPayment struct {
+	AmountPaid    int64 `json:"amount_paid"`
+	PaidOutOfBand bool  `json:"paid_out_of_band"`
 }
 
 // Only usage-priced lines are matchable: the plan fee and anything else on the
 // invoice fall outside the frozen close plan's credit prices. Every applied
-// credit grant is subtracted, including earlier matching credit.
-func matchingInvoiceUsage(inv StripeInvoiceAmounts, prices []string) (matchingUsage, error) {
+// credit grant is subtracted, including earlier matching credit. Cash is
+// attributed to the fee first, so usage the customer did not pay is unmatched.
+func matchingInvoiceUsage(inv StripeInvoiceAmounts, paid matchingPayment, prices []string) (matchingUsage, error) {
 	var u matchingUsage
 	if len(prices) == 0 {
 		u.SkipReason = "close plan does not identify usage prices"
+		return u, nil
+	}
+	if paid.PaidOutOfBand || paid.AmountPaid < 0 {
+		u.SkipReason = "invoice was not paid by the customer through Stripe"
 		return u, nil
 	}
 	if inv.Lines.HasMore || len(inv.Taxes) != 0 || inv.AmountShipping != 0 || inv.PrePaymentCreditNotes != 0 || inv.PostPaymentCreditNotes != 0 {
@@ -66,8 +76,13 @@ func matchingInvoiceUsage(inv StripeInvoiceAmounts, prices []string) (matchingUs
 		usage[p] = true
 	}
 	var err error
+	other := int64(0)
 	for _, line := range inv.Lines.Data {
 		if line.Pricing.PriceDetails == nil || !usage[line.Pricing.PriceDetails.Price] {
+			other += line.Amount
+			for _, credit := range line.PretaxCredits {
+				other -= credit.Amount
+			}
 			continue
 		}
 		if line.Currency != "usd" || line.Amount < 0 {
@@ -92,6 +107,8 @@ func matchingInvoiceUsage(inv StripeInvoiceAmounts, prices []string) (matchingUs
 			}
 		}
 	}
+	net := u.UsageCents - u.CreditCents - u.DiscountCents
+	u.UnpaidCents = max(net-max(paid.AmountPaid-max(other, 0), 0), 0)
 	return u, nil
 }
 
@@ -152,9 +169,8 @@ func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *strip
 			rows.Close()
 			return err
 		}
-		if err = json.Unmarshal(raw, &m.Plan); err != nil {
-			rows.Close()
-			return err
+		if json.Unmarshal(raw, &m.Plan) != nil {
+			m.Plan = billing.InvoiceClosePlan{}
 		}
 		candidates = append(candidates, m)
 	}
@@ -180,7 +196,11 @@ func (h *Handlers) recordMatchingInvoice(ctx context.Context, client *stripeHTTP
 	if inv.Status != "paid" || inv.AmountRemaining == nil || *inv.AmountRemaining != 0 {
 		return fmt.Errorf("matching invoice %s is not fully paid", m.Invoice)
 	}
-	u, err := matchingInvoiceUsage(inv, m.Plan.CreditPrices)
+	var paid matchingPayment
+	if err = client.doForm(ctx, http.MethodGet, "/v1/invoices/"+url.PathEscape(m.Invoice), nil, &paid, ""); err != nil {
+		return err
+	}
+	u, err := matchingInvoiceUsage(inv, paid, m.Plan.CreditPrices)
 	if err != nil {
 		return err
 	}
@@ -201,9 +221,9 @@ func (h *Handlers) recordMatchingInvoice(ctx context.Context, client *stripeHTTP
 	}
 	defer tx.Rollback(ctx)
 	var id uuid.UUID
-	err = tx.QueryRow(ctx, `INSERT INTO billing_matching_credit(team_id,contract_id,invoice_id,customer_id,period_start,period_end,usage_cents,credit_applied_cents,discount_cents,matchable_cents,amount_cents,skip_reason,invoice_evidence,state,idempotency_key)
- VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,0,0,$10,$11,'skipped','') ON CONFLICT(invoice_id) DO NOTHING RETURNING id`,
-		m.Team, m.Contract, m.Invoice, m.Customer, m.Start, m.End, u.UsageCents, u.CreditCents, u.DiscountCents, reason, evidence).Scan(&id)
+	err = tx.QueryRow(ctx, `INSERT INTO billing_matching_credit(team_id,contract_id,invoice_id,customer_id,period_start,period_end,usage_cents,credit_applied_cents,discount_cents,unpaid_cents,matchable_cents,amount_cents,skip_reason,invoice_evidence,state,idempotency_key)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,0,$11,$12,'skipped','') ON CONFLICT(invoice_id) DO NOTHING RETURNING id`,
+		m.Team, m.Contract, m.Invoice, m.Customer, m.Start, m.End, u.UsageCents, u.CreditCents, u.DiscountCents, u.UnpaidCents, reason, evidence).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -245,8 +265,8 @@ func (h *Handlers) issueDueMatchingCredits(ctx context.Context, client *stripeHT
 		case issueErr == nil:
 			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET failures=0,last_error=NULL WHERE id=$1`, id)
 		case errors.Is(issueErr, errMatchingDeferred) || errors.Is(issueErr, errCreditInventoryPending):
+			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET next_attempt_at=clock_timestamp()+interval '30 seconds',last_error=$2 WHERE id=$1`, id, issueErr.Error())
 			issueErr = nil
-			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET next_attempt_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, id)
 		default:
 			log.Error().Err(issueErr).Str("matching_credit_id", id.String()).Msg("matching credit issuance failed; inspect before replaying")
 			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET failures=least(failures+1,10000),last_error=$2,
@@ -258,9 +278,10 @@ func (h *Handlers) issueDueMatchingCredits(ctx context.Context, client *stripeHT
 	return errors.Join(errs...)
 }
 
-// Issuance shares the invoice closer's per-team lock and waits out any close
-// in progress: a close freezes the eligible credit set, so a grant appearing
-// mid-close would wedge it. A grant issued between closes simply funds the next.
+// Issuance shares the invoice closer's per-team lock and waits until every
+// ended period is released: a close freezes or recomputes the eligible credit
+// set for its period, so a grant appearing before release could wedge it. A
+// grant issued while no period awaits closing simply funds the next invoice.
 func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPClient, id uuid.UUID) error {
 	var team, contract uuid.UUID
 	var customer, key string
@@ -283,11 +304,13 @@ func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPCl
 	if !locked {
 		return errMatchingDeferred
 	}
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_invoice_close WHERE team_id=$1 AND state IN ('prepared','adjusted','finalizing'))`, team).Scan(&closing); err != nil {
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_account a USING(team_id)
+ WHERE p.team_id=$1 AND p.period_end<=clock_timestamp() AND p.period_end>a.enrolled_at
+  AND NOT EXISTS(SELECT 1 FROM billing_invoice_close j WHERE (j.team_id,j.period_start,j.period_end)=(p.team_id,p.period_start,p.period_end) AND j.state='released'))`, team).Scan(&closing); err != nil {
 		return err
 	}
 	if closing {
-		return errMatchingDeferred
+		return fmt.Errorf("%w: an ended billing period is not yet released", errMatchingDeferred)
 	}
 	var state string
 	var payload []byte
@@ -388,9 +411,13 @@ func matchingGrantForm(raw []byte) (url.Values, error) {
 // Refunds and credit notes after a match are surfaced for staff; matched
 // credit is never clawed back automatically.
 func (h *Handlers) reviewMatchedInvoices(ctx context.Context, client *stripeHTTPClient) error {
+	if _, err := h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET review_checked_at='infinity' WHERE id IN (SELECT id FROM billing_matching_credit
+ WHERE amount_cents>0 AND flagged_at IS NULL AND (review_checked_at IS NULL OR review_checked_at<clock_timestamp()-interval '1 day') AND created_at<=clock_timestamp()-interval '120 days'
+ ORDER BY review_checked_at NULLS FIRST LIMIT 100)`); err != nil {
+		return err
+	}
 	rows, err := h.Pool.Query(ctx, `SELECT id,invoice_id,customer_id FROM billing_matching_credit
- WHERE amount_cents>0 AND flagged_at IS NULL AND created_at>clock_timestamp()-interval '120 days'
-  AND (review_checked_at IS NULL OR review_checked_at<clock_timestamp()-interval '1 day')
+ WHERE amount_cents>0 AND flagged_at IS NULL AND (review_checked_at IS NULL OR review_checked_at<clock_timestamp()-interval '1 day')
  ORDER BY review_checked_at NULLS FIRST,id LIMIT 10`)
 	if err != nil {
 		return err
@@ -480,4 +507,36 @@ func (c *stripeHTTPClient) matchedInvoiceReversal(ctx context.Context, id, custo
 		}
 	}
 	return "", nil, nil
+}
+
+// Matching credit is owned by its ledger; no other flow may adopt it.
+func (h *Handlers) withoutMatchingGrants(ctx context.Context, grants []billing.InvoiceCreditGrant) ([]billing.InvoiceCreditGrant, error) {
+	ids := make([]string, len(grants))
+	for i, g := range grants {
+		ids[i] = g.ID
+	}
+	rows, err := h.Pool.Query(ctx, `SELECT stripe_credit_grant_id FROM billing_matching_credit WHERE stripe_credit_grant_id=ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	owned := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		owned[id] = true
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	kept := []billing.InvoiceCreditGrant{}
+	for _, g := range grants {
+		if !owned[g.ID] {
+			kept = append(kept, g)
+		}
+	}
+	return kept, nil
 }
