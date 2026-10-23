@@ -844,3 +844,51 @@ func TestTeamPlanChangeFreeEntryRequiresDeployedPauseSupport(t *testing.T) {
 		t.Fatalf("readiness blocked undo: %v", err)
 	}
 }
+
+func TestTeamPlanChangeRejectsEarlyExplicitCancellation(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindSubscription)
+	terms := testPlanTerms("starter", planKindPrepaid, 1, nil)
+	req := f.intent(t, "starter", "early-cancel", terms)
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = s.periodEnd.Add(-2 * time.Hour).Unix() })
+	if _, _, err := f.h.planChangeBoundary(t.Context(), f.team, f.plan(t), time.Now()); !errors.Is(err, errTeamPlanChangeConflict) {
+		t.Fatalf("preview accepted earlier cancellation with later item boundary: %v", err)
+	}
+	if _, err := f.h.scheduleTeamPlanChangeTo(t.Context(), req, terms); !errors.Is(err, errTeamPlanChangeConflict) {
+		t.Fatalf("accepted early cancellation after preview: %v", err)
+	}
+	var count int
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM team_plan_change WHERE team_id=$1`, f.team).Scan(&count); err != nil || count != 0 || len(f.stripe.writes) != 0 {
+		t.Fatalf("early cancellation created work: %d %v %v", count, err, f.stripe.writes)
+	}
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = 0 })
+	c, err := f.request(t, "starter", "scheduled-before-early-cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = s.periodEnd.Add(-2 * time.Hour).Unix() })
+	f.tick(t)
+	if c = f.reload(t, c.ID); c.ProviderCancelAt != nil || c.State != "scheduled" || !c.EffectiveAt.Equal(f.stripe.periodEnd) || len(f.stripe.writes) != 0 {
+		t.Fatalf("confirmed mismatched early cancellation: %+v", c)
+	}
+}
+
+func TestTeamPlanChangeDoesNotRollAnEndingSubscriptionIntoLaterCycle(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "period_end", true: "explicit"}[explicit], func(t *testing.T) {
+			f := newPlanChangeV2Fixture(t, planKindSubscription)
+			f.stripe.set(func(s *renewalStripe) {
+				s.periodEnd = time.Now().Add(30 * time.Minute).Truncate(time.Second)
+				s.cancel = true
+				if explicit {
+					s.cancelAt = s.periodEnd.Unix()
+				}
+			})
+			if _, _, err := f.h.planChangeBoundary(t.Context(), f.team, f.plan(t), time.Now()); !errors.Is(err, errTeamPlanChangeConflict) {
+				t.Fatalf("moved already-ending subscription into a later cycle: %v", err)
+			}
+			if len(f.stripe.writes) != 0 {
+				t.Fatalf("changed an independent cancellation: %v", f.stripe.writes)
+			}
+		})
+	}
+}

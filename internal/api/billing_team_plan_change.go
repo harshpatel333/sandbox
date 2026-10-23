@@ -349,8 +349,11 @@ func (h *Handlers) planChangeSubscription(ctx context.Context, team, contract uu
 		return nil, time.Time{}, teamPlanChangeConflict("the team's subscription has already ended")
 	}
 	end := subscriptionPeriodEnd(sub)
-	if sub.CancelAt != 0 && time.Unix(sub.CancelAt, 0).After(end) {
-		return nil, time.Time{}, teamPlanChangeConflict("the subscription cancellation is later than this billing period; confirm its cancellation date before changing plans")
+	if sub.CancelAt != 0 && !time.Unix(sub.CancelAt, 0).Equal(end) {
+		return nil, time.Time{}, teamPlanChangeConflict("the subscription cancellation does not match the billing period; reconcile its cancellation date before changing plans")
+	}
+	if subscriptionWillEnd(sub) && end.Sub(time.Now()) < planChangeMinNotice {
+		return nil, time.Time{}, teamPlanChangeConflict("the subscription is already ending too soon to schedule a plan change")
 	}
 	return &subscription, end, nil
 }
@@ -441,7 +444,7 @@ func subscriptionStopsBy(sub invoiceSubscription, boundary time.Time) bool {
 		return true
 	}
 	if sub.CancelAt != 0 {
-		return !time.Unix(sub.CancelAt, 0).After(boundary)
+		return time.Unix(sub.CancelAt, 0).Equal(boundary)
 	}
 	return sub.CancelAtPeriodEnd && !subscriptionPeriodEnd(sub).After(boundary)
 }
@@ -584,7 +587,7 @@ func (h *Handlers) stopPlanChangeRenewal(ctx context.Context, c teamPlanChange, 
 		}
 	}
 	if subscriptionWillEnd(sub) && !subscriptionStopsBy(sub, c.EffectiveAt) {
-		return now, errors.New("the subscription cancellation is later than the confirmed plan change")
+		return now, errors.New("the subscription cancellation does not match the confirmed plan change")
 	}
 	if !subscriptionWillEnd(sub) {
 		if err = h.setSubscriptionRenewal(ctx, *c.Subscription, c.ID, false); err != nil {
@@ -674,7 +677,7 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 			return end, fencedPlanChangeUpdate(ctx, h.Pool, c, `effective_at=$3`, end)
 		}
 		if !subscriptionStopsBy(sub, c.EffectiveAt) {
-			return now, errors.New("the subscription cancellation is later than the confirmed plan change")
+			return now, errors.New("the subscription cancellation does not match the confirmed plan change")
 		}
 	}
 	tx, err := h.Pool.Begin(ctx)
