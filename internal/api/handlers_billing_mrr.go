@@ -145,7 +145,7 @@ func (h *Handlers) loadMRROverview(ctx context.Context, q db.DBTX, now time.Time
 		return mrrOverview{}, err
 	}
 	var totalTeams int64
-	if err := q.QueryRow(ctx, `SELECT count(*) FROM team WHERE home_region=$1 AND id::text<>$2`, region, systemTeam).Scan(&totalTeams); err != nil {
+	if err := q.QueryRow(ctx, `SELECT count(*) FROM team WHERE home_region=$1 AND id IS DISTINCT FROM NULLIF($2,'')::uuid`, region, systemTeam).Scan(&totalTeams); err != nil {
 		return mrrOverview{}, err
 	}
 	names := map[string]string{
