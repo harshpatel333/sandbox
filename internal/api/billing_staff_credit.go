@@ -34,6 +34,7 @@ type staffCreditRequest struct {
 
 type staffCredit struct {
 	ID          uuid.UUID  `json:"id"`
+	Key         string     `json:"idempotency_key"`
 	AmountCents int64      `json:"amount_cents"`
 	Reason      string     `json:"reason"`
 	RequestedBy uuid.UUID  `json:"requested_by"`
@@ -45,11 +46,11 @@ type staffCredit struct {
 	customer    string
 }
 
-const staffCreditColumns = `id,amount_cents,reason,requested_by,requested_at,state,stripe_credit_grant_id,issued_at,last_error,customer_id`
+const staffCreditColumns = `id,idempotency_key,amount_cents,reason,requested_by,requested_at,state,stripe_credit_grant_id,issued_at,last_error,customer_id`
 
 func scanStaffCredit(row pgx.Row) (staffCredit, error) {
 	var s staffCredit
-	err := row.Scan(&s.ID, &s.AmountCents, &s.Reason, &s.RequestedBy, &s.RequestedAt, &s.State, &s.GrantID, &s.IssuedAt, &s.LastError, &s.customer)
+	err := row.Scan(&s.ID, &s.Key, &s.AmountCents, &s.Reason, &s.RequestedBy, &s.RequestedAt, &s.State, &s.GrantID, &s.IssuedAt, &s.LastError, &s.customer)
 	return s, err
 }
 
