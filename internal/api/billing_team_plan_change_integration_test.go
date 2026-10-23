@@ -75,6 +75,9 @@ var planChangeTestKeys = map[string]string{planKindSubscription: "pro_monthly", 
 func newPlanChangeV2Fixture(t *testing.T, kind string) planChangeV2Fixture {
 	t.Helper()
 	h, team := newPlanAssignmentFixture(t)
+	if on, err := h.pricingV2Enabled(t.Context()); err != nil || on {
+		t.Fatalf("committed assignment fixture must start with entry off: %v %v", on, err)
+	}
 	f := planChangeV2Fixture{h: h, team: team, actor: uuid.New(), stripe: &renewalStripe{t: t, sub: "sub_" + uuid.NewString(), status: "active"}}
 	srv := httptest.NewServer(f.stripe)
 	t.Cleanup(srv.Close)
@@ -109,11 +112,9 @@ func newPlanChangeV2Fixture(t *testing.T, kind string) planChangeV2Fixture {
 		}
 		a.ContractID = &contract
 	}
-	setPricingVersion(t, h, "v2")
 	if _, err = assignInTx(t, h, a); err != nil {
 		t.Fatal(err)
 	}
-	setPricingVersion(t, h, "legacy")
 	return f
 }
 
@@ -610,11 +611,9 @@ func TestTeamPlanChangeStaffViewReportsPendingAndUndo(t *testing.T) {
 
 func TestTeamPlanChangeCustomWithoutBillingAccountUsesOneConnection(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
-	setPricingVersion(t, h, "v2")
 	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("custom_example", planKindCustom, 100, nil), Source: planSourceStaff, Reason: "agreement"}); err != nil {
 		t.Fatal(err)
 	}
-	setPricingVersion(t, h, "legacy")
 	cfg := h.Pool.Config()
 	cfg.MaxConns = 1
 	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
@@ -687,5 +686,41 @@ func TestTeamPlanChangeImmediateConsentAndReplay(t *testing.T) {
 	terms.Limits.MaxConcurrent = int32p(2)
 	if replay, err := f.h.scheduleTeamPlanChangeTo(t.Context(), req, terms); err != nil || replay.ID != c.ID {
 		t.Fatalf("recorded consent could not replay after target terms changed: %+v %v", replay, err)
+	}
+}
+
+func TestTeamPlanChangeHistorySurvivesTeamDeletionWithoutRestoringRenewal(t *testing.T) {
+	for _, stage := range []string{"scheduled", "cancelled", "undone"} {
+		t.Run(stage, func(t *testing.T) {
+			f := newPlanChangeV2Fixture(t, planKindCustom)
+			c, err := scanTeamPlanChange(f.h.Pool.QueryRow(t.Context(), `INSERT INTO team_plan_change(team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,subscription_id,requested_by,requested_via,reason,idempotency_key)
+                VALUES($1,$2,'free','free','{}','{"max_concurrent":1}',$5,true,$3,$4,'customer','requested by the team','delete-team') RETURNING `+teamPlanChangeColumns, f.team, f.plan(t).ID, f.stripe.sub, f.actor, f.stripe.periodEnd))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stage != "scheduled" {
+				f.tick(t)
+			}
+			if stage == "undone" {
+				if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writes := len(f.stripe.writes)
+			if err = f.h.DB.DeleteTeam(t.Context(), f.team); err != nil {
+				t.Fatal(err)
+			}
+			retained := f.reload(t, c.ID)
+			if retained.State != "undone" || retained.needsRenewal() || retained.FromAssignment != c.FromAssignment {
+				t.Fatalf("deleted team has active work or lost history: %+v", retained)
+			}
+			if ran, err := f.h.runDueTeamPlanChange(t.Context(), f.team); err != nil || ran || len(f.stripe.writes) != writes {
+				t.Fatalf("deleted team retried provider work: %v %v %v", ran, err, f.stripe.writes)
+			}
+			if _, err = f.h.Pool.Exec(t.Context(), `INSERT INTO team_plan_change(team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,requested_by,requested_via,reason,idempotency_key)
+    SELECT team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,requested_by,requested_via,reason,'deleted-team-insert' FROM team_plan_change WHERE id=$1`, c.ID); err == nil {
+				t.Fatal("accepted new work for a deleted team")
+			}
+		})
 	}
 }

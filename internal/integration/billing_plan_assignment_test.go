@@ -108,14 +108,8 @@ func TestIntegration_BillingPlanChangeWrites(t *testing.T) {
 
 func TestIntegration_BillingPlanChangeStaffPendingAndUndoReason(t *testing.T) {
 	team, key := seedTeamAndKey(t)
-	if _, err := testPool.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version='v2'`); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
         VALUES($1,'custom_example','custom','{"display_name":"Example plan"}','{"max_concurrent":100}',clock_timestamp(),'staff','agreement')`, team); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testPool.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
 		t.Fatal(err)
 	}
 	anchor := time.Now().UTC().AddDate(0, -1, 0).Add(30 * time.Minute).Truncate(time.Second)

@@ -804,6 +804,9 @@ func TestIntegration_PricingSwitchActivatesTheV2Catalog(t *testing.T) {
 		pro.Allowance.OnExhausted != "payg" || *pro.Limits.MaxConcurrent != 1000 || *pro.Limits.MaxVCPU != 8 {
 		t.Fatalf("pro card=%+v", pro)
 	}
+	if pro.Monthly.Available || len(body.Plans) != 0 {
+		t.Fatalf("offers advertised without Stripe: %+v", body)
+	}
 	var monthly int64
 	var annualAvailable bool
 	if err := testPool.QueryRow(ctx, `SELECT (SELECT charge_amount_cents FROM billing_plan WHERE offer_key='pro_monthly'),(SELECT available FROM billing_plan WHERE offer_key='pro_annual')`).Scan(&monthly, &annualAvailable); err != nil ||
@@ -863,6 +866,7 @@ func TestIntegration_PublicBillingPlansListTodaysPurchasablePlans(t *testing.T) 
 	}
 	h := api.NewHandlers(&stubVMD{}, db.New(testPool), cfg)
 	h.Pool = testPool
+	h.Stripe = api.NewStripeBillingClient(&config.Config{StripeSecretKey: "sk_test_example", StripeAPIVersion: "2026-07-29.dahlia"})
 	w := do(api.SetupRouter(t.Context(), h, testPool), "GET", "/billing/plans/public", "", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("plans: %d %s", w.Code, w.Body.String())

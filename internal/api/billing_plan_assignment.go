@@ -537,25 +537,46 @@ func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 var errPricingV2Off = errors.New("pricing v2 is off")
 
 func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, body staffPlanAssignmentBody) (teamPlan, error) {
-	var allowed bool
-	if err := h.Pool.QueryRow(ctx, `SELECT billing_pricing_version()='v2' OR EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1)`, team).Scan(&allowed); err != nil {
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
 		return teamPlan{}, err
 	}
-	if !allowed {
+	defer tx.Rollback(ctx)
+	var version string
+	if err := tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch FOR SHARE`).Scan(&version); err != nil {
+		return teamPlan{}, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM team WHERE id=$1 FOR NO KEY UPDATE`, team); err != nil {
+		return teamPlan{}, err
+	}
+	prior, err := scanTeamPlan(tx.QueryRow(ctx, `SELECT `+teamPlanColumns+` FROM team_plan_assignment WHERE team_id=$1 AND idempotency_key=$2`, team, body.Key))
+	if err == nil {
+		if prior.VersionID == nil || *prior.VersionID != body.VersionID || prior.Source != planSourceStaff {
+			return teamPlan{}, errPlanAssignmentReused
+		}
+		return prior, tx.Commit(ctx)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return teamPlan{}, err
+	}
+	if version != "v2" {
 		return teamPlan{}, errPricingV2Off
 	}
-	terms, err := h.planTermsVersion(ctx, body.VersionID, 0)
+	catalogVersion, err := scanPlanVersion(tx.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1 AND state<>'draft' FOR SHARE`, body.VersionID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return teamPlan{}, errUnknownPlan
+	}
+	if err != nil {
+		return teamPlan{}, err
+	}
+	catalog := &Handlers{DB: db.New(tx)}
+	terms, err := catalog.termsOfVersion(ctx, catalogVersion, 0)
 	if err != nil {
 		return teamPlan{}, err
 	}
 	if terms.Kind != planKindCustom || terms.Limits.MaxConcurrent == nil {
 		return teamPlan{}, errUnknownPlan
 	}
-	tx, err := h.Pool.Begin(ctx)
-	if err != nil {
-		return teamPlan{}, err
-	}
-	defer tx.Rollback(ctx)
 	plan, err := assignTeamPlan(ctx, tx, planAssignment{Team: team, Terms: terms, Source: planSourceStaff, Actor: &actor, Reason: body.Reason, Key: body.Key})
 	if err != nil {
 		return plan, err

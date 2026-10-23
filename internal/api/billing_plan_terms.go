@@ -276,7 +276,8 @@ func (t planTerms) ownsPrice() bool {
 
 // planPriced reports whether checkout may sell t in this environment.
 func (h *Handlers) planPriced(t planTerms) bool {
-	return t.ownsPrice() || (h.Config != nil && h.Config.PlanPriceID(t.OfferKey) != "")
+	stripe, ok := h.Stripe.(*stripeHTTPClient)
+	return ok && stripe != nil && (t.ownsPrice() || (h.Config != nil && h.Config.PlanPriceID(t.OfferKey) != ""))
 }
 
 // freezeContractLimits records the limits a contract was sold or assigned

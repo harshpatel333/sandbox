@@ -4,7 +4,7 @@
 -- it applies. Upgrades are not recorded here: they apply on payment.
 CREATE TABLE team_plan_change (
  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
- team_id uuid NOT NULL REFERENCES team(id),
+ team_id uuid NOT NULL,
  from_assignment_id uuid NOT NULL REFERENCES team_plan_assignment(id),
  target_plan_key text NOT NULL CHECK(btrim(target_plan_key)<>''),
  target_kind text NOT NULL CHECK(target_kind IN ('free','prepaid','subscription','legacy_payg','custom')),
@@ -54,6 +54,8 @@ DECLARE bookkeeping text[]:=ARRAY['next_check_at','lease_token','lease_until','f
 BEGIN
  IF TG_OP<>'UPDATE' AND TG_OP<>'INSERT' THEN RAISE EXCEPTION 'plan change history is immutable'; END IF;
  IF TG_OP='INSERT' THEN
+  PERFORM 1 FROM team WHERE id=NEW.team_id FOR KEY SHARE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'plan change team does not exist' USING ERRCODE='23503'; END IF;
   IF NEW.state<>'scheduled' OR NEW.provider_cancel_preexisting OR num_nonnulls(NEW.provider_cancel_requested_at,NEW.provider_cancel_at,NEW.provider_renewed_at,
    NEW.undone_at,NEW.undone_by,NEW.undo_reason,NEW.applied_at,NEW.applied_assignment_id,NEW.completed_at)<>0 THEN
    RAISE EXCEPTION 'a plan change starts scheduled';
@@ -97,6 +99,23 @@ CREATE TRIGGER team_plan_change_guard BEFORE INSERT OR UPDATE OR DELETE ON team_
  FOR EACH ROW EXECUTE FUNCTION guard_team_plan_change();
 CREATE TRIGGER team_plan_change_truncate_guard BEFORE TRUNCATE ON team_plan_change
  FOR EACH STATEMENT EXECUTE FUNCTION guard_team_plan_change();
+
+CREATE FUNCTION finish_deleted_team_plan_changes() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ UPDATE team_plan_change SET
+  state=CASE WHEN state='scheduled' THEN 'undone' WHEN state='applied' THEN 'completed' ELSE state END,
+  undone_at=CASE WHEN state='scheduled' THEN clock_timestamp() ELSE undone_at END,
+  undo_reason=CASE WHEN state='scheduled' THEN 'the team was deleted' ELSE undo_reason END,
+  provider_renewed_at=CASE WHEN state IN ('scheduled','undone') AND provider_cancel_requested_at IS NOT NULL
+   THEN COALESCE(provider_renewed_at,clock_timestamp()) ELSE provider_renewed_at END,
+  completed_at=CASE WHEN state='applied' THEN clock_timestamp() ELSE completed_at END,
+  next_check_at='infinity',lease_token=NULL,lease_until=NULL
+ WHERE team_id=OLD.id AND (state IN ('scheduled','applied') OR (state='undone' AND provider_renewed_at IS NULL));
+ RETURN OLD;
+END $$;
+CREATE TRIGGER team_plan_change_team_deleted AFTER DELETE ON team
+ FOR EACH ROW EXECUTE FUNCTION finish_deleted_team_plan_changes();
+REVOKE ALL ON FUNCTION finish_deleted_team_plan_changes() FROM PUBLIC;
 
 ALTER TABLE team_plan_change ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON team_plan_change FROM PUBLIC;
