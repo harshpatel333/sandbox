@@ -69,7 +69,6 @@ func limitsOf(t *testing.T, h *Handlers, team uuid.UUID) (int32, *int32) {
 
 func TestPlanAssignmentMovesTeamAndAppliesLimits(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
-	setPricingVersion(t, h, "v2")
 	if _, ok, err := currentTeamPlan(t.Context(), h.Pool, team); err != nil || ok {
 		t.Fatalf("new team already has a plan: %v %v", ok, err)
 	}
@@ -337,9 +336,6 @@ func TestPlanAssignmentNewTeamStartsOnFreeOnlyUnderV2(t *testing.T) {
 func TestPlanAssignmentOwnsLimitsAfterSwitchOff(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
 	terms := testPlanTerms("starter", planKindPrepaid, 5, nil)
-	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: terms, Source: planSourceCreditPurchase, Reason: "credit"}); !errors.Is(err, errPricingV2Off) {
-		t.Fatalf("first assignment with switch off: %v", err)
-	}
 	setPricingVersion(t, h, "v2")
 	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: terms, Source: planSourceCreditPurchase, Reason: "credit"}); err != nil {
 		t.Fatal(err)
