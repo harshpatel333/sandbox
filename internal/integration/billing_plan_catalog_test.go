@@ -363,13 +363,17 @@ func TestIntegration_BillingCatalogStaffAPI(t *testing.T) {
 	if w = do(http.MethodPut, "/internal/billing/catalog/plans/"+draft.ID, admin, strings.Replace(draftBody, "Talk to us", "Custom pricing", 1)); w.Code != 200 || !strings.Contains(w.Body.String(), "Custom pricing") {
 		t.Fatalf("update draft = %d %s", w.Code, w.Body)
 	}
+	expected := w.Body.String()
+	if stale := do(http.MethodPost, "/internal/billing/catalog/plans/"+draft.ID+"/publish", admin, `{"reason":"stale approval","expected":`+draftBody+`}`); stale.Code != http.StatusConflict {
+		t.Fatalf("published changed draft from stale approval: %d %s", stale.Code, stale.Body)
+	}
 	if w = do(http.MethodPost, "/internal/billing/catalog/plans", admin, `{"family":"pro","kind":"subscription","display_name":"Pro","monthly_fee_cents":100,"limits":{"max_concurrent":1},"credit_schedule":[{"start_months":0,"every_months":0,"amount_cents":1,"expires_after_months":1}]}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("invalid draft = %d %s", w.Code, w.Body)
 	}
 	if w = do(http.MethodPost, "/internal/billing/catalog/plans/"+draft.ID+"/publish", admin, `{"reason":" "}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("publish without a reason = %d %s", w.Code, w.Body)
 	}
-	if w = do(http.MethodPost, "/internal/billing/catalog/plans/"+draft.ID+"/publish", admin, `{"reason":"Approved card copy"}`); w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"published"`) {
+	if w = do(http.MethodPost, "/internal/billing/catalog/plans/"+draft.ID+"/publish", admin, `{"reason":"Approved card copy","expected":`+expected+`}`); w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"published"`) {
 		t.Fatalf("publish = %d %s", w.Code, w.Body)
 	}
 	t.Cleanup(func() { publishPlanCopy(t, previous, "") })
@@ -939,13 +943,6 @@ func TestIntegration_PricingV2HasNoSignupPromotions(t *testing.T) {
 		t.Fatalf("card bonus outcome=%s err=%v", reason, err)
 	}
 
-	// A team activated under v2 keeps no card bonus if the switch goes back.
-	if _, err := testPool.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
-		t.Fatal(err)
-	}
-	if w := sendStripeActivationWebhook(t, router, "evt_v2_again_"+teamID.String(), teamID, owner, created.Add(time.Minute)); w.Code != http.StatusOK {
-		t.Fatalf("second activation: %d %s", w.Code, w.Body)
-	}
 	if len(stripe.creditGrantCalls) != 0 {
 		t.Fatalf("card bonus granted under v2: %+v", stripe.creditGrantCalls)
 	}

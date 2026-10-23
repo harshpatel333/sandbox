@@ -111,16 +111,20 @@ func forgetPricingVersion() {
 // signup choice "free" means legacy pay as you go, while the v2 "free" family
 // is the Free plan. v2 code reads a team's plan from its plan assignment only.
 func (h *Handlers) planTerms(ctx context.Context, offerKey string) (planTerms, error) {
+	model, err := h.pricingVersion(ctx)
+	if err != nil {
+		return planTerms{}, err
+	}
+	return h.planTermsForPricingVersion(ctx, offerKey, model)
+}
+
+func (h *Handlers) planTermsForPricingVersion(ctx context.Context, offerKey, model string) (planTerms, error) {
 	family, months, ok := planOfferInterval(offerKey)
 	if !ok && planFamilyPattern(offerKey) {
 		family, ok = offerKey, true
 	}
 	if !ok || h.Pool == nil {
 		return planTerms{}, errUnknownPlan
-	}
-	model, err := h.pricingVersion(ctx)
-	if err != nil {
-		return planTerms{}, err
 	}
 	v, err := scanPlanVersion(h.Pool.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version
  WHERE family=$1 AND state<>'draft' ORDER BY (pricing_version=$2 AND state='published') DESC, pricing_version=$2 DESC, state='published' DESC, retired_at DESC NULLS LAST, version DESC LIMIT 1`, family, model))
@@ -163,7 +167,7 @@ func (h *Handlers) listAssignableVersions(ctx context.Context) ([]planVersion, e
 	if err != nil {
 		return nil, err
 	}
-	rows, err := h.Pool.Query(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE state='published' AND pricing_version=$1 AND NOT display_only ORDER BY sort_order,family`, model)
+	rows, err := h.Pool.Query(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE state='published' AND (pricing_version=$1 OR (family='payg' AND pricing_version='legacy' AND kind='legacy_payg')) AND NOT display_only ORDER BY sort_order,family`, model)
 	if err != nil {
 		return nil, err
 	}

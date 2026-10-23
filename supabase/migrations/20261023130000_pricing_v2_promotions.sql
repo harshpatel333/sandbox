@@ -1,6 +1,5 @@
 -- Pricing v2 has no signup trial and no card bonus. Both promotions take
--- their existing "denied, no credit" paths while the switch is on v2, and a
--- team denied under v2 stays denied if the switch goes back to legacy. With
+-- their existing "denied, no credit" paths while the switch is on v2. With
 -- the switch on legacy nothing changes.
 
 -- The $5 signup trial: every team-creation path claims through this function.
@@ -112,8 +111,7 @@ RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pub
 BEGIN
     SET LOCAL lock_timeout = '5s';
     PERFORM pg_advisory_xact_lock(hashtext('stripe-promo-user:' || COALESCE(p_user_id::text, ''))::bigint);
-    IF (billing_pricing_version() = 'v2'
-        OR EXISTS (SELECT 1 FROM stripe_promotion_outcome WHERE team_id = p_team_id AND reason = 'pricing_v2'))
+    IF billing_pricing_version() = 'v2'
        AND NOT EXISTS (SELECT 1 FROM team_billing_account
            WHERE team_id = p_team_id AND stripe_activation_credit_reserved_at IS NOT NULL) THEN
         RETURN 'pricing_v2';
@@ -127,34 +125,20 @@ ALTER TABLE stripe_promotion_outcome ADD CONSTRAINT stripe_promotion_outcome_rea
  CHECK (reason IN ('ineligible','user_already_redeemed','owner_conflict','device_already_redeemed',
  'evidence_missing','device_reservation_pending','authority_unavailable','sponsored_onboarding','pricing_v2'));
 
--- The signup eligibility preview reports the trial as unavailable under v2.
-ALTER FUNCTION evaluate_signup_promotion_snapshot(uuid) RENAME TO evaluate_signup_promotion_snapshot_before_pricing_v2;
-CREATE OR REPLACE FUNCTION evaluate_signup_promotion_snapshot(p_user_id uuid)
-RETURNS TABLE(ownership text, device_decision text, eligibility text, reason text)
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, extensions AS $$
-BEGIN
-    RETURN QUERY SELECT s.ownership, s.device_decision,
-        CASE WHEN billing_pricing_version() = 'v2' THEN 'ineligible' ELSE s.eligibility END,
-        CASE WHEN billing_pricing_version() = 'v2' THEN 'pricing_v2' ELSE s.reason END
-    FROM evaluate_signup_promotion_snapshot_before_pricing_v2(p_user_id) s;
-END $$;
-
 REVOKE ALL ON FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean),
-    reserve_stripe_promotion_before_pricing_v2(uuid,uuid,text,text,timestamptz,boolean),
-    evaluate_signup_promotion_snapshot(uuid), evaluate_signup_promotion_snapshot_before_pricing_v2(uuid) FROM PUBLIC;
+    reserve_stripe_promotion_before_pricing_v2(uuid,uuid,text,text,timestamptz,boolean) FROM PUBLIC;
 DO $$ DECLARE r text; BEGIN
     FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
-            EXECUTE format('REVOKE ALL ON FUNCTION reserve_stripe_promotion_before_pricing_v2(uuid,uuid,text,text,timestamptz,boolean), evaluate_signup_promotion_snapshot_before_pricing_v2(uuid) FROM %I', r);
+            EXECUTE format('REVOKE ALL ON FUNCTION reserve_stripe_promotion_before_pricing_v2(uuid,uuid,text,text,timestamptz,boolean) FROM %I', r);
         END IF;
     END LOOP;
     FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
-            EXECUTE format('REVOKE ALL ON FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean), evaluate_signup_promotion_snapshot(uuid) FROM %I', r);
+            EXECUTE format('REVOKE ALL ON FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean) FROM %I', r);
         END IF;
     END LOOP;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
-        GRANT EXECUTE ON FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean),
-            evaluate_signup_promotion_snapshot(uuid) TO service_role;
+        GRANT EXECUTE ON FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean) TO service_role;
     END IF;
 END $$;

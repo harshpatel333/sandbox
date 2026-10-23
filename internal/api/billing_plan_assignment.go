@@ -232,9 +232,6 @@ func assignInitialTeamPlans(ctx context.Context, tx pgx.Tx, as []planAssignment)
 // new plan's frozen limits. A repeated idempotency key returns the assignment
 // it created.
 func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan, error) {
-	if err := a.validate(); err != nil {
-		return teamPlan{}, err
-	}
 	var now time.Time
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp() FROM team WHERE id=$1 FOR NO KEY UPDATE`, a.Team).Scan(&now); err != nil {
 		return teamPlan{}, err
@@ -252,6 +249,9 @@ func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan,
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return teamPlan{}, err
 		}
+	}
+	if err := a.validate(); err != nil {
+		return teamPlan{}, err
 	}
 	terms, limits, version, err := a.frozen()
 	if err != nil {
@@ -310,20 +310,14 @@ type customerBillingPeriod struct {
 }
 
 // GetBillingPlan tells a team which plan it is on, its limits, the current
-// billing period and any change waiting to take effect. Plan is null while
-// pricing v2 is off, so turning it off restores today's billing page.
+// billing period and any change waiting to take effect.
 func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	team, ok := h.requireBillingRead(c)
 	if !ok {
 		return
 	}
 	ctx := c.Request.Context()
-	var current teamPlan
-	assigned := false
-	on, err := h.pricingV2Enabled(ctx)
-	if err == nil && on {
-		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
-	}
+	current, assigned, err := currentTeamPlan(ctx, h.Pool, team)
 	var limits teamLimits
 	if err == nil && assigned {
 		limits, err = h.teamEffectiveLimits(ctx, team)
@@ -412,17 +406,14 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	terms, err := h.planTerms(ctx, target)
+	terms, err := h.planTermsForPricingVersion(ctx, target, "v2")
 	if errors.Is(err, errUnknownPlan) {
 		respondErrorMsg(c, "invalid_plan", "this plan is not available", http.StatusBadRequest)
 		return
 	}
 	var current teamPlan
-	var assigned, on bool
+	var assigned bool
 	if err == nil {
-		on, err = h.pricingV2Enabled(ctx)
-	}
-	if err == nil && on {
 		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
 	}
 	if err != nil {
@@ -522,11 +513,11 @@ func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 var errPricingV2Off = errors.New("pricing v2 is off")
 
 func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, body staffPlanAssignmentBody) (teamPlan, error) {
-	on, err := h.pricingV2Enabled(ctx)
-	if err != nil {
+	var allowed bool
+	if err := h.Pool.QueryRow(ctx, `SELECT billing_pricing_version()='v2' OR EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1)`, team).Scan(&allowed); err != nil {
 		return teamPlan{}, err
 	}
-	if !on {
+	if !allowed {
 		return teamPlan{}, errPricingV2Off
 	}
 	terms, err := h.planTermsVersion(ctx, body.VersionID, 0)

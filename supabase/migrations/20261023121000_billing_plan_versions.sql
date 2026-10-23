@@ -365,7 +365,7 @@ RETURNS TABLE(max_concurrent integer, max_vcpu integer, max_memory_mib integer, 
 LANGUAGE sql STABLE AS $$
     WITH base AS (
         SELECT max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates
-        FROM billing_plan_version WHERE family = 'payg' AND pricing_version = 'legacy' AND state <> 'draft'
+        FROM billing_plan_version WHERE family = 'payg' AND pricing_version = 'legacy' AND kind = 'legacy_payg' AND state <> 'draft'
         ORDER BY state = 'published' DESC, version DESC LIMIT 1
     ), frozen AS (
         SELECT l.max_templates FROM billing_commercial_contract c JOIN billing_contract_limits l ON l.contract_id = c.id

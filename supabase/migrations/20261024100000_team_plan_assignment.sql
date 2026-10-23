@@ -9,7 +9,7 @@ CREATE TABLE team_plan_assignment (
  kind text NOT NULL CHECK(kind IN ('free','prepaid','subscription','legacy_payg','custom')),
  plan_version_id uuid REFERENCES billing_plan_version(id),
  terms jsonb NOT NULL CHECK(jsonb_typeof(terms)='object'),
- limits jsonb NOT NULL CHECK(jsonb_typeof(limits)='object' AND jsonb_typeof(limits->'max_concurrent')='number'),
+ limits jsonb NOT NULL CHECK(jsonb_typeof(limits)='object' AND (jsonb_typeof(limits->'max_concurrent')='number') IS TRUE),
  effective_from timestamptz NOT NULL,
  effective_to timestamptz CHECK(effective_to IS NULL OR effective_to>=effective_from),
  contract_id uuid REFERENCES billing_commercial_contract(id),
@@ -69,7 +69,6 @@ CREATE FUNCTION team_limits_follow_assignment() RETURNS trigger LANGUAGE plpgsql
 BEGIN
  IF current_setting('superserve.applying_plan_limits',true)='on'
   AND current_setting('superserve.applying_assignment_limits',true) IS DISTINCT FROM 'on'
-  AND billing_pricing_version()='v2'
   AND EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=NEW.id AND effective_to IS NULL) THEN
   NEW.max_sandboxes:=OLD.max_sandboxes;
   NEW.max_template_vcpu:=OLD.max_template_vcpu;
@@ -81,30 +80,6 @@ END $$;
 CREATE TRIGGER team_a_limits_follow_assignment
  BEFORE UPDATE OF max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib ON team
  FOR EACH ROW EXECUTE FUNCTION team_limits_follow_assignment();
-
--- Puts teams that pricing v2 assigned plans back on the limits the legacy
--- model gives them now: their active contract's, an active sponsored annual
--- waiver's, or Free's. Run with pricing v2 off, in batches: pass the team id
--- the previous call returned (or the nil uuid) until it returns NULL.
-CREATE FUNCTION restore_legacy_team_limits(p_after uuid, p_batch integer) RETURNS uuid LANGUAGE plpgsql AS $$
-DECLARE r uuid; c uuid; last uuid;
-BEGIN
- IF billing_pricing_version()<>'legacy' THEN RAISE EXCEPTION 'turn pricing v2 off before restoring legacy limits'; END IF;
- FOR r IN SELECT DISTINCT team_id FROM team_plan_assignment WHERE team_id>p_after ORDER BY team_id LIMIT p_batch LOOP
-  c:=NULL;
-  SELECT id INTO c FROM billing_commercial_contract WHERE team_id=r AND status='active' AND charge_kind<>'sponsored_entitlement'
-   ORDER BY starts_at DESC LIMIT 1;
-  IF c IS NOT NULL THEN
-   PERFORM apply_contract_limits(c);
-  ELSIF EXISTS(SELECT 1 FROM billing_sponsored_annual_authority WHERE team_id=r AND state='active' AND clock_timestamp()<waiver_ends_at) THEN
-   PERFORM apply_plan_limits(r,'pro_annual');
-  ELSE
-   PERFORM apply_plan_limits(r,'free');
-  END IF;
-  last:=r;
- END LOOP;
- RETURN last;
-END $$;
 
 CREATE FUNCTION team_plan_assignment_apply_limits() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -140,6 +115,28 @@ BEGIN
 END $$;
 CREATE TRIGGER team_new_free_plan AFTER INSERT ON team FOR EACH ROW EXECUTE FUNCTION assign_new_team_free_plan();
 
+CREATE OR REPLACE FUNCTION team_effective_limits(p_team uuid)
+RETURNS TABLE(max_concurrent integer, max_vcpu integer, max_memory_mib integer, max_disk_mib integer, max_templates integer)
+LANGUAGE sql STABLE AS $$
+    WITH base AS (
+        SELECT max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates
+        FROM billing_plan_version WHERE family = 'payg' AND pricing_version = 'legacy' AND kind = 'legacy_payg' AND state <> 'draft'
+        ORDER BY state = 'published' DESC, version DESC LIMIT 1
+    ), assigned AS (
+        SELECT (limits->>'max_templates')::integer AS max_templates FROM team_plan_assignment
+        WHERE team_id=p_team AND effective_to IS NULL
+    ), frozen AS (
+        SELECT l.max_templates FROM billing_commercial_contract c JOIN billing_contract_limits l ON l.contract_id = c.id
+        WHERE c.team_id = p_team AND c.status = 'active' ORDER BY c.starts_at DESC LIMIT 1
+    )
+    SELECT t.max_sandboxes,
+        COALESCE(t.max_template_vcpu, b.max_template_vcpu),
+        COALESCE(t.max_template_memory_mib, b.max_template_memory_mib),
+        COALESCE(t.max_template_disk_mib, b.max_template_disk_mib),
+        COALESCE(t.max_templates, (SELECT max_templates FROM assigned), (SELECT max_templates FROM frozen), b.max_templates)
+    FROM team t LEFT JOIN base b ON true WHERE t.id = p_team;
+$$;
+
 ALTER TABLE team_plan_assignment ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON team_plan_assignment FROM PUBLIC;
 DO $$ DECLARE r text; f regprocedure; BEGIN
@@ -152,7 +149,7 @@ DO $$ DECLARE r text; f regprocedure; BEGIN
    END IF;
   END IF;
  END LOOP;
- FOREACH f IN ARRAY ARRAY['guard_team_plan_assignment()'::regprocedure,'apply_assignment_limits(uuid,jsonb)'::regprocedure,'team_plan_assignment_apply_limits()'::regprocedure,'team_limits_follow_assignment()'::regprocedure,'restore_legacy_team_limits(uuid,integer)'::regprocedure,'assign_new_team_free_plan()'::regprocedure] LOOP
+ FOREACH f IN ARRAY ARRAY['guard_team_plan_assignment()'::regprocedure,'apply_assignment_limits(uuid,jsonb)'::regprocedure,'team_plan_assignment_apply_limits()'::regprocedure,'team_limits_follow_assignment()'::regprocedure,'assign_new_team_free_plan()'::regprocedure] LOOP
   EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC',f);
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role',f); END IF;
  END LOOP;
