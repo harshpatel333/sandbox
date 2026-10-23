@@ -88,7 +88,7 @@ CREATE TRIGGER staff_credit_customer_binding BEFORE UPDATE OF stripe_customer_id
  FOR EACH ROW EXECUTE FUNCTION guard_staff_credit_customer_binding();
 REVOKE ALL ON FUNCTION guard_staff_credit_customer_binding() FROM PUBLIC;
 
--- Security-invoker triggers and the backend run these as the backend role.
+-- The backend role uses these through its own queries and the security-invoker triggers.
 DO $$ DECLARE f regprocedure; BEGIN
  FOREACH f IN ARRAY ARRAY['guard_billing_staff_credit_grant()'::regprocedure,'guard_staff_credit_customer_binding()'::regprocedure] LOOP
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role',f); END IF;
