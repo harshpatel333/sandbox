@@ -143,3 +143,40 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). We use the Developer Certificate of Orig
 OCVSAL 1.0 — see [LICENSE](LICENSE).
 
 Built on [Firecracker](https://github.com/firecracker-microvm/firecracker) (Apache 2.0).
+
+### Pricing v2 migration
+
+Deploy the Free allowance migration and billing pause worker before applying
+existing teams to Free. Schema alone queues pause requests but an older API
+worker does not consume them. Requests are durable and scoped to the assigned
+plan: restarting a worker resumes outstanding targets, and retrying a request
+does not capture a later customer resume. Existing assignments and pause targets
+continue to be serviced when the pricing switch is turned off.
+
+Migration is a human-run CLI, with no startup job or HTTP apply endpoint. Point
+`DATABASE_URL` and `TEAM_CREATION_REGION` at one region at a time. Set
+`SYSTEM_TEAM_ID` to exclude the system team and configure `STRIPE_SECRET_KEY`
+and `STRIPE_API_VERSION` to resolve lapsed customers' remaining credit.
+
+```bash
+go run ./cmd/pricing-v2-migrate report --format json
+```
+
+Review the report, enable pricing v2 through the staff pricing-switch API, then
+run the explicit apply command with an operator identity and reason:
+
+```bash
+go run ./cmd/pricing-v2-migrate apply --confirm --actor operator@example.com --reason 'pricing migration'
+go run ./cmd/pricing-v2-migrate report --format json
+```
+
+Active commercial contracts are linked to initial assignments with their stored
+financial terms, grant schedules and frozen limits. The CLI leaves pending
+contracts, in-flight commercial operations, system teams and managed-billing
+teams for review. Existing assignments are preserved. Free assignments queue
+running sandboxes for pause in the same transaction. No Stripe charges, credit
+grants or contract transitions are performed by backfill.
+
+Apply scans bounded pages past deferred customers. If a complete pass makes no
+progress it exits with the unresolved count; inspect the report and rerun after
+the provider or busy team recovers. Committed assignments survive interruption.

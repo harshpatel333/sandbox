@@ -604,6 +604,16 @@ type BillingFinalizationAttempt struct {
 	LastAttemptAt time.Time `json:"last_attempt_at"`
 }
 
+type BillingFreeAllowance struct {
+	TeamID          uuid.UUID          `json:"team_id"`
+	WindowStartedAt time.Time          `json:"window_started_at"`
+	ResetsAt        time.Time          `json:"resets_at"`
+	AllowanceUsd    pgtype.Numeric     `json:"allowance_usd"`
+	UsedUsd         pgtype.Numeric     `json:"used_usd"`
+	BlockedUntil    pgtype.Timestamptz `json:"blocked_until"`
+	EvaluatedAt     time.Time          `json:"evaluated_at"`
+}
+
 type BillingFundingAccount struct {
 	TeamID             uuid.UUID          `json:"team_id"`
 	Observe            bool               `json:"observe"`
@@ -1040,6 +1050,21 @@ type BillingSponsoredPromotionRecovery struct {
 	BeforeEvidence []byte             `json:"before_evidence"`
 	AfterEvidence  []byte             `json:"after_evidence"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+type BillingTeamPauseRequest struct {
+	AssignmentID uuid.UUID `json:"assignment_id"`
+	TeamID       uuid.UUID `json:"team_id"`
+	RequestedAt  time.Time `json:"requested_at"`
+}
+
+type BillingTeamPauseTarget struct {
+	SandboxID    uuid.UUID          `json:"sandbox_id"`
+	TeamID       uuid.UUID          `json:"team_id"`
+	AssignmentID uuid.UUID          `json:"assignment_id"`
+	Reason       string             `json:"reason"`
+	RequestedAt  time.Time          `json:"requested_at"`
+	DoneAt       pgtype.Timestamptz `json:"done_at"`
 }
 
 type BillingUsageEntitlement struct {

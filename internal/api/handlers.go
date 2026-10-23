@@ -969,7 +969,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		respondErrorMsg(c, "abuse_denied", "Sandbox operation is not permitted", http.StatusForbidden)
 		return "", false
 	}
-	if !h.requireBillingEligible(c, teamID) {
+	shapeLimit, admitted := h.requireSandboxAdmission(c, teamID)
+	if !admitted {
 		return "", false
 	}
 
@@ -979,6 +980,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		TeamID:  teamID,
 		LockKey: sandboxID.String(),
 	}
+	claimParams.MaxVcpu, claimParams.MaxMemoryMib, claimParams.MaxDiskMib = shapeLimit.claimCaps()
 	if caller, machine := machineCallerFromContext(c); machine {
 		if caller.PrincipalID == uuid.Nil || caller.TeamID != teamID {
 			respondError(c, ErrForbidden)
@@ -992,6 +994,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// polling or exposing another principal's sandbox state.
 	if errors.Is(err, pgx.ErrNoRows) && claimParams.MachinePrincipalID.Valid && !h.requireMachineSandboxOwner(c, sandboxID, teamID) {
 		return "", false
+	}
+	if errors.Is(err, pgx.ErrNoRows) && shapeLimit != nil {
+		if sbx, readErr := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{ID: sandboxID, TeamID: teamID}); readErr == nil && sbx.Status == db.SandboxStatusPaused && !shapeLimit.admits(sbx.VcpuCount, sbx.MemoryMib, sbx.DiskMib) {
+			respondSandboxExceedsPlan(c, shapeLimit, sbx.VcpuCount, sbx.MemoryMib, sbx.DiskMib)
+			return "", false
+		}
 	}
 	if err == pgx.ErrNoRows && settled != nil {
 		// The caller's wait is its lookup, not this claim.
@@ -3154,7 +3162,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
-	if !h.requireComputeAllowed(c, teamID, abuse.ActionCreate) || !h.requireBillingEligible(c, teamID) {
+	if !h.requireComputeAllowed(c, teamID, abuse.ActionCreate) {
+		return
+	}
+	shapeLimit, billingAdmitted := h.requireSandboxAdmission(c, teamID)
+	if !billingAdmitted {
 		return
 	}
 
@@ -3226,6 +3238,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			deltaDir = filepath.Dir(deltaPath)
 		}
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
+		if !shapeLimit.admits(tpl.Vcpu, tpl.MemoryMib, tpl.DiskMib) {
+			respondSandboxExceedsPlan(c, shapeLimit, tpl.Vcpu, tpl.MemoryMib, tpl.DiskMib)
+			return
+		}
 		imageVcpu = uint32(tpl.Vcpu)
 		imageMemMiB = uint32(tpl.MemoryMib)
 		fromTemplateName = tpl.Name
@@ -3259,6 +3275,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		if snap.Kind != snapshotKindMemFS {
 			respondErrorMsg(c, "conflict", fmt.Sprintf("a %q snapshot cannot create a sandbox yet", snap.Kind), http.StatusConflict)
+			return
+		}
+		if !shapeLimit.admits(snap.VcpuCount, snap.MemoryMib, snap.DiskMib) {
+			respondSandboxExceedsPlan(c, shapeLimit, snap.VcpuCount, snap.MemoryMib, snap.DiskMib)
 			return
 		}
 		source = snap

@@ -11,7 +11,6 @@ import (
 )
 
 // billingEligCache is an in-process, TTL-bounded cache of per-team sandbox
-// billing eligibility, fronting IsTeamSandboxBillingEligible on the
 // create/resume request paths. The synchronous check is a fast-fail gate,
 // not the enforcement — trialEligibilityLoop and reconcileActivatedSandbox
 // pause ineligible teams on their own cadence regardless — so a
@@ -44,9 +43,37 @@ const (
 	billingEligCacheMaxEntries = 4096
 )
 
+type sandboxShapeLimit struct {
+	vcpu, memoryMib, diskMib int32
+}
+
+func (l *sandboxShapeLimit) admits(vcpu, memoryMib, diskMib int32) bool {
+	within := func(v, limit int32) bool { return limit <= 0 || v <= limit }
+	return l == nil || (within(vcpu, l.vcpu) && within(memoryMib, l.memoryMib) && within(diskMib, l.diskMib))
+}
+
+func (l *sandboxShapeLimit) claimCaps() (vcpu, memoryMib, diskMib *int32) {
+	if l == nil {
+		return nil, nil, nil
+	}
+	present := func(limit int32) *int32 {
+		if limit <= 0 {
+			return nil
+		}
+		return &limit
+	}
+	return present(l.vcpu), present(l.memoryMib), present(l.diskMib)
+}
+
+type sandboxAdmission struct {
+	eligible          bool
+	limit             *sandboxShapeLimit
+	allowanceResetsAt *time.Time
+}
+
 type billingEligEntry struct {
-	eligible bool
-	checked  time.Time // stamped from query start, so a slow read can't stretch the window
+	admission sandboxAdmission
+	checked   time.Time // stamped from query start, so a slow read can't stretch the window
 }
 
 // billingEligCache's zero value is ready to use.
@@ -57,23 +84,23 @@ type billingEligCache struct {
 }
 
 func (e billingEligEntry) ttl() time.Duration {
-	if e.eligible {
+	if e.admission.eligible {
 		return billingEligibleTTL
 	}
 	return billingIneligibleTTL
 }
 
-func (c *billingEligCache) get(teamID uuid.UUID, now time.Time) (eligible, ok bool) {
+func (c *billingEligCache) get(teamID uuid.UUID, now time.Time) (sandboxAdmission, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, exists := c.m[teamID]
 	if !exists || now.Sub(e.checked) > e.ttl() {
-		return false, false
+		return sandboxAdmission{}, false
 	}
-	return e.eligible, true
+	return e.admission, true
 }
 
-func (c *billingEligCache) put(teamID uuid.UUID, eligible bool, checked time.Time) {
+func (c *billingEligCache) put(teamID uuid.UUID, admission sandboxAdmission, checked time.Time) {
 	c.mu.Lock()
 	if c.m == nil {
 		c.m = make(map[uuid.UUID]billingEligEntry)
@@ -102,43 +129,50 @@ func (c *billingEligCache) put(teamID uuid.UUID, eligible bool, checked time.Tim
 		}
 		delete(c.m, k)
 	}
-	c.m[teamID] = billingEligEntry{eligible: eligible, checked: checked}
+	c.m[teamID] = billingEligEntry{admission: admission, checked: checked}
 	c.mu.Unlock()
 }
 
-// teamBillingEligibleCached answers from the cache when fresh, else runs one
 // shared read per team: the flight is detached and bounded (it may outlive
 // its caller and must not inherit a long request deadline), while each
 // waiter still selects on its own ctx so a hung-up client returns
 // immediately. Errors are never cached.
-func (h *Handlers) teamBillingEligibleCached(ctx context.Context, teamID uuid.UUID) (bool, error) {
+func (h *Handlers) teamSandboxAdmissionCached(ctx context.Context, teamID uuid.UUID) (sandboxAdmission, error) {
 	c := &h.billingElig
-	if eligible, ok := c.get(teamID, time.Now()); ok {
-		return eligible, nil
+	if admission, ok := c.get(teamID, time.Now()); ok {
+		return admission, nil
 	}
 	ch := c.group.DoChan(teamID.String(), func() (interface{}, error) {
 		// Re-check under the flight: a caller that missed while a previous
 		// flight was completing enters a fresh flight after it — without
 		// this, back-to-back flights double-read what the first just cached.
-		if eligible, ok := c.get(teamID, time.Now()); ok {
-			return eligible, nil
+		if admission, ok := c.get(teamID, time.Now()); ok {
+			return admission, nil
 		}
 		start := time.Now()
 		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), billingEligQueryTimeout)
 		defer cancel()
-		eligible, err := h.DB.IsTeamSandboxBillingEligible(qctx, teamID)
-		if err == nil {
-			c.put(teamID, eligible, start)
+		row, err := h.DB.GetTeamSandboxAdmission(qctx, teamID)
+		if err != nil {
+			return sandboxAdmission{}, err
 		}
-		return eligible, err
+		admission := sandboxAdmission{eligible: row.Eligible}
+		if row.ShapeLimited {
+			admission.limit = &sandboxShapeLimit{vcpu: row.MaxVcpu, memoryMib: row.MaxMemoryMib, diskMib: row.MaxDiskMib}
+		}
+		if row.AllowanceBlocked {
+			admission.allowanceResetsAt = &row.AllowanceResetsAt
+		}
+		c.put(teamID, admission, start)
+		return admission, nil
 	})
 	select {
 	case res := <-ch:
 		if res.Err != nil {
-			return false, res.Err
+			return sandboxAdmission{}, res.Err
 		}
-		return res.Val.(bool), nil
+		return res.Val.(sandboxAdmission), nil
 	case <-ctx.Done():
-		return false, ctx.Err()
+		return sandboxAdmission{}, ctx.Err()
 	}
 }

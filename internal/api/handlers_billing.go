@@ -1052,25 +1052,51 @@ func billingAccountHasEstablishedSubscription(account db.GetTeamBillingAccountRo
 	}
 }
 
-func (h *Handlers) requireBillingEligible(c *gin.Context, teamID uuid.UUID) bool {
+func (h *Handlers) requireSandboxAdmission(c *gin.Context, teamID uuid.UUID) (*sandboxShapeLimit, bool) {
 	// Lightweight handler tests use a query mock without the billing schema;
 	// production handlers always have a pool-backed database.
 	if h.Pool == nil {
-		return true
+		return nil, true
 	}
 	started := time.Now()
-	eligible, err := h.teamBillingEligibleCached(c.Request.Context(), teamID)
+	admission, err := h.teamSandboxAdmissionCached(c.Request.Context(), teamID)
 	log.Debug().Str("team_id", teamID.String()).Int64("billing_eligibility_ms", time.Since(started).Milliseconds()).Msg("billing eligibility check")
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read sandbox billing eligibility failed")
 		respondError(c, ErrInternal)
-		return false
+		return nil, false
 	}
-	if !eligible {
-		respondErrorMsg(c, "billing_ineligible", "Sandbox usage is unavailable until billing is active", http.StatusPaymentRequired)
-		return false
+	if !admission.eligible {
+		if admission.allowanceResetsAt != nil {
+			respondFreeAllowanceExhausted(c, *admission.allowanceResetsAt)
+		} else {
+			respondErrorMsg(c, "billing_ineligible", "Sandbox usage is unavailable until billing is active", http.StatusPaymentRequired)
+		}
+		return nil, false
 	}
-	return true
+	return admission.limit, true
+}
+
+func respondSandboxExceedsPlan(c *gin.Context, limit *sandboxShapeLimit, vcpu, memoryMib, diskMib int32) {
+	limits := gin.H{}
+	var allowed []string
+	for _, d := range []struct {
+		key, unit string
+		cap       int32
+	}{{"max_vcpu", "vCPU", limit.vcpu}, {"max_memory_mib", "MiB memory", limit.memoryMib}, {"max_disk_mib", "MiB disk", limit.diskMib}} {
+		if d.cap > 0 {
+			limits[d.key] = d.cap
+			allowed = append(allowed, fmt.Sprintf("%d %s", d.cap, d.unit))
+		}
+	}
+	c.JSON(http.StatusPaymentRequired, gin.H{
+		"error": gin.H{
+			"code": "sandbox_exceeds_plan_limits",
+			"message": fmt.Sprintf("This sandbox (%d vCPU, %d MiB memory, %d MiB disk) is larger than your plan allows (%s). Upgrade your plan or use a smaller template.",
+				vcpu, memoryMib, diskMib, strings.Join(allowed, ", ")),
+			"limits": limits,
+		},
+	})
 }
 
 func currentBillingPeriod(now time.Time) (time.Time, time.Time) {
