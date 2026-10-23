@@ -285,10 +285,12 @@ type customerPlan struct {
 }
 
 type customerPendingPlanChange struct {
+	ID                uuid.UUID `json:"id"`
 	TargetPlanKey     string    `json:"target_plan_key"`
 	TargetDisplayName string    `json:"target_display_name"`
 	EffectiveAt       time.Time `json:"effective_at"`
 	Undoable          bool      `json:"undoable"`
+	PausesRunning     bool      `json:"pauses_running"`
 }
 
 type customerBillingPeriod struct {
