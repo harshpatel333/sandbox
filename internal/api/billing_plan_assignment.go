@@ -236,13 +236,6 @@ func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan,
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp() FROM team WHERE id=$1 FOR NO KEY UPDATE`, a.Team).Scan(&now); err != nil {
 		return teamPlan{}, err
 	}
-	var allowed bool
-	if err := tx.QueryRow(ctx, `SELECT billing_pricing_version()='v2' OR EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1)`, a.Team).Scan(&allowed); err != nil {
-		return teamPlan{}, err
-	}
-	if !allowed {
-		return teamPlan{}, errPricingV2Off
-	}
 	var key *string
 	if a.Key != "" {
 		key = &a.Key

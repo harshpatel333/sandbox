@@ -28,9 +28,6 @@ CREATE FUNCTION guard_team_plan_assignment() RETURNS trigger LANGUAGE plpgsql AS
 BEGIN
  IF TG_OP<>'UPDATE' AND TG_OP<>'INSERT' THEN RAISE EXCEPTION 'plan assignment history is immutable'; END IF;
  IF TG_OP='INSERT' THEN
-  IF billing_pricing_version()<>'v2' AND NOT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=NEW.team_id) THEN
-   RAISE EXCEPTION 'pricing v2 is off' USING ERRCODE='55000';
-  END IF;
   IF NEW.effective_to IS NOT NULL OR NEW.effective_from>clock_timestamp() THEN
    RAISE EXCEPTION 'a plan assignment starts open and not in the future';
   END IF;
