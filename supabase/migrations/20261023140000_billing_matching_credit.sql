@@ -42,7 +42,8 @@ CREATE TABLE billing_matching_credit (
     amount_cents bigint NOT NULL CHECK (amount_cents >= 0),
     skip_reason text CHECK (btrim(skip_reason) <> ''),
     invoice_evidence jsonb NOT NULL CHECK (jsonb_typeof(invoice_evidence) = 'object'),
-    state text NOT NULL CHECK (state IN ('pending', 'uncertain', 'issued', 'skipped')),
+    -- withheld: staff declined a match held for a reversed payment; it no longer reserves cap.
+    state text NOT NULL CHECK (state IN ('pending', 'uncertain', 'issued', 'skipped', 'withheld')),
     idempotency_key text NOT NULL UNIQUE,
     request_payload jsonb,
     first_attempt_at timestamptz,
@@ -64,7 +65,8 @@ CREATE TABLE billing_matching_credit (
     CHECK ((state = 'skipped') = (amount_cents = 0)),
     CHECK (skip_reason IS NULL OR state = 'skipped'),
     CHECK ((state = 'skipped') = (request_payload IS NULL)),
-    CHECK ((state IN ('pending', 'skipped')) = (first_attempt_at IS NULL)),
+    CHECK ((state IN ('pending', 'skipped', 'withheld')) = (first_attempt_at IS NULL)),
+    CHECK (state <> 'withheld' OR acknowledged_at IS NOT NULL),
     CHECK ((state = 'issued') = (stripe_credit_grant_id IS NOT NULL AND issuance_evidence IS NOT NULL AND issued_at IS NOT NULL)),
     CHECK ((flagged_at IS NULL) = (flag_reason IS NULL)),
     CHECK (acknowledged_at IS NULL OR flagged_at IS NOT NULL),
@@ -111,7 +113,7 @@ BEGIN
                 AND k.customer_id = NEW.customer_id AND k.state = 'paid') THEN
             RAISE EXCEPTION 'matching requires a released and fully paid usage invoice';
         END IF;
-        SELECT COALESCE(sum(amount_cents), 0) INTO used FROM billing_matching_credit WHERE contract_id = NEW.contract_id;
+        SELECT COALESCE(sum(amount_cents), 0) INTO used FROM billing_matching_credit WHERE contract_id = NEW.contract_id AND state <> 'withheld';
         NEW.matchable_cents := greatest(NEW.usage_cents - NEW.credit_applied_cents - NEW.discount_cents - NEW.unpaid_cents, 0);
         earned := floor(NEW.matchable_cents::numeric * r.matching_bps / 10000)::bigint;
         NEW.amount_cents := CASE WHEN NEW.skip_reason IS NOT NULL THEN 0
@@ -154,11 +156,15 @@ BEGIN
     IF NEW.state IS DISTINCT FROM OLD.state OR NEW.first_attempt_at IS DISTINCT FROM OLD.first_attempt_at
         OR (NEW.stripe_credit_grant_id, NEW.issuance_evidence, NEW.issued_at) IS DISTINCT FROM (OLD.stripe_credit_grant_id, OLD.issuance_evidence, OLD.issued_at) THEN
         IF OLD.state = 'pending' AND NEW.state = 'uncertain' THEN
-            IF OLD.flagged_at IS NOT NULL THEN
+            IF OLD.flagged_at IS NOT NULL AND OLD.acknowledged_at IS NULL THEN
                 RAISE EXCEPTION 'a flagged match is held for staff and cannot be issued';
             END IF;
             IF NEW.first_attempt_at IS NULL OR NEW.first_attempt_at > clock_timestamp() OR NEW.first_attempt_at < clock_timestamp() - interval '1 minute' THEN
                 RAISE EXCEPTION 'issuance intent must be recorded at dispatch';
+            END IF;
+        ELSIF OLD.state = 'pending' AND NEW.state = 'withheld' THEN
+            IF OLD.flagged_at IS NULL OR OLD.acknowledged_at IS NOT NULL OR NEW.acknowledged_at IS NULL OR NEW.first_attempt_at IS NOT NULL THEN
+                RAISE EXCEPTION 'only staff acknowledging a held match can withhold it';
             END IF;
         ELSIF OLD.state = 'uncertain' AND NEW.state = 'issued' AND NEW.first_attempt_at = OLD.first_attempt_at THEN
             IF NEW.issuance_evidence->>'id' IS DISTINCT FROM NEW.stripe_credit_grant_id

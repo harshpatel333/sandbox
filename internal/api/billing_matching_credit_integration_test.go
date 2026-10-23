@@ -587,4 +587,58 @@ func TestMatchingCreditWithholdsReversedPayments(t *testing.T) {
 	if _, err := m.f.h.Pool.Exec(t.Context(), `UPDATE billing_matching_credit SET state='uncertain',first_attempt_at=clock_timestamp() WHERE invoice_id=$1`, waiting); err == nil {
 		t.Fatal("database allowed a flagged match to be dispatched")
 	}
+	var id uuid.UUID
+	if err := m.f.h.Pool.QueryRow(t.Context(), `SELECT id FROM billing_matching_credit WHERE invoice_id=$1`, waiting).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := acknowledgeMatchingFlag(t.Context(), m.f.h.Pool, m.f.c.TeamID, id, uuid.New(), "won dispute", ""); err == nil {
+		t.Fatal("held match acknowledged without a resolution")
+	}
+	if _, state, err := acknowledgeMatchingFlag(t.Context(), m.f.h.Pool, m.f.c.TeamID, id, uuid.New(), "dispute was won", "issue"); err != nil || state != "pending" {
+		t.Fatal("staff could not release a held match", state, err)
+	}
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := m.row(waiting); r.State != "issued" || len(m.posts) != 1 {
+		t.Fatalf("released match was not issued: %+v", r)
+	}
+}
+
+func TestMatchingCreditWithheldMatchReleasesCap(t *testing.T) {
+	m := newMatchingFixture(t, 10000, 70000, 0)
+	prior, ended := m.f.start.AddDate(0, -2, 0), m.f.start.AddDate(0, -1, 0)
+	m.exec(`UPDATE billing_invoice_account SET enrolled_at=$2 WHERE team_id=$1`, m.f.c.TeamID, prior)
+	m.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),0,0,0)`, m.f.c.TeamID, ended, m.f.start)
+	held := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.refunded = true
+	m.mu.Unlock()
+	m.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'released',clock_timestamp(),'{}','{}')`, m.f.c.TeamID, ended, m.f.start, "in_"+strings.ReplaceAll(uuid.NewString(), "-", ""))
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	var id uuid.UUID
+	if err := m.f.h.Pool.QueryRow(t.Context(), `SELECT id FROM billing_matching_credit WHERE invoice_id=$1 AND flagged_at IS NOT NULL`, held).Scan(&id); err != nil {
+		t.Fatal("reversal did not hold the match", err)
+	}
+	if _, state, err := acknowledgeMatchingFlag(t.Context(), m.f.h.Pool, m.f.c.TeamID, id, uuid.New(), "refunded", "withhold"); err != nil || state != "withheld" {
+		t.Fatal("staff could not withhold a held match", state, err)
+	}
+	m.mu.Lock()
+	m.refunded = false
+	m.mu.Unlock()
+	next := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := m.row(next); r.Paid != 70000 || r.State != "issued" || len(m.posts) != 1 {
+		t.Fatalf("withheld match kept reserving cap: %+v", r)
+	}
+	if r := m.row(held); r.State != "withheld" {
+		t.Fatalf("withheld match changed: %+v", r)
+	}
 }

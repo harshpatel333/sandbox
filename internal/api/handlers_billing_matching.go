@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/superserve-ai/sandbox/internal/billing"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 type matchingRuleRequest struct {
@@ -23,6 +25,13 @@ type matchingRuleRequest struct {
 
 type matchingReasonRequest struct {
 	Reason string `json:"reason"`
+}
+
+// A match held for a reversed payment must be resolved: withhold releases
+// its cap, issue sends the grant anyway (e.g. a dispute the merchant won).
+type matchingAcknowledgeRequest struct {
+	Reason     string `json:"reason"`
+	Resolution string `json:"resolution"`
 }
 
 func bindMatchingReason(c *gin.Context) (string, bool) {
@@ -56,7 +65,7 @@ func (h *Handlers) GetTeamMatchingCredit(c *gin.Context) {
 	err = h.Pool.QueryRow(c.Request.Context(), `SELECT jsonb_build_object(
  'rules',(SELECT COALESCE(jsonb_agg(`+matchingRuleJSON+` ORDER BY r.created_at DESC),'[]') FROM billing_contract_matching_rule r
    JOIN billing_commercial_contract c ON c.id=r.contract_id
-   CROSS JOIN LATERAL (SELECT COALESCE(sum(amount_cents),0) matched FROM billing_matching_credit WHERE contract_id=r.contract_id) m WHERE r.team_id=$1),
+   CROSS JOIN LATERAL (SELECT COALESCE(sum(amount_cents),0) matched FROM billing_matching_credit WHERE contract_id=r.contract_id AND state<>'withheld') m WHERE r.team_id=$1),
  'credits',(SELECT COALESCE(jsonb_agg(`+matchingCreditJSON+` ORDER BY x.created_at DESC),'[]') FROM
    (SELECT * FROM billing_matching_credit WHERE team_id=$1 ORDER BY created_at DESC LIMIT 200) x))`, team).Scan(&raw)
 	if err != nil {
@@ -191,20 +200,29 @@ func (h *Handlers) AcknowledgeMatchingCreditFlag(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	reason, ok := bindMatchingReason(c)
-	if !ok {
+	var req matchingAcknowledgeRequest
+	if err = c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Reason) == "" || (req.Resolution != "" && req.Resolution != "withhold" && req.Resolution != "issue") {
+		respondErrorMsg(c, "bad_request", "reason is required; resolution must be withhold or issue", http.StatusBadRequest)
 		return
 	}
-	var acknowledged time.Time
-	err = h.Pool.QueryRow(c.Request.Context(), `UPDATE billing_matching_credit SET acknowledged_at=clock_timestamp(),acknowledged_by=$3,acknowledgement_reason=$4
- WHERE id=$1 AND team_id=$2 AND flagged_at IS NOT NULL AND acknowledged_at IS NULL RETURNING acknowledged_at`, credit, team, actor, reason).Scan(&acknowledged)
+	reason := strings.TrimSpace(req.Reason)
+	acknowledged, state, err := acknowledgeMatchingFlag(c.Request.Context(), h.Pool, team, credit, actor, reason, req.Resolution)
 	if errors.Is(err, pgx.ErrNoRows) {
-		respondErrorMsg(c, "not_found", "no unacknowledged flag for this matching credit", http.StatusNotFound)
+		respondErrorMsg(c, "conflict", "no unacknowledged flag for this matching credit; a held match needs resolution withhold or issue, and only a held match accepts one", http.StatusConflict)
 		return
 	}
 	if err != nil {
 		respondError(c, ErrInternal)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"id": credit, "acknowledged_at": acknowledged, "acknowledged_by": actor, "acknowledgement_reason": reason})
+	c.JSON(http.StatusOK, gin.H{"id": credit, "state": state, "acknowledged_at": acknowledged, "acknowledged_by": actor, "acknowledgement_reason": reason})
+}
+
+func acknowledgeMatchingFlag(ctx context.Context, q db.DBTX, team, credit, actor uuid.UUID, reason, resolution string) (time.Time, string, error) {
+	var acknowledged time.Time
+	var state string
+	err := q.QueryRow(ctx, `UPDATE billing_matching_credit SET acknowledged_at=clock_timestamp(),acknowledged_by=$3,acknowledgement_reason=$4,
+ state=CASE WHEN state='pending' AND $5='withhold' THEN 'withheld' ELSE state END,next_attempt_at=clock_timestamp()
+ WHERE id=$1 AND team_id=$2 AND flagged_at IS NOT NULL AND acknowledged_at IS NULL AND (state='pending')=($5<>'') RETURNING acknowledged_at,state`, credit, team, actor, reason, resolution).Scan(&acknowledged, &state)
+	return acknowledged, state, err
 }
