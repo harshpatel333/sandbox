@@ -205,6 +205,9 @@ func (a *PricingV2Activation) ApplyBatch(ctx context.Context, actor, reason stri
 
 func (a *PricingV2Activation) ApplyBatchAfter(ctx context.Context, actor, reason string, size int32, after *ActivationCursor) (ActivationBatch, error) {
 	h := a.h
+	if system, err := uuid.Parse(h.Config.SystemTeamID); err != nil || system == uuid.Nil {
+		return ActivationBatch{}, errors.New("apply requires a valid nonzero SYSTEM_TEAM_ID")
+	}
 	if actor == "" || reason == "" {
 		return ActivationBatch{}, errors.New("an actor and a reason are required")
 	}

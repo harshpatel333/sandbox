@@ -155,7 +155,7 @@ continue to be serviced when the pricing switch is turned off.
 
 Migration is a human-run CLI, with no startup job or HTTP apply endpoint. Point
 `DATABASE_URL` and `TEAM_CREATION_REGION` at one region at a time. Set
-`SYSTEM_TEAM_ID` to exclude the system team and configure `STRIPE_SECRET_KEY`
+`SYSTEM_TEAM_ID` to a valid nonzero UUID to exclude the system team; apply refuses missing or malformed values. Configure `STRIPE_SECRET_KEY`
 and `STRIPE_API_VERSION` to resolve lapsed customers' remaining credit.
 
 ```bash

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/api"
@@ -64,6 +65,8 @@ func parse(args []string, getenv func(string) string) (options, error) {
 		return o, errors.New("--format must be text, json or csv")
 	case o.command == "apply" && (!o.confirm || o.actor == "" || o.reason == ""):
 		return o, errors.New("apply changes customers' plans; it needs --confirm, --actor and --reason")
+	case o.command == "apply" && !validSystemTeam(getenv("SYSTEM_TEAM_ID")):
+		return o, errors.New("apply requires a valid nonzero SYSTEM_TEAM_ID")
 	case o.batch < 1 || o.batch > 5000:
 		return o, errors.New("--batch must be between 1 and 5000")
 	}
@@ -178,4 +181,9 @@ func envOr(getenv func(string) string, key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func validSystemTeam(value string) bool {
+	id, err := uuid.Parse(value)
+	return err == nil && id != uuid.Nil
 }
