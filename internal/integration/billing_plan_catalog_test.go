@@ -39,7 +39,6 @@ func TestIntegration_PlanCatalogPurchaseKeepsCheckoutTerms(t *testing.T) {
 	if _, err := testPool.Exec(t.Context(), `UPDATE billing_plan SET monthly_credit_cents=7500,available=false WHERE offer_key='starter_monthly'`); err != nil {
 		t.Fatal(err)
 	}
-	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
 	f.mu.Lock()
 	f.status = "complete"
 	f.paid = true
@@ -71,4 +70,17 @@ func TestIntegration_PlanCatalogCompletesPurchaseStartedBeforeCatalog(t *testing
 	if err := testPool.QueryRow(t.Context(), `SELECT entitlement_amount_cents FROM billing_commercial_contract WHERE team_id=$1 AND status='active'`, f.team).Scan(&credit); err != nil || credit != 100000 {
 		t.Fatalf("legacy purchase credit=%d err=%v", credit, err)
 	}
+}
+
+func TestIntegration_PlanCatalogResumeUsesCheckoutTerms(t *testing.T) {
+	setCatalogPlan(t, "starter_monthly", 10000, 5000, true)
+	f, r, key := newProFixture(t, "starter_monthly")
+	f.amount = 10000
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
+	// Returning to the checkout replays the purchase as started, even after the
+	// plan's price changes and it stops accepting new checkouts.
+	if _, err := testPool.Exec(t.Context(), `UPDATE billing_plan SET charge_amount_cents=20000,available=false WHERE offer_key='starter_monthly'`); err != nil {
+		t.Fatal(err)
+	}
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
 }
