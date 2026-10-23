@@ -3821,6 +3821,25 @@ func (q *Queries) StripePromotionWasAttempted(ctx context.Context, arg StripePro
 	return attempted, err
 }
 
+const teamSignupTrialCreditUnspent = `-- name: TeamSignupTrialCreditUnspent :one
+SELECT (EXISTS (
+  SELECT 1 FROM team_credit_grant g
+  WHERE g.team_id = $1 AND g.reason = 'signup trial credit'
+    AND g.amount_usd > 0 AND g.remaining_usd = g.amount_usd
+    AND (g.expires_at IS NULL OR g.expires_at > now())
+) AND NOT EXISTS (
+  SELECT 1 FROM team_billing_account a
+  WHERE a.team_id = $1 AND a.trial_ended_at IS NOT NULL
+))::boolean AS unspent
+`
+
+func (q *Queries) TeamSignupTrialCreditUnspent(ctx context.Context, teamID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, teamSignupTrialCreditUnspent, teamID)
+	var unspent bool
+	err := row.Scan(&unspent)
+	return unspent, err
+}
+
 const updateBillingUsageExportStatus = `-- name: UpdateBillingUsageExportStatus :one
 UPDATE billing_usage_export
 SET status = $1,

@@ -18,8 +18,10 @@ func TestIntegration_CheckoutSubmitMessageFollowsGeneration(t *testing.T) {
 	for _, path := range []string{"legacy_route", "publication_decision"} {
 		// "disabled" begins without the message; "flag_off" begins with it and
 		// replays after the setting is turned off; "null" and "stale" model a
-		// generation begun by a writer that predates the message.
-		for _, generation := range []string{"new", "disabled", "flag_off", "null", "stale"} {
+		// generation begun by a writer that predates the message. The message
+		// promises the signup trial credit, so "spent", "expired", "no_grant"
+		// and "trial_ended" begin without it.
+		for _, generation := range []string{"new", "disabled", "flag_off", "null", "stale", "spent", "expired", "no_grant", "trial_ended"} {
 			t.Run(path+"/"+generation, func(t *testing.T) {
 				ctx := context.Background()
 				f := newPublicationCheckoutFixture(t)
@@ -29,6 +31,23 @@ func TestIntegration_CheckoutSubmitMessageFollowsGeneration(t *testing.T) {
 					})
 				}
 				f.router = router(generation != "disabled")
+				if generation != "no_grant" {
+					remaining, expires := "5", "NULL"
+					switch generation {
+					case "spent":
+						remaining = "4.99"
+					case "expired":
+						expires = "now() - interval '1 minute'"
+					}
+					if _, err := testPool.Exec(ctx, `INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason,expires_at) VALUES($1,5,`+remaining+`,'signup trial credit',`+expires+`)`, f.team); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if generation == "trial_ended" {
+					if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account(team_id,trial_ended_at) VALUES($1,now()) ON CONFLICT(team_id) DO UPDATE SET trial_ended_at=now()`, f.team); err != nil {
+						t.Fatal(err)
+					}
+				}
 				request := func() {
 					t.Helper()
 					var code int
@@ -44,7 +63,7 @@ func TestIntegration_CheckoutSubmitMessageFollowsGeneration(t *testing.T) {
 				request()
 				want := checkoutSubmitMessage
 				switch generation {
-				case "disabled":
+				case "disabled", "spent", "expired", "no_grant", "trial_ended":
 					want = ""
 				case "flag_off":
 					f.router = router(false)

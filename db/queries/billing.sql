@@ -612,6 +612,17 @@ WHERE team_id = sqlc.arg(team_id)
   AND checkout_subscription_id IS NULL
 FOR UPDATE;
 
+-- name: TeamSignupTrialCreditUnspent :one
+SELECT (EXISTS (
+  SELECT 1 FROM team_credit_grant g
+  WHERE g.team_id = sqlc.arg(team_id) AND g.reason = 'signup trial credit'
+    AND g.amount_usd > 0 AND g.remaining_usd = g.amount_usd
+    AND (g.expires_at IS NULL OR g.expires_at > now())
+) AND NOT EXISTS (
+  SELECT 1 FROM team_billing_account a
+  WHERE a.team_id = sqlc.arg(team_id) AND a.trial_ended_at IS NOT NULL
+))::boolean AS unspent;
+
 -- name: BeginTeamBillingCheckout :one
 WITH locks AS MATERIALIZED (
     SELECT lock_stripe_checkout_identity(sqlc.arg(actor_id)::uuid)

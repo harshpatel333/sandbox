@@ -16,12 +16,16 @@ func isCheckoutPublicationConflict(err error) bool {
 }
 
 // checkoutSubmitMessageEnabled decides only whether a new generation begins
-// with the submit message; replays follow what the generation recorded.
-func (h *Handlers) checkoutSubmitMessageEnabled() bool {
-	return h.Config != nil && h.Config.StripeCheckoutSubmitMessage
+// with the submit message; replays follow what the generation recorded. The
+// message promises the signup trial credit, so it needs that grant untouched.
+func (h *Handlers) checkoutSubmitMessageEnabled(ctx context.Context, team uuid.UUID) (bool, error) {
+	if h.Config == nil || !h.Config.StripeCheckoutSubmitMessage {
+		return false, nil
+	}
+	return h.DB.TeamSignupTrialCreditUnspent(ctx, team)
 }
 
-func (h *Handlers) beginCheckoutWithPublicationDecision(ctx context.Context, team, actor uuid.UUID, req billingCheckoutSessionRequest, requestKey string, attempt uuid.UUID) (db.TeamBillingAccount, error) {
+func (h *Handlers) beginCheckoutWithPublicationDecision(ctx context.Context, team, actor uuid.UUID, req billingCheckoutSessionRequest, requestKey string, attempt uuid.UUID, submitMessage bool) (db.TeamBillingAccount, error) {
 	var account db.TeamBillingAccount
 	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -31,7 +35,7 @@ func (h *Handlers) beginCheckoutWithPublicationDecision(ctx context.Context, tea
 	q := h.DB.WithTx(tx)
 	if err := q.BeginStripeCheckoutWithPublicationDecision(ctx, db.BeginStripeCheckoutWithPublicationDecisionParams{
 		TeamID: team, UserID: actor, OperationID: req.OperationID, HomeRegion: req.HomeRegion,
-		RequestKey: requestKey, Decision: req.Decision, AttemptID: attempt, SubmitMessage: h.checkoutSubmitMessageEnabled(),
+		RequestKey: requestKey, Decision: req.Decision, AttemptID: attempt, SubmitMessage: submitMessage,
 	}); err != nil {
 		return account, err
 	}

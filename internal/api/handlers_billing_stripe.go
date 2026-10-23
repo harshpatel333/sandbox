@@ -1751,17 +1751,23 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 	}
 	requestKey := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs)
 	attemptID := uuid.New()
+	beginWithMessage, err := h.checkoutSubmitMessageEnabled(c.Request.Context(), teamID)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("checkout submit message eligibility failed")
+		respondError(c, ErrInternal)
+		return
+	}
 	var checkoutAccount db.TeamBillingAccount
 	if trusted {
 		requestKey += ":intent:" + req.OperationID.String()
-		checkoutAccount, err = h.beginCheckoutWithPublicationDecision(c.Request.Context(), teamID, actorID, req, requestKey, attemptID)
+		checkoutAccount, err = h.beginCheckoutWithPublicationDecision(c.Request.Context(), teamID, actorID, req, requestKey, attemptID, beginWithMessage)
 	} else {
 		checkoutAccount, err = h.DB.BeginTeamBillingCheckout(c.Request.Context(), db.BeginTeamBillingCheckoutParams{
 			TeamID:        teamID,
 			ActorID:       pgtype.UUID{Bytes: actorID, Valid: true},
 			RequestKey:    stringPtr(requestKey),
 			AttemptID:     attemptID,
-			SubmitMessage: h.checkoutSubmitMessageEnabled(),
+			SubmitMessage: beginWithMessage,
 		})
 		resumed := errors.Is(err, pgx.ErrNoRows)
 		if resumed {
