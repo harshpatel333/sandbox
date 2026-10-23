@@ -177,3 +177,50 @@ func TestIntegration_BillingPlanChangeStaffPendingAndUndoReason(t *testing.T) {
 		t.Fatalf("undone change still pending: %d %s", w.Code, w.Body)
 	}
 }
+
+func TestIntegration_BillingPlanChangeCustomerConsent(t *testing.T) {
+	team, key := seedTeamAndKey(t)
+	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+        VALUES($1,'custom_example','custom','{"display_name":"Example"}','{"max_concurrent":100}',clock_timestamp(),'staff','agreement')`, team); err != nil {
+		t.Fatal(err)
+	}
+	r := newRouter(t)
+	w := do(r, http.MethodGet, "/billing/plan-change-preview?target_plan=free", key, "")
+	var preview struct {
+		Token string `json:"preview_token"`
+	}
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &preview) != nil || len(preview.Token) != 64 {
+		t.Fatalf("exit preview missing consent token with entry off: %d %s", w.Code, w.Body)
+	}
+	for _, body := range []string{
+		`{"target_plan":"free","idempotency_key":"consent","confirm_pauses_running":true}`,
+		`{"target_plan":"free","idempotency_key":"consent","preview_token":"` + preview.Token + `"}`,
+	} {
+		if w := do(r, http.MethodPost, "/billing/plan-changes", key, body); w.Code != http.StatusBadRequest {
+			t.Fatalf("missing consent accepted: %d %s", w.Code, w.Body)
+		}
+	}
+	body := `{"target_plan":"free","idempotency_key":"consent","preview_token":"` + preview.Token + `","confirm_pauses_running":true}`
+	w = do(r, http.MethodPost, "/billing/plan-changes", key, body)
+	var change struct {
+		ID string `json:"id"`
+	}
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &change) != nil || change.ID == "" {
+		t.Fatalf("confirmed exit refused with entry off: %d %s", w.Code, w.Body)
+	}
+	read := do(r, http.MethodGet, "/billing/plan", key, "")
+	var active struct {
+		Plan *struct {
+			Key string `json:"plan_key"`
+		} `json:"plan"`
+		Pending *struct {
+			ID string `json:"id"`
+		} `json:"pending_change"`
+	}
+	if read.Code != http.StatusOK || json.Unmarshal(read.Body.Bytes(), &active) != nil || active.Plan == nil || active.Plan.Key != "custom_example" || active.Pending == nil || active.Pending.ID != change.ID {
+		t.Fatalf("entry rollback hid the current assignment or pending exit: %d %s", read.Code, read.Body)
+	}
+	if w = do(r, http.MethodPost, "/billing/plan-changes/"+change.ID+"/undo", key, ""); w.Code != http.StatusOK {
+		t.Fatalf("undo refused with entry off: %d %s", w.Code, w.Body)
+	}
+}

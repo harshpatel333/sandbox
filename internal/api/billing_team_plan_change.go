@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -123,12 +124,36 @@ func pendingCustomerPlanChange(ctx context.Context, q db.DBTX, team uuid.UUID) (
 
 // teamPlanChangeRequest asks to move a team to a self-serve plan.
 type teamPlanChangeRequest struct {
-	Team   uuid.UUID
-	Target string
-	Key    string
-	Actor  uuid.UUID
-	Via    string
-	Reason string
+	Team                 uuid.UUID
+	Target               string
+	Key                  string
+	Actor                uuid.UUID
+	Via                  string
+	Reason               string
+	PreviewToken         string
+	ConfirmPausesRunning bool
+}
+
+func planChangeConsentToken(current teamPlan, terms planTerms, timing string, effective time.Time) (string, error) {
+	var boundary *time.Time
+	if timing != planChangeNow {
+		at := effective.UTC()
+		boundary = &at
+	}
+	payload := struct {
+		Team          uuid.UUID       `json:"team_id"`
+		Assignment    uuid.UUID       `json:"assignment_id"`
+		Terms         frozenPlanTerms `json:"terms"`
+		Limits        planLimits      `json:"limits"`
+		Timing        string          `json:"timing"`
+		EffectiveAt   *time.Time      `json:"effective_at"`
+		PausesRunning bool            `json:"pauses_running"`
+	}{current.TeamID, current.ID, freezePlanTerms(terms), terms.Limits, timing, boundary, terms.Kind == planKindFree}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(encoded)), nil
 }
 
 // scheduleTeamPlanChange records a downgrade or a move to Free. Moves that
@@ -220,6 +245,18 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 			return teamPlanChange{}, teamPlanChangeConflict("the team's subscription could not be found")
 		}
 		effective = periodEnd
+	}
+	if req.Via == "customer" || req.PreviewToken != "" {
+		if terms.Kind == planKindFree && !req.ConfirmPausesRunning {
+			return teamPlanChange{}, teamPlanChangeConflict("confirm that all running compute will be paused before continuing")
+		}
+		token, err := planChangeConsentToken(locked, terms, timing, effective)
+		if err != nil {
+			return teamPlanChange{}, err
+		}
+		if req.PreviewToken == "" || token != req.PreviewToken || timing == planChangeEndOfPeriod && effective.Sub(now) < planChangeMinNotice {
+			return teamPlanChange{}, teamPlanChangeConflict("the plan change preview changed; reload it and confirm again")
+		}
 	}
 	frozen, limits, _, err := planAssignment{Terms: terms}.frozen()
 	if err != nil {
@@ -652,9 +689,11 @@ func (h *Handlers) waitForPlanChangePauses(ctx context.Context, team uuid.UUID) 
 }
 
 type teamPlanChangeBody struct {
-	TargetPlan string `json:"target_plan"`
-	Key        string `json:"idempotency_key"`
-	Reason     string `json:"reason"`
+	TargetPlan           string `json:"target_plan"`
+	Key                  string `json:"idempotency_key"`
+	Reason               string `json:"reason"`
+	PreviewToken         string `json:"preview_token"`
+	ConfirmPausesRunning bool   `json:"confirm_pauses_running"`
 }
 
 func decodeTeamPlanChange(c *gin.Context) (teamPlanChangeBody, bool) {
@@ -670,7 +709,7 @@ func decodeTeamPlanChange(c *gin.Context) (teamPlanChangeBody, bool) {
 		respondErrorMsg(c, "invalid_plan", "target_plan must be free, starter or pro_monthly", http.StatusBadRequest)
 		return body, false
 	}
-	if strings.TrimSpace(body.Key) == "" || len(body.Key) > 200 || len(body.Reason) > 2000 {
+	if strings.TrimSpace(body.Key) == "" || len(body.Key) > 200 || len(body.Reason) > 2000 || len(body.PreviewToken) > 64 {
 		respondErrorMsg(c, "bad_request", "idempotency_key (up to 200 characters) is required and reason is at most 2000 characters", http.StatusBadRequest)
 		return body, false
 	}
@@ -713,11 +752,15 @@ func (h *Handlers) RequestBillingPlanChange(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if len(body.PreviewToken) != 64 || body.TargetPlan == "free" && !body.ConfirmPausesRunning {
+		respondErrorMsg(c, "bad_request", "preview_token is required and moves to Free require confirm_pauses_running", http.StatusBadRequest)
+		return
+	}
 	reason := body.Reason
 	if reason == "" {
 		reason = "requested by the team"
 	}
-	change, err := h.scheduleTeamPlanChange(c.Request.Context(), teamPlanChangeRequest{Team: team, Target: body.TargetPlan, Key: body.Key, Actor: actor, Via: "customer", Reason: reason})
+	change, err := h.scheduleTeamPlanChange(c.Request.Context(), teamPlanChangeRequest{Team: team, Target: body.TargetPlan, Key: body.Key, Actor: actor, Via: "customer", Reason: reason, PreviewToken: body.PreviewToken, ConfirmPausesRunning: body.ConfirmPausesRunning})
 	h.respondTeamPlanChange(c, team, change, err)
 }
 
@@ -759,7 +802,7 @@ func (h *Handlers) RequestTeamPlanChange(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "reason is required", http.StatusBadRequest)
 		return
 	}
-	change, err := h.scheduleTeamPlanChange(c.Request.Context(), teamPlanChangeRequest{Team: team, Target: body.TargetPlan, Key: body.Key, Actor: actor, Via: "staff", Reason: body.Reason})
+	change, err := h.scheduleTeamPlanChange(c.Request.Context(), teamPlanChangeRequest{Team: team, Target: body.TargetPlan, Key: body.Key, Actor: actor, Via: "staff", Reason: body.Reason, PreviewToken: body.PreviewToken, ConfirmPausesRunning: body.ConfirmPausesRunning})
 	h.respondTeamPlanChange(c, team, change, err)
 }
 

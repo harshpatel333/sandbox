@@ -403,6 +403,7 @@ type customerPlanChangePreview struct {
 	PausesRunning     bool       `json:"pauses_running"`
 	Limits            planLimits `json:"limits"`
 	Blocked           string     `json:"blocked,omitempty"`
+	PreviewToken      string     `json:"preview_token,omitempty"`
 }
 
 // GetBillingPlanChangePreview tells a team when a move to a plan would take
@@ -468,6 +469,12 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		}
 		if preview.Timing != planChangeAfterPurchase {
 			preview.EffectiveAt = &at
+			preview.PreviewToken, err = planChangeConsentToken(current, terms, preview.Timing, at)
+			if err != nil {
+				log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
+				respondError(c, ErrInternal)
+				return
+			}
 		}
 	} else {
 		preview.Timing = ""

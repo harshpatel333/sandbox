@@ -301,7 +301,10 @@ paths:
         until shortly before; leaving Starter for Free takes effect at once. A
         move to Free pauses all running sandboxes when it takes effect.
         Upgrades happen on purchase instead. Repeating a request with the same
-        idempotency key returns the original change. Requires `billing:write`.
+        idempotency key returns the original change. Send the preview_token from
+        the confirmed preview; changed terms, limits or effective boundary return
+        409 and require another preview and confirmation. Moves to Free require
+        confirm_pauses_running=true. Requires `billing:write`.
       security:
         - apiKey: []
       requestBody:
@@ -311,7 +314,7 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [target_plan, idempotency_key]
+              required: [target_plan, idempotency_key, preview_token]
               properties:
                 target_plan:
                   type: string
@@ -319,6 +322,14 @@ paths:
                 idempotency_key:
                   type: string
                   maxLength: 200
+                preview_token:
+                  type: string
+                  minLength: 64
+                  maxLength: 64
+                  description: Token from the confirmed exit preview, binding its assignment, terms, limits and effective boundary. Immediate moves bind to immediate timing.
+                confirm_pauses_running:
+                  type: boolean
+                  description: Must be true when target_plan is free, confirming that all running compute will be paused.
                 reason:
                   type: string
                   maxLength: 2000
@@ -5444,6 +5455,11 @@ components:
           type: boolean
         limits:
           $ref: "#/components/schemas/BillingPlanLimits"
+        preview_token:
+          type: string
+          minLength: 64
+          maxLength: 64
+          description: Present for an available downgrade or exit; return it unchanged when confirming the request.
         blocked:
           type: string
           description: Why the team cannot make this change; absent when it can.

@@ -117,11 +117,34 @@ func newPlanChangeV2Fixture(t *testing.T, kind string) planChangeV2Fixture {
 	return f
 }
 
+func (f planChangeV2Fixture) intent(t *testing.T, target, key string, terms planTerms) teamPlanChangeRequest {
+	t.Helper()
+	current := f.plan(t)
+	timing, _ := planChangeRule(current.Kind, terms.Kind)
+	at := time.Now()
+	if timing == planChangeEndOfPeriod {
+		var err error
+		_, at, err = f.h.planChangeBoundary(t.Context(), f.team, current, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	token, err := planChangeConsentToken(current, terms, timing, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return teamPlanChangeRequest{Team: f.team, Target: target, Key: key, Actor: f.actor, Via: "customer", Reason: "requested by the team", PreviewToken: token, ConfirmPausesRunning: true}
+}
+
 func (f planChangeV2Fixture) request(t *testing.T, target, key string) (teamPlanChange, error) {
 	t.Helper()
 	kind := map[string]string{"pro_monthly": planKindSubscription, "starter": planKindPrepaid, "free": planKindFree}[target]
-	return f.h.scheduleTeamPlanChangeTo(t.Context(), teamPlanChangeRequest{Team: f.team, Target: target, Key: key, Actor: f.actor, Via: "customer", Reason: "requested by the team"},
-		testPlanTerms(target, kind, 1, nil))
+	terms := testPlanTerms(target, kind, 1, nil)
+	req := teamPlanChangeRequest{Team: f.team, Target: target, Key: key, Actor: f.actor, Via: "customer", Reason: "requested by the team"}
+	if _, err := replayTeamPlanChange(t.Context(), f.h.Pool, req); err == nil {
+		return f.h.scheduleTeamPlanChangeTo(t.Context(), req, terms)
+	}
+	return f.h.scheduleTeamPlanChangeTo(t.Context(), f.intent(t, target, key, terms), terms)
 }
 
 func (f planChangeV2Fixture) tick(t *testing.T) {
@@ -390,8 +413,10 @@ func TestTeamPlanChangeRefusals(t *testing.T) {
 		t.Fatalf("team without a plan scheduled a change: %v", err)
 	}
 	g := newPlanChangeV2Fixture(t, planKindSubscription)
+	terms := testPlanTerms("free", planKindFree, 1, nil)
+	req := g.intent(t, "free", "k1", terms)
 	g.stripe.set(func(s *renewalStripe) { s.status = "canceled" })
-	if _, err := g.request(t, "free", "k1"); !errors.Is(err, errTeamPlanChangeConflict) {
+	if _, err := g.h.scheduleTeamPlanChangeTo(t.Context(), req, terms); !errors.Is(err, errTeamPlanChangeConflict) || !strings.Contains(err.Error(), "already ended") {
 		t.Fatalf("downgrade scheduled on an ended subscription: %v", err)
 	}
 }
@@ -442,7 +467,11 @@ func TestTeamPlanChangeExitAndUndoContinueWhilePricingV2IsOff(t *testing.T) {
 	if err != nil || on {
 		t.Fatalf("fixture must have entry switched off: %v %v", on, err)
 	}
-	c, err := f.h.scheduleTeamPlanChange(t.Context(), teamPlanChangeRequest{Team: f.team, Target: "free", Key: "exit", Actor: f.actor, Via: "customer", Reason: "leave plan"})
+	terms, err := f.h.planTermsForPricingVersion(t.Context(), "free", "v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := f.h.scheduleTeamPlanChange(t.Context(), f.intent(t, "free", "exit", terms))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -595,5 +624,53 @@ func TestTeamPlanChangeCustomWithoutBillingAccountUsesOneConnection(t *testing.T
 	c, err := h.scheduleTeamPlanChangeTo(ctx, teamPlanChangeRequest{Team: team, Target: "free", Key: "custom-exit", Actor: uuid.New(), Via: "staff", Reason: "end agreement"}, testPlanTerms("free", planKindFree, 1, nil))
 	if err != nil || c.State != "scheduled" || !c.EffectiveAt.After(time.Now()) {
 		t.Fatalf("custom exit without billing account: %+v %v", c, err)
+	}
+}
+
+func TestTeamPlanChangeConsentRejectsChangedPreviewWithoutScheduling(t *testing.T) {
+	for _, scenario := range []string{"period", "limits", "assignment", "pause_confirmation"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newPlanChangeV2Fixture(t, planKindSubscription)
+			terms := testPlanTerms("free", planKindFree, 1, nil)
+			req := f.intent(t, "free", "consent", terms)
+			switch scenario {
+			case "period":
+				f.stripe.set(func(s *renewalStripe) { s.periodEnd = s.periodEnd.AddDate(0, 1, 0) })
+			case "limits":
+				terms.Limits.MaxConcurrent = int32p(2)
+			case "assignment":
+				current := f.plan(t)
+				if _, err := assignInTx(t, f.h, planAssignment{Team: f.team, Terms: testPlanTerms("pro_monthly", planKindSubscription, 1000, nil), ContractID: current.ContractID, Source: planSourceStaff, Reason: "updated agreement"}); err != nil {
+					t.Fatal(err)
+				}
+			case "pause_confirmation":
+				req.ConfirmPausesRunning = false
+			}
+			if _, err := f.h.scheduleTeamPlanChangeTo(t.Context(), req, terms); !errors.Is(err, errTeamPlanChangeConflict) {
+				t.Fatalf("changed consent was accepted: %v", err)
+			}
+			var count int
+			if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM team_plan_change WHERE team_id=$1`, f.team).Scan(&count); err != nil || count != 0 || len(f.stripe.writes) != 0 {
+				t.Fatalf("rejected consent created work: %d %v %v", count, f.stripe.writes, err)
+			}
+		})
+	}
+}
+
+func TestTeamPlanChangeImmediateConsentAndReplay(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindPrepaid)
+	terms := testPlanTerms("free", planKindFree, 1, nil)
+	req := f.intent(t, "free", "immediate-consent", terms)
+	later, err := planChangeConsentToken(f.plan(t), terms, planChangeNow, time.Now().Add(time.Hour))
+	if err != nil || later != req.PreviewToken {
+		t.Fatalf("immediate preview expired with its display timestamp: %s %v", later, err)
+	}
+	c, err := f.h.scheduleTeamPlanChangeTo(t.Context(), req, terms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terms.Limits.MaxConcurrent = int32p(2)
+	if replay, err := f.h.scheduleTeamPlanChangeTo(t.Context(), req, terms); err != nil || replay.ID != c.ID {
+		t.Fatalf("recorded consent could not replay after target terms changed: %+v %v", replay, err)
 	}
 }
