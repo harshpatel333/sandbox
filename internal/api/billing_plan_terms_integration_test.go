@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
@@ -77,5 +78,39 @@ func TestPlanTermsFeeLessFamily(t *testing.T) {
 	var offers int
 	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_plan WHERE family=$1`, family).Scan(&offers); err != nil || offers != 0 {
 		t.Fatalf("fee-less family created checkout offers: %d %v", offers, err)
+	}
+}
+
+func TestPlanTermsAcrossPricingModels(t *testing.T) {
+	cfg, err := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
+	if err != nil || !strings.HasSuffix(cfg.ConnConfig.Database, "_test") {
+		t.Fatal("requires migrated disposable test database")
+	}
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	h := &Handlers{Pool: pool}
+	setModel := func(model string) {
+		if _, err := pool.Exec(context.Background(), `UPDATE billing_pricing_switch SET pricing_version=$1`, model); err != nil {
+			t.Fatal(err)
+		}
+		forgetPricingVersion()
+	}
+	t.Cleanup(func() { setModel("legacy") })
+
+	starter, err := h.planTerms(t.Context(), "starter")
+	if err != nil || starter.Kind != "prepaid" || !starter.Retired || starter.Available {
+		t.Fatalf("starter under legacy = %+v, %v", starter, err)
+	}
+	setModel("v2")
+	if starter, err = h.planTerms(t.Context(), "starter"); err != nil || starter.Kind != "prepaid" || starter.Retired {
+		t.Fatalf("starter under v2 = %+v, %v", starter, err)
+	}
+	// Teams on legacy pay as you go keep it under v2, so it stays assignable.
+	payg, err := h.planTerms(t.Context(), "payg")
+	if err != nil || payg.Kind != "legacy_payg" || payg.PricingVersion != "legacy" || payg.Retired || payg.Available {
+		t.Fatalf("payg under v2 = %+v, %v", payg, err)
 	}
 }

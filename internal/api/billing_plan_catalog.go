@@ -55,9 +55,11 @@ type planCompute struct {
 // planAllowance is the usage included in each period. Period is "day_window"
 // (24 hours from the first start) or "month"; OnExhausted is "pause" or
 // "payg". A version stores either AmountCents or Compute; planTerms resolves
-// Compute to AmountCents.
+// both to AmountUSD, an exact decimal string, and Compute to AmountCents
+// rounded to the cent for display.
 type planAllowance struct {
 	AmountCents int64        `json:"amount_cents"`
+	AmountUSD   string       `json:"amount_usd,omitempty"`
 	Period      string       `json:"period"`
 	OnExhausted string       `json:"on_exhausted"`
 	Compute     *planCompute `json:"compute,omitempty"`
@@ -320,8 +322,8 @@ func planPriceLookupKey(versionID uuid.UUID, months int32) string {
 // keeps one price whichever path sells it; otherwise the version's own price
 // is found by lookup key or created once. Versions that do not own a price
 // (see ownsPrice) are sold only on the configured price. It reads only t's
-// VersionID, Version, PricingVersion, OfferKey, FeeCents and IntervalMonths,
-// so callers may pass frozen terms.
+// VersionID, Version, PricingVersion, OfferKey, DisplayName, FeeCents and
+// IntervalMonths, so callers may pass frozen terms.
 func (h *Handlers) ensurePlanPrice(ctx context.Context, c *stripeHTTPClient, t planTerms) (storagePrice, error) {
 	if configured := h.Config.PlanPriceID(t.OfferKey); configured != "" {
 		p, err := c.verifiedPlanPrice(ctx, proOffer{Key: t.OfferKey, Price: configured, Amount: t.FeeCents, Months: t.IntervalMonths})
@@ -372,7 +374,7 @@ func (c *stripeHTTPClient) versionPlanPrice(ctx context.Context, t planTerms) (s
 	form.Set("recurring[interval_count]", "1")
 	form.Set("recurring[usage_type]", "licensed")
 	form.Set("lookup_key", key)
-	form.Set("product_data[name]", "Superserve "+catalogPlanName(t.OfferKey))
+	form.Set("product_data[name]", "Superserve "+catalogPlanName(t.DisplayName, t.IntervalMonths))
 	form.Set("metadata[plan_version_id]", t.VersionID.String())
 	form.Set("metadata[commercial_offer]", t.OfferKey)
 	var created struct {

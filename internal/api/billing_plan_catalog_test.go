@@ -1,6 +1,7 @@
 package api
 
 import (
+	"math/big"
 	"testing"
 )
 
@@ -159,6 +160,14 @@ func TestPlanOfferInterval(t *testing.T) {
 		_, months, ok := planOfferInterval(key)
 		if months != want || ok != (want != 0) {
 			t.Errorf("%s: months=%d ok=%v", key, months, ok)
+		}
+	}
+}
+
+func TestDecimalString(t *testing.T) {
+	for in, want := range map[[2]int64]string{{1332, 10000}: "0.1332", {25000, 100}: "250", {5, 1}: "5", {1, 3}: "0.333333333333"} {
+		if got := decimalString(big.NewRat(in[0], in[1])); got != want {
+			t.Errorf("decimalString(%d/%d) = %s, want %s", in[0], in[1], got, want)
 		}
 	}
 }
