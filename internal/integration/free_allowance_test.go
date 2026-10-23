@@ -20,8 +20,9 @@ func assignFreePlan(t *testing.T, teamID uuid.UUID, since time.Time) {
 	t.Helper()
 	if _, err := testPool.Exec(context.Background(), `
 		INSERT INTO team_plan_assignment (team_id, plan_key, kind, terms, limits, effective_from, source, reason)
-		VALUES ($1, 'free', 'free', '{"allowance":{"amount_usd":0.1332}}',
-		        '{"max_sandboxes":1,"max_template_vcpu":1,"max_template_memory_mib":1024,"max_template_disk_mib":4096}', $2, 'migration', 'test')`, teamID, since); err != nil {
+		VALUES ($1, 'free', 'free',
+		        '{"allowance":{"amount_cents":13,"period":"day_window","on_exhausted":"pause","compute":{"seconds":7200,"vcpu":1,"memory_gib":1}}}',
+		        '{"max_sandboxes":1,"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096}', $2, 'migration', 'test')`, teamID, since); err != nil {
 		t.Fatalf("assign free plan: %v", err)
 	}
 }

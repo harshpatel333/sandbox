@@ -3,13 +3,13 @@
 -- Inert until a team holds a Free plan assignment.
 
 CREATE OR REPLACE FUNCTION billing_free_plan(p_team uuid)
-RETURNS TABLE(free_since timestamptz, allowance_usd numeric, max_vcpu int, max_memory_mib int, max_disk_mib int)
+RETURNS TABLE(free_since timestamptz, allowance jsonb, max_vcpu int, max_memory_mib int, max_disk_mib int)
 LANGUAGE sql STABLE AS $$
  SELECT a.effective_from,
-        COALESCE((a.terms->'allowance'->>'amount_usd')::numeric, 0),
-        (a.limits->>'max_template_vcpu')::int,
-        (a.limits->>'max_template_memory_mib')::int,
-        (a.limits->>'max_template_disk_mib')::int
+        COALESCE(a.terms->'allowance', '{}'::jsonb),
+        (a.limits->>'max_vcpu')::int,
+        (a.limits->>'max_memory_mib')::int,
+        (a.limits->>'max_disk_mib')::int
  FROM team_plan_assignment a
  WHERE a.team_id = p_team AND a.effective_to IS NULL AND a.kind = 'free';
 $$;
@@ -91,7 +91,11 @@ LANGUAGE sql STABLE AS $$
  )
  SELECT win.started,
         win.started + interval '24 hours',
-        plan.allowance_usd,
+        round(CASE WHEN plan.allowance ? 'compute'
+              THEN (plan.allowance->'compute'->>'seconds')::numeric
+                   * ((plan.allowance->'compute'->>'vcpu')::numeric * rates.vcpu_usd
+                      + (plan.allowance->'compute'->>'memory_gib')::numeric * rates.memory_gib_usd)
+              ELSE COALESCE((plan.allowance->>'amount_cents')::numeric / 100, 0) END, 6),
         round(COALESCE((SELECT usd FROM used), 0), 6)
  FROM plan, rates, win;
 $$;
