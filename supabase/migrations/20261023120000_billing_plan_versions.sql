@@ -591,3 +591,14 @@ DO $$ DECLARE r text; f text; BEGIN
         END LOOP;
     END LOOP;
 END $$;
+
+-- Triggers and functions run as the writing role, which can be service_role,
+-- so the helpers they call stay executable for it.
+DO $$ DECLARE f text; BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        FOREACH f IN ARRAY ARRAY['billing_credit_schedule_valid(jsonb)', 'billing_plan_version_monthly_credit(billing_plan_version)',
+            'sync_billing_plan_offers(text)', 'billing_signup_promotion_cents(text)', 'apply_contract_limits(uuid)'] LOOP
+            EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role', f);
+        END LOOP;
+    END IF;
+END $$;
