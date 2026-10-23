@@ -344,6 +344,16 @@ type BackupWalk struct {
 	StartedAt time.Time `json:"started_at"`
 }
 
+type BillingCatalogAudit struct {
+	ID        uuid.UUID `json:"id"`
+	ActorID   uuid.UUID `json:"actor_id"`
+	Action    string    `json:"action"`
+	VersionID uuid.UUID `json:"version_id"`
+	Reason    string    `json:"reason"`
+	Terms     []byte    `json:"terms"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type BillingCommercialContract struct {
 	ID                     uuid.UUID          `json:"id"`
 	TeamID                 uuid.UUID          `json:"team_id"`
@@ -376,6 +386,15 @@ type BillingContractEntitlementSchedule struct {
 	ContractID  uuid.UUID `json:"contract_id"`
 	MonthOffset int32     `json:"month_offset"`
 	AmountCents int64     `json:"amount_cents"`
+}
+
+type BillingContractLimit struct {
+	ContractID           uuid.UUID `json:"contract_id"`
+	MaxSandboxes         int32     `json:"max_sandboxes"`
+	MaxTemplateVcpu      *int32    `json:"max_template_vcpu"`
+	MaxTemplateMemoryMib *int32    `json:"max_template_memory_mib"`
+	MaxTemplateDiskMib   *int32    `json:"max_template_disk_mib"`
+	CreatedAt            time.Time `json:"created_at"`
 }
 
 type BillingContractPayment struct {
@@ -815,11 +834,12 @@ type BillingPlanVersion struct {
 	SortOrder            int32              `json:"sort_order"`
 	DisplayOnly          bool               `json:"display_only"`
 	SelfServe            bool               `json:"self_serve"`
+	Public               bool               `json:"public"`
 	MonthlyFeeCents      *int64             `json:"monthly_fee_cents"`
 	AnnualFeeCents       *int64             `json:"annual_fee_cents"`
 	CreditSchedule       []byte             `json:"credit_schedule"`
-	MatchingPercent      *int32             `json:"matching_percent"`
-	MatchingCapCents     *int64             `json:"matching_cap_cents"`
+	MatchingBps          *int32             `json:"matching_bps"`
+	CapCents             *int64             `json:"cap_cents"`
 	MaxSandboxes         *int32             `json:"max_sandboxes"`
 	MaxTemplateVcpu      *int32             `json:"max_template_vcpu"`
 	MaxTemplateMemoryMib *int32             `json:"max_template_memory_mib"`
