@@ -619,6 +619,7 @@ WITH locks AS MATERIALIZED (
 UPDATE team_billing_account
 SET checkout_initializing_at = now(),
     checkout_request_key = sqlc.arg(request_key),
+    checkout_submit_message_generation = CASE WHEN sqlc.arg(submit_message)::boolean THEN now() END,
     checkout_pending_attempt_ids = ARRAY[sqlc.arg(attempt_id)::uuid],
     checkout_may_exist = false,
     checkout_subscription_id = NULL,
@@ -1608,7 +1609,8 @@ SELECT storage_billing_activated(sqlc.arg(team_id)::uuid, sqlc.arg(period_end)::
 -- name: BeginStripeCheckoutWithPublicationDecision :exec
 SELECT begin_stripe_checkout_with_publication_decision(
     sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(operation_id)::uuid,
-    sqlc.arg(home_region)::text, sqlc.arg(request_key)::text, sqlc.arg(decision)::text, sqlc.arg(attempt_id)::uuid);
+    sqlc.arg(home_region)::text, sqlc.arg(request_key)::text, sqlc.arg(decision)::text, sqlc.arg(attempt_id)::uuid,
+    sqlc.arg(submit_message)::boolean);
 
 -- name: StripeCheckoutPublicationFailed :one
 SELECT stripe_checkout_publication_failed(sqlc.arg(team_id)::uuid,

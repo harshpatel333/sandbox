@@ -1875,6 +1875,8 @@ type TeamBillingAccount struct {
 	StripeActivationIdentityKey              *string            `json:"stripe_activation_identity_key"`
 	StripeCheckoutIdentityEvidenceVersion    pgtype.UUID        `json:"stripe_checkout_identity_evidence_version"`
 	StripeActivationIdentityEvidenceVersion  pgtype.UUID        `json:"stripe_activation_identity_evidence_version"`
+	// checkout_initializing_at of the PAYG Checkout generation whose session includes the submit message; any other value means no message.
+	CheckoutSubmitMessageGeneration pgtype.Timestamptz `json:"checkout_submit_message_generation"`
 }
 
 type TeamBillingPeriod struct {

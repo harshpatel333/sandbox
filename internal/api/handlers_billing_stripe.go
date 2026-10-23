@@ -40,6 +40,8 @@ const (
 	maxStripeWebhookBodyBytes   = 1 << 20
 	checkoutSessionLifetime     = 24 * time.Hour
 	stripePromotionReplayWindow = 23 * time.Hour
+	// The cancel URL leads to the credit-only path.
+	checkoutSubmitMessage = "Not ready? Use the back arrow to continue with $5 in credit."
 
 	platformBillingWritePermission = "platform:billing:write"
 )
@@ -161,6 +163,8 @@ type StripeCreateCheckoutSessionParams struct {
 	PriceIDs                 []string
 	IdempotencyKey           string
 	ExpiresAt                *time.Time
+	// Omitted when empty so persisted Pro payloads keep their encoding.
+	SubmitMessage string `json:",omitempty"`
 }
 
 // StripeCheckoutPlanTerms freezes the catalog terms a purchase started with.
@@ -496,6 +500,9 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 		i := len(params.PriceIDs)
 		form.Set(fmt.Sprintf("line_items[%d][price]", i), params.BasePriceID)
 		form.Set(fmt.Sprintf("line_items[%d][quantity]", i), "1")
+	}
+	if params.SubmitMessage != "" {
+		form.Set("custom_text[submit][message]", params.SubmitMessage)
 	}
 	var resp struct {
 		ID  string `json:"id"`
@@ -1759,10 +1766,11 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		checkoutAccount, err = h.beginCheckoutWithPublicationDecision(c.Request.Context(), teamID, actorID, req, requestKey, attemptID)
 	} else {
 		checkoutAccount, err = h.DB.BeginTeamBillingCheckout(c.Request.Context(), db.BeginTeamBillingCheckoutParams{
-			TeamID:     teamID,
-			ActorID:    pgtype.UUID{Bytes: actorID, Valid: true},
-			RequestKey: stringPtr(requestKey),
-			AttemptID:  attemptID,
+			TeamID:        teamID,
+			ActorID:       pgtype.UUID{Bytes: actorID, Valid: true},
+			RequestKey:    stringPtr(requestKey),
+			AttemptID:     attemptID,
+			SubmitMessage: h.checkoutSubmitMessageEnabled(),
 		})
 		resumed := errors.Is(err, pgx.ErrNoRows)
 		if resumed {
@@ -1788,6 +1796,12 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 	// Replays use the original expiration and actor as well as the same key.
 	// The local fence outlives this deadline until expiration is confirmed.
 	expiresAt := leaseStartedAt.Add(checkoutSessionLifetime - time.Minute)
+	// Generations begun without the message, including those begun by writers
+	// that predate it, must replay without it.
+	var submitMessage string
+	if checkoutAccount.CheckoutSubmitMessageGeneration.Valid && checkoutAccount.CheckoutSubmitMessageGeneration.Time.Equal(checkoutAccount.CheckoutInitializingAt.Time) {
+		submitMessage = checkoutSubmitMessage
+	}
 	session, err := h.Stripe.CreateCheckoutSession(c.Request.Context(), StripeCreateCheckoutSessionParams{
 		CustomerID:        customerID,
 		SuccessURL:        successURL,
@@ -1800,6 +1814,7 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 			"checkout_generation": leaseStartedAt.Format(time.RFC3339Nano),
 		},
 		IdempotencyKey: checkoutSessionIdempotencyKeyForLease(teamID, customerID, successURL, cancelURL, priceIDs, leaseStartedAt),
+		SubmitMessage:  submitMessage,
 	})
 	if err != nil {
 		// A transport, timeout, or decode failure is ambiguous: Stripe may have
