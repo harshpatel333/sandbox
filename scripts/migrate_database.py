@@ -360,8 +360,13 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
             preview = cli_run(cli, database_url, project, ["db", "push", "--dry-run", "--yes"], deadline)
         except MigrationError as error:
             local = versions | ({VERSION} if target == "use4" else set())
-            raise MigrationError(
-                f"{error}{history_divergence(cli, database_url, project, local, deadline)}") from None
+            try:
+                detail = history_divergence(cli, database_url, project, local, deadline)
+            except Exception:
+                # The refusal is the message that matters. A surprise raised while
+                # describing it may cost the detail, never the refusal itself.
+                detail = ""
+            raise MigrationError(f"{error}{detail}") from None
         if AGGREGATE in preview:
             raise MigrationError("CLI proposed replaying the shared-Auth aggregate")
         # Recheck before executing against the same composed snapshot. No path
