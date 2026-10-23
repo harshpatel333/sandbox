@@ -426,4 +426,22 @@ func TestStaffPlanAssignmentUnderV2(t *testing.T) {
 	if _, err = h.assignStaffPlan(t.Context(), team, actor, staffPlanAssignmentBody{Key: "k2", VersionID: free.VersionID, Reason: "r"}); !errors.Is(err, errUnknownPlan) {
 		t.Fatalf("staff assigned a non-custom plan: %v", err)
 	}
+	setPricingVersion(t, h, "legacy")
+	if _, err := h.assignStaffPlan(t.Context(), team, actor, staffPlanAssignmentBody{Key: "new-after-off", VersionID: version, Reason: "new custom deal"}); !errors.Is(err, errPricingV2Off) {
+		t.Fatalf("new staff assignment for assigned team while off: %v", err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `SELECT retire_billing_plan_version($1,$2)`, version, actor); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := h.assignStaffPlan(t.Context(), team, actor, body); err != nil || again.ID != plan.ID {
+		t.Fatalf("recorded staff commitment did not replay after off and retirement: %+v %v", again, err)
+	}
+	if _, err := h.assignStaffPlan(t.Context(), team, actor, staffPlanAssignmentBody{Key: body.Key, VersionID: uuid.New(), Reason: body.Reason}); !errors.Is(err, errPlanAssignmentReused) {
+		t.Fatalf("replayed key accepted different version while off: %v", err)
+	}
+	history, err := teamPlanHistory(t.Context(), h.Pool, team, 10)
+	if err != nil || len(history) != 1 || history[0].ID != plan.ID {
+		t.Fatalf("off requests changed assignment history: %+v %v", history, err)
+	}
+
 }
