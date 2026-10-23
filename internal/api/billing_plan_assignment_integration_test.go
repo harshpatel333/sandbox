@@ -126,6 +126,7 @@ func TestPlanAssignmentRefusesRetiredAndReusedKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.Terms.Retired = true
 	again, err := assignInTx(t, h, a)
 	if err != nil || again.ID != first.ID {
 		t.Fatalf("repeated request assigned again: %+v %v", again, err)
@@ -167,6 +168,17 @@ func TestPlanAssignmentHistoryIsImmutable(t *testing.T) {
 	}
 	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE id=$1`, p.ID); err == nil {
 		t.Fatal("a closed assignment was closed again")
+	}
+}
+
+func TestPlanAssignmentRequiresConcurrencyWithCustomizedLimits(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE team SET max_sandboxes=77 WHERE id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	setPricingVersion(t, h, "v2")
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free','{}','{}',clock_timestamp(),'staff','missing limits')`, team); err == nil {
+		t.Fatal("assignment without concurrency persisted on customized team")
 	}
 }
 
