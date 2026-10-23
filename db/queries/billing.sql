@@ -613,15 +613,15 @@ WHERE team_id = sqlc.arg(team_id)
 FOR UPDATE;
 
 -- name: TeamSignupTrialCreditUnspent :one
-SELECT (EXISTS (
+-- Grant balances only drop when a billing period is finalized, so live usage
+-- decides whether any of the trial has been spent.
+SELECT (trial.state = 'active' AND trial.consumed_usd = 0 AND NOT EXISTS (
   SELECT 1 FROM team_credit_grant g
   WHERE g.team_id = sqlc.arg(team_id) AND g.reason = 'signup trial credit'
-    AND g.amount_usd > 0 AND g.remaining_usd = g.amount_usd
+    AND g.remaining_usd < g.amount_usd
     AND (g.expires_at IS NULL OR g.expires_at > now())
-) AND NOT EXISTS (
-  SELECT 1 FROM team_billing_account a
-  WHERE a.team_id = sqlc.arg(team_id) AND a.trial_ended_at IS NOT NULL
-))::boolean AS unspent;
+))::boolean AS unspent
+FROM get_team_trial_balance(sqlc.arg(team_id)) AS trial;
 
 -- name: BeginTeamBillingCheckout :one
 WITH locks AS MATERIALIZED (

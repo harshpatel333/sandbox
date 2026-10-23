@@ -3822,17 +3822,17 @@ func (q *Queries) StripePromotionWasAttempted(ctx context.Context, arg StripePro
 }
 
 const teamSignupTrialCreditUnspent = `-- name: TeamSignupTrialCreditUnspent :one
-SELECT (EXISTS (
+SELECT (trial.state = 'active' AND trial.consumed_usd = 0 AND NOT EXISTS (
   SELECT 1 FROM team_credit_grant g
   WHERE g.team_id = $1 AND g.reason = 'signup trial credit'
-    AND g.amount_usd > 0 AND g.remaining_usd = g.amount_usd
+    AND g.remaining_usd < g.amount_usd
     AND (g.expires_at IS NULL OR g.expires_at > now())
-) AND NOT EXISTS (
-  SELECT 1 FROM team_billing_account a
-  WHERE a.team_id = $1 AND a.trial_ended_at IS NOT NULL
 ))::boolean AS unspent
+FROM get_team_trial_balance($1) AS trial
 `
 
+// Grant balances only drop when a billing period is finalized, so live usage
+// decides whether any of the trial has been spent.
 func (q *Queries) TeamSignupTrialCreditUnspent(ctx context.Context, teamID uuid.UUID) (bool, error) {
 	row := q.db.QueryRow(ctx, teamSignupTrialCreditUnspent, teamID)
 	var unspent bool
