@@ -205,7 +205,7 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":%d}},"available_balance":{"monetary":{"currency":"usd","value":%d}}}]}`, total, total)
 	case path == "/v1/billing/credit_balance_summary":
 		id := r.URL.Query().Get("filter[credit_grant]")
-		fmt.Fprintf(w, `{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":%d}}}]}`, f.balances[id])
+		fmt.Fprintf(w, `{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":%d}},"available_balance":{"monetary":{"currency":"usd","value":%d}}}]}`, f.balances[id], f.balances[id])
 	default:
 		f.t.Errorf("unexpected provider request %s %s", r.Method, r.URL)
 		http.Error(w, "unexpected", 500)
@@ -744,11 +744,54 @@ func TestPrepaidEnrolmentIsRetriedAfterPayment(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.exec(`UPDATE billing_funding_account SET observe=false WHERE team_id=$1`, f.team)
+	var budget int
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT max_observed_teams FROM billing_funding_policy`).Scan(&budget); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET max_observed_teams=$1`, budget)
+	})
+	f.exec(`UPDATE billing_funding_policy SET max_observed_teams=greatest(1,(SELECT count(*) FROM billing_funding_account WHERE observe))`)
+	f.exec(`INSERT INTO billing_funding_account(team_id,observe) SELECT id,true FROM team WHERE id<>$1 AND NOT EXISTS(SELECT 1 FROM billing_funding_account WHERE observe) LIMIT 1 ON CONFLICT(team_id) DO UPDATE SET observe=true`, f.team)
+	if err := f.h.enrolPrepaidObservation(t.Context(), f.team); err != errPrepaidCapacity {
+		t.Fatal("expected the cohort to be full", err)
+	}
+	f.exec(`UPDATE billing_funding_policy SET max_observed_teams=$1`, budget)
 	if err := f.h.retryPrepaidEnrolment(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	var observed bool
 	if err := f.h.Pool.QueryRow(t.Context(), `SELECT observe FROM billing_funding_account WHERE team_id=$1`, f.team).Scan(&observed); err != nil || !observed {
 		t.Fatal("a paid team that lost its observation slot was not enrolled again", err)
+	}
+}
+
+func TestFundingObservationUnchangedForTeamsWithoutPrepaidCredit(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.mu.Lock()
+	for i := 0; i < 3; i++ {
+		var g entitlementGrant
+		g.ID, g.Customer, g.Category, g.Priority = "credgr_"+uuid.NewString(), f.customer, "promotional", 50
+		g.Created, g.EffectiveAt = time.Now().Add(-time.Hour).Unix(), time.Now().Add(-time.Hour).Unix()
+		g.Amount.Type, g.Amount.Monetary.Currency, g.Amount.Monetary.Value = "monetary", "usd", 1000
+		g.Applicability.Scope.PriceType = "metered"
+		f.grants[g.ID] = g
+		f.balances[g.ID] = 1000
+	}
+	f.mu.Unlock()
+	total, _, _, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+	if err != nil || total != 3000 {
+		t.Fatal(total, err)
+	}
+	if f.aggregateReads != 0 {
+		t.Fatal("a team without prepaid credit was observed through the aggregate balance")
+	}
+	f.enableAutoRecharge(5000, 500)
+	f.observe(0, true)
+	if err = f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if total, _, _, _, _, err = f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now()); err != nil || total != 3500 || f.aggregateReads == 0 {
+		t.Fatal("issued prepaid credit did not switch the team to the aggregate balance", total, err, f.aggregateReads)
 	}
 }

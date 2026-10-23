@@ -201,3 +201,7 @@ CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS
 $$;
 CREATE INDEX billing_prepaid_purchase_customer_open ON billing_prepaid_purchase(customer_id)
     WHERE payment_state IN ('uncertain', 'processing');
+-- Set when a paid prepaid team could not take an observation slot; the
+-- prepaid worker retries until it does.
+ALTER TABLE billing_funding_account ADD COLUMN prepaid_enrolment_due_at timestamptz;
+CREATE INDEX billing_funding_account_prepaid_enrolment_due ON billing_funding_account(prepaid_enrolment_due_at) WHERE prepaid_enrolment_due_at IS NOT NULL;

@@ -31,9 +31,12 @@ func (h *Handlers) enrolPrepaidObservation(ctx context.Context, team uuid.UUID) 
 	if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_funding_account(team_id) VALUES($1) ON CONFLICT(team_id) DO NOTHING`, team); err != nil {
 		return err
 	}
-	_, err := h.Pool.Exec(ctx, `UPDATE billing_funding_account SET observe=true WHERE team_id=$1 AND NOT observe`, team)
+	_, err := h.Pool.Exec(ctx, `UPDATE billing_funding_account SET observe=true,prepaid_enrolment_due_at=NULL WHERE team_id=$1 AND (NOT observe OR prepaid_enrolment_due_at IS NOT NULL)`, team)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "P0001" {
+		if _, markErr := h.Pool.Exec(ctx, `UPDATE billing_funding_account SET prepaid_enrolment_due_at=COALESCE(prepaid_enrolment_due_at,clock_timestamp()) WHERE team_id=$1`, team); markErr != nil {
+			return markErr
+		}
 		return errPrepaidCapacity
 	}
 	return err
@@ -351,9 +354,7 @@ func (c *stripeHTTPClient) meteredCreditBalance(ctx context.Context, customer st
 // A paid prepaid team must be observed for its balance to count and for
 // auto-recharge to work; enrolment that failed after payment is retried here.
 func (h *Handlers) retryPrepaidEnrolment(ctx context.Context) error {
-	rows, err := h.Pool.Query(ctx, `SELECT DISTINCT p.team_id FROM billing_prepaid_purchase p
- LEFT JOIN billing_funding_account f USING(team_id)
- WHERE p.credit_state='issued' AND NOT COALESCE(f.observe,false) LIMIT 20`)
+	rows, err := h.Pool.Query(ctx, `SELECT team_id FROM billing_funding_account WHERE prepaid_enrolment_due_at IS NOT NULL ORDER BY prepaid_enrolment_due_at LIMIT 20`)
 	if err != nil {
 		return err
 	}
@@ -364,7 +365,12 @@ func (h *Handlers) retryPrepaidEnrolment(ctx context.Context) error {
 	var errs []error
 	for _, team := range teams {
 		allowed, err := prepaidPlanAllowsPurchase(ctx, h, team)
-		if err != nil || !allowed {
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if !allowed {
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_funding_account SET prepaid_enrolment_due_at=NULL WHERE team_id=$1`, team)
 			errs = append(errs, err)
 			continue
 		}
