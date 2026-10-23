@@ -360,11 +360,11 @@ func TestMatchingCreditRequiresFullPayment(t *testing.T) {
 	open := m.paidInvoice("processing", usageLine("price_cpu", 70000))
 	partial := m.paidInvoice("paid", usageLine("price_cpu", 70000))
 	m.unpaid[partial] = true
-	if err := m.tick(); err == nil {
-		t.Fatal("partially paid invoice was accepted")
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
 	}
 	var rows int
-	if err := m.f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_matching_credit WHERE contract_id=$1`, m.f.c.ID).Scan(&rows); err != nil || rows != 0 || len(m.posts) != 0 {
+	if err := m.f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_matching_credit WHERE contract_id=$1`, m.f.c.ID).Scan(&rows); err != nil || rows != 1 || len(m.posts) != 0 {
 		t.Fatal("matched before full payment", rows, err)
 	}
 	m.exec(`UPDATE billing_invoice_collection SET state='paid' WHERE invoice_id=$1`, open)
@@ -374,8 +374,11 @@ func TestMatchingCreditRequiresFullPayment(t *testing.T) {
 	if err := m.tick(); err != nil {
 		t.Fatal(err)
 	}
-	if m.row(open).Paid != 70000 || m.row(partial).Paid != 70000 {
-		t.Fatal("settled invoices were not matched")
+	if m.row(open).Paid != 70000 {
+		t.Fatal("settled invoice was not matched")
+	}
+	if r := m.row(partial); r.State != "skipped" || r.Flag == "" || r.Paid != 0 {
+		t.Fatalf("payment discrepancy was not held for staff: %+v", r)
 	}
 }
 
@@ -770,5 +773,68 @@ func TestMatchingCreditYieldsToSuccessorContract(t *testing.T) {
 	}
 	if r := m.row(before); r.State != "issued" {
 		t.Fatalf("usage before the successor started was not matched: %+v", r)
+	}
+}
+
+func TestMatchingCreditPaymentDiscrepanciesDoNotStarveQueue(t *testing.T) {
+	m := newMatchingFixture(t, 10000, 8_000_000, 0)
+	var unpaid []string
+	for i := 0; i < 21; i++ {
+		invoice := m.paidInvoice("paid", usageLine("price_cpu", 100))
+		m.unpaid[invoice] = true
+		unpaid = append(unpaid, invoice)
+	}
+	valid := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	for i := 0; i < 2; i++ {
+		if err := m.tick(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, invoice := range unpaid {
+		if r := m.row(invoice); r.State != "skipped" || r.Flag == "" || r.Paid != 0 {
+			t.Fatalf("payment discrepancy not retired for staff: %+v", r)
+		}
+	}
+	if r := m.row(valid); r.State != "issued" {
+		t.Fatalf("payment discrepancies starved a valid invoice: %+v", r)
+	}
+}
+
+func TestMatchingCreditFinalReviewChecksReversals(t *testing.T) {
+	for _, refunded := range []bool{false, true} {
+		t.Run(fmt.Sprint(refunded), func(t *testing.T) {
+			m := newMatchingFixture(t, 10000, 8_000_000, 0)
+			invoice := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+			if err := m.tick(); err != nil {
+				t.Fatal(err)
+			}
+			conn, err := m.f.h.Pool.Acquire(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, sql := range []string{`SET session_replication_role=replica`, `UPDATE billing_matching_credit SET issued_at=now()-interval '120 days 1 hour',review_checked_at=now()-interval '25 hours' WHERE invoice_id=$1`, `SET session_replication_role=origin`} {
+				var args []any
+				if strings.Contains(sql, "$1") {
+					args = append(args, invoice)
+				}
+				if _, err = conn.Exec(t.Context(), sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			conn.Release()
+			m.mu.Lock()
+			m.refunded = refunded
+			m.mu.Unlock()
+			if err = m.tick(); err != nil {
+				t.Fatal(err)
+			}
+			if r := m.row(invoice); (r.Flag != "") != refunded {
+				t.Fatalf("final review missed reversal: %+v", r)
+			}
+			var retired bool
+			if err = m.f.h.Pool.QueryRow(t.Context(), `SELECT review_checked_at='infinity'::timestamptz FROM billing_matching_credit WHERE invoice_id=$1`, invoice).Scan(&retired); err != nil || retired == refunded {
+				t.Fatal("final review retirement", retired, err)
+			}
+		})
 	}
 }

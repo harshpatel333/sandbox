@@ -204,9 +204,6 @@ func (h *Handlers) recordMatchingInvoice(ctx context.Context, client *stripeHTTP
 	if inv.ID != m.Invoice || inv.Customer != m.Customer {
 		return fmt.Errorf("matching invoice %s ownership changed", m.Invoice)
 	}
-	if inv.Status != "paid" || inv.AmountRemaining == nil || *inv.AmountRemaining != 0 {
-		return fmt.Errorf("matching invoice %s is not fully paid", m.Invoice)
-	}
 	var paid matchingPayment
 	if err = client.doForm(ctx, http.MethodGet, "/v1/invoices/"+url.PathEscape(m.Invoice), nil, &paid, ""); err != nil {
 		return err
@@ -215,6 +212,9 @@ func (h *Handlers) recordMatchingInvoice(ctx context.Context, client *stripeHTTP
 	u, err := matchingInvoiceUsage(inv, paid, m.Prices)
 	if err != nil {
 		return err
+	}
+	if inv.Status != "paid" || inv.AmountRemaining == nil || *inv.AmountRemaining != 0 {
+		u.SkipReason = "invoice is not fully paid despite its paid collection record"
 	}
 	if u.SkipReason == "" && invoiceSettlementHash(inv) != m.Hash {
 		u.SkipReason = "invoice changed after its verified settlement"
@@ -453,11 +453,6 @@ func (h *Handlers) reviewMatchedInvoices(ctx context.Context, client *stripeHTTP
 	}
 	var errs []error
 	for _, m := range due {
-		if m.Expired {
-			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET review_checked_at='infinity' WHERE id=$1`, m.ID)
-			errs = append(errs, err)
-			continue
-		}
 		reason, evidence, err := client.matchedInvoiceReversal(ctx, m.Invoice, m.Customer)
 		if err != nil {
 			errs = append(errs, err)
@@ -465,6 +460,8 @@ func (h *Handlers) reviewMatchedInvoices(ctx context.Context, client *stripeHTTP
 		} else if reason != "" {
 			log.Warn().Str("matching_credit_id", m.ID.String()).Str("invoice_id", m.Invoice).Str("reason", reason).Msg("matched invoice was reversed; staff review required")
 			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET review_checked_at=clock_timestamp(),flagged_at=clock_timestamp(),flag_reason=$2,flag_evidence=$3 WHERE id=$1 AND flagged_at IS NULL`, m.ID, reason, evidence)
+		} else if m.Expired {
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET review_checked_at='infinity' WHERE id=$1`, m.ID)
 		} else {
 			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET review_checked_at=clock_timestamp() WHERE id=$1`, m.ID)
 		}
