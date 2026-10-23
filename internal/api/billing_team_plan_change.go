@@ -174,6 +174,19 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 			return teamPlanChange{}, err
 		}
 	}
+	if assigned && (current.Kind == planKindCustom || current.Kind == planKindSubscription && periodEnd.Sub(time.Now()) < planChangeMinNotice) {
+		var anchor pgtype.Timestamptz
+		if err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, req.Team).Scan(&anchor); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return teamPlanChange{}, err
+		}
+		from := time.Now()
+		if current.Kind == planKindSubscription {
+			from = periodEnd.Add(time.Second)
+		}
+		if periodEnd, err = h.planChangePeriodEnd(ctx, req.Team, anchor, from); err != nil {
+			return teamPlanChange{}, err
+		}
+	}
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return teamPlanChange{}, err
@@ -216,25 +229,10 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 	}
 	effective := now
 	if timing == planChangeEndOfPeriod {
-		if current.Kind == planKindSubscription {
-			if subscription == nil {
-				return teamPlanChange{}, teamPlanChangeConflict("the team's subscription could not be found")
-			}
-			effective = periodEnd
+		if current.Kind == planKindSubscription && subscription == nil {
+			return teamPlanChange{}, teamPlanChangeConflict("the team's subscription could not be found")
 		}
-		if current.Kind != planKindSubscription || effective.Sub(now) < planChangeMinNotice {
-			var anchor pgtype.Timestamptz
-			if err = tx.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, req.Team).Scan(&anchor); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-				return teamPlanChange{}, err
-			}
-			from := now
-			if current.Kind == planKindSubscription {
-				from = effective.Add(time.Second)
-			}
-			if effective, err = h.planChangePeriodEnd(ctx, req.Team, anchor, from); err != nil {
-				return teamPlanChange{}, err
-			}
-		}
+		effective = periodEnd
 	}
 	frozen, limits, _, err := planAssignment{Terms: terms}.frozen()
 	if err != nil {
@@ -423,7 +421,7 @@ func (h *Handlers) advanceTeamPlanChange(ctx context.Context, c teamPlanChange) 
 	case c.State == "scheduled":
 		return h.applyTeamPlanChange(ctx, c)
 	case c.State == "applied":
-		if err := h.pauseTeamForPlan(ctx, c.Team); err != nil {
+		if err := h.waitForPlanChangePauses(ctx, c.Team); err != nil {
 			return now, err
 		}
 		_, err := h.Pool.Exec(ctx, `UPDATE team_plan_change SET state='completed',completed_at=clock_timestamp() WHERE id=$1 AND lease_token=$2 AND state='applied'`, c.ID, c.lease)
@@ -610,6 +608,11 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 	if err != nil {
 		return now, err
 	}
+	if c.PausesRunning {
+		if err = tx.QueryRow(ctx, `SELECT request_team_pause_all($1,'plan_switch_free')`, c.Team).Scan(new(int32)); err != nil {
+			return now, err
+		}
+	}
 	if _, err = tx.Exec(ctx, `UPDATE team_plan_change SET state='applied',applied_at=clock_timestamp(),applied_assignment_id=$2 WHERE id=$1`, c.ID, plan.ID); err != nil {
 		return now, err
 	}
@@ -621,8 +624,16 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 	return now, tx.Commit(ctx)
 }
 
-func (h *Handlers) pauseTeamForPlan(ctx context.Context, team uuid.UUID) error {
-	return errors.New("pausing a team for a plan change is not available yet")
+func (h *Handlers) waitForPlanChangePauses(ctx context.Context, team uuid.UUID) error {
+	var pending bool
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_team_pause_target t
+        WHERE team_id=$1 AND reason='plan_switch_free' AND done_at IS NULL AND NOT billing_pause_target_settled(t))`, team).Scan(&pending); err != nil {
+		return err
+	}
+	if pending {
+		return errors.New("waiting for the team's running sandboxes to pause")
+	}
+	return nil
 }
 
 type teamPlanChangeBody struct {

@@ -9,7 +9,7 @@ CREATE TABLE team_plan_change (
  target_plan_key text NOT NULL CHECK(btrim(target_plan_key)<>''),
  target_kind text NOT NULL CHECK(target_kind IN ('free','prepaid','subscription','legacy_payg','custom')),
  target_terms jsonb NOT NULL CHECK(jsonb_typeof(target_terms)='object'),
- target_limits jsonb NOT NULL CHECK(jsonb_typeof(target_limits)='object' AND jsonb_typeof(target_limits->'max_concurrent')='number'),
+ target_limits jsonb NOT NULL CHECK(jsonb_typeof(target_limits)='object' AND (jsonb_typeof(target_limits->'max_concurrent')='number') IS TRUE),
  effective_at timestamptz NOT NULL,
  pauses_running boolean NOT NULL,
  subscription_id text CHECK(subscription_id IS NULL OR btrim(subscription_id)<>''),

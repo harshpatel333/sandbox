@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -107,9 +108,11 @@ func newPlanChangeV2Fixture(t *testing.T, kind string) planChangeV2Fixture {
 		}
 		a.ContractID = &contract
 	}
+	setPricingVersion(t, h, "v2")
 	if _, err = assignInTx(t, h, a); err != nil {
 		t.Fatal(err)
 	}
+	setPricingVersion(t, h, "legacy")
 	return f
 }
 
@@ -174,6 +177,16 @@ func TestTeamPlanChangeStarterToFreeAppliesNow(t *testing.T) {
 	}
 	f.tick(t)
 	c = f.reload(t, c.ID)
+	var pausesAvailable bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT to_regprocedure('request_team_pause_all(uuid,text)') IS NOT NULL`).Scan(&pausesAvailable); err != nil {
+		t.Fatal(err)
+	}
+	if !pausesAvailable {
+		if c.State != "scheduled" || c.LastError == nil || f.plan(t).PlanKey != "starter" {
+			t.Fatalf("free applied without durable pause support: %+v", c)
+		}
+		return
+	}
 	plan := f.plan(t)
 	if c.State != "applied" || plan.PlanKey != "free" || plan.Source != planSourcePlanChange || plan.ID != *c.AppliedPlan {
 		t.Fatalf("free not applied: %+v %+v", c, plan)
@@ -182,8 +195,8 @@ func TestTeamPlanChangeStarterToFreeAppliesNow(t *testing.T) {
 		t.Fatalf("free limits not applied: %d", max)
 	}
 	f.tick(t)
-	if c = f.reload(t, c.ID); c.State != "applied" || c.LastError == nil {
-		t.Fatalf("change completed without pausing the team: %+v", c)
+	if c = f.reload(t, c.ID); c.State != "completed" {
+		t.Fatalf("change did not complete after durable pause requests settled: %+v", c)
 	}
 	if len(f.stripe.writes) != 0 {
 		t.Fatalf("a team without a subscription touched Stripe: %v", f.stripe.writes)
@@ -479,7 +492,7 @@ func TestTeamPlanChangeSingleConnectionAndUndoAfterReassignment(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	f.h.Pool, f.h.DB = pool, db.New(pool)
+	f.h = &Handlers{Pool: pool, DB: db.New(pool), Stripe: f.h.Stripe}
 	c, err := f.request(t, "free", "single-connection")
 	if err != nil {
 		t.Fatal(err)
@@ -497,5 +510,51 @@ func TestTeamPlanChangeSingleConnectionAndUndoAfterReassignment(t *testing.T) {
 	f.tick(t)
 	if len(f.stripe.writes) != 1 || !f.stripe.cancel || f.reload(t, c.ID).ProviderRenewedAt == nil {
 		t.Fatalf("undo resurrected replaced subscription: %v", f.stripe.writes)
+	}
+}
+
+func TestTeamPlanChangeStaffViewReportsPendingAndUndo(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindSubscription)
+	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO profile(id,email,provider) VALUES($1,'staff@superserve.ai','google')`, f.actor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO user_role_assignments(user_id,role_id,scope_type) SELECT $1,id,'platform' FROM roles WHERE name='platform_admin'`, f.actor); err != nil {
+		t.Fatal(err)
+	}
+	view := func() *customerPendingPlanChange {
+		t.Helper()
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+		c.Request.Header.Set(internalActorHeader, f.actor.String())
+		c.Params = gin.Params{{Key: "team_id", Value: f.team.String()}}
+		f.h.GetTeamPlanAssignments(c)
+		var response struct {
+			Pending json.RawMessage `json:"pending_change"`
+		}
+		if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &response) != nil || len(response.Pending) == 0 {
+			t.Fatalf("staff view missing pending change status: %d %s", w.Code, w.Body.String())
+		}
+		var pending *customerPendingPlanChange
+		if err := json.Unmarshal(response.Pending, &pending); err != nil {
+			t.Fatal(err)
+		}
+		return pending
+	}
+	if pending := view(); pending != nil {
+		t.Fatalf("unexpected pending change: %+v", pending)
+	}
+	change, err := f.request(t, "free", "staff-view")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending := view(); pending == nil || pending.ID != change.ID || pending.TargetPlanKey != "free" || !pending.Undoable || !pending.PausesRunning || !pending.EffectiveAt.Equal(change.EffectiveAt) {
+		t.Fatalf("staff cannot see scheduled downgrade and undo: %+v", pending)
+	}
+	if _, err := f.h.undoTeamPlanChange(t.Context(), f.team, change.ID, f.actor, "changed my mind"); err != nil {
+		t.Fatal(err)
+	}
+	if pending := view(); pending != nil {
+		t.Fatalf("undone change still pending: %+v", pending)
 	}
 }
