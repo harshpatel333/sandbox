@@ -25,7 +25,7 @@ func (h *Handlers) beginCheckoutWithPublicationDecision(ctx context.Context, tea
 	q := h.DB.WithTx(tx)
 	if err := q.BeginStripeCheckoutWithPublicationDecision(ctx, db.BeginStripeCheckoutWithPublicationDecisionParams{
 		TeamID: team, UserID: actor, OperationID: req.OperationID, HomeRegion: req.HomeRegion,
-		RequestKey: requestKey, Decision: req.Decision, AttemptID: attempt,
+		RequestKey: requestKey, Decision: req.Decision, AttemptID: attempt, SubmitMessage: true,
 	}); err != nil {
 		return account, err
 	}

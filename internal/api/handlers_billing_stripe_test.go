@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -261,6 +262,7 @@ type stripeCheckoutSessionRoundTripper struct {
 	backdateStartDate string
 	clientReferenceID string
 	expiresAt         string
+	submitMessage     []string
 }
 
 type stripeCreditBalanceRoundTripper struct {
@@ -437,6 +439,7 @@ func (r *stripeCheckoutSessionRoundTripper) RoundTrip(req *http.Request) (*http.
 	r.backdateStartDate = form.Get("subscription_data[backdate_start_date]")
 	r.clientReferenceID = form.Get("client_reference_id")
 	r.expiresAt = form.Get("expires_at")
+	r.submitMessage = form["custom_text[submit][message]"]
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(strings.NewReader(`{"id":"cs_test_123","url":"https://checkout.stripe.test/session"}`)),
@@ -465,6 +468,34 @@ func TestStripeCreateCheckoutSessionSendsExpiry(t *testing.T) {
 	}
 	if transport.expiresAt != "1787331600" {
 		t.Fatalf("checkout expires_at = %q, want %q", transport.expiresAt, "1787331600")
+	}
+}
+
+func TestStripeCreateCheckoutSessionSendsSubmitMessageOnlyWhenRequested(t *testing.T) {
+	for _, message := range []string{"", checkoutSubmitMessage} {
+		transport := &stripeCheckoutSessionRoundTripper{}
+		client := &stripeHTTPClient{
+			baseURL:    "https://stripe.example.test",
+			secretKey:  "sk_test_example",
+			apiVersion: "2025-06-30",
+			httpClient: &http.Client{Transport: transport},
+		}
+		if _, err := client.CreateCheckoutSession(t.Context(), StripeCreateCheckoutSessionParams{
+			CustomerID:    "cus_example",
+			SuccessURL:    "https://app.superserve.test/billing/success",
+			CancelURL:     "https://app.superserve.test/billing/cancel",
+			PriceIDs:      []string{"price_cpu"},
+			SubmitMessage: message,
+		}); err != nil {
+			t.Fatalf("create checkout session: %v", err)
+		}
+		var want []string
+		if message != "" {
+			want = []string{message}
+		}
+		if !reflect.DeepEqual(transport.submitMessage, want) {
+			t.Fatalf("custom_text[submit][message] = %q, want %q", transport.submitMessage, want)
+		}
 	}
 }
 
