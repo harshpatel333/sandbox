@@ -106,6 +106,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/billing/summary", h.GetBillingSummary)
 		api.GET("/billing/usage-series", h.GetBillingUsageSeries)
 		api.GET("/billing/pricing", h.GetBillingPricing)
+		api.GET("/billing/plan", h.GetBillingPlan)
 		api.GET("/teams/:team_id/billing/usage", h.GetTeamBillingUsage)
 		api.GET("/teams/:team_id/billing/periods", h.ListTeamBillingPeriods)
 		api.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetTeamBillingExportPreview)
