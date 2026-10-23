@@ -181,6 +181,11 @@ func newBillingRouter(t *testing.T, stripe api.StripeBillingClient) *gin.Engine 
 
 func newBillingRouterWithPool(t *testing.T, stripe api.StripeBillingClient, pool *pgxpool.Pool, resources ...config.BillingResourceConfig) *gin.Engine {
 	t.Helper()
+	return newBillingRouterWithConfig(t, stripe, pool, nil, resources...)
+}
+
+func newBillingRouterWithConfig(t *testing.T, stripe api.StripeBillingClient, pool *pgxpool.Pool, mutate func(*config.Config), resources ...config.BillingResourceConfig) *gin.Engine {
+	t.Helper()
 	t.Setenv("INTERNAL_API_TOKEN", internalRBACToken)
 	cfg := &config.Config{
 		BillingResources:              resources,
@@ -192,6 +197,9 @@ func newBillingRouterWithPool(t *testing.T, stripe api.StripeBillingClient, pool
 		StripeAPIVersion:              "2025-06-30",
 		StripeCheckoutPriceIDs:        []string{"price_cpu", "price_memory", "price_storage"},
 		AppAllowedOrigins:             []string{"https://app.superserve.test"},
+	}
+	if mutate != nil {
+		mutate(cfg)
 	}
 	h := api.NewHandlers(&stubVMD{}, db.New(pool), cfg)
 	h.Pool = pool

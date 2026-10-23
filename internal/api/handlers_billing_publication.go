@@ -15,6 +15,12 @@ func isCheckoutPublicationConflict(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+// checkoutSubmitMessageEnabled decides only whether a new generation begins
+// with the submit message; replays follow what the generation recorded.
+func (h *Handlers) checkoutSubmitMessageEnabled() bool {
+	return h.Config != nil && h.Config.StripeCheckoutSubmitMessage
+}
+
 func (h *Handlers) beginCheckoutWithPublicationDecision(ctx context.Context, team, actor uuid.UUID, req billingCheckoutSessionRequest, requestKey string, attempt uuid.UUID) (db.TeamBillingAccount, error) {
 	var account db.TeamBillingAccount
 	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{})
@@ -25,7 +31,7 @@ func (h *Handlers) beginCheckoutWithPublicationDecision(ctx context.Context, tea
 	q := h.DB.WithTx(tx)
 	if err := q.BeginStripeCheckoutWithPublicationDecision(ctx, db.BeginStripeCheckoutWithPublicationDecisionParams{
 		TeamID: team, UserID: actor, OperationID: req.OperationID, HomeRegion: req.HomeRegion,
-		RequestKey: requestKey, Decision: req.Decision, AttemptID: attempt, SubmitMessage: true,
+		RequestKey: requestKey, Decision: req.Decision, AttemptID: attempt, SubmitMessage: h.checkoutSubmitMessageEnabled(),
 	}); err != nil {
 		return account, err
 	}

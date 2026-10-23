@@ -1761,7 +1761,7 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 			ActorID:       pgtype.UUID{Bytes: actorID, Valid: true},
 			RequestKey:    stringPtr(requestKey),
 			AttemptID:     attemptID,
-			SubmitMessage: true,
+			SubmitMessage: h.checkoutSubmitMessageEnabled(),
 		})
 		resumed := errors.Is(err, pgx.ErrNoRows)
 		if resumed {

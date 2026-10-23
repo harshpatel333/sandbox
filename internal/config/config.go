@@ -46,6 +46,14 @@ type Config struct {
 	BillingResources              []BillingResourceConfig
 	AppAllowedOrigins             []string // APP_ALLOWED_ORIGINS, comma-separated browser origins allowed in billing redirects
 
+	// StripeCheckoutSubmitMessage (STRIPE_CHECKOUT_SUBMIT_MESSAGE) begins new
+	// PAYG Checkout generations with the submit message. Releases before the
+	// one that reads the per-generation flag replay every generation without
+	// the message, which Stripe rejects for a generation begun with it, so
+	// enable this only once no such release can serve requests. Turning it off
+	// again only affects generations begun afterwards.
+	StripeCheckoutSubmitMessage bool
+
 	// SandboxAccessTokenSeed is the HMAC seed shared with the edge
 	// proxy. Both sides derive per-sandbox access tokens as
 	// HMAC-SHA256(seed, sandboxID). Loaded from SANDBOX_ACCESS_TOKEN_SEED
@@ -165,6 +173,7 @@ func Load() (*Config, error) {
 		StripeAPIBaseURL:              envOrDefault("STRIPE_API_BASE_URL", "https://api.stripe.com"),
 		StripeAPIVersion:              strings.TrimSpace(os.Getenv("STRIPE_API_VERSION")),
 		StripeCheckoutPriceIDs:        checkoutPriceIDs,
+		StripeCheckoutSubmitMessage:   boolEnv("STRIPE_CHECKOUT_SUBMIT_MESSAGE", false),
 		StripeProMonthlyPriceID:       strings.TrimSpace(os.Getenv("STRIPE_PRO_MONTHLY_PRICE_ID")),
 		StripeProAnnualPriceID:        strings.TrimSpace(os.Getenv("STRIPE_PRO_ANNUAL_PRICE_ID")),
 		BillingResources:              billingResources(checkoutPriceIDs),
