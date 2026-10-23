@@ -98,8 +98,8 @@ func (h *Handlers) CreateStaffCreditGrant(c *gin.Context) {
 // recently ended and still being closed through the usage-only credit ledger,
 // which cannot place credit that became effective after the period ended into
 // that period's held invoice.
-func (h *Handlers) usageLedgerPeriodClosing(ctx context.Context, team uuid.UUID) (bool, error) {
-	rows, err := h.Pool.Query(ctx, `SELECT p.period_start,p.period_end FROM team_billing_period p JOIN billing_invoice_account i USING(team_id)
+func (h *Handlers) usageLedgerPeriodClosing(ctx context.Context, team uuid.UUID, reader db.DBTX) (bool, error) {
+	rows, err := reader.Query(ctx, `SELECT p.period_start,p.period_end FROM team_billing_period p JOIN billing_invoice_account i USING(team_id)
         WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp()+interval '5 minutes' AND p.period_end>clock_timestamp()-interval '7 days'
         AND NOT EXISTS(SELECT 1 FROM billing_invoice_close c WHERE c.team_id=p.team_id AND c.period_start=p.period_start AND c.period_end=p.period_end AND c.state='released')`, team)
 	if err != nil {
@@ -113,11 +113,11 @@ func (h *Handlers) usageLedgerPeriodClosing(ctx context.Context, team uuid.UUID)
 		return false, err
 	}
 	for _, p := range periods {
-		a, _, err := h.invoiceAccountForPeriod(ctx, p)
+		a, _, err := h.invoiceAccountForPeriod(ctx, p, reader)
 		if err != nil {
 			return true, nil
 		}
-		path, err := h.invoiceCreditPath(ctx, p, a)
+		path, err := h.invoiceCreditPath(ctx, p, a, reader)
 		if err != nil || path == invoiceCreditsLedger {
 			return true, err
 		}
@@ -230,7 +230,7 @@ func (h *Handlers) beginStaffCreditAttempt(ctx context.Context, team uuid.UUID, 
 	if customer == nil || *customer != credit.customer {
 		return staffCreditConflict("team's billing customer changed since the credit was requested")
 	}
-	closing, err := h.usageLedgerPeriodClosing(ctx, team)
+	closing, err := h.usageLedgerPeriodClosing(ctx, team, tx)
 	if err != nil {
 		return err
 	}

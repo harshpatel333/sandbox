@@ -81,6 +81,7 @@ func newStaffCreditFixture(t *testing.T, withCustomer bool) (*Handlers, uuid.UUI
 	if err != nil || !strings.HasSuffix(cfg.ConnConfig.Database, "_test") {
 		t.Fatal("DATABASE_URL must name a migrated disposable test database")
 	}
+	cfg.MaxConns = 1
 	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
 	if err != nil {
 		t.Fatal(err)
