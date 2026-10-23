@@ -111,6 +111,7 @@ BEGIN
         IF NOT EXISTS (SELECT 1 FROM billing_invoice_close j JOIN billing_invoice_collection k USING (invoice_id)
             WHERE j.invoice_id = NEW.invoice_id AND j.team_id = NEW.team_id AND j.period_start = NEW.period_start
                 AND j.period_end = NEW.period_end AND j.state = 'released' AND j.plan->>'customer' = NEW.customer_id
+                AND j.plan->>'subscription' = c.subscription_id
                 AND k.customer_id = NEW.customer_id AND k.state = 'paid') THEN
             RAISE EXCEPTION 'matching requires a released and fully paid usage invoice';
         END IF;

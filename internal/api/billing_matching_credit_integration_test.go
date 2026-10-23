@@ -33,6 +33,7 @@ type matchingFixture struct {
 	unpaid    map[string]bool
 	paid      map[string]int64
 	prices    any
+	planSub   string
 	periodEnd time.Time
 }
 
@@ -200,7 +201,11 @@ func (m *matchingFixture) invoiceFor(start, end time.Time, closeState, collectio
 	if m.prices != nil {
 		prices = m.prices
 	}
-	plan := map[string]any{"customer": m.f.c.CustomerID, "subscription": m.f.c.SubscriptionID, "credit_version": 1, "credit_prices": prices, "base_cents": 100000, "expected_cents": 0, "credit_before_cents": 0, "resources": []any{}}
+	subscription := m.f.c.SubscriptionID
+	if m.planSub != "" {
+		subscription = m.planSub
+	}
+	plan := map[string]any{"customer": m.f.c.CustomerID, "subscription": subscription, "credit_version": 1, "credit_prices": prices, "base_cents": 100000, "expected_cents": 0, "credit_before_cents": 0, "resources": []any{}}
 	raw, _ := json.Marshal(plan)
 	m.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),0,0,0)`, m.f.c.TeamID, start, end)
 	m.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,$6,clock_timestamp(),$5,'{}')`, m.f.c.TeamID, start, end, id, raw, closeState)
@@ -704,5 +709,30 @@ func TestMatchingCreditReviewWindowStartsAtIssuance(t *testing.T) {
 	}
 	if r := m.row(invoice); r.Flag == "" {
 		t.Fatalf("refund after a late issuance escaped review: %+v", r)
+	}
+}
+
+func TestMatchingCreditIgnoresReplacementSubscriptions(t *testing.T) {
+	m := newMatchingFixture(t, 10000, 8_000_000, 0)
+	m.planSub = "sub_" + uuid.NewString()
+	replacement := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := m.f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_matching_credit WHERE invoice_id=$1`, replacement).Scan(&rows); err != nil || rows != 0 || len(m.posts) != 0 {
+		t.Fatal("an invoice from another subscription was matched under this contract", rows, err)
+	}
+	if _, err := m.f.h.Pool.Exec(t.Context(), `INSERT INTO billing_matching_credit(team_id,contract_id,invoice_id,customer_id,period_start,period_end,usage_cents,credit_applied_cents,discount_cents,unpaid_cents,matchable_cents,amount_cents,invoice_evidence,state,idempotency_key)
+ SELECT team_id,$2,invoice_id,$3,period_start,period_end,1,0,0,0,0,0,'{}','skipped','' FROM billing_invoice_close WHERE invoice_id=$1`, replacement, m.f.c.ID, m.f.c.CustomerID); err == nil {
+		t.Fatal("ledger accepted an invoice from another subscription")
+	}
+	m.planSub = ""
+	own := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := m.row(own); r.State != "issued" {
+		t.Fatalf("the contract's own subscription was not matched: %+v", r)
 	}
 }
