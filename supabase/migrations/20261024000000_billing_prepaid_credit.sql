@@ -2,7 +2,7 @@
 -- payment and then issues exactly one non-expiring credit grant for it.
 CREATE TABLE billing_prepaid_purchase (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    team_id uuid NOT NULL REFERENCES team(id),
+    team_id uuid NOT NULL,
     customer_id text NOT NULL CHECK (btrim(customer_id) <> ''),
     source text NOT NULL CHECK (source IN ('checkout', 'auto_recharge')),
     amount_cents bigint NOT NULL CHECK (amount_cents >= 500 AND amount_cents % 500 = 0 AND amount_cents <= 100000000),
@@ -50,7 +50,7 @@ CREATE UNIQUE INDEX billing_prepaid_auto_recharge_in_flight ON billing_prepaid_p
     WHERE source = 'auto_recharge' AND payment_state IN ('pending', 'uncertain', 'processing');
 
 CREATE TABLE billing_prepaid_auto_recharge (
-    team_id uuid PRIMARY KEY REFERENCES team(id),
+    team_id uuid PRIMARY KEY REFERENCES team(id) ON DELETE CASCADE,
     enabled boolean NOT NULL DEFAULT false,
     threshold_cents bigint CHECK (threshold_cents >= 500 AND threshold_cents % 500 = 0 AND threshold_cents <= 100000000),
     amount_cents bigint CHECK (amount_cents >= 500 AND amount_cents % 500 = 0 AND amount_cents <= 100000000),
@@ -69,6 +69,8 @@ CREATE FUNCTION guard_billing_prepaid_purchase() RETURNS trigger LANGUAGE plpgsq
 BEGIN
     IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'prepaid purchase history is immutable'; END IF;
     IF TG_OP = 'INSERT' THEN
+        PERFORM 1 FROM team WHERE id=NEW.team_id FOR KEY SHARE;
+        IF NOT FOUND THEN RAISE EXCEPTION 'purchase team does not exist' USING ERRCODE='23503'; END IF;
         NEW.payment_idempotency_key := 'prepaid-payment:v1:' || NEW.id;
         NEW.credit_idempotency_key := 'prepaid-credit:v1:' || NEW.id;
         NEW.payment_state := 'pending';

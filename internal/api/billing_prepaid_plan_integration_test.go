@@ -286,3 +286,27 @@ func TestPrepaidInitialCheckoutRecoversSessionAfterLostResponse(t *testing.T) {
 		t.Fatalf("open recovered checkout was credited: %+v", r)
 	}
 }
+
+func TestPrepaidTeamDeletionKeepsPurchaseAuditAndDropsSettings(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	id := uuid.New()
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled) VALUES($1,false)`, team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key) VALUES($1,$2,'cus_deleted_fixture','checkout',500,$3,'','')`, id, team, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.DB.DeleteTeam(t.Context(), team); err != nil {
+		t.Fatal("prepaid state blocked team deletion", err)
+	}
+	var audit, settings bool
+	if err := h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE id=$1 AND team_id=$2),EXISTS(SELECT 1 FROM billing_prepaid_auto_recharge WHERE team_id=$2)`, id, team).Scan(&audit, &settings); err != nil || !audit || settings {
+		t.Fatal("deleted team's prepaid state", audit, settings, err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key) VALUES($1,'cus_deleted_fixture','checkout',500,$2,'','')`, team, uuid.New()); err == nil {
+		t.Fatal("purchase accepted for deleted team")
+	}
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE billing_prepaid_purchase SET next_attempt_at='9999-01-01' WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+}
