@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -181,5 +182,68 @@ func TestPlanAssignmentStaffViewRequiresStaff(t *testing.T) {
 		if w.Code != actor.want {
 			t.Fatalf("plan assignments with actor %q: got %d want %d", actor.header, w.Code, actor.want)
 		}
+	}
+}
+
+func TestPlanAssignmentInitialBackfill(t *testing.T) {
+	h, assigned := newPlanAssignmentFixture(t)
+	if _, err := assignInTx(t, h, planAssignment{Team: assigned, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceSignup, Reason: "signed up"}); err != nil {
+		t.Fatal(err)
+	}
+	var fresh []uuid.UUID
+	for range 3 {
+		team, err := h.DB.CreateTeam(t.Context(), "plan-backfill-"+uuid.NewString())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fresh = append(fresh, team.ID)
+	}
+	busy := fresh[2]
+	locker, err := h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = locker.Exec(t.Context(), `SELECT 1 FROM team WHERE id=$1 FOR UPDATE`, busy); err != nil {
+		t.Fatal(err)
+	}
+	batch := []planAssignment{
+		{Team: assigned, Terms: testPlanTerms("legacy_payg", 20, nil), Kind: planKindLegacyPAYG, Source: planSourceMigration, Reason: "pricing v2"},
+		{Team: fresh[0], Terms: testPlanTerms("legacy_payg", 20, nil), Kind: planKindLegacyPAYG, Source: planSourceMigration, Reason: "pricing v2"},
+		{Team: fresh[1], Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceMigration, Reason: "pricing v2"},
+		{Team: busy, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceMigration, Reason: "pricing v2"},
+	}
+	run := func() []uuid.UUID {
+		tx, err := h.Pool.Begin(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(context.WithoutCancel(t.Context()))
+		done, err := assignInitialTeamPlans(t.Context(), tx, batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = tx.Commit(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		return done
+	}
+	done := run()
+	if len(done) != 2 || !slices.Contains(done, fresh[0]) || !slices.Contains(done, fresh[1]) {
+		t.Fatalf("first pass assigned %v", done)
+	}
+	if p, _, _ := currentTeamPlan(t.Context(), h.Pool, assigned); p.Kind != planKindFree {
+		t.Fatalf("backfill replaced an existing plan: %+v", p)
+	}
+	if max, _ := teamLimits(t, h, fresh[1]); max != 1 {
+		t.Fatalf("backfilled limits not applied: %d", max)
+	}
+	if err = locker.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if done = run(); len(done) != 1 || done[0] != busy {
+		t.Fatalf("second pass should pick up only the busy team: %v", done)
+	}
+	if done = run(); len(done) != 0 {
+		t.Fatalf("re-run assigned again: %v", done)
 	}
 }

@@ -133,16 +133,87 @@ func validPlanKind(kind string) bool {
 	return false
 }
 
+func (a planAssignment) validate() error {
+	if a.Terms.Retired {
+		return errPlanRetired
+	}
+	if !validPlanKind(a.Kind) || a.Terms.OfferKey == "" || a.Terms.Limits.MaxSandboxes == nil || a.Reason == "" {
+		return errors.New("plan assignment needs a plan, kind, limits and reason")
+	}
+	return nil
+}
+
+func (a planAssignment) frozen() (terms, limits []byte, version *uuid.UUID, err error) {
+	if terms, err = json.Marshal(freezePlanTerms(a.Terms)); err != nil {
+		return
+	}
+	if limits, err = json.Marshal(a.Terms.Limits); err != nil {
+		return
+	}
+	if a.Terms.VersionID != uuid.Nil {
+		version = &a.Terms.VersionID
+	}
+	return
+}
+
+// assignInitialTeamPlans gives teams their first plan in one statement, for
+// bulk backfills. Teams that already have a plan are left alone, so it can be
+// re-run, and teams whose row is busy right now are skipped for a later pass
+// rather than waited on. It returns the teams it assigned.
+func assignInitialTeamPlans(ctx context.Context, tx pgx.Tx, as []planAssignment) ([]uuid.UUID, error) {
+	byTeam := make(map[uuid.UUID]planAssignment, len(as))
+	ids := make([]uuid.UUID, 0, len(as))
+	for _, a := range as {
+		if err := a.validate(); err != nil {
+			return nil, err
+		}
+		if _, dup := byTeam[a.Team]; !dup {
+			ids = append(ids, a.Team)
+		}
+		byTeam[a.Team] = a
+	}
+	rows, err := tx.Query(ctx, `SELECT t.id FROM team t WHERE t.id=ANY($1)
+        AND NOT EXISTS(SELECT 1 FROM team_plan_assignment a WHERE a.team_id=t.id) FOR NO KEY UPDATE OF t SKIP LOCKED`, ids)
+	if err != nil {
+		return nil, err
+	}
+	free, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil || len(free) == 0 {
+		return nil, err
+	}
+	var (
+		versions, contracts  []*uuid.UUID
+		keys, kinds, sources []string
+		reasons              []string
+		terms, limits        [][]byte
+		actors               []*uuid.UUID
+	)
+	for _, id := range free {
+		a := byTeam[id]
+		t, l, v, err := a.frozen()
+		if err != nil {
+			return nil, err
+		}
+		versions, contracts, actors = append(versions, v), append(contracts, a.ContractID), append(actors, a.Actor)
+		keys, kinds, sources, reasons = append(keys, a.Terms.OfferKey), append(kinds, a.Kind), append(sources, a.Source), append(reasons, a.Reason)
+		terms, limits = append(terms, t), append(limits, l)
+	}
+	rows, err = tx.Query(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,contract_id,source,assigned_by,reason)
+        SELECT t,k,kd,v,tm,l,clock_timestamp(),c,s,a,r FROM unnest($1::uuid[],$2::text[],$3::text[],$4::uuid[],$5::jsonb[],$6::jsonb[],$7::uuid[],$8::text[],$9::uuid[],$10::text[]) AS x(t,k,kd,v,tm,l,c,s,a,r)
+        RETURNING team_id`, free, keys, kinds, versions, terms, limits, contracts, sources, actors, reasons)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+}
+
 // assignTeamPlan moves a team onto a plan within tx: it closes the open
 // assignment and opens the new one at the same instant, and the team takes the
 // new plan's frozen limits. A repeated idempotency key returns the assignment
 // it created.
 func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan, error) {
-	if a.Terms.Retired {
-		return teamPlan{}, errPlanRetired
-	}
-	if !validPlanKind(a.Kind) || a.Terms.OfferKey == "" || a.Terms.Limits.MaxSandboxes == nil || a.Reason == "" {
-		return teamPlan{}, errors.New("plan assignment needs a plan, kind, limits and reason")
+	if err := a.validate(); err != nil {
+		return teamPlan{}, err
 	}
 	var key *string
 	if a.Key != "" {
@@ -162,17 +233,9 @@ func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan,
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp() FROM team WHERE id=$1 FOR NO KEY UPDATE`, a.Team).Scan(&now); err != nil {
 		return teamPlan{}, err
 	}
-	terms, err := json.Marshal(freezePlanTerms(a.Terms))
+	terms, limits, version, err := a.frozen()
 	if err != nil {
 		return teamPlan{}, err
-	}
-	limits, err := json.Marshal(a.Terms.Limits)
-	if err != nil {
-		return teamPlan{}, err
-	}
-	var version *uuid.UUID
-	if a.Terms.VersionID != uuid.Nil {
-		version = &a.Terms.VersionID
 	}
 	if _, err = tx.Exec(ctx, `UPDATE team_plan_assignment SET effective_to=$2 WHERE team_id=$1 AND effective_to IS NULL`, a.Team, now); err != nil {
 		return teamPlan{}, err
