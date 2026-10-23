@@ -171,8 +171,10 @@ func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *strip
   AND j.plan->>'customer'=c.customer_id AND j.plan->>'subscription'=c.subscription_id
   AND NOT EXISTS(SELECT 1 FROM billing_commercial_contract n WHERE n.subscription_id=c.subscription_id AND n.id<>c.id AND n.starts_at>c.starts_at AND n.starts_at<=j.period_start)
  JOIN billing_invoice_collection k ON k.invoice_id=j.invoice_id AND k.state='paid'
+ LEFT JOIN billing_matching_invoice_inspection i ON i.invoice_id=j.invoice_id
  WHERE NOT EXISTS(SELECT 1 FROM billing_matching_credit m WHERE m.invoice_id=j.invoice_id)
- ORDER BY j.period_start,j.invoice_id LIMIT 20`)
+ AND (i.invoice_id IS NULL OR i.next_attempt_at<=clock_timestamp())
+ ORDER BY COALESCE(i.next_attempt_at,'-infinity'::timestamptz),j.period_start,j.invoice_id LIMIT 20`)
 	if err != nil {
 		return err
 	}
@@ -191,7 +193,28 @@ func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *strip
 	}
 	var errs []error
 	for _, m := range candidates {
-		errs = append(errs, h.recordMatchingInvoice(ctx, client, m))
+		var claimed string
+		err := h.Pool.QueryRow(ctx, `INSERT INTO billing_matching_invoice_inspection(invoice_id) VALUES($1)
+ ON CONFLICT(invoice_id) DO UPDATE SET failures=least(billing_matching_invoice_inspection.failures+1,10000),
+ next_attempt_at=clock_timestamp()+make_interval(secs=>least(3600,300*power(2,least(billing_matching_invoice_inspection.failures,4)))::double precision),
+ last_error=NULL WHERE billing_matching_invoice_inspection.next_attempt_at<=clock_timestamp() RETURNING invoice_id`, m.Invoice).Scan(&claimed)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		workErr := h.recordMatchingInvoice(ctx, client, m)
+		ack, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		var message *string
+		if workErr != nil {
+			value := workErr.Error()
+			message = &value
+		}
+		_, err = h.Pool.Exec(ack, `UPDATE billing_matching_invoice_inspection SET last_error=$2 WHERE invoice_id=$1`, m.Invoice, message)
+		cancel()
+		errs = append(errs, workErr, err)
 	}
 	return errors.Join(errs...)
 }
