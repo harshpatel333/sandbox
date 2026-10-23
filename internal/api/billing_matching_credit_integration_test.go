@@ -736,3 +736,39 @@ func TestMatchingCreditIgnoresReplacementSubscriptions(t *testing.T) {
 		t.Fatalf("the contract's own subscription was not matched: %+v", r)
 	}
 }
+
+func TestMatchingCreditYieldsToSuccessorContract(t *testing.T) {
+	m := newMatchingFixture(t, 10000, 8_000_000, 0)
+	before := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	successorStart := m.periodEnd
+	invoice := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	conn, err := m.f.h.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	for _, sql := range []string{
+		`SET session_replication_role=replica`,
+		`INSERT INTO billing_commercial_contract(team_id,offer_key,status,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor)
+ SELECT team_id,offer_key,'ended',$2,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,$2 FROM billing_commercial_contract WHERE id=$1`,
+		`SET session_replication_role=origin`,
+	} {
+		var args []any
+		if strings.Contains(sql, "$1") {
+			args = []any{m.f.c.ID, successorStart}
+		}
+		if _, err = conn.Exec(t.Context(), sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err = m.f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_matching_credit WHERE invoice_id=$1`, invoice).Scan(&rows); err != nil || rows != 0 {
+		t.Fatal("a contract kept matching after a successor started on its subscription", rows, err)
+	}
+	if r := m.row(before); r.State != "issued" {
+		t.Fatalf("usage before the successor started was not matched: %+v", r)
+	}
+}
