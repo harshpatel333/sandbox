@@ -247,3 +247,29 @@ func TestPlanAssignmentInitialBackfill(t *testing.T) {
 		t.Fatalf("re-run assigned again: %v", done)
 	}
 }
+
+func TestStaffPlanAssignmentRefusedWhilePricingV2IsOff(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	if _, err := h.assignStaffPlan(t.Context(), team, uuid.New(), staffPlanAssignmentBody{Key: "k", VersionID: uuid.New(), Reason: "enterprise approval"}); !errors.Is(err, errPricingV2Off) {
+		t.Fatalf("plan assigned with pricing v2 off: %v", err)
+	}
+	if _, ok, _ := currentTeamPlan(t.Context(), h.Pool, team); ok {
+		t.Fatal("refused assignment left a plan behind")
+	}
+	for _, actor := range []struct {
+		header string
+		want   int
+	}{{"", http.StatusUnauthorized}, {uuid.NewString(), http.StatusForbidden}} {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"idempotency_key":"k","version_id":"`+uuid.NewString()+`","reason":"r"}`))
+		if actor.header != "" {
+			c.Request.Header.Set(internalActorHeader, actor.header)
+		}
+		c.Params = gin.Params{{Key: "team_id", Value: team.String()}}
+		h.AssignTeamPlan(c)
+		if w.Code != actor.want {
+			t.Fatalf("staff assign with actor %q: got %d want %d", actor.header, w.Code, actor.want)
+		}
+	}
+}

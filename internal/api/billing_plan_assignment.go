@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -460,4 +463,91 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		preview.Timing = ""
 	}
 	c.JSON(http.StatusOK, preview)
+}
+
+// pricingV2Active reports whether the pricing v2 switch is on. Until the
+// switch exists every v2 write is refused.
+func (h *Handlers) pricingV2Active(ctx context.Context) (bool, error) {
+	return false, nil
+}
+
+type staffPlanAssignmentBody struct {
+	Key       string    `json:"idempotency_key"`
+	VersionID uuid.UUID `json:"version_id"`
+	Reason    string    `json:"reason"`
+}
+
+// AssignTeamPlan lets staff put a team on a custom plan version, such as an
+// Enterprise arrangement. The team needs no billing account or Stripe
+// customer; the plan applies at once and replaces the team's current plan.
+func (h *Handlers) AssignTeamPlan(c *gin.Context) {
+	team, ok := ycTeam(c)
+	if !ok {
+		return
+	}
+	actor, ok := h.requirePlatformBilling(c, platformBillingWritePermission)
+	if !ok {
+		return
+	}
+	var body staffPlanAssignmentBody
+	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 8192))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&body) != nil || decoder.Decode(&struct{}{}) != io.EOF || body.VersionID == uuid.Nil {
+		respondErrorMsg(c, "bad_request", "idempotency_key, version_id and reason are required", http.StatusBadRequest)
+		return
+	}
+	body.Reason = strings.TrimSpace(body.Reason)
+	if strings.TrimSpace(body.Key) == "" || len(body.Key) > 200 || body.Reason == "" || len(body.Reason) > 2000 {
+		respondErrorMsg(c, "bad_request", "idempotency_key, version_id and reason are required", http.StatusBadRequest)
+		return
+	}
+	ctx := c.Request.Context()
+	plan, err := h.assignStaffPlan(ctx, team, actor, body)
+	var pgErr *pgconn.PgError
+	switch {
+	case errors.Is(err, errPricingV2Off):
+		respondErrorMsg(c, "conflict", "plan assignment is not available yet", http.StatusConflict)
+	case errors.Is(err, errUnknownPlan):
+		respondErrorMsg(c, "invalid_plan", "version_id must be a published plan version without fees", http.StatusBadRequest)
+	case errors.Is(err, errPlanRetired):
+		respondErrorMsg(c, "conflict", "this plan version is retired", http.StatusConflict)
+	case errors.Is(err, errPlanAssignmentReused):
+		respondErrorMsg(c, "conflict", "idempotency key was used for a different plan assignment", http.StatusConflict)
+	case errors.Is(err, pgx.ErrNoRows), errors.As(err, &pgErr) && pgErr.Code == "23503":
+		respondErrorMsg(c, "not_found", "team not found", http.StatusNotFound)
+	case err != nil:
+		log.Error().Err(err).Str("team_id", team.String()).Msg("staff plan assignment failed")
+		respondErrorMsg(c, "unavailable", "the plan could not be assigned; retry with the same request", http.StatusServiceUnavailable)
+	default:
+		c.JSON(http.StatusOK, plan)
+	}
+}
+
+var errPricingV2Off = errors.New("pricing v2 is off")
+
+func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, body staffPlanAssignmentBody) (teamPlan, error) {
+	on, err := h.pricingV2Active(ctx)
+	if err != nil {
+		return teamPlan{}, err
+	}
+	if !on {
+		return teamPlan{}, errPricingV2Off
+	}
+	terms, err := h.planTermsVersion(ctx, body.VersionID, 0)
+	if err != nil {
+		return teamPlan{}, err
+	}
+	if terms.Limits.MaxSandboxes == nil {
+		return teamPlan{}, errUnknownPlan
+	}
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return teamPlan{}, err
+	}
+	defer tx.Rollback(ctx)
+	plan, err := assignTeamPlan(ctx, tx, planAssignment{Team: team, Terms: terms, Kind: planKindCustom, Source: planSourceStaff, Actor: &actor, Reason: body.Reason, Key: body.Key})
+	if err != nil {
+		return plan, err
+	}
+	return plan, tx.Commit(ctx)
 }
