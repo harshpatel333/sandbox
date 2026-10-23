@@ -273,3 +273,48 @@ func TestStaffPlanAssignmentRefusedWhilePricingV2IsOff(t *testing.T) {
 		}
 	}
 }
+
+func TestPlanAssignmentLimitsRestoreWhenPricingV2TurnsOff(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	eight := int32(8)
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE team SET max_sandboxes=20,max_template_vcpu=NULL,limits_customized=false WHERE id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []planAssignment{
+		{Team: team, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceMigration, Reason: "pricing v2"},
+		{Team: team, Terms: testPlanTerms("pro_monthly", 1000, &eight), Kind: planKindSubscription, Source: planSourceCheckout, Reason: "paid"},
+	} {
+		if _, err := assignInTx(t, h, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	customized, err := h.DB.CreateTeam(t.Context(), "plan-restore-"+uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = assignInTx(t, h, planAssignment{Team: customized.ID, Terms: testPlanTerms("free", 1, nil), Kind: planKindFree, Source: planSourceMigration, Reason: "pricing v2"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE team SET max_sandboxes=55 WHERE id=$1`, customized.ID); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		var n int
+		if err = h.Pool.QueryRow(t.Context(), `SELECT restore_pre_assignment_limits(500)`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+	}
+	if max, vcpu := teamLimits(t, h, team); max != 20 || vcpu != nil {
+		t.Fatalf("limits before pricing v2 not restored: %d %v", max, vcpu)
+	}
+	var customizedFlag bool
+	if err = h.Pool.QueryRow(t.Context(), `SELECT limits_customized FROM team WHERE id=$1`, team).Scan(&customizedFlag); err != nil || customizedFlag {
+		t.Fatalf("restoring marked the team's limits as hand-set: %v %v", customizedFlag, err)
+	}
+	if max, _ := teamLimits(t, h, customized.ID); max != 55 {
+		t.Fatalf("hand-set limits were overwritten on restore: %d", max)
+	}
+}

@@ -17,6 +17,9 @@ CREATE TABLE team_plan_assignment (
  assigned_by uuid,
  reason text NOT NULL CHECK(length(btrim(reason)) BETWEEN 1 AND 2000),
  idempotency_key text CHECK(idempotency_key IS NULL OR length(idempotency_key) BETWEEN 1 AND 200),
+ -- The team's limits just before its first assignment, so turning pricing v2
+ -- back off can restore them exactly.
+ previous_limits jsonb CHECK(previous_limits IS NULL OR jsonb_typeof(previous_limits)='object'),
  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  UNIQUE(team_id,idempotency_key)
 );
@@ -33,6 +36,11 @@ BEGIN
   END IF;
   IF EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=NEW.team_id AND (effective_to IS NULL OR effective_to>NEW.effective_from)) THEN
    RAISE EXCEPTION 'plan assignments of a team cannot overlap';
+  END IF;
+  NEW.previous_limits:=NULL;
+  IF NOT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=NEW.team_id) THEN
+   SELECT jsonb_build_object('max_sandboxes',max_sandboxes,'max_template_vcpu',max_template_vcpu,'max_template_memory_mib',max_template_memory_mib,
+    'max_template_disk_mib',max_template_disk_mib,'limits_customized',limits_customized) INTO NEW.previous_limits FROM team WHERE id=NEW.team_id;
   END IF;
   RETURN NEW;
  END IF;
@@ -61,6 +69,31 @@ BEGIN
  PERFORM set_config('superserve.applying_plan_limits','off',true);
 END $$;
 
+-- Puts teams back on the limits they had before pricing v2 assigned them a
+-- plan, for turning pricing v2 off. Teams whose limits staff have set by hand
+-- since keep them. Returns how many teams were restored; run it until it
+-- returns zero, as each call handles at most p_batch teams.
+CREATE FUNCTION restore_pre_assignment_limits(p_batch integer) RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE n integer;
+BEGIN
+ PERFORM set_config('superserve.applying_plan_limits','on',true);
+ WITH first AS (
+  SELECT DISTINCT ON (a.team_id) a.team_id,a.previous_limits p FROM team_plan_assignment a
+  WHERE a.previous_limits IS NOT NULL ORDER BY a.team_id,a.effective_from
+ ), due AS (
+  SELECT t.id,f.p FROM team t JOIN first f ON f.team_id=t.id
+  WHERE NOT t.limits_customized AND (t.max_sandboxes,t.max_template_vcpu,t.max_template_memory_mib,t.max_template_disk_mib)
+   IS DISTINCT FROM ((f.p->>'max_sandboxes')::integer,(f.p->>'max_template_vcpu')::integer,(f.p->>'max_template_memory_mib')::integer,(f.p->>'max_template_disk_mib')::integer)
+  LIMIT p_batch FOR NO KEY UPDATE OF t SKIP LOCKED
+ )
+ UPDATE team t SET max_sandboxes=(d.p->>'max_sandboxes')::integer,max_template_vcpu=(d.p->>'max_template_vcpu')::integer,
+  max_template_memory_mib=(d.p->>'max_template_memory_mib')::integer,max_template_disk_mib=(d.p->>'max_template_disk_mib')::integer
+ FROM due d WHERE t.id=d.id;
+ GET DIAGNOSTICS n=ROW_COUNT;
+ PERFORM set_config('superserve.applying_plan_limits','off',true);
+ RETURN n;
+END $$;
+
 CREATE FUNCTION team_plan_assignment_apply_limits() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  PERFORM apply_assignment_limits(NEW.team_id,NEW.limits);
@@ -81,7 +114,7 @@ DO $$ DECLARE r text; f regprocedure; BEGIN
    END IF;
   END IF;
  END LOOP;
- FOREACH f IN ARRAY ARRAY['guard_team_plan_assignment()'::regprocedure,'apply_assignment_limits(uuid,jsonb)'::regprocedure,'team_plan_assignment_apply_limits()'::regprocedure] LOOP
+ FOREACH f IN ARRAY ARRAY['guard_team_plan_assignment()'::regprocedure,'apply_assignment_limits(uuid,jsonb)'::regprocedure,'team_plan_assignment_apply_limits()'::regprocedure,'restore_pre_assignment_limits(integer)'::regprocedure] LOOP
   EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC',f);
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role',f); END IF;
  END LOOP;
