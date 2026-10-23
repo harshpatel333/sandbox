@@ -2,9 +2,12 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -46,5 +49,30 @@ func TestPrepaidGrantFormIsPaidNonExpiringMetered(t *testing.T) {
 	form, err := prepaidGrantForm(raw)
 	if err != nil || form.Get("category") != "paid" || form.Has("expires_at") || form.Get("applicability_config[scope][price_type]") != "metered" || form.Get("metadata[prepaid_purchase_id]") != id.String() {
 		t.Fatal(form, err)
+	}
+}
+
+func TestInvoiceCreditLedgerPagesBeyondOneHundredGrants(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/billing/credit_balance_summary" {
+			fmt.Fprint(w, `{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":100}}}]}`)
+			return
+		}
+		page := 0
+		if r.URL.Query().Get("starting_after") != "" {
+			page = 1
+		}
+		data := []map[string]any{}
+		for i := 0; i < 100; i++ {
+			data = append(data, map[string]any{"id": fmt.Sprintf("credgr_%d_%d", page, i), "applicability_config": map[string]any{"scope": map[string]any{"price_type": "metered"}}})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": data, "has_more": page == 0})
+	}))
+	defer srv.Close()
+	c := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+	total, err := c.invoiceCreditLedger(t.Context(), "cus_example", time.Now().Unix())
+	if err != nil || total != 200*100 {
+		t.Fatal(total, err)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +43,7 @@ type prepaidFixture struct {
 	intentKeys          []string
 	grantPosts          []url.Values
 	decline, loseIntent bool
+	aggregateReads      int
 	assigned            []uuid.UUID
 }
 
@@ -180,6 +182,7 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 		for _, g := range f.grants {
 			data = append(data, g)
 		}
+		sort.Slice(data, func(i, j int) bool { return data[i].ID > data[j].ID })
 		json.NewEncoder(w).Encode(map[string]any{"data": data})
 	case strings.HasSuffix(path, "/void"):
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/v1/billing/credit_grants/"), "/void")
@@ -189,6 +192,17 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(g)
 	case strings.HasPrefix(path, "/v1/billing/credit_grants/"):
 		json.NewEncoder(w).Encode(f.grants[strings.TrimPrefix(path, "/v1/billing/credit_grants/")])
+	case path == "/v1/invoices":
+		fmt.Fprint(w, `{"data":[]}`)
+	case path == "/v1/billing/credit_balance_summary" && r.URL.Query().Get("filter[type]") == "applicability_scope":
+		f.aggregateReads++
+		total := int64(0)
+		for id, g := range f.grants {
+			if g.VoidedAt == 0 {
+				total += f.balances[id]
+			}
+		}
+		fmt.Fprintf(w, `{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":%d}},"available_balance":{"monetary":{"currency":"usd","value":%d}}}]}`, total, total)
 	case path == "/v1/billing/credit_balance_summary":
 		id := r.URL.Query().Get("filter[credit_grant]")
 		fmt.Fprintf(w, `{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":%d}}}]}`, f.balances[id])
@@ -322,17 +336,18 @@ func TestPrepaidAutoRechargeDeclineDisablesAndRecordsWhy(t *testing.T) {
 func TestPrepaidAutoRechargeSafetyCaps(t *testing.T) {
 	f := newPrepaidFixture(t)
 	f.enableAutoRecharge(2000, 500)
-	for i := 0; i < prepaidLiveGrantLimit+2; i++ {
-		f.observe(0, true)
-		if err := f.tick(); err != nil {
-			t.Fatal(err)
-		}
+	f.exec(`INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key,next_attempt_at)
+ SELECT $1,$2,'checkout',500,gen_random_uuid(),'','','9999-01-01' FROM generate_series(1,$3)`, f.team, f.customer, prepaidLiveGrantLimit)
+	f.observe(0, true)
+	if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
 	}
-	if n := len(f.intentPosts); n != prepaidLiveGrantLimit {
-		t.Fatalf("unspent purchases were not bounded: %d charges", n)
+	var auto int
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1 AND source='auto_recharge'`, f.team).Scan(&auto); err != nil || auto != 0 {
+		t.Fatal("unspent purchases were not bounded", auto, err)
 	}
-	f.exec(`UPDATE billing_prepaid_purchase SET credit_voided_at=clock_timestamp() WHERE team_id=$1`, f.team)
-	for i := 0; i < prepaidAutoRechargeDailyCap; i++ {
+	f.exec(`UPDATE billing_prepaid_purchase SET payment_state='failed',failure_reason='fixture' WHERE team_id=$1`, f.team)
+	for i := 0; i <= prepaidAutoRechargeDailyCap; i++ {
 		f.observe(0, true)
 		if err := f.tick(); err != nil {
 			t.Fatal(err)
@@ -593,5 +608,49 @@ func TestPrepaidOpenCheckoutDoesNotBlockAutoRecharge(t *testing.T) {
 	var n int
 	if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1 AND source='auto_recharge'`, f.team).Scan(&n); err != nil || n != 1 {
 		t.Fatal("an open manual checkout suppressed auto-recharge", n, err)
+	}
+}
+
+func TestPrepaidObservationScalesPastEightGrants(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(5000, 500)
+	f.observe(0, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	var seed entitlementGrant
+	for _, g := range f.grants {
+		seed = g
+	}
+	for i := 0; i < 11; i++ {
+		g := seed
+		g.ID = "credgr_" + uuid.NewString()
+		f.grants[g.ID] = g
+		f.balances[g.ID] = 500
+	}
+	f.mu.Unlock()
+	if len(f.grants) < 9 {
+		t.Fatalf("fixture needs more than eight live grants, has %d", len(f.grants))
+	}
+	total, _, _, _, verify, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+	if err != nil {
+		t.Fatal("a prepaid team with many purchases could not be observed", err)
+	}
+	if total != int64(len(f.grants))*500 || f.aggregateReads == 0 {
+		t.Fatalf("aggregate balance %d for %d grants (aggregate reads %d)", total, len(f.grants), f.aggregateReads)
+	}
+	if verify == nil || verify(nil) != nil {
+		t.Fatal("aggregate observation is not stable", verify == nil)
+	}
+	f.mu.Lock()
+	for id, g := range f.grants {
+		g.Applicability.Scope.PriceType = ""
+		f.grants[id] = g
+		break
+	}
+	f.mu.Unlock()
+	if _, _, _, _, _, err = f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now()); err == nil {
+		t.Fatal("a price-scoped grant did not fall back to the bounded per-grant observation")
 	}
 }
