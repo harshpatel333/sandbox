@@ -6,14 +6,18 @@ import (
 	"context"
 	"errors"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"sort"
-"strings"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -414,8 +418,13 @@ func TestIntegration_FreeShape_AdmissionCarriesLimitsAndResumeRefusesLarger(t *t
 	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'paused' WHERE id = $1`, fits); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := testQueries.ClaimResume(ctx, db.ClaimResumeParams{ID: large, TeamID: team, LockKey: large.String()}); err != nil || c.Sandbox.Status != db.SandboxStatusResuming {
-		t.Fatalf("claim without plan limits = %+v, %v; want the legacy claim unchanged", c, err)
+	if _, err := testQueries.ClaimResume(ctx, db.ClaimResumeParams{ID: large, TeamID: team, LockKey: large.String()}); err == nil {
+		t.Fatal("claim without supplied caps bypassed the current Free plan")
+	} else {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "SS002" {
+			t.Fatalf("claim without supplied caps = %v", err)
+		}
 	}
 }
 
@@ -775,3 +784,151 @@ func TestIntegration_PricingV2Activation_RequiresSystemTeamBeforeApply(t *testin
 	}
 }
 
+func TestIntegration_FreeShape_CachedLegacyAdmissionCannotBypassDowngrade(t *testing.T) {
+	ctx := t.Context()
+	team, key := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason) VALUES($1,5,5,'signup trial credit')`, team); err != nil {
+		t.Fatal(err)
+	}
+	if err := testQueries.RefreshTeamTrialEligibility(ctx, team); err != nil {
+		t.Fatal(err)
+	}
+	paused := seedPausedSandbox(t, team)
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET vcpu_count=2,memory_mib=1024,disk_mib=4096 WHERE id=$1`, paused); err != nil {
+		t.Fatal(err)
+	}
+	tpl, err := testQueries.CreateTemplate(ctx, db.CreateTemplateParams{TeamID: testSystemTeamID, Name: "shape-" + uuid.NewString(), BuildSpec: []byte(`{"from":"example/image:stable"}`), Vcpu: 2, MemoryMib: 1024, DiskMib: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE template SET status='ready',snapshot_path='/snapshots/shape.snap',mem_path='/snapshots/shape.mem',base_path='/snapshots/shape.ext4' WHERE id=$1`, tpl.ID); err != nil {
+		t.Fatal(err)
+	}
+	h := pauseHandlers(t, &stubVMD{})
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	if !api.RequireBillingEligibleForTest(h, c, team) {
+		t.Fatalf("legacy cache warmup: %d %s", w.Code, w.Body.String())
+	}
+	assignFreePlan(t, team, time.Now())
+	setOwnerHeartbeat(t, testDefaultHostID, time.Now())
+	r := api.SetupRouter(ctx, h, testPool)
+	created := do(r, http.MethodPost, "/sandboxes", key, `{"name":"shape-cache-bypass","from_template":"`+tpl.ID.String()+`"}`)
+	if created.Code != http.StatusPaymentRequired || !strings.Contains(created.Body.String(), "sandbox_exceeds_plan_limits") {
+		t.Fatalf("cached create = %d %s", created.Code, created.Body.String())
+	}
+	resumed := do(r, http.MethodPost, "/sandboxes/"+paused.String()+"/resume", key, `{}`)
+	if resumed.Code != http.StatusPaymentRequired || !strings.Contains(resumed.Body.String(), "sandbox_exceeds_plan_limits") {
+		t.Fatalf("cached resume = %d %s", resumed.Code, resumed.Body.String())
+	}
+	if state := readPauseOp(t, paused); state.status != "paused" {
+		t.Fatalf("rejected resume state = %s", state.status)
+	}
+}
+
+func TestIntegration_FreeShape_DowngradeSerializesWithInFlightAdmission(t *testing.T) {
+	ctx := t.Context()
+	team, _ := seedTeamAndKey(t)
+	admission, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admission.Rollback(context.Background())
+	var sandbox uuid.UUID
+	if err := admission.QueryRow(ctx, `INSERT INTO sandbox(team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib)
+        VALUES($1,'in-flight-shape','starting',$2,2,1024,4096) RETURNING id`, team, testDefaultHostID).Scan(&sandbox); err != nil {
+		t.Fatal(err)
+	}
+	change, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer change.Rollback(context.Background())
+	if _, err := change.Exec(ctx, `SET LOCAL lock_timeout='100ms'`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = change.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+        VALUES($1,'free','free','{}','{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096}',clock_timestamp(),'plan_change','downgrade')`, team)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("downgrade crossed uncommitted admission: %v", err)
+	}
+	if err := change.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := admission.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assignFreePlan(t, team, time.Now())
+	if n, err := testQueries.RequestTeamPauseAll(ctx, db.RequestTeamPauseAllParams{TeamID: team, Reason: "plan_switch_free"}); err != nil || n != 1 {
+		t.Fatalf("downgrade queued %d, %v; want the admission that committed first", n, err)
+	}
+	var targeted bool
+	if err := testPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_team_pause_target WHERE sandbox_id=$1)`, sandbox).Scan(&targeted); err != nil || !targeted {
+		t.Fatalf("in-flight admission targeted=%v, %v", targeted, err)
+	}
+}
+
+func TestIntegration_FreeShape_AssignmentContentionFailsWithoutWaiting(t *testing.T) {
+	for _, mode := range []string{"plan_change", "admin_import"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := t.Context()
+			team, key := seedTeamAndKey(t)
+			assignFreePlan(t, team, time.Now())
+			paused := seedPausedSandbox(t, team)
+			h := pauseHandlers(t, &stubVMD{})
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+			if !api.RequireBillingEligibleForTest(h, c, team) {
+				t.Fatalf("cache warmup: %s", w.Body.String())
+			}
+			holder, err := testPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer holder.Rollback(context.Background())
+			lock := `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`
+			if mode == "admin_import" {
+				lock = `SELECT id FROM team WHERE id=$1 FOR UPDATE`
+			}
+			if _, err := holder.Exec(ctx, lock, team); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "admin_import" {
+				if _, err := holder.Exec(ctx, `LOCK TABLE team_plan_assignment IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var durations []float64
+			for i := 0; i < 30; i++ {
+				attempt, cancel := context.WithTimeout(ctx, time.Second)
+				start := time.Now()
+				_, err := testPool.Exec(attempt, `INSERT INTO sandbox(team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib) VALUES($1,$2,'starting',$3,1,1024,4096)`, team, "shape-contention-"+uuid.NewString(), testDefaultHostID)
+				durations = append(durations, float64(time.Since(start))/float64(time.Millisecond))
+				cancel()
+				var pgErr *pgconn.PgError
+				if !errors.As(err, &pgErr) || pgErr.Code != "SS003" {
+					t.Fatalf("admission waited on assignment owner: %v", err)
+				}
+			}
+			sort.Float64s(durations)
+			t.Logf("samples=%d contention refusal p50=%.3fms p95=%.3fms", len(durations), durations[15], durations[28])
+			r := api.SetupRouter(ctx, h, testPool)
+			resumed := do(r, http.MethodPost, "/sandboxes/"+paused.String()+"/resume", key, `{}`)
+			if resumed.Code != http.StatusServiceUnavailable || !strings.Contains(resumed.Body.String(), "service_unavailable") {
+				t.Fatalf("contended resume: %d %s", resumed.Code, resumed.Body.String())
+			}
+			if state := readPauseOp(t, paused); state.status != "paused" {
+				t.Fatalf("contended resume state=%s", state.status)
+			}
+			if err := holder.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status='resuming' WHERE id=$1`, paused); err != nil {
+				t.Fatalf("admission did not recover after assignment release: %v", err)
+			}
+		})
+	}
+}

@@ -153,6 +153,17 @@ plan: restarting a worker resumes outstanding targets, and retrying a request
 does not capture a later customer resume. Existing assignments and pause targets
 continue to be serviced when the pricing switch is turned off.
 
+Free shape enforcement runs inside existing create/resume SQL. An indexed team
+row lock and open-assignment lookup serialize admission with plan changes. The
+lock does not wait: a concurrent plan change or regional import returns a
+retryable `503 service_unavailable`, avoiding a wait on provider operations.
+Existing admission phase latency measurements include this work. Run the local
+SQL/guard percentile benchmark with:
+
+```bash
+go test -tags integration ./internal/integration -run '^$' -bench '^BenchmarkFreeShapeAdmission$' -benchtime=100x
+```
+
 Migration is a human-run CLI, with no startup job or HTTP apply endpoint. Point
 `DATABASE_URL` and `TEAM_CREATION_REGION` at one region at a time. Set
 `SYSTEM_TEAM_ID` to a valid nonzero UUID to exclude the system team; apply refuses missing or malformed values. Configure `STRIPE_SECRET_KEY`

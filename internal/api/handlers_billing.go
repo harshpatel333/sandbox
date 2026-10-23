@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/errgroup"
@@ -1052,11 +1054,11 @@ func billingAccountHasEstablishedSubscription(account db.GetTeamBillingAccountRo
 	}
 }
 
-func (h *Handlers) requireSandboxAdmission(c *gin.Context, teamID uuid.UUID) (*sandboxShapeLimit, bool) {
+func (h *Handlers) requireSandboxAdmission(c *gin.Context, teamID uuid.UUID) bool {
 	// Lightweight handler tests use a query mock without the billing schema;
 	// production handlers always have a pool-backed database.
 	if h.Pool == nil {
-		return nil, true
+		return true
 	}
 	started := time.Now()
 	admission, err := h.teamSandboxAdmissionCached(c.Request.Context(), teamID)
@@ -1064,7 +1066,7 @@ func (h *Handlers) requireSandboxAdmission(c *gin.Context, teamID uuid.UUID) (*s
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read sandbox billing eligibility failed")
 		respondError(c, ErrInternal)
-		return nil, false
+		return false
 	}
 	if !admission.eligible {
 		if admission.allowanceResetsAt != nil {
@@ -1072,9 +1074,9 @@ func (h *Handlers) requireSandboxAdmission(c *gin.Context, teamID uuid.UUID) (*s
 		} else {
 			respondErrorMsg(c, "billing_ineligible", "Sandbox usage is unavailable until billing is active", http.StatusPaymentRequired)
 		}
-		return nil, false
+		return false
 	}
-	return admission.limit, true
+	return true
 }
 
 func respondSandboxExceedsPlan(c *gin.Context, limit *sandboxShapeLimit, vcpu, memoryMib, diskMib int32) {
@@ -1318,4 +1320,31 @@ func billingTrialRunway(row db.GetTeamTrialRunwayRow, eligible bool, state strin
 	default:
 		return "unknown", &observed
 	}
+}
+
+func respondSandboxAdmissionError(c *gin.Context, err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	if pgErr.Code == "SS003" {
+		respondErrorMsg(c, "service_unavailable", "Team plan assignment is changing; retry the request", http.StatusServiceUnavailable)
+		return true
+	}
+	if pgErr.Code != "SS002" {
+		return false
+	}
+	var shape struct {
+		MaxVCPU   int32 `json:"max_vcpu"`
+		MaxMemory int32 `json:"max_memory_mib"`
+		MaxDisk   int32 `json:"max_disk_mib"`
+		VCPU      int32 `json:"vcpu"`
+		Memory    int32 `json:"memory_mib"`
+		Disk      int32 `json:"disk_mib"`
+	}
+	if json.Unmarshal([]byte(pgErr.Detail), &shape) != nil {
+		return false
+	}
+	respondSandboxExceedsPlan(c, &sandboxShapeLimit{vcpu: shape.MaxVCPU, memoryMib: shape.MaxMemory, diskMib: shape.MaxDisk}, shape.VCPU, shape.Memory, shape.Disk)
+	return true
 }

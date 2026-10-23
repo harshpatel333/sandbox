@@ -21,6 +21,27 @@ LANGUAGE sql STABLE AS $$
  WHERE a.team_id = p_team AND a.effective_to IS NULL AND a.kind = 'free';
 $$;
 
+CREATE FUNCTION guard_free_sandbox_shape() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE f record;
+BEGIN
+ BEGIN
+  PERFORM 1 FROM team WHERE id=NEW.team_id FOR SHARE NOWAIT;
+ EXCEPTION WHEN lock_not_available THEN
+  RAISE EXCEPTION 'team plan assignment is changing' USING ERRCODE='SS003';
+ END;
+ SELECT * INTO f FROM billing_free_plan(NEW.team_id);
+ IF FOUND AND ((f.max_vcpu IS NOT NULL AND NEW.vcpu_count>f.max_vcpu)
+  OR (f.max_memory_mib IS NOT NULL AND NEW.memory_mib>f.max_memory_mib)
+  OR (f.max_disk_mib IS NOT NULL AND NEW.disk_mib>f.max_disk_mib)) THEN
+  RAISE EXCEPTION 'sandbox exceeds plan limits' USING ERRCODE='SS002',
+   DETAIL=jsonb_build_object('max_vcpu',COALESCE(f.max_vcpu,0),'max_memory_mib',COALESCE(f.max_memory_mib,0),
+    'max_disk_mib',COALESCE(f.max_disk_mib,0),'vcpu',NEW.vcpu_count,'memory_mib',NEW.memory_mib,'disk_mib',NEW.disk_mib)::text;
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER sandbox_free_shape BEFORE INSERT OR UPDATE OF status ON sandbox
+ FOR EACH ROW WHEN (NEW.status IN ('starting','resuming')) EXECUTE FUNCTION guard_free_sandbox_shape();
+
 CREATE OR REPLACE FUNCTION billing_compute_rates(p_team uuid)
 RETURNS TABLE(vcpu_usd numeric, memory_gib_usd numeric)
 LANGUAGE sql STABLE AS $$
@@ -236,7 +257,7 @@ DO $$ DECLARE r text; f regprocedure; BEGIN
    END IF;
   END IF;
  END LOOP;
- FOREACH f IN ARRAY ARRAY['billing_free_plan(uuid)'::regprocedure,'billing_compute_rates(uuid)'::regprocedure,
+ FOREACH f IN ARRAY ARRAY['guard_free_sandbox_shape()'::regprocedure,'billing_free_plan(uuid)'::regprocedure,'billing_compute_rates(uuid)'::regprocedure,
   'billing_free_window_start(uuid,timestamptz,timestamptz,timestamptz)'::regprocedure,'billing_free_allowance_eval(uuid)'::regprocedure,
   'billing_free_allowance_refresh(uuid)'::regprocedure,'billing_free_allowance_blocked(uuid)'::regprocedure,
   'request_team_pause_all(uuid,text)'::regprocedure,'billing_pause_target_settled(billing_team_pause_target)'::regprocedure,

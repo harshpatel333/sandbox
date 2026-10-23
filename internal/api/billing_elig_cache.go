@@ -10,18 +10,6 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// billingEligCache is an in-process, TTL-bounded cache of per-team sandbox
-// create/resume request paths. The synchronous check is a fast-fail gate,
-// not the enforcement — trialEligibilityLoop and reconcileActivatedSandbox
-// pause ineligible teams on their own cadence regardless — so a
-// bounded-stale answer here loses nothing while removing a DB round trip
-// from every create.
-//
-// Both verdicts are cached, with asymmetric TTLs. Invalidation is
-// deliberately TTL-only: a Stripe webhook lands on ONE control-plane
-// replica, so an in-process invalidation hook could never reach the
-// others — the short ineligible TTL is what actually bounds the
-// "just paid, still blocked" window on every replica.
 const (
 	// billingEligibleTTL bounds how long an ineligible-turning team can keep
 	// passing the gate; the enforcement loops reclaim its sandboxes on the
@@ -47,27 +35,8 @@ type sandboxShapeLimit struct {
 	vcpu, memoryMib, diskMib int32
 }
 
-func (l *sandboxShapeLimit) admits(vcpu, memoryMib, diskMib int32) bool {
-	within := func(v, limit int32) bool { return limit <= 0 || v <= limit }
-	return l == nil || (within(vcpu, l.vcpu) && within(memoryMib, l.memoryMib) && within(diskMib, l.diskMib))
-}
-
-func (l *sandboxShapeLimit) claimCaps() (vcpu, memoryMib, diskMib *int32) {
-	if l == nil {
-		return nil, nil, nil
-	}
-	present := func(limit int32) *int32 {
-		if limit <= 0 {
-			return nil
-		}
-		return &limit
-	}
-	return present(l.vcpu), present(l.memoryMib), present(l.diskMib)
-}
-
 type sandboxAdmission struct {
 	eligible          bool
-	limit             *sandboxShapeLimit
 	allowanceResetsAt *time.Time
 }
 
@@ -157,9 +126,6 @@ func (h *Handlers) teamSandboxAdmissionCached(ctx context.Context, teamID uuid.U
 			return sandboxAdmission{}, err
 		}
 		admission := sandboxAdmission{eligible: row.Eligible}
-		if row.ShapeLimited {
-			admission.limit = &sandboxShapeLimit{vcpu: row.MaxVcpu, memoryMib: row.MaxMemoryMib, diskMib: row.MaxDiskMib}
-		}
 		if row.AllowanceBlocked {
 			admission.allowanceResetsAt = &row.AllowanceResetsAt
 		}
