@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -405,7 +406,7 @@ func TestRestoreForResume_SessionRequiresCapability(t *testing.T) {
 	net := &network.VMNetInfo{TAPDevice: "tap0"}
 	for _, capable := range []bool{false, true} {
 		m := resumeManager(t, capable)
-		tracked, armed, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", net, nil, nil)
+		tracked, armed, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", "", net, nil, nil)
 		if err != nil || !tracked {
 			t.Fatalf("capable=%v: restore failed or untracked: %v", capable, err)
 		}
@@ -416,6 +417,52 @@ func TestRestoreForResume_SessionRequiresCapability(t *testing.T) {
 	bodies := fc.snapshotBodies()
 	if len(bodies) != 2 || loadBodyHasSession(bodies[0]) || !loadBodyHasSession(bodies[1]) {
 		t.Fatalf("session must appear only for the capable binary, got %v", bodies)
+	}
+}
+
+// A layered resume replays the trace recorded next to its template base,
+// and only when resume prefetch is on.
+func TestRestoreForResume_ReplaysTemplateTrace(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "mem.snap")
+	trace := filepath.Join(filepath.Dir(base), accessLogFilename)
+	if err := os.WriteFile(trace, []byte("4096\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fc := startSnapshotAPIFake(t, nil)
+	for _, on := range []bool{false, true} {
+		m := resumeManager(t, false)
+		m.cfg.ResumePrefetchEnabled = on
+		m.lookupWakeTrace(filepath.Dir(base))
+		if _, _, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem.diff", base, m.resumeAccessLog(base), &network.VMNetInfo{TAPDevice: "tap0"}, nil, nil); err != nil {
+			t.Fatalf("prefetch=%v: %v", on, err)
+		}
+	}
+	bodies := fc.snapshotBodies()
+	want := `"access_log_path":"` + trace + `"`
+	if len(bodies) != 2 || strings.Contains(bodies[0], "access_log_path") || !strings.Contains(bodies[1], want) {
+		t.Fatalf("the trace must reach the load only with prefetch on, got %v", bodies)
+	}
+}
+
+// An uncached template resumes without prefetch rather than waiting on the
+// disk; the background lookup it starts serves the next resume.
+func TestResumeAccessLog_FillsCacheOffTheResumePath(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "mem.snap")
+	trace := filepath.Join(filepath.Dir(base), accessLogFilename)
+	if err := os.WriteFile(trace, []byte("4096\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := resumeManager(t, false)
+	m.cfg.ResumePrefetchEnabled = true
+	if got := m.resumeAccessLog(base); got != "" {
+		t.Fatalf("an uncached template must resume without prefetch, got %q", got)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for m.resumeAccessLog(base) != trace {
+		if time.Now().After(deadline) {
+			t.Fatal("the background lookup never cached the trace")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -430,7 +477,7 @@ func TestRestoreForResume_UnknownSessionFieldFallsBack(t *testing.T) {
 		return http.StatusNoContent, ""
 	})
 	m := resumeManager(t, true)
-	tracked, armed, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", &network.VMNetInfo{TAPDevice: "tap0"}, nil, nil)
+	tracked, armed, _, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", "", &network.VMNetInfo{TAPDevice: "tap0"}, nil, nil)
 	if err != nil {
 		t.Fatalf("the unguarded retry must succeed: %v", err)
 	}
@@ -472,7 +519,7 @@ func TestRestoreForResume_DoubleRollbackRetriesEachFieldOnce(t *testing.T) {
 	m := resumeManager(t, true)
 	m.clockRealtimeCapable.Store(true)
 	freeze := false
-	_, armed, usedClock, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, nil)
+	_, armed, usedClock, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, nil)
 	if err != nil || armed != "" || usedClock {
 		t.Fatalf("the bare retry must succeed with nothing armed, got err=%v armed=%q clock=%v", err, armed, usedClock)
 	}
@@ -643,7 +690,7 @@ func TestRestoreForResume_RunsTheHookBeforeTheLegacyRetry(t *testing.T) {
 	freeze := false
 	requestsAtHook := -1
 	hook := func() error { requestsAtHook = len(fc.snapshotBodies()); return nil }
-	_, _, usedClock, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, hook)
+	_, _, usedClock, err := m.restoreForResume(fc.socketPath, "/tmp/snap", "/tmp/mem", "", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, hook)
 	if err != nil || usedClock {
 		t.Fatalf("err=%v usedClock=%v; want a legacy success", err, usedClock)
 	}
@@ -657,7 +704,7 @@ func TestRestoreForResume_RunsTheHookBeforeTheLegacyRetry(t *testing.T) {
 	fc2 := startSnapshotAPIFake(t, refuseClock)
 	m2 := resumeManager(t, true)
 	m2.clockRealtimeCapable.Store(true)
-	_, _, _, err = m2.restoreForResume(fc2.socketPath, "/tmp/snap", "/tmp/mem", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, func() error { return io.ErrUnexpectedEOF })
+	_, _, _, err = m2.restoreForResume(fc2.socketPath, "/tmp/snap", "/tmp/mem", "", "", &network.VMNetInfo{TAPDevice: "tap0"}, &freeze, func() error { return io.ErrUnexpectedEOF })
 	if err == nil || !strings.Contains(err.Error(), io.ErrUnexpectedEOF.Error()) {
 		t.Fatalf("err=%v, want the hook's error", err)
 	}

@@ -25,7 +25,7 @@ info:
     ## Sandbox environment
 
     By default sandboxes boot from the curated `superserve/base` template (Ubuntu 24.04,
-    1 vCPU, 1 GB RAM, 4 GB disk, with Python 3.12, Node.js 22, npm, git, curl,
+    1 vCPU, 1 GB RAM, 8 GB disk, with Python 3.12, Node.js 22, npm, git, curl,
     and build-essential pre-installed). Callers can override with any template
     name (e.g. `superserve/python-3.11`, `superserve/node-22`) or a team-owned template UUID
     via the `from_template` field on `POST /sandboxes`.

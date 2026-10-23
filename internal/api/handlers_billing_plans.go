@@ -25,8 +25,9 @@ type billingPlan struct {
 	Limits             billingPlanLimits `json:"limits"`
 }
 
-// GetPublicBillingPlans lists the plans new customers can buy. Like public
-// pricing it is unauthenticated so signup pages render from the catalog.
+// GetPublicBillingPlans lists the plans new customers can buy in this
+// environment. Like public pricing it is unauthenticated so signup pages
+// render from the catalog.
 func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
 	if h.Pool == nil {
 		respondErrorMsg(c, "service_unavailable", "plans are not available", http.StatusServiceUnavailable)
@@ -40,7 +41,7 @@ func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	plans, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (billingPlan, error) {
+	all, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (billingPlan, error) {
 		var p billingPlan
 		err := row.Scan(&p.Key, &p.Family, &p.Name, &p.IntervalMonths, &p.PriceCents, &p.MonthlyCreditCents,
 			&p.Limits.MaxSandboxes, &p.Limits.MaxTemplateVCPU, &p.Limits.MaxTemplateMemoryMiB, &p.Limits.MaxTemplateDiskMiB)
@@ -50,6 +51,12 @@ func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
 		log.Error().Err(err).Msg("list billing plans failed")
 		respondError(c, ErrInternal)
 		return
+	}
+	plans := []billingPlan{}
+	for _, p := range all {
+		if h.Config != nil && h.Config.PlanPriceID(p.Key) != "" {
+			plans = append(plans, p)
+		}
 	}
 	c.Header("Cache-Control", publicPricingCacheControl)
 	c.JSON(http.StatusOK, gin.H{"plans": plans})
