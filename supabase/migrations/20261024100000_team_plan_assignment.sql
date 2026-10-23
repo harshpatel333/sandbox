@@ -9,7 +9,7 @@ CREATE TABLE team_plan_assignment (
  kind text NOT NULL CHECK(kind IN ('free','prepaid','subscription','legacy_payg','custom')),
  plan_version_id uuid REFERENCES billing_plan_version(id),
  terms jsonb NOT NULL CHECK(jsonb_typeof(terms)='object'),
- limits jsonb NOT NULL CHECK(jsonb_typeof(limits)='object' AND jsonb_typeof(limits->'max_concurrent')='number'),
+ limits jsonb NOT NULL CHECK(jsonb_typeof(limits)='object' AND (jsonb_typeof(limits->'max_concurrent')='number') IS TRUE),
  effective_from timestamptz NOT NULL,
  effective_to timestamptz CHECK(effective_to IS NULL OR effective_to>=effective_from),
  contract_id uuid REFERENCES billing_commercial_contract(id),

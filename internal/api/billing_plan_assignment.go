@@ -232,9 +232,6 @@ func assignInitialTeamPlans(ctx context.Context, tx pgx.Tx, as []planAssignment)
 // new plan's frozen limits. A repeated idempotency key returns the assignment
 // it created.
 func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan, error) {
-	if err := a.validate(); err != nil {
-		return teamPlan{}, err
-	}
 	var now time.Time
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp() FROM team WHERE id=$1 FOR NO KEY UPDATE`, a.Team).Scan(&now); err != nil {
 		return teamPlan{}, err
@@ -259,6 +256,9 @@ func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan,
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return teamPlan{}, err
 		}
+	}
+	if err := a.validate(); err != nil {
+		return teamPlan{}, err
 	}
 	terms, limits, version, err := a.frozen()
 	if err != nil {
