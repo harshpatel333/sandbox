@@ -385,9 +385,6 @@ func planPriceIDs(raw string) (map[string]string, error) {
 		if !ok || key == "" || price == "" {
 			return nil, fmt.Errorf("%q is not offer_key=price_id", pair)
 		}
-		if key == "pro_monthly" || key == "pro_annual" {
-			return nil, fmt.Errorf("%s is set by its own STRIPE_PRO_* variable", key)
-		}
 		if _, dup := ids[key]; dup {
 			return nil, fmt.Errorf("%s is listed more than once", key)
 		}
@@ -396,16 +393,21 @@ func planPriceIDs(raw string) (map[string]string, error) {
 	return ids, nil
 }
 
-// PlanPriceID returns the Stripe base price for a catalog plan. The Pro
-// prices keep their own variables, which YC and sponsored annual also use.
+// PlanPriceID returns the Stripe base price for checking out a catalog plan.
+// The Pro variables predate STRIPE_PLAN_PRICE_IDS and apply when it has no
+// entry, so a repriced Pro plan can get its own price while YC and sponsored
+// annual keep STRIPE_PRO_ANNUAL_PRICE_ID at the fixed YC amount.
 func (c *Config) PlanPriceID(offer string) string {
+	if id := c.StripePlanPriceIDs[offer]; id != "" {
+		return id
+	}
 	switch offer {
 	case "pro_monthly":
 		return c.StripeProMonthlyPriceID
 	case "pro_annual":
 		return c.StripeProAnnualPriceID
 	}
-	return c.StripePlanPriceIDs[offer]
+	return ""
 }
 
 func splitCSV(raw string) []string {
