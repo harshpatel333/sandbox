@@ -27,6 +27,14 @@ type proOffer struct {
 	Pricing    string
 	Matching   *planMatching
 	Limits     *planLimits
+	// PricingV2 purchases accept a promotion code at checkout and assign the
+	// team's plan when they activate.
+	PricingV2   bool
+	Family      string
+	Version     int32
+	DisplayName string
+	// Promotion is the discount the contract was sold with, if any.
+	Promotion *proInvoiceDiscount
 }
 
 // Purchases started before the plan catalog carry no frozen terms.
@@ -76,7 +84,7 @@ func (h *Handlers) checkoutOffer(ctx context.Context, team uuid.UUID, key string
 func frozenProOffer(key string, payload StripeCreateCheckoutSessionParams) (proOffer, error) {
 	t := payload.PlanTerms
 	if t == nil {
-		if o, ok := legacyProOffers[key]; ok {
+		if o, ok := legacyProOffers[key]; ok && !payload.AllowPromotionCodes {
 			return o, nil
 		}
 		return proOffer{}, errors.New("unsupported offer")
@@ -84,7 +92,10 @@ func frozenProOffer(key string, payload StripeCreateCheckoutSessionParams) (proO
 	if t.Amount <= 0 || t.Credit <= 0 || (t.Months != 1 && t.Months != 12) {
 		return proOffer{}, errors.New("invalid frozen plan terms")
 	}
-	return proOffer{Key: key, Amount: t.Amount, Months: t.Months, Credit: t.Credit, VersionID: t.VersionID, Matching: t.Matching, Limits: t.Limits}, nil
+	if payload.AllowPromotionCodes != t.PricingV2 || (t.PricingV2 && (t.Months != 1 || t.VersionID == uuid.Nil || t.Limits == nil || t.Limits.MaxSandboxes == nil || t.Family == "" || t.Version <= 0)) {
+		return proOffer{}, errors.New("invalid frozen pricing v2 terms")
+	}
+	return proOffer{Key: key, Amount: t.Amount, Months: t.Months, Credit: t.Credit, VersionID: t.VersionID, Matching: t.Matching, Limits: t.Limits, PricingV2: t.PricingV2, Family: t.Family, Version: t.Version, DisplayName: t.DisplayName}, nil
 }
 
 func (c proChoice) frozenOffer() (proOffer, error) {
