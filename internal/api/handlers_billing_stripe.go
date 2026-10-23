@@ -2509,7 +2509,7 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, read
 	var denialReason string
 	switch state {
 	case "acquired", "existing", "blocked":
-	case "ineligible", "user_already_redeemed", "owner_conflict", "device_already_redeemed", "evidence_missing", "device_reservation_pending", "sponsored":
+	case "ineligible", "user_already_redeemed", "owner_conflict", "device_already_redeemed", "evidence_missing", "device_reservation_pending", "sponsored", "pricing_v2":
 		denialReason = state
 		if state == "sponsored" {
 			denialReason = "sponsored_onboarding"

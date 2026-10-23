@@ -55,9 +55,11 @@ type planCompute struct {
 // planAllowance is the usage included in each period. Period is "day_window"
 // (24 hours from the first start) or "month"; OnExhausted is "pause" or
 // "payg". A version stores either AmountCents or Compute; planTerms resolves
-// Compute to AmountCents.
+// both to AmountUSD, an exact decimal string, and Compute to AmountCents
+// rounded to the cent for display.
 type planAllowance struct {
 	AmountCents int64        `json:"amount_cents"`
+	AmountUSD   string       `json:"amount_usd,omitempty"`
 	Period      string       `json:"period"`
 	OnExhausted string       `json:"on_exhausted"`
 	Compute     *planCompute `json:"compute,omitempty"`

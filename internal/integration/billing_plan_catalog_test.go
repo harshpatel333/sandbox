@@ -274,6 +274,7 @@ type publicPlansBody struct {
 		MonthlyCreditCents *int64 `json:"monthly_credit_cents"`
 		Allowance          *struct {
 			AmountCents int64  `json:"amount_cents"`
+			AmountUSD   string `json:"amount_usd"`
 			Period      string `json:"period"`
 			OnExhausted string `json:"on_exhausted"`
 			Summary     string `json:"summary"`
@@ -782,18 +783,20 @@ func TestIntegration_PricingSwitchActivatesTheV2Catalog(t *testing.T) {
 		t.Fatalf("v2 cards=%v version=%s", families, body.PricingVersion)
 	}
 	var freeCents int64
+	var freeUSD string
 	if err := testPool.QueryRow(ctx, `WITH r AS (SELECT DISTINCT ON (resource) resource, price_usd FROM pricing_rate r JOIN pricing_plan p ON p.key = r.plan_key
 		WHERE r.plan_key = 'payg' AND p.active AND unit = 'second' AND effective_from <= now() AND (effective_to IS NULL OR effective_to > now())
 		ORDER BY resource, effective_from DESC, r.created_at DESC, r.id DESC)
-		SELECT round(7200 * 100 * ((SELECT price_usd FROM r WHERE resource = 'vcpu') + (SELECT price_usd FROM r WHERE resource = 'memory_gib')))::bigint`).Scan(&freeCents); err != nil {
+		, usd AS (SELECT 7200 * ((SELECT price_usd FROM r WHERE resource = 'vcpu') + (SELECT price_usd FROM r WHERE resource = 'memory_gib')) AS v)
+		SELECT round(v * 100)::bigint, trim_scale(v)::text FROM usd`).Scan(&freeCents, &freeUSD); err != nil {
 		t.Fatal(err)
 	}
 	free, pro := body.Cards[0], body.Cards[2]
 	if free.Allowance == nil || free.Allowance.Period != "day_window" || free.Allowance.OnExhausted != "pause" ||
-		free.Allowance.AmountCents != freeCents || freeCents <= 0 || *free.Limits.MaxConcurrent != 1 || *free.Limits.MaxDiskMiB != 4096 {
+		free.Allowance.AmountCents != freeCents || freeCents <= 0 || free.Allowance.AmountUSD != freeUSD || *free.Limits.MaxConcurrent != 1 || *free.Limits.MaxDiskMiB != 4096 {
 		t.Fatalf("free card=%+v", free)
 	}
-	if pro.Monthly == nil || pro.Monthly.PriceCents != 25000 || pro.Annual != nil || pro.Allowance == nil || pro.Allowance.AmountCents != 25000 ||
+	if pro.Monthly == nil || pro.Monthly.PriceCents != 25000 || pro.Annual != nil || pro.Allowance == nil || pro.Allowance.AmountCents != 25000 || pro.Allowance.AmountUSD != "250" ||
 		pro.Allowance.OnExhausted != "payg" || *pro.Limits.MaxConcurrent != 1000 || *pro.Limits.MaxVCPU != 8 {
 		t.Fatalf("pro card=%+v", pro)
 	}
@@ -877,5 +880,69 @@ func TestIntegration_PublicBillingPlansListTodaysPurchasablePlans(t *testing.T) 
 	want := "[{pro_monthly 1 120000 100000} {pro_annual 12 1200000 100000}]"
 	if got != want {
 		t.Fatalf("plans = %s, want %s", got, want)
+	}
+}
+
+func setPricingSwitch(t *testing.T, version string) {
+	t.Helper()
+	if _, err := testPool.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version=$1`, version); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(context.Background(), `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
+			t.Error(err)
+		}
+	})
+}
+
+func TestIntegration_PricingV2HasNoSignupPromotions(t *testing.T) {
+	ctx := t.Context()
+	setPricingSwitch(t, "v2")
+	userID := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, userID, "v2-"+uuid.NewString()[:8]+"@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	trialTeam, err := provisionTeamForUser(ctx, userID, "v2-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var grants int
+	var reason string
+	var denied bool
+	if err := testPool.QueryRow(ctx, `SELECT (SELECT COUNT(*) FROM team_credit_grant WHERE team_id=$1 AND reason='signup trial credit'),
+		(SELECT reason FROM team_signup_promotion_outcome WHERE team_id=$1), EXISTS(SELECT 1 FROM team_signup_trial_denial WHERE team_id=$1)`, trialTeam).
+		Scan(&grants, &reason, &denied); err != nil || grants != 0 || reason != "pricing_v2" || !denied {
+		t.Fatalf("trial grants=%d reason=%s denied=%v err=%v", grants, reason, denied, err)
+	}
+
+	teamID, _, owner := seedTeamAndKeyWithRole(t, "team_owner")
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status) VALUES ($1,$2,$3,'incomplete')`,
+		teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+		t.Fatal(err)
+	}
+	stripe := &fakeStripeClient{}
+	router := newBillingRouter(t, stripe)
+	created := time.Now().UTC().Truncate(time.Second)
+	if w := sendStripeActivationWebhook(t, router, "evt_v2_"+teamID.String(), teamID, owner, created); w.Code != http.StatusOK {
+		t.Fatalf("activation: %d %s", w.Code, w.Body)
+	}
+	var trialEnded, reserved bool
+	if err := testPool.QueryRow(ctx, `SELECT trial_ended_at IS NOT NULL, stripe_activation_credit_reserved_at IS NOT NULL FROM team_billing_account WHERE team_id=$1`, teamID).
+		Scan(&trialEnded, &reserved); err != nil || !trialEnded || reserved {
+		t.Fatalf("account trial ended=%v reserved=%v err=%v", trialEnded, reserved, err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT reason FROM stripe_promotion_outcome WHERE team_id=$1`, teamID).Scan(&reason); err != nil || reason != "pricing_v2" {
+		t.Fatalf("card bonus outcome=%s err=%v", reason, err)
+	}
+
+	// A team activated under v2 keeps no card bonus if the switch goes back.
+	if _, err := testPool.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
+		t.Fatal(err)
+	}
+	if w := sendStripeActivationWebhook(t, router, "evt_v2_again_"+teamID.String(), teamID, owner, created.Add(time.Minute)); w.Code != http.StatusOK {
+		t.Fatalf("second activation: %d %s", w.Code, w.Body)
+	}
+	if len(stripe.creditGrantCalls) != 0 {
+		t.Fatalf("card bonus granted under v2: %+v", stripe.creditGrantCalls)
 	}
 }

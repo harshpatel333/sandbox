@@ -5071,6 +5071,9 @@ components:
               type: integer
               format: int64
               description: Included usage in USD cents per period, priced at the current rate card for compute allowances.
+            amount_usd:
+              type: string
+              description: Included usage in USD per period as an exact decimal, e.g. `0.1332`; compute allowances are priced at the current rate card. `amount_cents` is this amount rounded to the cent.
             period:
               type: string
               enum: [day_window, month]

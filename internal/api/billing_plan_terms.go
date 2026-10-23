@@ -202,8 +202,13 @@ func (h *Handlers) termsOfVersion(ctx context.Context, v planVersion, months int
 // resolveAllowance prices a compute allowance at the public rate card, the
 // same rates public pricing shows, rounded half up to the cent.
 func (h *Handlers) resolveAllowance(ctx context.Context, a *planAllowance) (*planAllowance, error) {
-	if a == nil || a.Compute == nil {
-		return a, nil
+	if a == nil {
+		return nil, nil
+	}
+	if a.Compute == nil {
+		resolved := *a
+		resolved.AmountUSD = decimalString(big.NewRat(a.AmountCents, 100))
+		return &resolved, nil
 	}
 	rows, err := h.DB.ListActivePricingRates(ctx, publicPricingPlanKey)
 	if err != nil {
@@ -220,11 +225,20 @@ func (h *Handlers) resolveAllowance(ctx context.Context, a *planAllowance) (*pla
 		return nil, errors.New("rate card has no per-second vcpu and memory rates")
 	}
 	perSecond := new(big.Rat).Add(new(big.Rat).Mul(big.NewRat(int64(a.Compute.VCPU), 1), vcpu), new(big.Rat).Mul(big.NewRat(int64(a.Compute.MemoryGiB), 1), memory))
-	cents := new(big.Rat).Mul(perSecond, big.NewRat(int64(a.Compute.Seconds)*100, 1))
+	usd := new(big.Rat).Mul(perSecond, big.NewRat(int64(a.Compute.Seconds), 1))
+	cents := new(big.Rat).Mul(usd, big.NewRat(100, 1))
 	cents.Add(cents, big.NewRat(1, 2))
 	resolved := *a
 	resolved.AmountCents = new(big.Int).Quo(cents.Num(), cents.Denom()).Int64()
+	resolved.AmountUSD = decimalString(usd)
 	return &resolved, nil
+}
+
+// decimalString writes r, a USD amount from numeric rates, as a plain
+// decimal without trailing zeros.
+func decimalString(r *big.Rat) string {
+	s := strings.TrimRight(r.FloatString(12), "0")
+	return strings.TrimSuffix(s, ".")
 }
 
 func numericRat(n pgtype.Numeric) *big.Rat {
