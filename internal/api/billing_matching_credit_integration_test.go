@@ -32,6 +32,7 @@ type matchingFixture struct {
 	refunded  bool
 	unpaid    map[string]bool
 	paid      map[string]int64
+	prices    any
 	periodEnd time.Time
 }
 
@@ -195,7 +196,11 @@ func (m *matchingFixture) invoiceFor(start, end time.Time, closeState, collectio
 	m.mu.Lock()
 	m.invoices[id] = inv
 	m.mu.Unlock()
-	plan := map[string]any{"customer": m.f.c.CustomerID, "subscription": m.f.c.SubscriptionID, "credit_version": 1, "credit_prices": []string{"price_cpu", "price_memory", "price_round", "price_storage"}, "base_cents": 100000, "expected_cents": 0, "credit_before_cents": 0, "resources": []any{}}
+	var prices any = []string{"price_cpu", "price_memory", "price_round", "price_storage"}
+	if m.prices != nil {
+		prices = m.prices
+	}
+	plan := map[string]any{"customer": m.f.c.CustomerID, "subscription": m.f.c.SubscriptionID, "credit_version": 1, "credit_prices": prices, "base_cents": 100000, "expected_cents": 0, "credit_before_cents": 0, "resources": []any{}}
 	raw, _ := json.Marshal(plan)
 	m.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),0,0,0)`, m.f.c.TeamID, start, end)
 	m.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,$6,clock_timestamp(),$5,'{}')`, m.f.c.TeamID, start, end, id, raw, closeState)
@@ -640,5 +645,60 @@ func TestMatchingCreditWithheldMatchReleasesCap(t *testing.T) {
 	}
 	if r := m.row(held); r.State != "withheld" {
 		t.Fatalf("withheld match changed: %+v", r)
+	}
+}
+
+func TestMatchingCreditRetiresMalformedPlansDurably(t *testing.T) {
+	m := newMatchingFixture(t, 10000, 8_000_000, 0)
+	m.prices = map[string]any{"unexpected": true}
+	var malformed []string
+	for i := 0; i < 21; i++ {
+		malformed = append(malformed, m.paidInvoice("paid", usageLine("price_cpu", 100)))
+	}
+	m.prices = nil
+	valid := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	for i := 0; i < 2; i++ {
+		if err := m.tick(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, invoice := range malformed {
+		if r := m.row(invoice); r.State != "skipped" || r.Skip == "" || r.Flag == "" {
+			t.Fatalf("malformed plan not retired for staff: %+v", r)
+		}
+	}
+	if r := m.row(valid); r.State != "issued" {
+		t.Fatalf("malformed plans starved a valid invoice: %+v", r)
+	}
+}
+
+func TestMatchingCreditReviewWindowStartsAtIssuance(t *testing.T) {
+	m := newMatchingFixture(t, 10000, 8_000_000, 0)
+	invoice := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := m.f.h.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	for _, sql := range []string{`SET session_replication_role=replica`, `UPDATE billing_matching_credit SET created_at=created_at-interval '200 days',review_checked_at=NULL WHERE invoice_id=$1`, `SET session_replication_role=origin`} {
+		var args []any
+		if strings.Contains(sql, "$1") {
+			args = append(args, invoice)
+		}
+		if _, err = conn.Exec(t.Context(), sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.mu.Lock()
+	m.refunded = true
+	m.mu.Unlock()
+	if err = m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := m.row(invoice); r.Flag == "" {
+		t.Fatalf("refund after a late issuance escaped review: %+v", r)
 	}
 }

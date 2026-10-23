@@ -156,13 +156,14 @@ type matchingCandidate struct {
 	Invoice, Customer string
 	Hash              string
 	Start, End        time.Time
-	Plan              billing.InvoiceClosePlan
+	Prices            []string
 }
 
 // Collection is the durable record of payment: invoice.paid webhooks wake it
 // and its poller recovers missed events, so a paid collection is the trigger.
 func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *stripeHTTPClient) error {
-	rows, err := h.Pool.Query(ctx, `SELECT r.team_id,r.contract_id,j.invoice_id,c.customer_id,k.settlement_hash,j.period_start,j.period_end,j.plan
+	rows, err := h.Pool.Query(ctx, `SELECT r.team_id,r.contract_id,j.invoice_id,c.customer_id,k.settlement_hash,j.period_start,j.period_end,
+ CASE WHEN jsonb_typeof(j.plan->'credit_prices')='array' THEN ARRAY(SELECT jsonb_array_elements_text(j.plan->'credit_prices')) ELSE '{}'::text[] END
  FROM billing_contract_matching_rule r
  JOIN billing_commercial_contract c ON c.id=r.contract_id
  JOIN billing_invoice_close j ON j.team_id=r.team_id AND j.state='released' AND j.period_start>=r.effective_from
@@ -177,14 +178,9 @@ func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *strip
 	var candidates []matchingCandidate
 	for rows.Next() {
 		var m matchingCandidate
-		var raw []byte
-		if err = rows.Scan(&m.Team, &m.Contract, &m.Invoice, &m.Customer, &m.Hash, &m.Start, &m.End, &raw); err != nil {
+		if err = rows.Scan(&m.Team, &m.Contract, &m.Invoice, &m.Customer, &m.Hash, &m.Start, &m.End, &m.Prices); err != nil {
 			rows.Close()
 			return err
-		}
-		if err := json.Unmarshal(raw, &m.Plan); err != nil {
-			log.Error().Err(err).Str("invoice_id", m.Invoice).Msg("matching skipped an unreadable close plan this pass")
-			continue
 		}
 		candidates = append(candidates, m)
 	}
@@ -215,7 +211,7 @@ func (h *Handlers) recordMatchingInvoice(ctx context.Context, client *stripeHTTP
 		return err
 	}
 	var flagEvidence []byte
-	u, err := matchingInvoiceUsage(inv, paid, m.Plan.CreditPrices)
+	u, err := matchingInvoiceUsage(inv, paid, m.Prices)
 	if err != nil {
 		return err
 	}
@@ -452,7 +448,7 @@ func matchingGrantForm(raw []byte) (url.Values, error) {
 // Refunds and credit notes after a match are surfaced for staff; matched
 // credit is never clawed back automatically.
 func (h *Handlers) reviewMatchedInvoices(ctx context.Context, client *stripeHTTPClient) error {
-	rows, err := h.Pool.Query(ctx, `SELECT id,invoice_id,customer_id,created_at<now()-interval '120 days' FROM billing_matching_credit
+	rows, err := h.Pool.Query(ctx, `SELECT id,invoice_id,customer_id,state='issued' AND issued_at<now()-interval '120 days' FROM billing_matching_credit
  WHERE amount_cents>0 AND flagged_at IS NULL AND review_checked_at IS DISTINCT FROM 'infinity'::timestamptz
   AND COALESCE(review_checked_at,'-infinity'::timestamptz)<now()-interval '1 day'
  ORDER BY COALESCE(review_checked_at,'-infinity'::timestamptz) LIMIT 10`)
