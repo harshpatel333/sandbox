@@ -39,6 +39,7 @@ func TestIntegration_PlanCatalogPurchaseKeepsCheckoutTerms(t *testing.T) {
 	if _, err := testPool.Exec(t.Context(), `UPDATE billing_plan SET monthly_credit_cents=7500,available=false WHERE offer_key='starter_monthly'`); err != nil {
 		t.Fatal(err)
 	}
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
 	f.mu.Lock()
 	f.status = "complete"
 	f.paid = true
