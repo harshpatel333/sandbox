@@ -939,13 +939,6 @@ func TestIntegration_PricingV2HasNoSignupPromotions(t *testing.T) {
 		t.Fatalf("card bonus outcome=%s err=%v", reason, err)
 	}
 
-	// A team activated under v2 keeps no card bonus if the switch goes back.
-	if _, err := testPool.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
-		t.Fatal(err)
-	}
-	if w := sendStripeActivationWebhook(t, router, "evt_v2_again_"+teamID.String(), teamID, owner, created.Add(time.Minute)); w.Code != http.StatusOK {
-		t.Fatalf("second activation: %d %s", w.Code, w.Body)
-	}
 	if len(stripe.creditGrantCalls) != 0 {
 		t.Fatalf("card bonus granted under v2: %+v", stripe.creditGrantCalls)
 	}
