@@ -171,3 +171,15 @@ func TestDecimalString(t *testing.T) {
 		}
 	}
 }
+
+func TestPlanPricedNeedsStripe(t *testing.T) {
+	terms := planTerms{PricingVersion: "v2", Version: 1}
+	h := &Handlers{}
+	if h.planPriced(terms) {
+		t.Fatal("v2 plan advertised without Stripe")
+	}
+	h.Stripe = &stripeHTTPClient{}
+	if !h.planPriced(terms) {
+		t.Fatal("v2 plan not available with Stripe")
+	}
+}
