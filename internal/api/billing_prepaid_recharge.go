@@ -176,7 +176,7 @@ func (h *Handlers) settlePrepaidPurchase(ctx context.Context, client *stripeHTTP
 			return err
 		}
 		if err := h.enrolPrepaidObservation(ctx, team); err != nil {
-			log.Error().Err(err).Str("team_id", team.String()).Msg("paid prepaid team could not be observed; it keeps today's eligibility until a slot frees")
+			return err
 		}
 	}
 	return h.issuePrepaidCredit(ctx, client, id)

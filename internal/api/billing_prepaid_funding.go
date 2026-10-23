@@ -29,12 +29,12 @@ func (h *Handlers) enrolPrepaidObservation(ctx context.Context, team uuid.UUID) 
 	if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_funding_account(team_id) VALUES($1) ON CONFLICT(team_id) DO NOTHING`, team); err != nil {
 		return err
 	}
+	if _, err := h.Pool.Exec(ctx, `UPDATE billing_funding_account SET prepaid_enrolment_due_at=COALESCE(prepaid_enrolment_due_at,clock_timestamp()) WHERE team_id=$1 AND NOT observe`, team); err != nil {
+		return err
+	}
 	_, err := h.Pool.Exec(ctx, `UPDATE billing_funding_account SET observe=true,prepaid_enrolment_due_at=NULL WHERE team_id=$1 AND (NOT observe OR prepaid_enrolment_due_at IS NOT NULL)`, team)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "P0001" {
-		if _, markErr := h.Pool.Exec(ctx, `UPDATE billing_funding_account SET prepaid_enrolment_due_at=COALESCE(prepaid_enrolment_due_at,clock_timestamp()) WHERE team_id=$1`, team); markErr != nil {
-			return markErr
-		}
 		return errPrepaidCapacity
 	}
 	return err
@@ -136,8 +136,9 @@ func (h *Handlers) prepaidCapacityAvailable(ctx context.Context, team uuid.UUID)
 // same metered-scope number Stripe applies to usage. Any other active grant
 // sends the team back to the per-grant observation, so no grant is counted
 // twice. Finalized, released periods have already debited the ledger, so the
-// reconciliation window starts no earlier than the end of the unbroken run of
-// them.
+// reconciliation window starts no earlier than invoice enrolment (Stripe
+// invoiced earlier periods itself) and the end of the unbroken run of
+// reconciled, released periods since then.
 func (h *Handlers) aggregateFundingGrants(ctx context.Context, client *stripeHTTPClient, team uuid.UUID, customer string, at time.Time) (fundingGrantSnapshot, bool, error) {
 	if h.Pool == nil {
 		return fundingGrantSnapshot{}, false, nil
@@ -145,10 +146,13 @@ func (h *Handlers) aggregateFundingGrants(ctx context.Context, client *stripeHTT
 	var prepaid bool
 	var floor *time.Time
 	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE team_id=$1 AND customer_id=$2 AND credit_state='issued'),
- (SELECT max(p.period_end) FROM team_billing_period p JOIN billing_invoice_close j USING(team_id,period_start,period_end)
-  WHERE p.team_id=$1 AND p.finalized_at IS NOT NULL AND j.state='released'
-   AND NOT EXISTS(SELECT 1 FROM team_billing_period q LEFT JOIN billing_invoice_close k USING(team_id,period_start,period_end)
-    WHERE q.team_id=p.team_id AND q.period_end<=p.period_end AND (q.finalized_at IS NULL OR k.state IS DISTINCT FROM 'released')))`, team, customer).Scan(&prepaid, &floor); err != nil || !prepaid {
+ (SELECT greatest(a.enrolled_at,(SELECT max(p.period_end) FROM team_billing_period p JOIN billing_invoice_close j USING(team_id,period_start,period_end)
+   WHERE p.team_id=a.team_id AND p.period_end>a.enrolled_at AND p.finalized_at IS NOT NULL AND j.state='released'
+    AND NOT EXISTS(SELECT 1 FROM team_billing_period q LEFT JOIN billing_invoice_close k USING(team_id,period_start,period_end)
+     WHERE q.team_id=p.team_id AND q.period_end>a.enrolled_at AND q.period_end<=p.period_end
+      AND (q.finalized_at IS NULL OR k.state IS DISTINCT FROM 'released'))
+    AND NOT EXISTS(SELECT 1 FROM billing_export_correction c WHERE c.team_id=p.team_id AND c.period_end<=p.period_end AND c.period_end>a.enrolled_at AND c.applied_at IS NULL)))
+  FROM billing_invoice_account a WHERE a.team_id=$1 AND a.customer_id=$2)`, team, customer).Scan(&prepaid, &floor); err != nil || !prepaid {
 		return fundingGrantSnapshot{}, false, err
 	}
 	inv, err := client.meteredGrantInventory(ctx, customer, at)

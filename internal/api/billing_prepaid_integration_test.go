@@ -705,6 +705,7 @@ func TestPrepaidObservationIgnoresSpentHistoryBeforeTheLastClose(t *testing.T) {
 	f.balances[old.ID] = 0
 	f.mu.Unlock()
 	closed := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+	f.exec(`INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','mtr_round',$4)`, f.team, f.customer, f.sub, closed.Add(-72*time.Hour))
 	f.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),0,0,0)`, f.team, closed.Add(-24*time.Hour), closed)
 	f.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'released',clock_timestamp(),'{}','{}')`, f.team, closed.Add(-24*time.Hour), closed, "in_"+strings.ReplaceAll(uuid.NewString(), "-", ""))
 	_, start, _, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
@@ -845,6 +846,7 @@ func TestPrepaidObservationFloorStopsAtTheFirstUnreleasedPeriod(t *testing.T) {
 	f.mu.Unlock()
 	day := 24 * time.Hour
 	base := time.Now().UTC().Add(-6 * day).Truncate(time.Second)
+	f.exec(`INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','mtr_round',$4)`, f.team, f.customer, f.sub, base.Add(-time.Hour))
 	period := func(start time.Time, released bool) {
 		f.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),0,0,0)`, f.team, start, start.Add(day))
 		state := "verified"
@@ -862,5 +864,63 @@ func TestPrepaidObservationFloorStopsAtTheFirstUnreleasedPeriod(t *testing.T) {
 	}
 	if !start.Equal(base.Add(day)) {
 		t.Fatalf("window starts at %s, want the end of the unbroken released run %s", start, base.Add(day))
+	}
+}
+
+func TestPrepaidObservationFloorIgnoresPeriodsBeforeEnrolment(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(5000, 500)
+	f.observe(0, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	day := 24 * time.Hour
+	enrolled := time.Now().UTC().Add(-3 * day).Truncate(time.Second)
+	f.mu.Lock()
+	for id, g := range f.grants {
+		g.Created = enrolled.Add(-30 * day).Unix()
+		g.EffectiveAt = g.Created
+		f.grants[id] = g
+	}
+	f.mu.Unlock()
+	f.exec(`INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','mtr_round',$4)`, f.team, f.customer, f.sub, enrolled)
+	f.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),0,0,0)`, f.team, enrolled.Add(-10*day), enrolled.Add(-9*day))
+	_, start, _, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start.Before(enrolled) {
+		t.Fatalf("window starts at %s, before invoice enrolment at %s", start, enrolled)
+	}
+}
+
+func TestPrepaidWorkerRetriesEnrolmentBeforeIssuingCredit(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.exec(`UPDATE billing_funding_account SET observe=false WHERE team_id=$1`, f.team)
+	id := uuid.New()
+	f.exec(`INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key) VALUES($1,$2,$3,'checkout',500,$4,'','')`, id, f.team, f.customer, uuid.New())
+	f.exec(`UPDATE billing_prepaid_purchase SET payment_state='succeeded',paid_at=clock_timestamp(),payment_evidence=jsonb_build_object('amount_cents',500,'customer',$2::text) WHERE id=$1`, id, f.customer)
+	constraint := "reject_prepaid_enrolment_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	f.exec(`ALTER TABLE billing_funding_account ADD CONSTRAINT ` + constraint + ` CHECK(team_id<>'` + f.team.String() + `'::uuid) NOT VALID`)
+	t.Cleanup(func() {
+		_, _ = f.h.Pool.Exec(context.Background(), `ALTER TABLE billing_funding_account DROP CONSTRAINT IF EXISTS `+constraint)
+	})
+	if err := f.h.settleDuePrepaidPurchases(t.Context(), f.client); err == nil {
+		t.Fatal("expected enrolment failure before its retry marker could be written")
+	}
+	if r := f.rows(); len(r) != 1 || r[0].Payment != "succeeded" || r[0].Credit != "none" || len(f.grantPosts) != 0 {
+		t.Fatalf("purchase stopped retrying after enrolment failure: %+v", r)
+	}
+	f.exec(`ALTER TABLE billing_funding_account DROP CONSTRAINT ` + constraint)
+	f.exec(`UPDATE billing_prepaid_purchase SET next_attempt_at=clock_timestamp() WHERE id=$1`, id)
+	if err := f.h.settleDuePrepaidPurchases(t.Context(), f.client); err != nil {
+		t.Fatal(err)
+	}
+	var observed bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT observe FROM billing_funding_account WHERE team_id=$1`, f.team).Scan(&observed); err != nil || !observed {
+		t.Fatal("worker did not retry enrolment", observed, err)
+	}
+	if r := f.rows(); r[0].Credit != "issued" || len(f.grantPosts) != 1 {
+		t.Fatalf("retry did not issue the paid credit exactly once: %+v", r)
 	}
 }
