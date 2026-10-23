@@ -121,7 +121,10 @@ func (h *Handlers) settleDuePrepaidPurchases(ctx context.Context, client *stripe
 		switch {
 		case workErr == nil:
 			_, err = h.Pool.Exec(ack, `UPDATE billing_prepaid_purchase SET failures=0,last_error=NULL WHERE id=$1`, id)
-		case errors.Is(workErr, errCreditIssuanceDeferred) || errors.Is(workErr, errPrepaidPaymentPending):
+		case errors.Is(workErr, errCreditIssuanceDeferred) || errors.Is(workErr, errCreditInventoryPending):
+			_, err = h.Pool.Exec(ack, `UPDATE billing_prepaid_purchase SET last_error=$2,next_attempt_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, id, workErr.Error())
+			workErr = nil
+		case errors.Is(workErr, errPrepaidPaymentPending):
 			var seconds int64
 			_ = h.Pool.QueryRow(ack, `SELECT extract(epoch FROM clock_timestamp()-created_at)::bigint FROM billing_prepaid_purchase WHERE id=$1`, id).Scan(&seconds)
 			age := time.Duration(seconds) * time.Second

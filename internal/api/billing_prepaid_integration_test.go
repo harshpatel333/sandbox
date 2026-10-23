@@ -751,12 +751,19 @@ func TestPrepaidEnrolmentIsRetriedAfterPayment(t *testing.T) {
 	t.Cleanup(func() {
 		_, _ = f.h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET max_observed_teams=$1`, budget)
 	})
-	f.exec(`UPDATE billing_funding_policy SET max_observed_teams=greatest(1,(SELECT count(*) FROM billing_funding_account WHERE observe))`)
-	f.exec(`INSERT INTO billing_funding_account(team_id,observe) SELECT id,true FROM team WHERE id<>$1 AND NOT EXISTS(SELECT 1 FROM billing_funding_account WHERE observe) LIMIT 1 ON CONFLICT(team_id) DO UPDATE SET observe=true`, f.team)
+	filler, err := f.h.DB.CreateTeam(t.Context(), "prepaid-filler-"+uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.h.Pool.Exec(context.Background(), `UPDATE billing_funding_account SET observe=false WHERE team_id=$1`, filler.ID)
+	})
+	f.exec(`UPDATE billing_funding_policy SET max_observed_teams=(SELECT count(*) FROM billing_funding_account WHERE observe)+1`)
+	f.exec(`INSERT INTO billing_funding_account(team_id,observe) VALUES($1,true) ON CONFLICT(team_id) DO UPDATE SET observe=true`, filler.ID)
 	if err := f.h.enrolPrepaidObservation(t.Context(), f.team); err != errPrepaidCapacity {
 		t.Fatal("expected the cohort to be full", err)
 	}
-	f.exec(`UPDATE billing_funding_policy SET max_observed_teams=$1`, budget)
+	f.exec(`UPDATE billing_funding_policy SET max_observed_teams=(SELECT count(*) FROM billing_funding_account WHERE observe)+1`)
 	if err := f.h.retryPrepaidEnrolment(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -793,5 +800,67 @@ func TestFundingObservationUnchangedForTeamsWithoutPrepaidCredit(t *testing.T) {
 	}
 	if total, _, _, _, _, err = f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now()); err != nil || total != 3500 || f.aggregateReads == 0 {
 		t.Fatal("issued prepaid credit did not switch the team to the aggregate balance", total, err, f.aggregateReads)
+	}
+}
+
+func TestPrepaidObservationFallsBackForExpiringGrants(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(5000, 500)
+	f.observe(0, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	var promo entitlementGrant
+	for _, g := range f.grants {
+		promo = g
+	}
+	promo.ID = "credgr_" + uuid.NewString()
+	promo.Category = "promotional"
+	promo.Amount.Monetary.Value = 1000
+	promo.ExpiresAt = time.Now().Add(30 * 24 * time.Hour).Unix()
+	f.grants[promo.ID] = promo
+	f.balances[promo.ID] = 1000
+	f.mu.Unlock()
+	reads := f.aggregateReads
+	total, _, _, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+	if err != nil || total != 1500 || f.aggregateReads != reads {
+		t.Fatal("an expiring grant was not observed exactly once through the per-grant path", total, err, f.aggregateReads-reads)
+	}
+}
+
+func TestPrepaidObservationFloorStopsAtTheFirstUnreleasedPeriod(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(5000, 500)
+	f.observe(0, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	for id, g := range f.grants {
+		g.Created = time.Now().Add(-10 * 24 * time.Hour).Unix()
+		g.EffectiveAt = g.Created
+		f.grants[id] = g
+	}
+	f.mu.Unlock()
+	day := 24 * time.Hour
+	base := time.Now().UTC().Add(-6 * day).Truncate(time.Second)
+	period := func(start time.Time, released bool) {
+		f.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),0,0,0)`, f.team, start, start.Add(day))
+		state := "verified"
+		if released {
+			state = "released"
+		}
+		f.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,$5,clock_timestamp(),'{}','{}')`, f.team, start, start.Add(day), "in_"+strings.ReplaceAll(uuid.NewString(), "-", ""), state)
+	}
+	period(base, true)
+	period(base.Add(day), false)
+	period(base.Add(2*day), true)
+	_, start, _, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !start.Equal(base.Add(day)) {
+		t.Fatalf("window starts at %s, want the end of the unbroken released run %s", start, base.Add(day))
 	}
 }
