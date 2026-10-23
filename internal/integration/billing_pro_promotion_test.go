@@ -60,6 +60,12 @@ func TestIntegration_ProPromotionCodeDiscountsTheCheckoutInvoice(t *testing.T) {
 			for range 2 {
 				assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
 			}
+			var assignments, concurrency int
+			var family, pricing, name string
+			var grant, allowance int64
+			if err := testPool.QueryRow(t.Context(), `SELECT count(*),max((limits->>'max_concurrent')::integer),max(terms->>'family'),max(terms->>'pricing_version'),max(terms->>'display_name'),max((terms#>>'{grants,0,amount_cents}')::bigint),max((terms#>>'{allowance,amount_cents}')::bigint) FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL AND contract_id IS NOT NULL`, f.team).Scan(&assignments, &concurrency, &family, &pricing, &name, &grant, &allowance); err != nil || grant != 25000 || allowance != 25000 || assignments != 1 || concurrency != 1000 || family != "pro" || pricing != "v2" || name != "Pro" {
+				t.Fatalf("paid plan assignment: count=%d concurrency=%d family=%q pricing=%q name=%q err=%v", assignments, concurrency, family, pricing, name, err)
+			}
 			if paid, discounted := proPaymentDiscount(t, f, false); paid != 25000-discount || discounted != discount {
 				t.Fatalf("checkout receipt paid=%d discount=%d", paid, discounted)
 			}
@@ -118,7 +124,7 @@ func TestIntegration_ProPromotionRenewalRejectsDiscounts(t *testing.T) {
 	}
 }
 
-func TestIntegration_ProPricingV2RefusesAnnualAndSellsToCommittedFreeTeams(t *testing.T) {
+func TestIntegration_ProPricingV2RefusesAnnualAndUnimplementedUpgrades(t *testing.T) {
 	f, r, key := newProFixture(t, "pro_monthly")
 	withPricingV2(t)
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_annual"), 400, "invalid_offer")
@@ -128,11 +134,16 @@ func TestIntegration_ProPricingV2RefusesAnnualAndSellsToCommittedFreeTeams(t *te
 	if _, err := testPool.Exec(t.Context(), `UPDATE team_billing_account SET trial_ended_at=now() WHERE team_id=$1`, f.team); err != nil {
 		t.Fatal(err)
 	}
-	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 200, f.session)
-	f.mu.Lock()
-	f.status, f.paid = "complete", true
-	f.mu.Unlock()
-	assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 409, "plan_conflict")
+}
+
+func TestIntegration_ProPricingV2RejectsExistingCalendarBeforePayment(t *testing.T) {
+	f, r, key := newProFixture(t, "pro_monthly")
+	withPricingV2(t)
+	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,stripe_customer_id,commercial_billing_anchor) VALUES($1,$2,now()-interval '10 days') ON CONFLICT(team_id) DO UPDATE SET commercial_billing_anchor=EXCLUDED.commercial_billing_anchor`, f.team, f.customer); err != nil {
+		t.Fatal(err)
+	}
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 409, "plan_conflict")
 }
 
 func TestIntegration_ProLegacyCheckoutOffersNoPromotionCodes(t *testing.T) {

@@ -564,21 +564,14 @@ func proMeteredPeriod(sub invoiceSubscription, offer proOffer) (int64, int64, er
 	return start, end, nil
 }
 
-// paidPlanAssigner puts a team on the plan a paid purchase activated, in the
-// activation transaction. Team plan assignment provides it; a pricing v2
-// purchase stays pending rather than activate without its plan.
-var paidPlanAssigner func(ctx context.Context, tx pgx.Tx, team, actor, contract uuid.UUID, terms planTerms) error
-
 // assignCheckoutPlan puts a team that paid for a pricing v2 plan on it from
 // activation, with the terms and limits frozen at checkout. It reads nothing
 // that can change after payment, so a catalog edit cannot block activation.
 func assignCheckoutPlan(ctx context.Context, tx pgx.Tx, choice proChoice, offer proOffer, contract uuid.UUID) error {
-	if paidPlanAssigner == nil {
-		return errors.New("pricing v2 activation needs team plan assignment")
-	}
-	terms := planTerms{OfferKey: choice.Offer, DisplayName: offer.DisplayName, FeeCents: offer.Amount, IntervalMonths: offer.Months, MonthlyCreditCents: offer.Credit,
-		VersionID: offer.VersionID, Version: offer.Version, PricingVersion: "v2", Family: offer.Family, Kind: "subscription", Matching: offer.Matching, Limits: *offer.Limits}
-	return paidPlanAssigner(ctx, tx, choice.Team, choice.Actor, contract, terms)
+	terms := planTerms{OfferKey: choice.Offer, DisplayName: offer.Name, FeeCents: offer.Amount, IntervalMonths: offer.Months, MonthlyCreditCents: offer.Credit,
+		VersionID: offer.VersionID, Version: offer.Version, PricingVersion: "v2", Family: offer.Family, Kind: "subscription", Grants: offer.Grants, Allowance: offer.Allowance, Matching: offer.Matching, Limits: *offer.Limits}
+	_, err := assignTeamPlan(ctx, tx, planAssignment{Team: choice.Team, Terms: terms, Source: planSourceCheckout, Actor: &choice.Actor, Reason: "paid checkout", ContractID: &contract, Key: "checkout:" + contract.String()})
+	return err
 }
 
 // recordPaymentPromotion records the promotion a contract's checkout invoice

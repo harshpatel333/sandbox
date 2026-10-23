@@ -174,10 +174,12 @@ type StripeCheckoutPlanTerms struct {
 	Matching  *planMatching `json:",omitempty"`
 	Limits    *planLimits   `json:",omitempty"`
 	// PricingV2 purchases also freeze the plan identity they assign.
-	PricingV2   bool   `json:",omitempty"`
-	Family      string `json:",omitempty"`
-	Version     int32  `json:",omitempty"`
-	DisplayName string `json:",omitempty"`
+	PricingV2   bool           `json:",omitempty"`
+	Family      string         `json:",omitempty"`
+	Version     int32          `json:",omitempty"`
+	DisplayName string         `json:",omitempty"`
+	Grants      []planGrant    `json:",omitempty"`
+	Allowance   *planAllowance `json:",omitempty"`
 }
 
 type StripeCheckoutSession struct {

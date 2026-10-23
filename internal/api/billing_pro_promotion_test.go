@@ -1,12 +1,10 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 )
 
 func TestCheckoutLineDiscountAcceptsOnlyThePromotion(t *testing.T) {
@@ -38,30 +36,12 @@ func TestCheckoutLineDiscountAcceptsOnlyThePromotion(t *testing.T) {
 	}
 }
 
-func TestCheckoutPlanAssignmentUsesFrozenTerms(t *testing.T) {
+func TestFrozenProOfferPreservesCatalogIdentity(t *testing.T) {
 	max := int32(1000)
-	team, actor, contract, version := uuid.New(), uuid.New(), uuid.New(), uuid.New()
-	offer := proOffer{Amount: 25000, Months: 1, Credit: 25000, VersionID: version, Version: 2, PricingV2: true, Family: "pro", DisplayName: "Pro", Limits: &planLimits{MaxConcurrent: &max}}
-	choice := proChoice{Team: team, Actor: actor, Offer: "pro_monthly"}
-	defer func(saved func(context.Context, pgx.Tx, uuid.UUID, uuid.UUID, uuid.UUID, planTerms) error) {
-		paidPlanAssigner = saved
-	}(paidPlanAssigner)
-	paidPlanAssigner = nil
-	if err := assignCheckoutPlan(t.Context(), nil, choice, offer, contract); err == nil {
-		t.Fatal("activated a pricing v2 purchase without assigning its plan")
-	}
-	var got planTerms
-	paidPlanAssigner = func(_ context.Context, _ pgx.Tx, gotTeam, gotActor, gotContract uuid.UUID, terms planTerms) error {
-		if gotTeam != team || gotActor != actor || gotContract != contract {
-			t.Fatalf("assignment identity: %v %v %v", gotTeam, gotActor, gotContract)
-		}
-		got = terms
-		return nil
-	}
-	if err := assignCheckoutPlan(t.Context(), nil, choice, offer, contract); err != nil {
-		t.Fatal(err)
-	}
-	if got.OfferKey != "pro_monthly" || got.Kind != "subscription" || got.FeeCents != 25000 || got.MonthlyCreditCents != 25000 || got.VersionID != version || got.Version != 2 || got.Family != "pro" || got.PricingVersion != "v2" || *got.Limits.MaxConcurrent != 1000 || got.Retired {
-		t.Fatalf("assigned terms differ from checkout: %+v", got)
+	version := uuid.New()
+	params := StripeCreateCheckoutSessionParams{AllowPromotionCodes: true, PlanTerms: &StripeCheckoutPlanTerms{Amount: 25000, Months: 1, Credit: 25000, VersionID: version, Version: 2, PricingV2: true, Family: "pro", DisplayName: "Pro", Limits: &planLimits{MaxConcurrent: &max}}}
+	got, err := frozenProOffer("pro_monthly", params)
+	if err != nil || got.VersionID != version || got.Version != 2 || got.Family != "pro" || got.Pricing != "v2" || got.Name != "Pro" || *got.Limits.MaxConcurrent != 1000 {
+		t.Fatalf("frozen catalog identity: %+v %v", got, err)
 	}
 }
