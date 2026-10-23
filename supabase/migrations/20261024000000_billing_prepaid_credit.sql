@@ -199,3 +199,5 @@ CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS
  FROM (SELECT p_team_id team_id) t LEFT JOIN billing_funding_account f USING(team_id)
  LEFT JOIN team_billing_account a USING(team_id);
 $$;
+CREATE INDEX billing_prepaid_purchase_customer_open ON billing_prepaid_purchase(customer_id)
+    WHERE payment_state IN ('uncertain', 'processing');

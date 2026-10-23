@@ -89,7 +89,7 @@ func (h *Handlers) startPrepaidPaymentCheckout(ctx context.Context, client *stri
 	if err != nil {
 		return prepaidCheckoutSession{}, err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_request=$2,payment_state='uncertain',payment_first_attempt_at=clock_timestamp() WHERE id=$1`, id, request); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_request=$2,payment_state='uncertain',payment_first_attempt_at=clock_timestamp(),next_attempt_at=clock_timestamp()+interval '2 minutes' WHERE id=$1`, id, request); err != nil {
 		return prepaidCheckoutSession{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -156,8 +156,21 @@ func (h *Handlers) settleCheckoutPurchase(ctx context.Context, client *stripeHTT
 		return err
 	}
 	if session == nil {
-		if request == nil || first == nil || time.Since(*first) >= 23*time.Hour {
+		if request == nil || first == nil {
 			return h.failPrepaidPayment(ctx, id, "", "the checkout was never opened", false)
+		}
+		if time.Since(*first) >= 23*time.Hour {
+			found, err := client.findPrepaidCheckout(ctx, customer, id)
+			if err != nil {
+				return err
+			}
+			if found == "" {
+				return h.failPrepaidPayment(ctx, id, "", "the checkout was never opened", false)
+			}
+			if _, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET checkout_session_id=$2,payment_state='processing' WHERE id=$1 AND checkout_session_id IS NULL AND payment_state='uncertain'`, id, found); err != nil {
+				return err
+			}
+			return errPrepaidPaymentPending
 		}
 		if _, err := h.dispatchPrepaidPaymentCheckout(ctx, client, id); err != nil {
 			return err
@@ -196,8 +209,11 @@ func (h *Handlers) settleCheckoutPurchase(ctx context.Context, client *stripeHTT
 		if pi.Status == "processing" || pi.Status == "requires_action" {
 			return errPrepaidPaymentPending
 		}
-		if pi.Status != "succeeded" || pi.AmountReceived != amount {
+		if pi.Status == "canceled" {
 			return h.failPrepaidPayment(ctx, id, "", "the payment did not succeed", false)
+		}
+		if pi.Status != "succeeded" || pi.AmountReceived != amount {
+			return errPrepaidPaymentPending
 		}
 		evidence, _ = json.Marshal(map[string]any{"amount_cents": pi.AmountReceived, "customer": pi.Customer, "checkout_session": s, "payment_intent": pi})
 		if _, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_intent_id=$2 WHERE id=$1 AND payment_intent_id IS NULL`, id, pi.ID); err != nil {
@@ -214,11 +230,11 @@ func (h *Handlers) settleCheckoutPurchase(ctx context.Context, client *stripeHTT
 		if inv.Customer != customer {
 			return errors.New("first invoice customer differs from the purchase")
 		}
-		if inv.Status == "open" || inv.Status == "draft" {
-			return errPrepaidPaymentPending
+		if inv.Status == "void" {
+			return h.failPrepaidPayment(ctx, id, "", "the first invoice was voided", false)
 		}
 		if inv.Status != "paid" || inv.AmountRemaining == nil || *inv.AmountRemaining != 0 {
-			return h.failPrepaidPayment(ctx, id, "", "the first invoice was not paid", false)
+			return errPrepaidPaymentPending
 		}
 		line, err := client.prepaidInvoiceLine(ctx, inv, id)
 		if err != nil {
@@ -259,4 +275,41 @@ func (c *stripeHTTPClient) prepaidInvoiceLine(ctx context.Context, inv StripeInv
 		return StripeInvoiceAmountLine{}, fmt.Errorf("first invoice carries %d credit lines for this purchase", len(found))
 	}
 	return found[0], nil
+}
+
+func (c *stripeHTTPClient) findPrepaidCheckout(ctx context.Context, customer string, id uuid.UUID) (string, error) {
+	cursor := ""
+	var found []string
+	for page := 0; page < 20; page++ {
+		q := url.Values{"customer": {customer}, "limit": {"100"}}
+		if cursor != "" {
+			q.Set("starting_after", cursor)
+		}
+		var list struct {
+			Data    []prepaidCheckoutSession `json:"data"`
+			HasMore bool                     `json:"has_more"`
+		}
+		if err := c.doForm(ctx, http.MethodGet, "/v1/checkout/sessions?"+q.Encode(), nil, &list, ""); err != nil {
+			return "", err
+		}
+		for _, s := range list.Data {
+			if s.Metadata["prepaid_purchase_id"] == id.String() {
+				found = append(found, s.ID)
+			}
+		}
+		if !list.HasMore {
+			if len(found) > 1 {
+				return "", errors.New("multiple checkouts carry one purchase identity; operator recovery required")
+			}
+			if len(found) == 1 {
+				return found[0], nil
+			}
+			return "", nil
+		}
+		if len(list.Data) == 0 {
+			return "", errors.New("empty incomplete checkout page")
+		}
+		cursor = list.Data[len(list.Data)-1].ID
+	}
+	return "", errors.New("checkout inventory exceeds the discovery bound")
 }

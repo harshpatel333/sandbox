@@ -129,12 +129,22 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "too many unspent credit purchases; use some credit or buy a larger amount later", http.StatusConflict)
 		return
 	}
-	if err = h.enrolPrepaidObservation(ctx, team); err != nil {
-		if errors.Is(err, errPrepaidCapacity) {
-			respondErrorMsg(c, "service_unavailable", "prepaid credit is temporarily unavailable; try again later", http.StatusServiceUnavailable)
-			return
-		}
+	capacity, err := h.prepaidCapacityAvailable(ctx, team)
+	if err != nil {
 		respondError(c, ErrInternal)
+		return
+	}
+	if !capacity {
+		respondErrorMsg(c, "service_unavailable", "prepaid credit is temporarily unavailable; try again later", http.StatusServiceUnavailable)
+		return
+	}
+	var proPending bool
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers+`)`, team).Scan(&proPending); err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if proPending {
+		proConflict(c)
 		return
 	}
 	account, err := h.DB.GetTeamBillingAccount(ctx, team)

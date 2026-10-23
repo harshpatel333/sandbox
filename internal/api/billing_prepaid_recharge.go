@@ -83,7 +83,7 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
   AND f.observed_generation=f.generation AND f.customer_id=b.stripe_customer_id
   AND f.credit_checked_at>clock_timestamp()-interval '2 minutes' AND f.credit_usd*100<a.threshold_cents
   AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id
-   AND (p.payment_state IN ('pending','uncertain','processing')
+   AND ((p.source='auto_recharge' AND p.payment_state IN ('pending','uncertain','processing'))
     OR (p.payment_state='succeeded' AND (p.credit_state<>'issued' OR p.credited_at>=f.credit_checked_at))))
   AND (SELECT count(*) FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id AND p.payment_state<>'failed' AND p.credit_voided_at IS NULL)<$1
  LIMIT 50
@@ -160,6 +160,9 @@ func (h *Handlers) settlePrepaidPurchase(ctx context.Context, client *stripeHTTP
 		if err := assignStarterAfterPurchase(ctx, h, team, id); err != nil {
 			return err
 		}
+		if err := h.enrolPrepaidObservation(ctx, team); err != nil {
+			log.Error().Err(err).Str("team_id", team.String()).Msg("paid prepaid team could not be observed; it keeps today's eligibility until a slot frees")
+		}
 	}
 	return h.issuePrepaidCredit(ctx, client, id)
 }
@@ -174,7 +177,7 @@ func (h *Handlers) chargeAutoRecharge(ctx context.Context, client *stripeHTTPCli
 		return err
 	}
 	if state == "pending" && !enabled {
-		return h.failPrepaidPayment(ctx, id, "", "auto-recharge was disabled before the charge was sent", false)
+		return h.failPrepaidPayment(ctx, id, "", "auto-recharge was disabled before the charge was sent", false, "pending")
 	}
 	var raw []byte
 	var first *time.Time
@@ -208,13 +211,13 @@ func (h *Handlers) chargeAutoRecharge(ctx context.Context, client *stripeHTTPCli
 	default:
 		form := url.Values{
 			"amount": {strconv.FormatInt(req.AmountCents, 10)}, "currency": {"usd"}, "customer": {req.Customer},
-			"payment_method": {req.PaymentMethod}, "off_session": {"true"}, "confirm": {"true"},
+			"payment_method": {req.PaymentMethod}, "payment_method_types[]": {"card"}, "off_session": {"true"}, "confirm": {"true"},
 			"description":                   {"Superserve prepaid credit (auto-recharge)"},
 			"metadata[prepaid_purchase_id]": {id.String()}, "metadata[team_id]": {team.String()},
 		}
 		err = client.doForm(ctx, http.MethodPost, "/v1/payment_intents", form, &pi, key)
 		var se *stripeRequestError
-		if errors.As(err, &se) && se.Status == http.StatusPaymentRequired {
+		if errors.As(err, &se) && (se.Status == http.StatusPaymentRequired || definitiveStripeRejection(err)) {
 			return h.failPrepaidPayment(ctx, id, "card_error", "the saved card was declined or needs authentication", true)
 		}
 	}
@@ -228,8 +231,17 @@ func (h *Handlers) recordPrepaidPaymentIntent(ctx context.Context, id uuid.UUID,
 	if pi.ID == "" || pi.Customer != req.Customer || pi.Metadata["prepaid_purchase_id"] != id.String() || pi.Currency != "usd" || pi.Amount != req.AmountCents {
 		return errors.New("payment intent does not match the saved auto-recharge request")
 	}
-	if _, err := h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_intent_id=$2,payment_state='processing' WHERE id=$1 AND payment_state IN ('uncertain','processing') AND payment_intent_id IS NULL`, id, pi.ID); err != nil {
+	var state string
+	if err := h.Pool.QueryRow(ctx, `UPDATE billing_prepaid_purchase SET payment_intent_id=COALESCE(payment_intent_id,$2),
+ payment_state=CASE WHEN payment_state='uncertain' THEN 'processing' ELSE payment_state END WHERE id=$1 RETURNING payment_state`, id, pi.ID).Scan(&state); err != nil {
 		return err
+	}
+	if state == "failed" {
+		if pi.Status == "succeeded" || pi.Status == "processing" {
+			log.Error().Str("prepaid_purchase_id", id.String()).Str("payment_intent", pi.ID).Msg("a failed prepaid purchase has a live payment; operator must credit or refund it")
+			return errors.New("failed prepaid purchase has a live payment; operator recovery required")
+		}
+		return nil
 	}
 	switch pi.Status {
 	case "succeeded":
@@ -254,14 +266,19 @@ func (h *Handlers) recordPrepaidPaymentIntent(ctx context.Context, id uuid.UUID,
 
 // A failed automatic charge turns auto-recharge off so the customer is never
 // retried silently; they choose whether to fix the card and enable it again.
-func (h *Handlers) failPrepaidPayment(ctx context.Context, id uuid.UUID, code, reason string, disable bool) error {
+// A payment fails only from the states the caller's evidence covers: a row that
+// may already have reached Stripe needs terminal provider evidence to fail.
+func (h *Handlers) failPrepaidPayment(ctx context.Context, id uuid.UUID, code, reason string, disable bool, from ...string) error {
+	if len(from) == 0 {
+		from = []string{"pending", "uncertain", "processing"}
+	}
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 	var team uuid.UUID
-	err = tx.QueryRow(ctx, `UPDATE billing_prepaid_purchase SET payment_state='failed',failure_code=NULLIF($2,''),failure_reason=$3 WHERE id=$1 AND payment_state<>'succeeded' AND payment_state<>'failed' RETURNING team_id`, id, code, reason).Scan(&team)
+	err = tx.QueryRow(ctx, `UPDATE billing_prepaid_purchase SET payment_state='failed',failure_code=NULLIF($2,''),failure_reason=$3 WHERE id=$1 AND payment_state=ANY($4) RETURNING team_id`, id, code, reason, from).Scan(&team)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}

@@ -526,6 +526,7 @@ func TestPrepaidSpentGrantIsVoidedOnlyOutsideClose(t *testing.T) {
 		t.Fatal("grant voided while an ended period awaits its close")
 	}
 	f.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'released',clock_timestamp(),'{}','{}')`, f.team, start, start.Add(24*time.Hour), "in_"+strings.ReplaceAll(uuid.NewString(), "-", ""))
+	f.exec(`UPDATE billing_prepaid_purchase SET credit_balance_checked_at=NULL WHERE team_id=$1`, f.team)
 	if err := f.h.voidSpentPrepaidGrants(t.Context(), f.client); err != nil {
 		t.Fatal(err)
 	}
@@ -534,5 +535,63 @@ func TestPrepaidSpentGrantIsVoidedOnlyOutsideClose(t *testing.T) {
 	}
 	if n, _ := f.h.prepaidUnspentPurchases(t.Context(), f.team); n != 0 {
 		t.Fatal("voided purchase still counts as unspent", n)
+	}
+}
+
+func TestPrepaidReenrolmentAtCapacity(t *testing.T) {
+	f := newPrepaidFixture(t)
+	var budget int
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT max_observed_teams FROM billing_funding_policy`).Scan(&budget); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET max_observed_teams=$1`, budget)
+	})
+	f.exec(`UPDATE billing_funding_policy SET max_observed_teams=(SELECT count(*) FROM billing_funding_account WHERE observe)`)
+	if err := f.h.enrolPrepaidObservation(t.Context(), f.team); err != nil {
+		t.Fatal("an already observed team was refused at capacity", err)
+	}
+	if ok, err := f.h.prepaidCapacityAvailable(t.Context(), f.team); err != nil || !ok {
+		t.Fatal("an observed team cannot buy credit at capacity", ok, err)
+	}
+	other, err := f.h.DB.CreateTeam(t.Context(), "prepaid-full-"+uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := f.h.prepaidCapacityAvailable(t.Context(), other.ID); err != nil || ok {
+		t.Fatal("a new team was offered a purchase with no observation slot", ok, err)
+	}
+}
+
+func TestPrepaidDisableNeverFailsAnInFlightCharge(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(2000, 5000)
+	f.observe(0, true)
+	f.loseIntent = true
+	if err := f.tick(); err == nil {
+		t.Fatal("expected a lost provider response")
+	}
+	f.exec(`UPDATE billing_prepaid_auto_recharge SET enabled=false WHERE team_id=$1`, f.team)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.rows(); len(r) != 1 || r[0].Payment != "succeeded" || r[0].Credit != "issued" {
+		t.Fatalf("a charge that may have reached Stripe was failed by a later disable: %+v", r)
+	}
+}
+
+func TestPrepaidOpenCheckoutDoesNotBlockAutoRecharge(t *testing.T) {
+	f := newPrepaidFixture(t)
+	if _, err := f.h.startPrepaidPaymentCheckout(t.Context(), f.client, f.team, uuid.New(), f.customer, 500, "https://console.example.com/ok", "https://console.example.com/cancel"); err != nil {
+		t.Fatal(err)
+	}
+	f.enableAutoRecharge(2000, 5000)
+	f.observe(0, true)
+	if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1 AND source='auto_recharge'`, f.team).Scan(&n); err != nil || n != 1 {
+		t.Fatal("an open manual checkout suppressed auto-recharge", n, err)
 	}
 }

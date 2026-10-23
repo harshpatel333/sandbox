@@ -18,12 +18,14 @@ const prepaidLiveGrantLimit = 5
 var errPrepaidCapacity = errors.New("prepaid credit is at its observation capacity")
 var errPrepaidTooManyUnspent = errors.New("too many unspent credit purchases")
 
-// enrolPrepaidObservation reserves a funding observation slot before any money
-// moves. Observation alone changes nothing: eligibility still follows today's
+// enrolPrepaidObservation takes a funding observation slot once a purchase is
+// paid. Observation alone changes nothing: eligibility still follows today's
 // rule until the team's credit is observed and prepaid enforcement begins.
 func (h *Handlers) enrolPrepaidObservation(ctx context.Context, team uuid.UUID) error {
-	_, err := h.Pool.Exec(ctx, `INSERT INTO billing_funding_account(team_id,observe) VALUES($1,true)
- ON CONFLICT(team_id) DO UPDATE SET observe=true WHERE NOT billing_funding_account.observe`, team)
+	if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_funding_account(team_id) VALUES($1) ON CONFLICT(team_id) DO NOTHING`, team); err != nil {
+		return err
+	}
+	_, err := h.Pool.Exec(ctx, `UPDATE billing_funding_account SET observe=true WHERE team_id=$1 AND NOT observe`, team)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "P0001" {
 		return errPrepaidCapacity
@@ -91,7 +93,8 @@ func (h *Handlers) voidSpentPrepaidGrant(ctx context.Context, client *stripeHTTP
 	}
 	release, err := h.holdCreditIssuanceFence(ctx, team)
 	if errors.Is(err, errCreditIssuanceDeferred) {
-		return nil
+		_, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET credit_balance_checked_at=clock_timestamp()-interval '50 minutes' WHERE id=$1`, id)
+		return err
 	}
 	if err != nil {
 		return err
@@ -110,4 +113,13 @@ func (h *Handlers) voidSpentPrepaidGrant(ctx context.Context, client *stripeHTTP
 	log.Info().Str("prepaid_purchase_id", id.String()).Str("grant_id", grant).Msg("voided fully consumed prepaid credit grant")
 	_, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET credit_voided_at=clock_timestamp(),credit_balance_checked_at=clock_timestamp() WHERE id=$1 AND credit_voided_at IS NULL`, id)
 	return err
+}
+
+// prepaidCapacityAvailable is checked before any money moves; the slot itself
+// is taken after payment so abandoned checkouts never hold one.
+func (h *Handlers) prepaidCapacityAvailable(ctx context.Context, team uuid.UUID) (bool, error) {
+	var ok bool
+	err := h.Pool.QueryRow(ctx, `SELECT COALESCE((SELECT observe FROM billing_funding_account WHERE team_id=$1),false)
+ OR (SELECT count(*) FROM billing_funding_account WHERE observe)<(SELECT max_observed_teams FROM billing_funding_policy WHERE singleton)`, team).Scan(&ok)
+	return ok, err
 }
