@@ -538,7 +538,15 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 	if version != "v2" {
 		return teamPlan{}, errPricingV2Off
 	}
-	terms, err := h.planTermsVersion(ctx, body.VersionID, 0)
+	catalogVersion, err := scanPlanVersion(tx.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1 AND state<>'draft'`, body.VersionID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return teamPlan{}, errUnknownPlan
+	}
+	if err != nil {
+		return teamPlan{}, err
+	}
+	catalog := &Handlers{DB: db.New(tx)}
+	terms, err := catalog.termsOfVersion(ctx, catalogVersion, 0)
 	if err != nil {
 		return teamPlan{}, err
 	}
