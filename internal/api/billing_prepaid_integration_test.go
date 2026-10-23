@@ -60,8 +60,16 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 	}
 	t.Cleanup(pool.Close)
 	h := &Handlers{Pool: pool, DB: db.New(pool), Config: &config.Config{}}
+	setPricingVersion(t, h, "v2")
 	team, err := h.DB.CreateTeam(t.Context(), "prepaid-"+uuid.NewString())
 	if err != nil {
+		t.Fatal(err)
+	}
+	terms, err := h.planTerms(t.Context(), "starter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = assignInTx(t, h, planAssignment{Team: team.ID, Terms: terms, Source: planSourceCreditPurchase, Reason: "fixture prepaid team"}); err != nil {
 		t.Fatal(err)
 	}
 	f := &prepaidFixture{t: t, h: h, team: team.ID, customer: "cus_" + uuid.NewString(), sub: "sub_" + uuid.NewString(),
@@ -145,6 +153,10 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewEncoder(w).Encode(map[string]any{"data": data})
 	case path == "/v1/checkout/sessions" && r.Method == http.MethodPost:
+		var frozen bool
+		if err := f.h.Pool.QueryRow(r.Context(), `SELECT plan_snapshot IS NOT NULL FROM billing_prepaid_purchase WHERE id=$1`, r.PostForm.Get("metadata[prepaid_purchase_id]")).Scan(&frozen); err != nil || !frozen {
+			f.t.Error("checkout dispatched before durable plan authority", frozen, err)
+		}
 		id, ok := f.sessionByKey[key]
 		if !ok {
 			id = "cs_" + strings.ReplaceAll(uuid.NewString(), "-", "")
@@ -153,6 +165,12 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 			f.sessionByKey[key] = id
 		}
 		json.NewEncoder(w).Encode(f.sessions[id])
+	case path == "/v1/checkout/sessions" && r.Method == http.MethodGet:
+		sessions := []map[string]any{}
+		for _, session := range f.sessions {
+			sessions = append(sessions, session)
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": sessions, "has_more": false})
 	case strings.HasPrefix(path, "/v1/checkout/sessions/"):
 		json.NewEncoder(w).Encode(f.sessions[strings.TrimPrefix(path, "/v1/checkout/sessions/")])
 	case strings.HasPrefix(path, "/v1/invoices/"):
@@ -419,13 +437,14 @@ func TestPrepaidFirstPurchaseUsesSubscriptionInvoice(t *testing.T) {
 		t.Fatal("replayed lease must map to the same purchase")
 	}
 	session := "cs_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if err := f.h.recordCheckoutPurchase(t.Context(), id, f.team, f.customer, uuid.New(), 1000, session); err != nil {
+	actor := uuid.New()
+	if err := f.h.recordCheckoutPurchase(t.Context(), id, f.team, f.customer, actor, 1000, session); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.h.recordCheckoutPurchase(t.Context(), id, f.team, f.customer, uuid.New(), 1000, session); err != nil {
+	if err := f.h.recordCheckoutPurchase(t.Context(), id, f.team, f.customer, actor, 1000, session); err != nil {
 		t.Fatal("replayed record failed", err)
 	}
-	if err := f.h.recordCheckoutPurchase(t.Context(), id, f.team, f.customer, uuid.New(), 1000, "cs_other"); err == nil {
+	if err := f.h.recordCheckoutPurchase(t.Context(), id, f.team, f.customer, actor, 1000, "cs_other"); err == nil {
 		t.Fatal("a purchase was rebound to another session")
 	}
 	invoice := "in_" + strings.ReplaceAll(uuid.NewString(), "-", "")

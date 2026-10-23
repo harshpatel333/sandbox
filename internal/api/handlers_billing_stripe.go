@@ -1826,7 +1826,17 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 	var purchaseID uuid.UUID
 	if prepaid != nil {
 		purchaseID = prepaidCheckoutPurchaseID(teamID, leaseStartedAt, prepaid.AmountCents)
+		if err := h.recordCheckoutPurchase(c.Request.Context(), purchaseID, teamID, customerID, checkoutActor, prepaid.AmountCents, ""); err != nil {
+			h.finishFailedStripeCheckoutAttempt(teamID, attemptID, checkoutAccount.CheckoutInitializingAt, false)
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("freeze prepaid checkout terms failed")
+			respondError(c, ErrInternal)
+			return
+		}
 		oneTime = []StripeCheckoutOneTimeLine{prepaidCheckoutOneTimeLine(purchaseID, prepaid.AmountCents)}
+	}
+	metadata := map[string]string{"activation_user_id": checkoutActor.String(), "checkout_generation": leaseStartedAt.Format(time.RFC3339Nano)}
+	if prepaid != nil {
+		metadata["prepaid_purchase_id"] = purchaseID.String()
 	}
 	session, err := h.Stripe.CreateCheckoutSession(c.Request.Context(), StripeCreateCheckoutSessionParams{
 		CustomerID:        customerID,
@@ -1835,12 +1845,9 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 		ClientReferenceID: teamID.String(),
 		PriceIDs:          priceIDs,
 		ExpiresAt:         &expiresAt,
-		Metadata: map[string]string{
-			"activation_user_id":  checkoutActor.String(),
-			"checkout_generation": leaseStartedAt.Format(time.RFC3339Nano),
-		},
-		IdempotencyKey: checkoutSessionIdempotencyKeyForLease(teamID, customerID, successURL, cancelURL, keyParts, leaseStartedAt),
-		OneTimeLines:   oneTime,
+		Metadata:          metadata,
+		IdempotencyKey:    checkoutSessionIdempotencyKeyForLease(teamID, customerID, successURL, cancelURL, keyParts, leaseStartedAt),
+		OneTimeLines:      oneTime,
 	})
 	if err != nil {
 		// A transport, timeout, or decode failure is ambiguous: Stripe may have

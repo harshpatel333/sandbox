@@ -56,21 +56,30 @@ func validPrepaidAmount(amount int64) bool {
 }
 
 func (h *Handlers) recordCheckoutPurchase(ctx context.Context, id, team uuid.UUID, customer string, actor uuid.UUID, amount int64, session string) error {
-	if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key)
- VALUES($1,$2,$3,'checkout',$4,$5,'','') ON CONFLICT(id) DO NOTHING`, id, team, customer, amount, actor); err != nil {
-		return err
-	}
-	var recorded *string
-	err := h.Pool.QueryRow(ctx, `UPDATE billing_prepaid_purchase SET checkout_session_id=COALESCE(checkout_session_id,$2),payment_state=CASE WHEN payment_state='pending' THEN 'processing' ELSE payment_state END,
- payment_first_attempt_at=COALESCE(payment_first_attempt_at,clock_timestamp())
- WHERE id=$1 AND team_id=$3 AND customer_id=$4 AND amount_cents=$5 RETURNING checkout_session_id`, id, session, team, customer, amount).Scan(&recorded)
+	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if recorded == nil || *recorded != session {
-		return errors.New("prepaid purchase is bound to a different checkout session")
+	defer tx.Rollback(ctx)
+	if err = h.preparePrepaidPurchase(ctx, tx, id, team, customer, actor, amount); err != nil {
+		return err
 	}
-	return nil
+	if session == "" {
+		if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_state='uncertain',payment_first_attempt_at=clock_timestamp(),next_attempt_at=clock_timestamp()+interval '2 minutes' WHERE id=$1 AND payment_state='pending'`, id); err != nil {
+			return err
+		}
+	} else {
+		var recorded *string
+		err = tx.QueryRow(ctx, `UPDATE billing_prepaid_purchase SET checkout_session_id=COALESCE(checkout_session_id,$2),payment_state=CASE WHEN payment_state IN ('pending','uncertain') THEN 'processing' ELSE payment_state END,
+   payment_first_attempt_at=COALESCE(payment_first_attempt_at,clock_timestamp()) WHERE id=$1 AND team_id=$3 AND customer_id=$4 AND amount_cents=$5 RETURNING checkout_session_id`, id, session, team, customer, amount).Scan(&recorded)
+		if err != nil {
+			return err
+		}
+		if recorded == nil || *recorded != session {
+			return errors.New("prepaid purchase is bound to a different checkout session")
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // Later purchases pay once in Checkout and save the card for auto-recharge.
@@ -80,9 +89,8 @@ func (h *Handlers) startPrepaidPaymentCheckout(ctx context.Context, client *stri
 		return prepaidCheckoutSession{}, err
 	}
 	defer tx.Rollback(ctx)
-	var id uuid.UUID
-	if err = tx.QueryRow(ctx, `INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key)
- VALUES($1,$2,'checkout',$3,$4,'','') RETURNING id`, team, customer, amount, actor).Scan(&id); err != nil {
+	id := uuid.New()
+	if err = h.preparePrepaidPurchase(ctx, tx, id, team, customer, actor, amount); err != nil {
 		return prepaidCheckoutSession{}, err
 	}
 	request, err := json.Marshal(prepaidCheckoutRequest{Customer: customer, Team: team.String(), AmountCents: amount, SuccessURL: successURL, CancelURL: cancelURL, ExpiresAt: time.Now().Add(23 * time.Hour).Unix()})
@@ -156,15 +164,18 @@ func (h *Handlers) settleCheckoutPurchase(ctx context.Context, client *stripeHTT
 		return err
 	}
 	if session == nil {
-		if request == nil || first == nil {
+		if first == nil {
 			return h.failPrepaidPayment(ctx, id, "", "the checkout was never opened", false)
 		}
-		if time.Since(*first) >= 23*time.Hour {
+		if request == nil || time.Since(*first) >= 23*time.Hour {
 			found, err := client.findPrepaidCheckout(ctx, customer, id)
 			if err != nil {
 				return err
 			}
 			if found == "" {
+				if time.Since(*first) < 23*time.Hour {
+					return errPrepaidPaymentPending
+				}
 				return h.failPrepaidPayment(ctx, id, "", "the checkout was never opened", false)
 			}
 			if _, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET checkout_session_id=$2,payment_state='processing' WHERE id=$1 AND checkout_session_id IS NULL AND payment_state='uncertain'`, id, found); err != nil {

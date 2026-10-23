@@ -49,11 +49,33 @@ func (h *Handlers) prepaidUnspentPurchases(ctx context.Context, team uuid.UUID) 
 // Prepaid enforcement starts only once a fresh observation already shows the
 // purchased credit, so switching rules never blips a paying team ineligible.
 func (h *Handlers) startPrepaidEnforcement(ctx context.Context) error {
-	_, err := h.Pool.Exec(ctx, `UPDATE billing_funding_account f SET enforce=true,prepaid=true
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `SELECT t.id FROM team t JOIN billing_funding_account f ON f.team_id=t.id
  WHERE f.observe AND NOT f.prepaid AND f.observed_generation=f.generation AND f.credit_usd>0 AND f.credit_valid_until>clock_timestamp()
+ AND EXISTS(SELECT 1 FROM team_plan_assignment a WHERE a.team_id=t.id AND a.effective_to IS NULL AND a.kind='prepaid')
+ AND EXISTS(SELECT 1 FROM billing_prepaid_purchase p JOIN team_billing_account a USING(team_id)
+  WHERE p.team_id=f.team_id AND p.credit_state='issued' AND p.customer_id=a.stripe_customer_id AND f.customer_id=a.stripe_customer_id AND f.credit_checked_at>p.credited_at)
+ ORDER BY t.id LIMIT 20 FOR NO KEY UPDATE OF t SKIP LOCKED`)
+	if err != nil {
+		return err
+	}
+	teams, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE billing_funding_account f SET enforce=true,prepaid=true
+ WHERE f.team_id=ANY($1) AND EXISTS(SELECT 1 FROM team_plan_assignment a WHERE a.team_id=f.team_id AND a.effective_to IS NULL AND a.kind='prepaid')
+ AND f.observe AND NOT f.prepaid AND f.observed_generation=f.generation AND f.credit_usd>0 AND f.credit_valid_until>clock_timestamp()
   AND EXISTS(SELECT 1 FROM billing_prepaid_purchase p JOIN team_billing_account a USING(team_id)
-   WHERE p.team_id=f.team_id AND p.credit_state='issued' AND p.customer_id=a.stripe_customer_id AND f.customer_id=a.stripe_customer_id AND f.credit_checked_at>p.credited_at)`)
-	return err
+   WHERE p.team_id=f.team_id AND p.credit_state='issued' AND p.customer_id=a.stripe_customer_id AND f.customer_id=a.stripe_customer_id AND f.credit_checked_at>p.credited_at)`, teams)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // A fully consumed purchase grant is voided so it stops counting toward the
@@ -300,16 +322,6 @@ func (h *Handlers) retryPrepaidEnrolment(ctx context.Context) error {
 	}
 	var errs []error
 	for _, team := range teams {
-		allowed, err := prepaidPlanAllowsPurchase(ctx, h, team)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if !allowed {
-			_, err = h.Pool.Exec(ctx, `UPDATE billing_funding_account SET prepaid_enrolment_due_at=NULL WHERE team_id=$1`, team)
-			errs = append(errs, err)
-			continue
-		}
 		if err = h.enrolPrepaidObservation(ctx, team); err != nil {
 			log.Error().Err(err).Str("team_id", team.String()).Msg("paid prepaid team is not observed; its balance and auto-recharge wait for an observation slot")
 			errs = append(errs, err)

@@ -7,6 +7,7 @@ CREATE TABLE billing_prepaid_purchase (
     source text NOT NULL CHECK (source IN ('checkout', 'auto_recharge')),
     amount_cents bigint NOT NULL CHECK (amount_cents >= 500 AND amount_cents % 500 = 0 AND amount_cents <= 100000000),
     actor_id uuid,
+    plan_snapshot jsonb CHECK (plan_snapshot IS NULL OR jsonb_typeof(plan_snapshot)='object'),
     payment_state text NOT NULL DEFAULT 'pending' CHECK (payment_state IN ('pending', 'uncertain', 'processing', 'succeeded', 'failed')),
     payment_idempotency_key text NOT NULL UNIQUE,
     payment_request jsonb,
@@ -82,8 +83,8 @@ BEGIN
         NEW.credit_voided_at := NULL;
         RETURN NEW;
     END IF;
-    IF (NEW.id, NEW.team_id, NEW.customer_id, NEW.source, NEW.amount_cents, NEW.actor_id, NEW.payment_idempotency_key, NEW.credit_idempotency_key, NEW.created_at)
-        IS DISTINCT FROM (OLD.id, OLD.team_id, OLD.customer_id, OLD.source, OLD.amount_cents, OLD.actor_id, OLD.payment_idempotency_key, OLD.credit_idempotency_key, OLD.created_at) THEN
+    IF (NEW.id, NEW.team_id, NEW.customer_id, NEW.source, NEW.amount_cents, NEW.actor_id, NEW.payment_idempotency_key, NEW.credit_idempotency_key, NEW.created_at, NEW.plan_snapshot)
+        IS DISTINCT FROM (OLD.id, OLD.team_id, OLD.customer_id, OLD.source, OLD.amount_cents, OLD.actor_id, OLD.payment_idempotency_key, OLD.credit_idempotency_key, OLD.created_at, OLD.plan_snapshot) THEN
         RAISE EXCEPTION 'prepaid purchase terms are immutable';
     END IF;
     IF OLD.payment_state IN ('succeeded', 'failed') AND (NEW.payment_state, NEW.payment_evidence, NEW.paid_at, NEW.failure_reason)

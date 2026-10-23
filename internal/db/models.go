@@ -940,6 +940,7 @@ type BillingPrepaidPurchase struct {
 	Source                 string             `json:"source"`
 	AmountCents            int64              `json:"amount_cents"`
 	ActorID                pgtype.UUID        `json:"actor_id"`
+	PlanSnapshot           []byte             `json:"plan_snapshot"`
 	PaymentState           string             `json:"payment_state"`
 	PaymentIdempotencyKey  string             `json:"payment_idempotency_key"`
 	PaymentRequest         []byte             `json:"payment_request"`
