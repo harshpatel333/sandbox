@@ -5154,10 +5154,10 @@ components:
       properties:
         key:
           type: string
-          description: Offer key used to start checkout, e.g. `starter_monthly`.
+          description: Offer key used to start checkout, e.g. `pro_monthly`.
         family:
           type: string
-          description: Plan family shared by its monthly and annual offers, e.g. `starter`.
+          description: Plan family shared by its monthly and annual offers, e.g. `pro`.
         name:
           type: string
         interval_months:

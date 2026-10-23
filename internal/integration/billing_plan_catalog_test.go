@@ -876,6 +876,10 @@ func TestIntegration_PublicBillingPlansListTodaysPurchasablePlans(t *testing.T) 
 	}
 	// Starter stays unavailable, even where a price is configured, so only
 	// the Pro offers checkout already sells are listed, at their current terms.
+	var starter int
+	if err := testPool.QueryRow(t.Context(), `SELECT (SELECT COUNT(*) FROM billing_plan WHERE family='starter') + (SELECT COUNT(*) FROM plan_limits WHERE offer_key LIKE 'starter%')`).Scan(&starter); err != nil || starter != 0 {
+		t.Fatalf("migrated catalog has %d Starter offer rows, err=%v", starter, err)
+	}
 	got := fmt.Sprint(body.Plans)
 	want := "[{pro_monthly 1 120000 100000} {pro_annual 12 1200000 100000}]"
 	if got != want {
