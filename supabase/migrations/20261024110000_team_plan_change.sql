@@ -9,7 +9,7 @@ CREATE TABLE team_plan_change (
  target_plan_key text NOT NULL CHECK(btrim(target_plan_key)<>''),
  target_kind text NOT NULL CHECK(target_kind IN ('free','prepaid','subscription','legacy_payg','custom')),
  target_terms jsonb NOT NULL CHECK(jsonb_typeof(target_terms)='object'),
- target_limits jsonb NOT NULL CHECK(jsonb_typeof(target_limits)='object' AND jsonb_typeof(target_limits->'max_sandboxes')='number'),
+ target_limits jsonb NOT NULL CHECK(jsonb_typeof(target_limits)='object' AND jsonb_typeof(target_limits->'max_concurrent')='number'),
  effective_at timestamptz NOT NULL,
  pauses_running boolean NOT NULL,
  subscription_id text CHECK(subscription_id IS NULL OR btrim(subscription_id)<>''),
@@ -19,9 +19,16 @@ CREATE TABLE team_plan_change (
  idempotency_key text NOT NULL CHECK(length(idempotency_key) BETWEEN 1 AND 200),
  requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  state text NOT NULL DEFAULT 'scheduled' CHECK(state IN ('scheduled','applied','completed','undone')),
+ -- The worker records that it is about to tell Stripe not to renew before it
+ -- does, and whether the subscription was already set to end; undoing a change
+ -- turns renewal back on only if this change turned it off.
+ provider_cancel_requested_at timestamptz,
+ provider_cancel_preexisting boolean NOT NULL DEFAULT false,
  provider_cancel_at timestamptz,
+ provider_renewed_at timestamptz,
  undone_at timestamptz,
  undone_by uuid,
+ undo_reason text CHECK(undo_reason IS NULL OR length(btrim(undo_reason)) BETWEEN 1 AND 2000),
  applied_at timestamptz,
  applied_assignment_id uuid UNIQUE REFERENCES team_plan_assignment(id),
  completed_at timestamptz,
@@ -31,42 +38,55 @@ CREATE TABLE team_plan_change (
  failures integer NOT NULL DEFAULT 0 CHECK(failures>=0),
  last_error text,
  UNIQUE(team_id,idempotency_key),
+ CHECK((state='undone')=(undo_reason IS NOT NULL)),
  CHECK((state='undone')=(undone_at IS NOT NULL) AND (state IN ('applied','completed'))=(applied_at IS NOT NULL AND applied_assignment_id IS NOT NULL)
   AND (state='completed')=(completed_at IS NOT NULL))
 );
 CREATE UNIQUE INDEX team_plan_change_pending ON team_plan_change(team_id) WHERE state='scheduled';
-CREATE INDEX team_plan_change_due ON team_plan_change(next_check_at,id) WHERE state IN ('scheduled','applied');
+CREATE INDEX team_plan_change_due ON team_plan_change(next_check_at,id)
+ WHERE state IN ('scheduled','applied') OR (state='undone' AND provider_cancel_requested_at IS NOT NULL AND provider_renewed_at IS NULL);
 CREATE INDEX team_plan_change_history ON team_plan_change(team_id,requested_at DESC);
 
 CREATE FUNCTION guard_team_plan_change() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE bookkeeping text[]:=ARRAY['next_check_at','lease_token','lease_until','failures','last_error'];
+ progress text[]:=ARRAY['state','effective_at','provider_cancel_requested_at','provider_cancel_preexisting','provider_cancel_at','provider_renewed_at',
+  'undone_at','undone_by','undo_reason','applied_at','applied_assignment_id','completed_at'];
 BEGIN
  IF TG_OP<>'UPDATE' AND TG_OP<>'INSERT' THEN RAISE EXCEPTION 'plan change history is immutable'; END IF;
  IF TG_OP='INSERT' THEN
-  IF NEW.state<>'scheduled' OR num_nonnulls(NEW.provider_cancel_at,NEW.undone_at,NEW.undone_by,NEW.applied_at,NEW.applied_assignment_id,NEW.completed_at)<>0 THEN
+  IF NEW.state<>'scheduled' OR NEW.provider_cancel_preexisting OR num_nonnulls(NEW.provider_cancel_requested_at,NEW.provider_cancel_at,NEW.provider_renewed_at,
+   NEW.undone_at,NEW.undone_by,NEW.undo_reason,NEW.applied_at,NEW.applied_assignment_id,NEW.completed_at)<>0 THEN
    RAISE EXCEPTION 'a plan change starts scheduled';
   END IF;
   RETURN NEW;
  END IF;
- IF (to_jsonb(NEW)-bookkeeping-ARRAY['state','effective_at','provider_cancel_at','undone_at','undone_by','applied_at','applied_assignment_id','completed_at'])
-  IS DISTINCT FROM (to_jsonb(OLD)-bookkeeping-ARRAY['state','effective_at','provider_cancel_at','undone_at','undone_by','applied_at','applied_assignment_id','completed_at']) THEN
+ IF (to_jsonb(NEW)-bookkeeping-progress) IS DISTINCT FROM (to_jsonb(OLD)-bookkeeping-progress) THEN
   RAISE EXCEPTION 'a plan change request is immutable';
  END IF;
- IF OLD.state IN ('completed','undone') AND (to_jsonb(NEW)-bookkeeping) IS DISTINCT FROM (to_jsonb(OLD)-bookkeeping) THEN
+ IF OLD.state IN ('completed','undone') AND (to_jsonb(NEW)-bookkeeping-'provider_renewed_at') IS DISTINCT FROM (to_jsonb(OLD)-bookkeeping-'provider_renewed_at') THEN
   RAISE EXCEPTION 'a finished plan change is immutable';
+ END IF;
+ IF NEW.provider_renewed_at IS DISTINCT FROM OLD.provider_renewed_at AND (OLD.provider_renewed_at IS NOT NULL OR NEW.state<>'undone'
+  OR OLD.provider_cancel_requested_at IS NULL) THEN
+  RAISE EXCEPTION 'renewal is restored once, after an undone change asked Stripe not to renew';
+ END IF;
+ IF (NEW.provider_cancel_requested_at IS DISTINCT FROM OLD.provider_cancel_requested_at
+  OR NEW.provider_cancel_preexisting IS DISTINCT FROM OLD.provider_cancel_preexisting)
+  AND (OLD.provider_cancel_requested_at IS NOT NULL OR OLD.state<>'scheduled' OR NEW.state<>'scheduled') THEN
+  RAISE EXCEPTION 'a subscription cancellation is requested once, while scheduled';
  END IF;
  IF NEW.state IS DISTINCT FROM OLD.state AND NOT (OLD.state,NEW.state) IN (('scheduled','applied'),('scheduled','undone'),('applied','completed')) THEN
   RAISE EXCEPTION 'plan change cannot move from % to %',OLD.state,NEW.state;
  END IF;
  IF OLD.provider_cancel_at IS NOT NULL AND NEW.provider_cancel_at IS DISTINCT FROM OLD.provider_cancel_at
-  OR NEW.provider_cancel_at IS NOT NULL AND OLD.provider_cancel_at IS NULL AND OLD.state<>'scheduled' THEN
-  RAISE EXCEPTION 'a subscription cancellation is recorded once, while scheduled';
+  OR NEW.provider_cancel_at IS NOT NULL AND OLD.provider_cancel_at IS NULL AND (OLD.state<>'scheduled' OR NEW.provider_cancel_requested_at IS NULL) THEN
+  RAISE EXCEPTION 'a subscription cancellation is confirmed once, after it was requested, while scheduled';
  END IF;
  -- A change whose subscription cancellation never reached Stripe before the
  -- period ended waits for the next period end rather than applying early.
  IF NEW.effective_at IS DISTINCT FROM OLD.effective_at AND (OLD.state<>'scheduled' OR NEW.state<>'scheduled'
-  OR OLD.provider_cancel_at IS NOT NULL OR NEW.effective_at<=OLD.effective_at) THEN
-  RAISE EXCEPTION 'only an unconfirmed change can move to a later effective time';
+  OR NEW.effective_at<=OLD.effective_at) THEN
+  RAISE EXCEPTION 'only a scheduled change can move to a later effective time';
  END IF;
  IF NEW.state='applied' AND OLD.state='scheduled' AND NEW.effective_at>clock_timestamp() THEN
   RAISE EXCEPTION 'a plan change cannot apply before it takes effect';

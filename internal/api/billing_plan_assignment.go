@@ -291,7 +291,13 @@ func (h *Handlers) GetTeamPlanAssignments(c *gin.Context) {
 	if len(history) > 0 && history[0].EffectiveTo == nil {
 		current = &history[0]
 	}
-	c.JSON(http.StatusOK, gin.H{"current": current, "history": history})
+	pending, err := pendingCustomerPlanChange(c.Request.Context(), h.Pool, team)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("load pending plan change failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"current": current, "history": history, "pending_change": pending})
 }
 
 type customerPlan struct {
@@ -350,14 +356,11 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 		plan = &customerPlan{PlanKey: current.PlanKey, Kind: current.Kind, DisplayName: current.Terms.DisplayName, EffectiveFrom: current.EffectiveFrom,
 			Limits: planLimits{MaxConcurrent: &limits.MaxConcurrent, MaxVCPU: &limits.MaxVCPU, MaxMemoryMiB: &limits.MaxMemoryMiB, MaxDiskMiB: &limits.MaxDiskMiB, MaxTemplates: &limits.MaxTemplates}}
 	}
-	var pending *customerPendingPlanChange
-	if change, ok, err := pendingTeamPlanChange(ctx, h.Pool, team); err != nil {
+	pending, err := pendingCustomerPlanChange(ctx, h.Pool, team)
+	if err != nil {
 		log.Error().Err(err).Str("team_id", team.String()).Msg("load pending plan change failed")
 		respondError(c, ErrInternal)
 		return
-	} else if ok {
-		pending = &customerPendingPlanChange{ID: change.ID, TargetPlanKey: change.TargetPlanKey, TargetDisplayName: change.TargetTerms.DisplayName,
-			EffectiveAt: change.EffectiveAt, Undoable: change.Undoable(time.Now()), PausesRunning: change.PausesRunning}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"plan":           plan,
@@ -428,7 +431,10 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		return
 	}
 	var current teamPlan
-	var assigned bool
+	var assigned, on bool
+	if err == nil {
+		on, err = h.pricingV2Enabled(ctx)
+	}
 	if err == nil {
 		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
 	}
@@ -446,6 +452,9 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		preview.Blocked = "this plan is no longer offered"
 	default:
 		preview.Timing, preview.Blocked = planChangeRule(current.Kind, kind)
+		if !on && preview.Timing == planChangeAfterPurchase {
+			preview.Timing, preview.Blocked = "", "new plans are not available yet"
+		}
 	}
 	if preview.Blocked == "" {
 		preview.PausesRunning = kind == planKindFree

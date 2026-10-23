@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -102,5 +103,56 @@ func TestIntegration_BillingPlanChangeWrites(t *testing.T) {
 	}
 	if w := do(r, "POST", "/billing/plan-changes/"+teamID.String()+"/undo", key, ""); w.Code != http.StatusNotFound {
 		t.Fatalf("undo of an unknown change: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegration_BillingPlanChangeStaffPendingAndUndoReason(t *testing.T) {
+	team, key := seedTeamAndKey(t)
+	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+        VALUES($1,'custom_example','custom','{"display_name":"Example plan"}','{"max_concurrent":100}',clock_timestamp(),'staff','agreement')`, team); err != nil {
+		t.Fatal(err)
+	}
+	staff := seedPlatformAdminProfile(t).String()
+	router := newInternalRouter(t)
+	path := "/internal/teams/" + team.String() + "/billing/plan-changes"
+	w := operatorRequest(router, http.MethodPost, path, staff, `{"target_plan":"free","idempotency_key":"staff-exit","reason":"end agreement"}`)
+	var change struct {
+		ID string `json:"id"`
+	}
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &change) != nil || change.ID == "" {
+		t.Fatalf("staff exit while entry off: %d %s", w.Code, w.Body)
+	}
+	for _, response := range []*httptest.ResponseRecorder{
+		doInternal(router, http.MethodGet, "/internal/teams/"+team.String()+"/billing/plan-assignments", staff, ""),
+		do(newRouter(t), http.MethodGet, "/billing/plan", key, ""),
+	} {
+		var body struct {
+			Pending *struct {
+				ID            string `json:"id"`
+				Undoable      bool   `json:"undoable"`
+				PausesRunning bool   `json:"pauses_running"`
+			} `json:"pending_change"`
+		}
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil || body.Pending == nil || body.Pending.ID != change.ID || !body.Pending.Undoable || !body.Pending.PausesRunning {
+			t.Fatalf("pending exit missing from billing read: %d %s", response.Code, response.Body)
+		}
+	}
+	undo := path + "/" + change.ID + "/undo"
+	if w := operatorRequest(router, http.MethodPost, undo, staff, `{}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("staff undo accepted without reason: %d %s", w.Code, w.Body)
+	}
+	if w := operatorRequest(router, http.MethodPost, undo, staff, `{"reason":"keep agreement"}`); w.Code != http.StatusOK {
+		t.Fatalf("staff undo failed with entry off: %d %s", w.Code, w.Body)
+	}
+	var reason string
+	if err := testPool.QueryRow(t.Context(), `SELECT undo_reason FROM team_plan_change WHERE id=$1`, change.ID).Scan(&reason); err != nil || reason != "keep agreement" {
+		t.Fatalf("undo reason not recorded: %q %v", reason, err)
+	}
+	w = doInternal(router, http.MethodGet, "/internal/teams/"+team.String()+"/billing/plan-assignments", staff, "")
+	var body struct {
+		Pending *json.RawMessage `json:"pending_change"`
+	}
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &body) != nil || body.Pending != nil {
+		t.Fatalf("undone change still pending: %d %s", w.Code, w.Body)
 	}
 }
