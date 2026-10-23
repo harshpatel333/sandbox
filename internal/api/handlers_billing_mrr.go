@@ -39,13 +39,15 @@ type mrrPlan struct {
 }
 
 type mrrOverview struct {
-	AsOf        time.Time `json:"as_of"`
-	Region      string    `json:"region"`
-	Currency    string    `json:"currency"`
-	MRRCents    int64     `json:"mrr_cents"`
-	Teams       int64     `json:"teams"`
-	PayingTeams int64     `json:"paying_teams"`
-	Plans       []mrrPlan `json:"plans"`
+	AsOf     time.Time `json:"as_of"`
+	Region   string    `json:"region"`
+	Currency string    `json:"currency"`
+	MRRCents int64     `json:"mrr_cents"`
+	Teams    int64     `json:"teams"`
+	// RevenueTeams counts teams contributing to MRR, including fee-waived
+	// deals valued at list price.
+	RevenueTeams int64     `json:"revenue_teams"`
+	Plans        []mrrPlan `json:"plans"`
 }
 
 func monthlyCents(feeCents int64, intervalMonths int32) int64 {
@@ -102,7 +104,7 @@ func buildMRROverview(groups []mrrContractGroup, totalTeams int64, proAnnual pla
 		out.MRRCents += cents
 		contracted += g.Teams
 		if cents > 0 {
-			out.PayingTeams += g.Teams
+			out.RevenueTeams += g.Teams
 		}
 	}
 	for _, p := range plans {
@@ -129,7 +131,7 @@ FROM billing_commercial_contract c JOIN team t ON t.id=c.team_id
 WHERE c.status='active' AND c.starts_at<=$1 AND (c.ends_at IS NULL OR c.ends_at>$1) AND t.home_region=$2
 GROUP BY 1,2,3,4,5`
 
-func (h *Handlers) loadMRROverview(ctx context.Context, q db.DBTX, now time.Time, region string) (mrrOverview, error) {
+func (h *Handlers) loadMRROverview(ctx context.Context, q db.DBTX, now time.Time, region, systemTeam string) (mrrOverview, error) {
 	rows, err := q.Query(ctx, mrrContractGroupsQuery, now, region)
 	if err != nil {
 		return mrrOverview{}, err
@@ -143,7 +145,7 @@ func (h *Handlers) loadMRROverview(ctx context.Context, q db.DBTX, now time.Time
 		return mrrOverview{}, err
 	}
 	var totalTeams int64
-	if err := q.QueryRow(ctx, `SELECT count(*) FROM team WHERE home_region=$1`, region).Scan(&totalTeams); err != nil {
+	if err := q.QueryRow(ctx, `SELECT count(*) FROM team WHERE home_region=$1 AND id::text<>$2`, region, systemTeam).Scan(&totalTeams); err != nil {
 		return mrrOverview{}, err
 	}
 	names := map[string]string{
@@ -187,7 +189,7 @@ func (h *Handlers) GetPlatformBillingMRR(c *gin.Context) {
 		respondErrorMsg(c, "service_unavailable", "billing is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	out, err := h.loadMRROverview(c.Request.Context(), h.Pool, h.nowUTC(), h.Config.TeamCreationRegion)
+	out, err := h.loadMRROverview(c.Request.Context(), h.Pool, h.nowUTC(), h.Config.TeamCreationRegion, h.Config.SystemTeamID)
 	if err != nil {
 		log.Error().Err(err).Msg("platform billing MRR query failed")
 		respondError(c, ErrInternal)

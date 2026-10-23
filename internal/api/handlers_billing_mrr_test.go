@@ -56,8 +56,8 @@ func TestBuildMRROverview(t *testing.T) {
 	if out.MRRCents != 2*120000+100000+3*100000+100000 {
 		t.Fatalf("mrr = %d", out.MRRCents)
 	}
-	if out.Teams != 20 || out.PayingTeams != 7 {
-		t.Fatalf("teams = %d paying = %d", out.Teams, out.PayingTeams)
+	if out.Teams != 20 || out.RevenueTeams != 7 {
+		t.Fatalf("teams = %d revenue = %d", out.Teams, out.RevenueTeams)
 	}
 	want := []mrrPlan{
 		{Key: "yc_2026", Name: "yc_2026", Teams: 3, MRRCents: 300000},
