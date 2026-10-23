@@ -30,11 +30,11 @@ func TestPlanTermsFeeLessFamily(t *testing.T) {
 		return r
 	}, strings.ReplaceAll(uuid.NewString()[:8], "-", ""))
 	var id uuid.UUID
-	if err := pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version(family,version,display_name,credit_schedule,matching_bps,cap_cents)
-		VALUES($1,1,'Example match','[{"start_months":0,"repeat":1,"every_months":1,"amount_cents":1000000,"expires_after_months":3}]',10000,8000000) RETURNING id`, family).Scan(&id); err != nil {
+	if err := pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version(family,version,kind,display_name,credit_schedule,matching_bps,cap_cents)
+		VALUES($1,1,'custom','Example match','[{"start_months":0,"repeat":1,"every_months":1,"amount_cents":1000000,"expires_after_months":3}]',10000,8000000) RETURNING id`, family).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(t.Context(), `SELECT publish_billing_catalog_version('billing_plan_version',$1,NULL)`, id); err != nil {
+	if _, err := pool.Exec(t.Context(), `SELECT publish_billing_plan_version($1,NULL)`, id); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(t.Context(), `SELECT retire_billing_plan_version($1,NULL)`, id) })

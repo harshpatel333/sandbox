@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -29,7 +28,7 @@ type activationRevocationStripe struct {
 	customer, grantID                        string
 	voided, failVoid, ambiguous, failBalance bool
 	expires                                  *int64
-	balance, amount                          int64
+	balance                                  int64
 	creates, voids, expiresCount             int
 }
 
@@ -39,7 +38,7 @@ func (s *activationRevocationStripe) serve(t *testing.T, w http.ResponseWriter, 
 	defer s.mu.Unlock()
 	grant := func() map[string]any {
 		g := map[string]any{"id": s.grantID, "customer": s.customer, "category": "promotional",
-			"amount":               map[string]any{"type": "monetary", "monetary": map[string]any{"currency": "usd", "value": s.amount}},
+			"amount":               map[string]any{"type": "monetary", "monetary": map[string]any{"currency": "usd", "value": 9500}},
 			"applicability_config": map[string]any{"scope": map[string]any{"price_type": "metered"}},
 			"metadata":             map[string]string{"activation_identity": "stripe-activation-credit-" + s.teamID.String()}, "expires_at": s.expires}
 		if s.voided {
@@ -50,13 +49,6 @@ func (s *activationRevocationStripe) serve(t *testing.T, w http.ResponseWriter, 
 	switch {
 	case r.Method == "POST" && r.URL.Path == "/v1/billing/credit_grants":
 		s.creates++
-		_ = r.ParseForm()
-		if created, err := strconv.ParseInt(r.Form.Get("amount[monetary][value]"), 10, 64); err == nil {
-			if s.balance == s.amount {
-				s.balance = created
-			}
-			s.amount = created
-		}
 		_ = json.NewEncoder(w).Encode(grant())
 	case r.Method == "GET" && r.URL.Path == "/v1/billing/credit_grants":
 		if r.URL.Query().Get("customer") != s.customer {
@@ -110,9 +102,7 @@ func (s *activationRevocationStripe) serve(t *testing.T, w http.ResponseWriter, 
 }
 
 func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
-	publishSignupPromotion(t, "card_bonus", 10000)
-	t.Cleanup(func() { publishSignupPromotion(t, "card_bonus", 9500) })
-	for _, scenario := range []string{"scheduled", "legacy_missing_id", "terminal", "deleted", "stale", "previous_subscription", "unrelated_subscription", "same_second", "transient", "ambiguous", "consumed", "expired", "already_voided", "local_finalization_failure", "partial_reconciled", "legacy_amount"} {
+	for _, scenario := range []string{"scheduled", "legacy_missing_id", "terminal", "deleted", "stale", "previous_subscription", "unrelated_subscription", "same_second", "transient", "ambiguous", "consumed", "expired", "already_voided", "local_finalization_failure", "partial_reconciled"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
 			teamID, key, userID := seedTeamAndKeyWithRole(t, "team_owner")
@@ -121,7 +111,7 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 			if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,$2)`, teamID, customer); err != nil {
 				t.Fatal(err)
 			}
-			stripe := &activationRevocationStripe{teamID: teamID, customer: customer, grantID: grantID, balance: 9500, amount: 9500}
+			stripe := &activationRevocationStripe{teamID: teamID, customer: customer, grantID: grantID, balance: 9500}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { stripe.serve(t, w, r) }))
 			defer server.Close()
 			client := api.NewStripeBillingClient(&config.Config{StripeSecretKey: "sk_test_example", StripeAPIVersion: "2025-06-30", StripeAPIBaseURL: server.URL})
@@ -135,19 +125,6 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 			}
 			if derefString(before.StripeActivationCreditGrantID) != grantID {
 				t.Fatalf("activation did not persist grant: %+v", before)
-			}
-			var recorded *int64
-			if err := testPool.QueryRow(ctx, `SELECT stripe_activation_credit_amount_cents FROM team_billing_account WHERE team_id=$1`, teamID).Scan(&recorded); err != nil || recorded == nil || *recorded != 10000 || stripe.amount != 10000 {
-				t.Fatalf("activation recorded=%v granted=%d err=%v", recorded, stripe.amount, err)
-			}
-			if scenario == "legacy_amount" {
-				// Grants made before amounts were recorded carry the historical $95.
-				if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET stripe_activation_credit_amount_cents=NULL WHERE team_id=$1`, teamID); err != nil {
-					t.Fatal(err)
-				}
-				stripe.mu.Lock()
-				stripe.amount, stripe.balance = 9500, 9500
-				stripe.mu.Unlock()
 			}
 			var redeemedAt time.Time
 			if err := testPool.QueryRow(ctx, `SELECT stripe_redemption_at FROM user_promotion_entitlement WHERE user_id=$1 AND stripe_redemption_team_id=$2`, userID, teamID).Scan(&redeemedAt); err != nil {
@@ -431,7 +408,7 @@ func TestIntegration_BillingRecoveryRevokesHistoricalActivationCredit(t *testing
 			if err := testPool.QueryRow(ctx, `SELECT row_to_json(u)::text FROM user_promotion_entitlement u WHERE user_id=$1`, userID).Scan(&userBefore); err != nil {
 				t.Fatal(err)
 			}
-			stripe := &activationRevocationStripe{teamID: teamID, customer: customer, grantID: grantID, balance: 9500, amount: 9500, failVoid: scenario == "transient"}
+			stripe := &activationRevocationStripe{teamID: teamID, customer: customer, grantID: grantID, balance: 9500, failVoid: scenario == "transient"}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "GET" && r.URL.Path == "/v1/subscriptions/"+sub {
 					_ = json.NewEncoder(w).Encode(map[string]any{"id": sub, "customer": customer, "status": "active", "cancel_at_period_end": true})

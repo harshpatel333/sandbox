@@ -394,6 +394,7 @@ type BillingContractLimit struct {
 	MaxTemplateVcpu      *int32    `json:"max_template_vcpu"`
 	MaxTemplateMemoryMib *int32    `json:"max_template_memory_mib"`
 	MaxTemplateDiskMib   *int32    `json:"max_template_disk_mib"`
+	MaxTemplates         *int32    `json:"max_templates"`
 	CreatedAt            time.Time `json:"created_at"`
 }
 
@@ -824,33 +825,60 @@ type BillingPlanRelease struct {
 }
 
 type BillingPlanVersion struct {
-	ID                   uuid.UUID          `json:"id"`
-	Family               string             `json:"family"`
-	Version              int32              `json:"version"`
-	State                string             `json:"state"`
-	DisplayName          string             `json:"display_name"`
-	Tagline              string             `json:"tagline"`
-	Features             []string           `json:"features"`
-	SortOrder            int32              `json:"sort_order"`
-	DisplayOnly          bool               `json:"display_only"`
-	SelfServe            bool               `json:"self_serve"`
-	Public               bool               `json:"public"`
-	MonthlyFeeCents      *int64             `json:"monthly_fee_cents"`
-	AnnualFeeCents       *int64             `json:"annual_fee_cents"`
-	CreditSchedule       []byte             `json:"credit_schedule"`
-	MatchingBps          *int32             `json:"matching_bps"`
-	CapCents             *int64             `json:"cap_cents"`
-	MaxSandboxes         *int32             `json:"max_sandboxes"`
-	MaxTemplateVcpu      *int32             `json:"max_template_vcpu"`
-	MaxTemplateMemoryMib *int32             `json:"max_template_memory_mib"`
-	MaxTemplateDiskMib   *int32             `json:"max_template_disk_mib"`
-	CreatedBy            pgtype.UUID        `json:"created_by"`
-	CreatedAt            time.Time          `json:"created_at"`
-	UpdatedAt            time.Time          `json:"updated_at"`
-	PublishedBy          pgtype.UUID        `json:"published_by"`
-	PublishedAt          pgtype.Timestamptz `json:"published_at"`
-	RetiredBy            pgtype.UUID        `json:"retired_by"`
-	RetiredAt            pgtype.Timestamptz `json:"retired_at"`
+	ID                        uuid.UUID          `json:"id"`
+	PricingVersion            string             `json:"pricing_version"`
+	Family                    string             `json:"family"`
+	Version                   int32              `json:"version"`
+	State                     string             `json:"state"`
+	Kind                      string             `json:"kind"`
+	DisplayName               string             `json:"display_name"`
+	PriceLabel                string             `json:"price_label"`
+	Tagline                   string             `json:"tagline"`
+	Features                  []string           `json:"features"`
+	SortOrder                 int32              `json:"sort_order"`
+	DisplayOnly               bool               `json:"display_only"`
+	SelfServe                 bool               `json:"self_serve"`
+	Public                    bool               `json:"public"`
+	MonthlyFeeCents           *int64             `json:"monthly_fee_cents"`
+	AnnualFeeCents            *int64             `json:"annual_fee_cents"`
+	CreditSchedule            []byte             `json:"credit_schedule"`
+	MatchingBps               *int32             `json:"matching_bps"`
+	CapCents                  *int64             `json:"cap_cents"`
+	AllowancePeriod           *string            `json:"allowance_period"`
+	AllowanceOnExhausted      *string            `json:"allowance_on_exhausted"`
+	AllowanceCents            *int64             `json:"allowance_cents"`
+	AllowanceComputeSeconds   *int32             `json:"allowance_compute_seconds"`
+	AllowanceComputeVcpu      *int32             `json:"allowance_compute_vcpu"`
+	AllowanceComputeMemoryGib *int32             `json:"allowance_compute_memory_gib"`
+	MaxSandboxes              *int32             `json:"max_sandboxes"`
+	MaxTemplateVcpu           *int32             `json:"max_template_vcpu"`
+	MaxTemplateMemoryMib      *int32             `json:"max_template_memory_mib"`
+	MaxTemplateDiskMib        *int32             `json:"max_template_disk_mib"`
+	MaxTemplates              *int32             `json:"max_templates"`
+	CreatedBy                 pgtype.UUID        `json:"created_by"`
+	CreatedAt                 time.Time          `json:"created_at"`
+	UpdatedAt                 time.Time          `json:"updated_at"`
+	PublishedBy               pgtype.UUID        `json:"published_by"`
+	PublishedAt               pgtype.Timestamptz `json:"published_at"`
+	RetiredBy                 pgtype.UUID        `json:"retired_by"`
+	RetiredAt                 pgtype.Timestamptz `json:"retired_at"`
+}
+
+type BillingPricingSwitch struct {
+	Singleton      bool        `json:"singleton"`
+	PricingVersion string      `json:"pricing_version"`
+	ChangedBy      pgtype.UUID `json:"changed_by"`
+	Reason         *string     `json:"reason"`
+	ChangedAt      time.Time   `json:"changed_at"`
+}
+
+type BillingPricingSwitchAudit struct {
+	ID          uuid.UUID `json:"id"`
+	ActorID     uuid.UUID `json:"actor_id"`
+	FromVersion string    `json:"from_version"`
+	ToVersion   string    `json:"to_version"`
+	Reason      string    `json:"reason"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type BillingProClosedPurchase struct {
@@ -935,21 +963,6 @@ type BillingSignupChoice struct {
 	PaidObservedAt    pgtype.Timestamptz `json:"paid_observed_at"`
 	PaidObservedUntil pgtype.Timestamptz `json:"paid_observed_until"`
 	Revision          int64              `json:"revision"`
-}
-
-type BillingSignupPromotionVersion struct {
-	ID          uuid.UUID          `json:"id"`
-	Promotion   string             `json:"promotion"`
-	Version     int32              `json:"version"`
-	State       string             `json:"state"`
-	AmountCents int64              `json:"amount_cents"`
-	CreatedBy   pgtype.UUID        `json:"created_by"`
-	CreatedAt   time.Time          `json:"created_at"`
-	UpdatedAt   time.Time          `json:"updated_at"`
-	PublishedBy pgtype.UUID        `json:"published_by"`
-	PublishedAt pgtype.Timestamptz `json:"published_at"`
-	RetiredBy   pgtype.UUID        `json:"retired_by"`
-	RetiredAt   pgtype.Timestamptz `json:"retired_at"`
 }
 
 type BillingSponsoredAnnualAuthority struct {
@@ -1306,6 +1319,7 @@ type PlanLimit struct {
 	MaxTemplateVcpu      *int32 `json:"max_template_vcpu"`
 	MaxTemplateMemoryMib *int32 `json:"max_template_memory_mib"`
 	MaxTemplateDiskMib   *int32 `json:"max_template_disk_mib"`
+	MaxTemplates         *int32 `json:"max_templates"`
 }
 
 type PricingPlan struct {
@@ -1939,7 +1953,6 @@ type TeamBillingAccount struct {
 	StripeActivationIdentityKey              *string            `json:"stripe_activation_identity_key"`
 	StripeCheckoutIdentityEvidenceVersion    pgtype.UUID        `json:"stripe_checkout_identity_evidence_version"`
 	StripeActivationIdentityEvidenceVersion  pgtype.UUID        `json:"stripe_activation_identity_evidence_version"`
-	StripeActivationCreditAmountCents        *int64             `json:"stripe_activation_credit_amount_cents"`
 }
 
 type TeamBillingPeriod struct {

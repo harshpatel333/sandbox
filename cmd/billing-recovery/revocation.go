@@ -54,8 +54,7 @@ func loadRevocationAccounts(ctx context.Context, pool *pgxpool.Pool, target, aft
               AND u.stripe_redemption_attempted_at IS NOT NULL
         ),
         a.stripe_activation_user_id, a.stripe_activation_credit_reservation_event_id,
-        (r.team_id IS NOT NULL AND r.completed_at IS NULL), (r.completed_at IS NOT NULL),
-        a.stripe_activation_credit_amount_cents
+        (r.team_id IS NOT NULL AND r.completed_at IS NULL), (r.completed_at IS NOT NULL)
         FROM team_billing_account a LEFT JOIN stripe_activation_credit_revocation r USING (team_id)
         WHERE ($1::uuid IS NULL OR a.team_id = $1)
           AND ($2::uuid IS NULL OR a.team_id > $2)
@@ -68,7 +67,7 @@ func loadRevocationAccounts(ctx context.Context, pool *pgxpool.Pool, target, aft
 	var accounts []billingAccount
 	for rows.Next() {
 		var a billingAccount
-		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.GrantID, &a.CancelAtPeriodEnd, &a.HistoricalCancellation, &a.HistoricalCancellationOwned, &a.ActivationReserved, &a.ActivationAttempted, &a.ActivationUserID, &a.ActivationReservationEventID, &a.RevocationPending, &a.RevocationComplete, &a.ActivationCreditCents); err != nil {
+		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.GrantID, &a.CancelAtPeriodEnd, &a.HistoricalCancellation, &a.HistoricalCancellationOwned, &a.ActivationReserved, &a.ActivationAttempted, &a.ActivationUserID, &a.ActivationReservationEventID, &a.RevocationPending, &a.RevocationComplete); err != nil {
 			return nil, err
 		}
 		accounts = append(accounts, a)
@@ -134,7 +133,7 @@ func auditRevocation(ctx context.Context, pool *pgxpool.Pool, stripe stripeClien
 		out["outcome"], out["reason"] = "reconciled", "unattempted_activation_reservation"
 		return out
 	}
-	grant, err := billing.FindStripeActivationGrant(ctx, stripe.request, account.TeamID, *account.CustomerID, deref(account.GrantID), account.activationCredit())
+	grant, err := billing.FindStripeActivationGrant(ctx, stripe.request, account.TeamID, *account.CustomerID, deref(account.GrantID))
 	if err != nil {
 		return unresolved(err)
 	}
@@ -252,7 +251,7 @@ func applyActivationRevocation(ctx context.Context, pool *pgxpool.Pool, stripe s
 	}
 	// Intent survives a failure or reversal. No activation settlement or credit
 	// creation is reachable from this path, including for user-scoped grants.
-	if _, err := billing.RevokeStripeActivationGrant(ctx, stripe.request, account.TeamID, *account.CustomerID, grantID, account.activationCredit()); err != nil {
+	if _, err := billing.RevokeStripeActivationGrant(ctx, stripe.request, account.TeamID, *account.CustomerID, grantID); err != nil {
 		return err
 	}
 	finalTx, err := conn.BeginTx(ctx, pgx.TxOptions{})

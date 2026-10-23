@@ -33,51 +33,85 @@ type planMatching struct {
 	CapCents    int64 `json:"cap_cents"`
 }
 
+// planLimits are the limits a plan grants. MaxConcurrent is the number of
+// sandboxes a team may run at once (paused ones do not count); the size caps
+// bound each sandbox's template.
 type planLimits struct {
-	MaxSandboxes         *int32 `json:"max_sandboxes"`
-	MaxTemplateVCPU      *int32 `json:"max_template_vcpu"`
-	MaxTemplateMemoryMiB *int32 `json:"max_template_memory_mib"`
-	MaxTemplateDiskMiB   *int32 `json:"max_template_disk_mib"`
+	MaxConcurrent *int32 `json:"max_concurrent"`
+	MaxVCPU       *int32 `json:"max_vcpu"`
+	MaxMemoryMiB  *int32 `json:"max_memory_mib"`
+	MaxDiskMiB    *int32 `json:"max_disk_mib"`
+	MaxTemplates  *int32 `json:"max_templates"`
 }
+
+// planCompute prices an allowance as Seconds of a sandbox with VCPU vCPUs and
+// MemoryGiB of memory at the current rate card.
+type planCompute struct {
+	Seconds   int32 `json:"seconds"`
+	VCPU      int32 `json:"vcpu"`
+	MemoryGiB int32 `json:"memory_gib"`
+}
+
+// planAllowance is the usage included in each period. Period is "day_window"
+// (24 hours from the first start) or "month"; OnExhausted is "pause" or
+// "payg". A version stores either AmountCents or Compute; planTerms resolves
+// Compute to AmountCents.
+type planAllowance struct {
+	AmountCents int64        `json:"amount_cents"`
+	Period      string       `json:"period"`
+	OnExhausted string       `json:"on_exhausted"`
+	Compute     *planCompute `json:"compute,omitempty"`
+}
+
+var planKinds = map[string]bool{"free": true, "prepaid": true, "subscription": true, "legacy_payg": true, "custom": true}
 
 type planVersion struct {
-	ID              uuid.UUID     `json:"id"`
-	Family          string        `json:"family"`
-	Version         int32         `json:"version"`
-	State           string        `json:"state"`
-	Public          bool          `json:"public"`
-	DisplayName     string        `json:"display_name"`
-	Tagline         string        `json:"tagline"`
-	Features        []string      `json:"features"`
-	SortOrder       int32         `json:"sort_order"`
-	DisplayOnly     bool          `json:"display_only"`
-	SelfServe       bool          `json:"self_serve"`
-	MonthlyFeeCents *int64        `json:"monthly_fee_cents"`
-	AnnualFeeCents  *int64        `json:"annual_fee_cents"`
-	CreditSchedule  []planGrant   `json:"credit_schedule"`
-	Matching        *planMatching `json:"matching"`
-	Limits          planLimits    `json:"limits"`
-	CreatedBy       *uuid.UUID    `json:"created_by"`
-	CreatedAt       time.Time     `json:"created_at"`
-	UpdatedAt       time.Time     `json:"updated_at"`
-	PublishedBy     *uuid.UUID    `json:"published_by"`
-	PublishedAt     *time.Time    `json:"published_at"`
-	RetiredBy       *uuid.UUID    `json:"retired_by"`
-	RetiredAt       *time.Time    `json:"retired_at"`
+	ID              uuid.UUID      `json:"id"`
+	PricingVersion  string         `json:"pricing_version"`
+	Family          string         `json:"family"`
+	Version         int32          `json:"version"`
+	State           string         `json:"state"`
+	Kind            string         `json:"kind"`
+	Public          bool           `json:"public"`
+	DisplayName     string         `json:"display_name"`
+	PriceLabel      string         `json:"price_label"`
+	Tagline         string         `json:"tagline"`
+	Features        []string       `json:"features"`
+	SortOrder       int32          `json:"sort_order"`
+	DisplayOnly     bool           `json:"display_only"`
+	SelfServe       bool           `json:"self_serve"`
+	MonthlyFeeCents *int64         `json:"monthly_fee_cents"`
+	AnnualFeeCents  *int64         `json:"annual_fee_cents"`
+	CreditSchedule  []planGrant    `json:"credit_schedule"`
+	Matching        *planMatching  `json:"matching"`
+	Allowance       *planAllowance `json:"allowance"`
+	Limits          planLimits     `json:"limits"`
+	CreatedBy       *uuid.UUID     `json:"created_by"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+	PublishedBy     *uuid.UUID     `json:"published_by"`
+	PublishedAt     *time.Time     `json:"published_at"`
+	RetiredBy       *uuid.UUID     `json:"retired_by"`
+	RetiredAt       *time.Time     `json:"retired_at"`
 }
 
-const planVersionColumns = `id,family,version,state,public,display_name,tagline,features,sort_order,display_only,self_serve,monthly_fee_cents,annual_fee_cents,
-credit_schedule,matching_bps,cap_cents,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,
+const planVersionColumns = `id,pricing_version,family,version,state,kind,public,display_name,price_label,tagline,features,sort_order,display_only,self_serve,
+monthly_fee_cents,annual_fee_cents,credit_schedule,matching_bps,cap_cents,
+allowance_period,allowance_on_exhausted,allowance_cents,allowance_compute_seconds,allowance_compute_vcpu,allowance_compute_memory_gib,
+max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates,
 created_by,created_at,updated_at,published_by,published_at,retired_by,retired_at`
 
 func scanPlanVersion(row pgx.Row) (planVersion, error) {
 	var v planVersion
 	var schedule []byte
 	var bps *int32
-	var capCents *int64
-	err := row.Scan(&v.ID, &v.Family, &v.Version, &v.State, &v.Public, &v.DisplayName, &v.Tagline, &v.Features, &v.SortOrder, &v.DisplayOnly, &v.SelfServe,
-		&v.MonthlyFeeCents, &v.AnnualFeeCents, &schedule, &bps, &capCents,
-		&v.Limits.MaxSandboxes, &v.Limits.MaxTemplateVCPU, &v.Limits.MaxTemplateMemoryMiB, &v.Limits.MaxTemplateDiskMiB,
+	var capCents, allowanceCents *int64
+	var period, onExhausted *string
+	var seconds, vcpu, memory *int32
+	err := row.Scan(&v.ID, &v.PricingVersion, &v.Family, &v.Version, &v.State, &v.Kind, &v.Public, &v.DisplayName, &v.PriceLabel, &v.Tagline, &v.Features,
+		&v.SortOrder, &v.DisplayOnly, &v.SelfServe, &v.MonthlyFeeCents, &v.AnnualFeeCents, &schedule, &bps, &capCents,
+		&period, &onExhausted, &allowanceCents, &seconds, &vcpu, &memory,
+		&v.Limits.MaxConcurrent, &v.Limits.MaxVCPU, &v.Limits.MaxMemoryMiB, &v.Limits.MaxDiskMiB, &v.Limits.MaxTemplates,
 		&v.CreatedBy, &v.CreatedAt, &v.UpdatedAt, &v.PublishedBy, &v.PublishedAt, &v.RetiredBy, &v.RetiredAt)
 	if err != nil {
 		return v, err
@@ -88,15 +122,24 @@ func scanPlanVersion(row pgx.Row) (planVersion, error) {
 	if bps != nil && capCents != nil {
 		v.Matching = &planMatching{MatchingBps: *bps, CapCents: *capCents}
 	}
+	if period != nil && onExhausted != nil {
+		v.Allowance = &planAllowance{Period: *period, OnExhausted: *onExhausted}
+		if allowanceCents != nil {
+			v.Allowance.AmountCents = *allowanceCents
+		}
+		if seconds != nil && vcpu != nil && memory != nil {
+			v.Allowance.Compute = &planCompute{Seconds: *seconds, VCPU: *vcpu, MemoryGiB: *memory}
+		}
+	}
 	return v, nil
 }
 
 // sellable reports whether new customers may check the version out: it is a
-// public self-serve plan whose subscription contract can deliver its terms,
-// one monthly credit and no matching rule.
+// public self-serve subscription whose contract can deliver its terms, one
+// monthly credit and no matching rule.
 func (v planVersion) sellable() bool {
 	_, uniform := uniformMonthlyCredit(v.CreditSchedule)
-	return v.SelfServe && v.Public && !v.DisplayOnly && v.hasFee() && uniform && v.Matching == nil
+	return v.SelfServe && v.Public && v.Kind == "subscription" && !v.DisplayOnly && v.hasFee() && uniform && v.Matching == nil
 }
 
 func (v planVersion) feeCents(months int32) *int64 {
@@ -112,14 +155,20 @@ func (v planVersion) validate() error {
 	if !planFamilyPattern(v.Family) {
 		return errors.New("family must be lowercase letters and digits joined by single underscores, starting with a letter")
 	}
+	if v.PricingVersion != "legacy" && v.PricingVersion != "v2" {
+		return errors.New("pricing version must be legacy or v2")
+	}
+	if !planKinds[v.Kind] {
+		return errors.New("kind must be free, prepaid, subscription, legacy_payg or custom")
+	}
 	if v.SortOrder < 0 || v.SortOrder > 1000 {
 		return errors.New("card order must be between 0 and 1000")
 	}
-	if strings.ContainsRune(v.DisplayName+v.Tagline+strings.Join(v.Features, ""), 0) {
+	if strings.ContainsRune(v.DisplayName+v.PriceLabel+v.Tagline+strings.Join(v.Features, ""), 0) {
 		return errors.New("text may not contain NUL characters")
 	}
-	if strings.TrimSpace(v.DisplayName) == "" || len(v.DisplayName) > 80 || len(v.Tagline) > 200 || len(v.Features) > 20 {
-		return errors.New("display name is required; name, tagline and features have length limits")
+	if strings.TrimSpace(v.DisplayName) == "" || len(v.DisplayName) > 80 || len(v.PriceLabel) > 80 || len(v.Tagline) > 200 || len(v.Features) > 20 {
+		return errors.New("display name is required; name, price label, tagline and features have length limits")
 	}
 	for _, f := range v.Features {
 		if strings.TrimSpace(f) == "" || len(f) > 200 {
@@ -137,37 +186,42 @@ func (v planVersion) validate() error {
 			return errors.New("fees must be positive")
 		}
 	}
-	for _, limit := range []*int32{v.Limits.MaxSandboxes, v.Limits.MaxTemplateVCPU, v.Limits.MaxTemplateMemoryMiB, v.Limits.MaxTemplateDiskMiB} {
+	for _, limit := range []*int32{v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB, v.Limits.MaxTemplates} {
 		if limit != nil && *limit <= 0 {
 			return errors.New("limits must be positive")
 		}
 	}
+	if a := v.Allowance; a != nil {
+		if (a.Period != "day_window" && a.Period != "month") || (a.OnExhausted != "pause" && a.OnExhausted != "payg") {
+			return errors.New("an allowance needs a period (day_window or month) and what happens when it runs out (pause or payg)")
+		}
+		if (a.AmountCents > 0) == (a.Compute != nil) {
+			return errors.New("an allowance is either a fixed amount or a compute basis")
+		}
+		if a.AmountCents < 0 || (a.Compute != nil && (a.Compute.Seconds <= 0 || a.Compute.VCPU <= 0 || a.Compute.MemoryGiB <= 0)) {
+			return errors.New("allowance amounts must be positive")
+		}
+	}
 	if v.DisplayOnly {
-		if v.MonthlyFeeCents != nil || v.AnnualFeeCents != nil || v.SelfServe || len(v.CreditSchedule) != 0 || v.Matching != nil {
-			return errors.New("display-only plans carry no fees, credits, matching or self-serve checkout")
+		if v.hasFee() || v.SelfServe || len(v.CreditSchedule) != 0 || v.Matching != nil || v.Allowance != nil {
+			return errors.New("display-only plans carry no fees, credits, matching, allowance or self-serve checkout")
 		}
 		return nil
+	}
+	if v.hasFee() != (v.Kind == "subscription") && v.Kind != "custom" {
+		return errors.New("subscription plans charge a fee and no other kind does")
 	}
 	if v.SelfServe && !v.sellable() {
-		return errors.New("self-serve checkout sells only public plans with a fee, one ongoing monthly credit grant expiring after a month, and no matching rule")
+		return errors.New("self-serve checkout sells only public subscriptions with a fee, one ongoing monthly credit grant expiring after a month, and no matching rule")
 	}
-	if !v.hasFee() {
-		if len(v.CreditSchedule) == 0 && v.Matching == nil {
-			return errors.New("a plan without fees needs a credit schedule or matching rule")
-		}
-		if !strings.Contains(v.Family, "_") {
-			return errors.New("plans without fees use a family with an underscore, such as custom_example")
-		}
-		if v.Public {
-			return errors.New("plans without fees are staff-assigned and cannot be public cards")
-		}
-		return nil
-	}
-	if strings.Contains(v.Family, "_") {
+	if v.hasFee() && strings.Contains(v.Family, "_") {
 		return errors.New("plans with fees use a family without underscores")
 	}
-	if v.Limits.MaxSandboxes == nil {
-		return errors.New("max sandboxes is required")
+	if v.Limits.MaxConcurrent == nil && v.Kind != "custom" {
+		return errors.New("max running sandboxes is required")
+	}
+	if v.Kind == "custom" && !v.hasFee() && len(v.CreditSchedule) == 0 && v.Matching == nil && v.Allowance == nil && v.Limits.MaxConcurrent == nil {
+		return errors.New("a custom plan needs a fee, credits, matching, an allowance or limits")
 	}
 	return nil
 }
@@ -322,4 +376,3 @@ func (c *stripeHTTPClient) versionPlanPrice(ctx context.Context, t planTerms) (s
 	o.Price = created.ID
 	return c.verifiedPlanPrice(ctx, o)
 }
-

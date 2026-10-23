@@ -8,6 +8,22 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
+// legacyLimits applies the pay-as-you-go plan's caps where a team row
+// leaves them open, as team_effective_limits does.
+func legacyLimits(team db.Team) teamLimits {
+	l := teamLimits{MaxVCPU: 2, MaxMemoryMiB: 2048, MaxDiskMiB: 8192, MaxTemplates: 10}
+	if team.MaxTemplateVcpu != nil {
+		l.MaxVCPU = *team.MaxTemplateVcpu
+	}
+	if team.MaxTemplateMemoryMib != nil {
+		l.MaxMemoryMiB = *team.MaxTemplateMemoryMib
+	}
+	if team.MaxTemplateDiskMib != nil {
+		l.MaxDiskMiB = *team.MaxTemplateDiskMib
+	}
+	return l
+}
+
 func TestValidateTemplateShapeDiskLimits(t *testing.T) {
 	systemID := uuid.New()
 	customerID := uuid.New()
@@ -38,7 +54,7 @@ func TestValidateTemplateShapeDiskLimits(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := validateTemplateShape(tc.team, systemID, 1, 1024, tc.disk); got != tc.want {
+			if got := validateTemplateShape(tc.team.ID, systemID, legacyLimits(tc.team), 1, 1024, tc.disk); got != tc.want {
 				t.Fatalf("validateTemplateShape() = %q, want %q", got, tc.want)
 			}
 		})
@@ -67,7 +83,7 @@ func TestValidateTemplateShapeComputeCeilings(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := validateTemplateShape(tc.team, systemID, tc.vcpu, tc.mem, 4096); got != tc.want {
+			if got := validateTemplateShape(tc.team.ID, systemID, legacyLimits(tc.team), tc.vcpu, tc.mem, 4096); got != tc.want {
 				t.Fatalf("validateTemplateShape() = %q, want %q", got, tc.want)
 			}
 		})

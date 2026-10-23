@@ -20,18 +20,6 @@ import (
 // planPreviewMonths is how far previews expand indefinitely repeating grants.
 const planPreviewMonths = 24
 
-type signupPromotionVersion struct {
-	ID          uuid.UUID  `json:"id"`
-	Promotion   string     `json:"promotion"`
-	Version     int32      `json:"version"`
-	State       string     `json:"state"`
-	AmountCents int64      `json:"amount_cents"`
-	CreatedBy   *uuid.UUID `json:"created_by"`
-	PublishedBy *uuid.UUID `json:"published_by"`
-	PublishedAt *string    `json:"published_at"`
-	RetiredAt   *string    `json:"retired_at"`
-}
-
 type planSchedulePreview struct {
 	Issues  []planGrantIssue `json:"issues"`
 	Summary string           `json:"summary"`
@@ -99,19 +87,6 @@ func (h *Handlers) listPlanVersions(ctx context.Context) ([]planVersion, error) 
 	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (planVersion, error) { return scanPlanVersion(row) })
 }
 
-func (h *Handlers) listSignupPromotionVersions(ctx context.Context) ([]signupPromotionVersion, error) {
-	rows, err := h.Pool.Query(ctx, `SELECT id,promotion,version,state,amount_cents,created_by,published_by,to_char(published_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"'),to_char(retired_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"')
- FROM billing_signup_promotion_version ORDER BY promotion,version DESC`)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (signupPromotionVersion, error) {
-		var p signupPromotionVersion
-		err := row.Scan(&p.ID, &p.Promotion, &p.Version, &p.State, &p.AmountCents, &p.CreatedBy, &p.PublishedBy, &p.PublishedAt, &p.RetiredAt)
-		return p, err
-	})
-}
-
 type planVersionResponse struct {
 	planVersion
 	Preview planSchedulePreview `json:"preview"`
@@ -128,9 +103,9 @@ func (h *Handlers) GetPlatformBillingCatalog(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	promotions, err := h.listSignupPromotionVersions(c.Request.Context())
+	model, err := h.pricingVersion(c.Request.Context())
 	if err != nil {
-		log.Error().Err(err).Msg("list signup promotion versions failed")
+		log.Error().Err(err).Msg("read pricing version failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -138,7 +113,7 @@ func (h *Handlers) GetPlatformBillingCatalog(c *gin.Context) {
 	for _, p := range plans {
 		out = append(out, planVersionResponse{planVersion: p, Preview: previewPlanSchedule(p.CreditSchedule)})
 	}
-	c.JSON(http.StatusOK, gin.H{"plans": out, "promotions": promotions})
+	c.JSON(http.StatusOK, gin.H{"plans": out, "pricing_version": model})
 }
 
 // PreviewPlanSchedule expands a draft schedule, passed as the JSON
@@ -163,28 +138,36 @@ func (h *Handlers) PreviewPlanSchedule(c *gin.Context) {
 // IDs and version numbers may be minted by the caller so the console can
 // write the same version to every region and retry until all agree.
 type planDraftRequest struct {
-	ID              *uuid.UUID    `json:"id"`
-	Version         *int32        `json:"version"`
-	Family          string        `json:"family"`
-	Public          bool          `json:"public"`
-	DisplayName     string        `json:"display_name"`
-	Tagline         string        `json:"tagline"`
-	Features        []string      `json:"features"`
-	SortOrder       int32         `json:"sort_order"`
-	DisplayOnly     bool          `json:"display_only"`
-	SelfServe       bool          `json:"self_serve"`
-	MonthlyFeeCents *int64        `json:"monthly_fee_cents"`
-	AnnualFeeCents  *int64        `json:"annual_fee_cents"`
-	CreditSchedule  []planGrant   `json:"credit_schedule"`
-	Matching        *planMatching `json:"matching"`
-	Limits          planLimits    `json:"limits"`
-	Reason          string        `json:"reason"`
+	ID              *uuid.UUID     `json:"id"`
+	Version         *int32         `json:"version"`
+	PricingVersion  string         `json:"pricing_version"`
+	Family          string         `json:"family"`
+	Kind            string         `json:"kind"`
+	Public          bool           `json:"public"`
+	DisplayName     string         `json:"display_name"`
+	PriceLabel      string         `json:"price_label"`
+	Tagline         string         `json:"tagline"`
+	Features        []string       `json:"features"`
+	SortOrder       int32          `json:"sort_order"`
+	DisplayOnly     bool           `json:"display_only"`
+	SelfServe       bool           `json:"self_serve"`
+	MonthlyFeeCents *int64         `json:"monthly_fee_cents"`
+	AnnualFeeCents  *int64         `json:"annual_fee_cents"`
+	CreditSchedule  []planGrant    `json:"credit_schedule"`
+	Matching        *planMatching  `json:"matching"`
+	Allowance       *planAllowance `json:"allowance"`
+	Limits          planLimits     `json:"limits"`
+	Reason          string         `json:"reason"`
 }
 
 func (r planDraftRequest) version() planVersion {
-	v := planVersion{Family: strings.TrimSpace(r.Family), Public: r.Public, DisplayName: strings.TrimSpace(r.DisplayName), Tagline: strings.TrimSpace(r.Tagline), Features: r.Features,
-		SortOrder: r.SortOrder, DisplayOnly: r.DisplayOnly, SelfServe: r.SelfServe, MonthlyFeeCents: r.MonthlyFeeCents, AnnualFeeCents: r.AnnualFeeCents,
-		CreditSchedule: r.CreditSchedule, Matching: r.Matching, Limits: r.Limits}
+	v := planVersion{PricingVersion: r.PricingVersion, Family: strings.TrimSpace(r.Family), Kind: r.Kind, Public: r.Public, DisplayName: strings.TrimSpace(r.DisplayName),
+		PriceLabel: strings.TrimSpace(r.PriceLabel), Tagline: strings.TrimSpace(r.Tagline), Features: r.Features, SortOrder: r.SortOrder, DisplayOnly: r.DisplayOnly,
+		SelfServe: r.SelfServe, MonthlyFeeCents: r.MonthlyFeeCents, AnnualFeeCents: r.AnnualFeeCents, CreditSchedule: r.CreditSchedule, Matching: r.Matching,
+		Allowance: r.Allowance, Limits: r.Limits}
+	if v.PricingVersion == "" {
+		v.PricingVersion = "legacy"
+	}
 	if v.Features == nil {
 		v.Features = []string{}
 	}
@@ -248,15 +231,50 @@ func bindCatalogReason(c *gin.Context) (string, bool) {
 	return checkCatalogReason(c, req.Reason)
 }
 
+// planWriteColumns are the columns a draft sets, in planVersionArgs order.
+const planWriteColumns = `public,display_name,price_label,tagline,features,sort_order,display_only,self_serve,monthly_fee_cents,annual_fee_cents,
+credit_schedule,matching_bps,cap_cents,allowance_period,allowance_on_exhausted,allowance_cents,allowance_compute_seconds,allowance_compute_vcpu,
+allowance_compute_memory_gib,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates`
+
 func planVersionArgs(v planVersion) []any {
 	schedule, _ := json.Marshal(v.CreditSchedule)
 	var bps *int32
-	var capCents *int64
+	var capCents, allowanceCents *int64
+	var period, onExhausted *string
+	var seconds, vcpu, memory *int32
 	if v.Matching != nil {
 		bps, capCents = &v.Matching.MatchingBps, &v.Matching.CapCents
 	}
-	return []any{v.Public, v.DisplayName, v.Tagline, v.Features, v.SortOrder, v.DisplayOnly, v.SelfServe, v.MonthlyFeeCents, v.AnnualFeeCents, schedule, bps, capCents,
-		v.Limits.MaxSandboxes, v.Limits.MaxTemplateVCPU, v.Limits.MaxTemplateMemoryMiB, v.Limits.MaxTemplateDiskMiB}
+	if a := v.Allowance; a != nil {
+		period, onExhausted = &a.Period, &a.OnExhausted
+		if a.Compute != nil {
+			seconds, vcpu, memory = &a.Compute.Seconds, &a.Compute.VCPU, &a.Compute.MemoryGiB
+		} else {
+			allowanceCents = &a.AmountCents
+		}
+	}
+	return []any{v.Public, v.DisplayName, v.PriceLabel, v.Tagline, v.Features, v.SortOrder, v.DisplayOnly, v.SelfServe, v.MonthlyFeeCents, v.AnnualFeeCents,
+		schedule, bps, capCents, period, onExhausted, allowanceCents, seconds, vcpu, memory,
+		v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB, v.Limits.MaxTemplates}
+}
+
+// placeholders returns "$from,...,$to".
+func placeholders(from, to int) string {
+	parts := make([]string, 0, to-from+1)
+	for i := from; i <= to; i++ {
+		parts = append(parts, fmt.Sprintf("$%d", i))
+	}
+	return strings.Join(parts, ",")
+}
+
+// assignments returns "column=$n,..." for planWriteColumns starting at $from.
+func planWriteAssignments(from int) string {
+	cols := strings.Split(strings.ReplaceAll(planWriteColumns, "\n", ""), ",")
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		parts[i] = fmt.Sprintf("%s=$%d", strings.TrimSpace(c), from+i)
+	}
+	return strings.Join(parts, ",")
 }
 
 func respondCatalogWriteError(c *gin.Context, err error) {
@@ -354,10 +372,9 @@ func (h *Handlers) CreatePlanVersionDraft(c *gin.Context) {
 	id, ok := h.catalogWrite(c, actor, "create_draft", reason, func(ctx context.Context, tx pgx.Tx) (uuid.UUID, []byte, error) {
 		var id uuid.UUID
 		var terms []byte
-		args := append([]any{v.Family, actor, req.ID, req.Version}, planVersionArgs(v)...)
-		err := tx.QueryRow(ctx, `INSERT INTO billing_plan_version(family,created_by,id,version,public,display_name,tagline,features,sort_order,display_only,self_serve,
- monthly_fee_cents,annual_fee_cents,credit_schedule,matching_bps,cap_cents,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib)
- SELECT $1,$2,COALESCE($3::uuid,gen_random_uuid()),COALESCE($4::integer,COALESCE(MAX(version),0)+1),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+		args := append([]any{v.Family, actor, req.ID, req.Version, v.PricingVersion, v.Kind}, planVersionArgs(v)...)
+		err := tx.QueryRow(ctx, `INSERT INTO billing_plan_version(family,created_by,id,version,pricing_version,kind,`+planWriteColumns+`)
+ SELECT $1,$2,COALESCE($3::uuid,gen_random_uuid()),COALESCE($4::integer,COALESCE(MAX(version),0)+1),$5,$6,`+placeholders(7, len(args))+`
  FROM billing_plan_version WHERE family=$1
  RETURNING id,to_jsonb(billing_plan_version.*)`, args...).Scan(&id, &terms)
 		return id, terms, err
@@ -391,16 +408,15 @@ func (h *Handlers) UpdatePlanVersionDraft(c *gin.Context) {
 		return
 	}
 	if existing, err := scanPlanVersion(h.Pool.QueryRow(c.Request.Context(), `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1`, id)); err == nil &&
-		existing.State == "draft" && existing.Family == v.Family && existing.contentKey() == v.contentKey() {
+		existing.State == "draft" && existing.Family == v.Family && existing.PricingVersion == v.PricingVersion && existing.contentKey() == v.contentKey() {
 		h.planVersionResponse(c, id, http.StatusOK)
 		return
 	}
 	if _, ok = h.catalogWrite(c, actor, "update_draft", reason, func(ctx context.Context, tx pgx.Tx) (uuid.UUID, []byte, error) {
 		var terms []byte
-		args := append([]any{id, v.Family}, planVersionArgs(v)...)
-		err := tx.QueryRow(ctx, `UPDATE billing_plan_version SET public=$3,display_name=$4,tagline=$5,features=$6,sort_order=$7,display_only=$8,self_serve=$9,
- monthly_fee_cents=$10,annual_fee_cents=$11,credit_schedule=$12,matching_bps=$13,cap_cents=$14,max_sandboxes=$15,max_template_vcpu=$16,
- max_template_memory_mib=$17,max_template_disk_mib=$18 WHERE id=$1 AND family=$2 AND state='draft' RETURNING to_jsonb(billing_plan_version.*)`, args...).Scan(&terms)
+		args := append([]any{id, v.Family, v.PricingVersion, v.Kind}, planVersionArgs(v)...)
+		err := tx.QueryRow(ctx, `UPDATE billing_plan_version SET kind=$4,`+planWriteAssignments(5)+`
+ WHERE id=$1 AND family=$2 AND pricing_version=$3 AND state='draft' RETURNING to_jsonb(billing_plan_version.*)`, args...).Scan(&terms)
 		if errors.Is(err, pgx.ErrNoRows) {
 			err = errOnlyDrafts
 		}
@@ -471,7 +487,7 @@ func (h *Handlers) PublishPlanVersion(c *gin.Context) {
 		return
 	}
 	if _, ok = h.catalogWrite(c, actor, "publish", reason, func(ctx context.Context, tx pgx.Tx) (uuid.UUID, []byte, error) {
-		if _, err := tx.Exec(ctx, `SELECT publish_billing_catalog_version('billing_plan_version',$1,$2)`, id, actor); err != nil {
+		if _, err := tx.Exec(ctx, `SELECT publish_billing_plan_version($1,$2)`, id, actor); err != nil {
 			return id, nil, err
 		}
 		terms, err := planVersionTerms(ctx, tx, id)
@@ -513,76 +529,4 @@ func (h *Handlers) RetirePlanVersion(c *gin.Context) {
 	}); ok {
 		h.planVersionResponse(c, id, http.StatusOK)
 	}
-}
-
-type promotionDraftRequest struct {
-	ID          *uuid.UUID `json:"id"`
-	Version     *int32     `json:"version"`
-	Promotion   string     `json:"promotion"`
-	AmountCents int64      `json:"amount_cents"`
-	Reason      string     `json:"reason"`
-}
-
-// PublishSignupPromotion records and publishes a new signup credit amount.
-// Grants already made keep the amount recorded when they were made.
-func (h *Handlers) PublishSignupPromotion(c *gin.Context) {
-	actor, ok := h.requirePlatformBilling(c, platformBillingWritePermission)
-	if !ok {
-		return
-	}
-	var req promotionDraftRequest
-	if err := c.ShouldBindJSON(&req); err != nil || (req.Promotion != "trial" && req.Promotion != "card_bonus") || req.AmountCents < 1 || req.AmountCents > 100000 {
-		respondErrorMsg(c, "bad_request", "promotion must be trial or card_bonus with an amount between $0.01 and $1,000", http.StatusBadRequest)
-		return
-	}
-	reason, ok := checkCatalogReason(c, req.Reason)
-	if !ok {
-		return
-	}
-	if req.Version != nil && *req.Version < 1 {
-		respondErrorMsg(c, "bad_request", "invalid promotion version", http.StatusBadRequest)
-		return
-	}
-	if req.ID != nil {
-		var promotion, state string
-		var amount int64
-		var version int32
-		err := h.Pool.QueryRow(c.Request.Context(), `SELECT promotion,state,amount_cents,version FROM billing_signup_promotion_version WHERE id=$1`, *req.ID).Scan(&promotion, &state, &amount, &version)
-		switch {
-		case err == nil && (promotion != req.Promotion || amount != req.AmountCents || (req.Version != nil && *req.Version != version)):
-			respondErrorMsg(c, "conflict", "a different promotion version already uses this id", http.StatusConflict)
-			return
-		case err == nil:
-			h.respondSignupPromotions(c, http.StatusOK)
-			return
-		case !errors.Is(err, pgx.ErrNoRows):
-			respondCatalogWriteError(c, err)
-			return
-		}
-	}
-	if _, ok = h.catalogWrite(c, actor, "publish_promotion", reason, func(ctx context.Context, tx pgx.Tx) (uuid.UUID, []byte, error) {
-		var id uuid.UUID
-		if err := tx.QueryRow(ctx, `INSERT INTO billing_signup_promotion_version(id,version,promotion,amount_cents,created_by)
- SELECT COALESCE($4::uuid,gen_random_uuid()),COALESCE($5::integer,COALESCE(MAX(version),0)+1),$1,$2,$3 FROM billing_signup_promotion_version WHERE promotion=$1 RETURNING id`,
-			req.Promotion, req.AmountCents, actor, req.ID, req.Version).Scan(&id); err != nil {
-			return id, nil, err
-		}
-		if _, err := tx.Exec(ctx, `SELECT publish_billing_catalog_version('billing_signup_promotion_version',$1,$2)`, id, actor); err != nil {
-			return id, nil, err
-		}
-		var terms []byte
-		err := tx.QueryRow(ctx, `SELECT to_jsonb(p) FROM billing_signup_promotion_version p WHERE id=$1`, id).Scan(&terms)
-		return id, terms, err
-	}); ok {
-		h.respondSignupPromotions(c, http.StatusCreated)
-	}
-}
-
-func (h *Handlers) respondSignupPromotions(c *gin.Context, status int) {
-	promotions, err := h.listSignupPromotionVersions(c.Request.Context())
-	if err != nil {
-		respondError(c, ErrInternal)
-		return
-	}
-	c.JSON(status, gin.H{"promotions": promotions})
 }

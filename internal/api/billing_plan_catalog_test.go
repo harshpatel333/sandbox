@@ -80,61 +80,74 @@ func TestUniformMonthlyCredit(t *testing.T) {
 }
 
 func TestPlanVersionValidate(t *testing.T) {
-	valid := planVersion{Family: "pro", DisplayName: "Pro", MonthlyFeeCents: int64p(120000), Limits: planLimits{MaxSandboxes: int32p(1000)},
-		CreditSchedule: []planGrant{{EveryMonths: 1, AmountCents: 100000, ExpiresAfterMonths: 1}}, Matching: &planMatching{MatchingBps: 10000, CapCents: 8000000}}
+	valid := planVersion{PricingVersion: "v2", Family: "pro", Kind: "subscription", DisplayName: "Pro", MonthlyFeeCents: int64p(25000),
+		Limits:         planLimits{MaxConcurrent: int32p(1000), MaxVCPU: int32p(8), MaxTemplates: int32p(10)},
+		CreditSchedule: []planGrant{{EveryMonths: 1, AmountCents: 25000, ExpiresAfterMonths: 1}},
+		Allowance:      &planAllowance{AmountCents: 25000, Period: "month", OnExhausted: "payg"}}
 	if err := valid.validate(); err != nil {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*planVersion){
-		"family":                func(v *planVersion) { v.Family = "Pro_1" },
-		"name":                  func(v *planVersion) { v.DisplayName = " " },
-		"no terms":              func(v *planVersion) { v.MonthlyFeeCents, v.CreditSchedule, v.Matching = nil, nil, nil },
-		"fee with underscore":   func(v *planVersion) { v.Family = "custom_example" },
-		"unsellable self-serve": func(v *planVersion) { v.SelfServe, v.Public = true, true },
-		"no-fee self-serve":     func(v *planVersion) { v.MonthlyFeeCents, v.SelfServe = nil, true },
-		"zero fee":              func(v *planVersion) { v.MonthlyFeeCents = int64p(0) },
-		"limits":                func(v *planVersion) { v.Limits.MaxSandboxes = nil },
-		"matching bps":          func(v *planVersion) { v.Matching.MatchingBps = 10001 },
-		"matching cap":          func(v *planVersion) { v.Matching.CapCents = 0 },
-		"grant every":           func(v *planVersion) { v.CreditSchedule[0].EveryMonths = 0 },
-		"grant repeat":          func(v *planVersion) { v.CreditSchedule[0].Repeat = int32p(0) },
-		"display-only terms":    func(v *planVersion) { v.DisplayOnly = true },
-		"blank feature":         func(v *planVersion) { v.Features = []string{""} },
+		"family":              func(v *planVersion) { v.Family = "Pro_1" },
+		"pricing version":     func(v *planVersion) { v.PricingVersion = "v3" },
+		"kind":                func(v *planVersion) { v.Kind = "trial" },
+		"name":                func(v *planVersion) { v.DisplayName = " " },
+		"subscription no fee": func(v *planVersion) { v.MonthlyFeeCents = nil },
+		"fee on prepaid":      func(v *planVersion) { v.Kind = "prepaid" },
+		"fee with underscore": func(v *planVersion) { v.Family = "custom_example" },
+		"zero fee":            func(v *planVersion) { v.MonthlyFeeCents = int64p(0) },
+		"limits":              func(v *planVersion) { v.Limits.MaxConcurrent = nil },
+		"zero templates":      func(v *planVersion) { v.Limits.MaxTemplates = int32p(0) },
+		"grant every":         func(v *planVersion) { v.CreditSchedule[0].EveryMonths = 0 },
+		"grant repeat":        func(v *planVersion) { v.CreditSchedule[0].Repeat = int32p(0) },
+		"display-only terms":  func(v *planVersion) { v.DisplayOnly = true },
+		"blank feature":       func(v *planVersion) { v.Features = []string{""} },
+		"allowance period":    func(v *planVersion) { v.Allowance.Period = "week" },
+		"allowance both":      func(v *planVersion) { v.Allowance.Compute = &planCompute{Seconds: 1, VCPU: 1, MemoryGiB: 1} },
+		"allowance neither":   func(v *planVersion) { v.Allowance.AmountCents = 0 },
+		"matching bps":        func(v *planVersion) { v.Matching = &planMatching{MatchingBps: 10001, CapCents: 1} },
+		"unsellable self-serve": func(v *planVersion) {
+			v.SelfServe, v.Public, v.Matching = true, true, &planMatching{MatchingBps: 1, CapCents: 1}
+		},
+		"NUL in name": func(v *planVersion) { v.DisplayName = "Pr\x00o" },
 	} {
 		v := valid
 		v.CreditSchedule = append([]planGrant{}, valid.CreditSchedule...)
-		m := *valid.Matching
-		v.Matching = &m
+		a := *valid.Allowance
+		v.Allowance = &a
 		mutate(&v)
 		if err := v.validate(); err == nil {
 			t.Errorf("%s: accepted %+v", name, v)
 		}
 	}
-	enterprise := planVersion{Family: "enterprise", DisplayName: "Enterprise", DisplayOnly: true}
-	if err := enterprise.validate(); err != nil {
-		t.Fatal(err)
-	}
-	matchingOnly := planVersion{Family: "custom_example", DisplayName: "Example match", Matching: &planMatching{MatchingBps: 10000, CapCents: 8000000}}
-	if err := matchingOnly.validate(); err != nil {
-		t.Fatalf("fee-less matching plan: %v", err)
-	}
 	for name, v := range map[string]planVersion{
-		"fee-less without underscore": {Family: "pro", DisplayName: "Pro credits", Matching: matchingOnly.Matching},
-		"public fee-less":             {Family: "custom_example", Public: true, DisplayName: "Example", Matching: matchingOnly.Matching},
-		"NUL in name":                 {Family: "custom_example", DisplayName: "Ex\x00ample", Matching: matchingOnly.Matching},
+		"enterprise": {PricingVersion: "v2", Family: "enterprise", Kind: "custom", DisplayName: "Enterprise", DisplayOnly: true},
+		"free": {PricingVersion: "v2", Family: "free", Kind: "free", Public: true, DisplayName: "Free", Limits: planLimits{MaxConcurrent: int32p(1)},
+			Allowance: &planAllowance{Period: "day_window", OnExhausted: "pause", Compute: &planCompute{Seconds: 7200, VCPU: 1, MemoryGiB: 1}}},
+		"starter":       {PricingVersion: "v2", Family: "starter", Kind: "prepaid", Public: true, DisplayName: "Starter", Limits: planLimits{MaxConcurrent: int32p(100)}},
+		"matching deal": {PricingVersion: "v2", Family: "custom_example", Kind: "custom", DisplayName: "Example", Matching: &planMatching{MatchingBps: 10000, CapCents: 8000000}},
 	} {
-		if err := v.validate(); err == nil {
-			t.Errorf("%s: accepted", name)
+		if err := v.validate(); err != nil {
+			t.Errorf("%s: %v", name, err)
 		}
 	}
 	sellable := valid
-	sellable.SelfServe, sellable.Public, sellable.Matching = true, true, nil
+	sellable.SelfServe, sellable.Public = true, true
 	if err := sellable.validate(); err != nil || !sellable.sellable() {
 		t.Fatalf("public self-serve plan: %v", err)
 	}
 	sellable.Public = false
 	if sellable.sellable() {
 		t.Fatal("non-public plan sellable")
+	}
+}
+
+func TestAllowanceSummary(t *testing.T) {
+	if got := allowanceSummary(&planAllowance{AmountCents: 25000, Period: "month", OnExhausted: "payg"}); got != "$250 of usage included every month" {
+		t.Errorf("pro summary %q", got)
+	}
+	if got := allowanceSummary(&planAllowance{AmountCents: 1440, Period: "day_window", OnExhausted: "pause", Compute: &planCompute{Seconds: 7200, VCPU: 1, MemoryGiB: 1}}); got != "$14.40 of compute every 24 hours" {
+		t.Errorf("free summary %q", got)
 	}
 }
 

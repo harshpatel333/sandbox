@@ -122,7 +122,7 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 			}))
 			defer server.Close()
 			client := &stripeHTTPClient{baseURL: server.URL, secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: server.Client()}
-			got, err := client.RevokeActivationCredit(context.Background(), teamID, "cus_example", "cred/grant", 9500)
+			got, err := client.RevokeActivationCredit(context.Background(), teamID, "cus_example", "cred/grant")
 			wantErr := strings.HasPrefix(name, "wrong_") || name == "conflicting_identity" || name == "transient" || name == "missing_balance"
 			if (err != nil) != wantErr {
 				t.Fatalf("grant=%q err=%v wantErr=%v", got, err, wantErr)
@@ -190,7 +190,7 @@ func TestStripeActivationRevocationIdentityPagination(t *testing.T) {
 			}))
 			defer server.Close()
 			client := &stripeHTTPClient{baseURL: server.URL, secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: server.Client()}
-			got, err := billing.FindStripeActivationGrant(t.Context(), client.doForm, teamID, "cus_example", "", 9500)
+			got, err := billing.FindStripeActivationGrant(t.Context(), client.doForm, teamID, "cus_example", "")
 			if (err == nil) != (scenario == "unique") {
 				t.Fatalf("grant=%v err=%v", got, err)
 			}

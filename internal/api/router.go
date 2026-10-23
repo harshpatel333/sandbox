@@ -217,7 +217,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.DELETE("/billing/catalog/plans/:version_id", h.DeletePlanVersionDraft)
 		operator.POST("/billing/catalog/plans/:version_id/publish", h.PublishPlanVersion)
 		operator.POST("/billing/catalog/plans/:version_id/retire", h.RetirePlanVersion)
-		operator.POST("/billing/catalog/promotions", h.PublishSignupPromotion)
+		operator.POST("/billing/pricing-version", h.SetPlatformPricingVersion)
 	}
 
 	machineAdministration := operator.Group("/machine-identity", machineAdministrationAuthorization())
@@ -252,6 +252,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/billing", h.ListPlatformBilling)
 		internal.GET("/billing/catalog", h.GetPlatformBillingCatalog)
 		internal.GET("/billing/catalog/preview", h.PreviewPlanSchedule)
+		internal.GET("/billing/pricing-version", h.GetPlatformPricingVersion)
 		internal.GET("/teams/:team_id/billing/usage", h.GetPlatformTeamBillingUsage)
 		internal.GET("/teams/:team_id/billing/periods", h.ListPlatformTeamBillingPeriods)
 		internal.POST("/billing/cutover", h.EstablishBillingCutover)

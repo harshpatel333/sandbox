@@ -103,12 +103,7 @@ const (
 	absoluteMaxMemoryMib = 131072
 	absoluteMaxDiskMib   = 131072
 
-	// Customer-team defaults (overridable via team.max_template_*).
-	defaultMaxVcpu      = 2
-	defaultMaxMemoryMib = 2048
-	defaultMaxDiskMib   = 8192
-	defaultMaxTemplates = 10
-
+	// Template shape when a request leaves it out.
 	defaultVcpu     = 1
 	defaultMemoryMi = 1024
 	defaultDiskMib  = 4096
@@ -119,7 +114,8 @@ const (
 var templateNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9._/-]*[a-z0-9])?$`)
 
 // validateTemplateShape returns a user-facing error message on failure, "" on pass.
-func validateTemplateShape(team db.Team, systemTeamID uuid.UUID, vcpu, memMib, diskMib int32) string {
+// limits are the team's effective limits; the system team has no team caps.
+func validateTemplateShape(teamID, systemTeamID uuid.UUID, limits teamLimits, vcpu, memMib, diskMib int32) string {
 	if vcpu < 1 || vcpu > absoluteMaxVcpu {
 		return fmt.Sprintf("vcpu must be 1-%d", absoluteMaxVcpu)
 	}
@@ -129,27 +125,18 @@ func validateTemplateShape(team db.Team, systemTeamID uuid.UUID, vcpu, memMib, d
 	if diskMib < 1024 || diskMib > absoluteMaxDiskMib {
 		return fmt.Sprintf("disk_mib must be 1024-%d", absoluteMaxDiskMib)
 	}
-	if team.ID == systemTeamID {
+	if teamID == systemTeamID {
 		return ""
 	}
-	effMaxVcpu := int32(defaultMaxVcpu)
-	if team.MaxTemplateVcpu != nil {
-		effMaxVcpu = *team.MaxTemplateVcpu
-	}
+	effMaxVcpu := limits.MaxVCPU
 	if vcpu > effMaxVcpu {
 		return fmt.Sprintf("vcpu must be 1-%d (your team's limit); contact support@superserve.ai for higher", effMaxVcpu)
 	}
-	effMaxMem := int32(defaultMaxMemoryMib)
-	if team.MaxTemplateMemoryMib != nil {
-		effMaxMem = *team.MaxTemplateMemoryMib
-	}
+	effMaxMem := limits.MaxMemoryMiB
 	if memMib > effMaxMem {
 		return fmt.Sprintf("memory_mib must be 256-%d (your team's limit); contact support@superserve.ai for higher", effMaxMem)
 	}
-	effMaxDisk := int32(defaultMaxDiskMib)
-	if team.MaxTemplateDiskMib != nil {
-		effMaxDisk = *team.MaxTemplateDiskMib
-	}
+	effMaxDisk := limits.MaxDiskMiB
 	if diskMib > effMaxDisk {
 		return fmt.Sprintf("disk_mib must be 1024-%d (your team's limit); contact support@superserve.ai for higher", effMaxDisk)
 	}
@@ -460,13 +447,13 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 	if req.DiskMib != nil {
 		diskMib = *req.DiskMib
 	}
-	team, err := h.DB.GetTeam(c.Request.Context(), teamID)
+	limits, err := h.teamEffectiveLimits(c.Request.Context(), teamID)
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetTeam failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read team limits failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	if msg := validateTemplateShape(team, h.systemTeamID(), vcpu, memMib, diskMib); msg != "" {
+	if msg := validateTemplateShape(teamID, h.systemTeamID(), limits, vcpu, memMib, diskMib); msg != "" {
 		respondErrorMsg(c, "bad_request", msg, http.StatusBadRequest)
 		return
 	}
@@ -510,10 +497,7 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-		effMaxTemplates := int64(defaultMaxTemplates)
-		if team.MaxTemplates != nil {
-			effMaxTemplates = int64(*team.MaxTemplates)
-		}
+		effMaxTemplates := int64(limits.MaxTemplates)
 		if count >= effMaxTemplates {
 			respondErrorMsg(c, "too_many_templates",
 				fmt.Sprintf("team has reached the limit of %d templates; delete some or contact support@superserve.ai for higher", effMaxTemplates),
