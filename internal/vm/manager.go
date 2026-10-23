@@ -362,6 +362,11 @@ type ManagerConfig struct {
 	// default false, with File as the fallback.
 	ResumeUffdEnabled bool
 
+	// ResumePrefetchEnabled replays the template's recorded wake trace on a
+	// layered UFFD resume, so pages the guest touches as it wakes are copied
+	// in the background instead of faulted one by one. Default false.
+	ResumePrefetchEnabled bool
+
 	// VerifySnapshotEnabled exposes the debug POST /verify-snapshot/{id} endpoint
 	// (re-snapshot a paused VM for bit-identical checks). Default false; intended
 	// for staging gate runs, not production.
@@ -614,6 +619,10 @@ type Manager struct {
 	// slot and veth. In-memory only: a restart rebuilds reservations from
 	// scratch and the startup sweep reclaims unprotected namespaces.
 	survivorNS sync.Map
+	// wakeTraces caches template build dir → its recorded access log ("" when
+	// it has none), so a resume finds the trace without touching the disk.
+	// Build dirs are immutable once published; one entry per template seen.
+	wakeTraces sync.Map
 	// orphanScanDone gates the fresh-unit linger skip: it is set only after
 	// startup reattach successfully listed active units and registered the
 	// BoltDB-missing ones as unconfirmed stops. Until then (or forever, if
@@ -2649,6 +2658,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		resumeClockFrozen bool
 		syncWake          time.Duration
 	)
+	resumeAccessLog := m.resumeAccessLog(basePath)
 	// A frozen image publishes Running with a wake owed before each launch (see
 	// persistWakeOwed). A resume that then fails leaves that record claiming a
 	// guest that never came back: put the sandbox back to Paused, unless a
@@ -2762,7 +2772,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		if m.restoreForResumeHook != nil {
 			dirtyTracked, trackingSessionID, restoreErr = m.restoreForResumeHook(socketPath, snapshotPath, memPath, basePath, netInfo)
 		} else {
-			dirtyTracked, trackingSessionID, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo, resumePolicy, demote)
+			dirtyTracked, trackingSessionID, resumeClockFrozen, restoreErr = m.restoreForResume(socketPath, snapshotPath, memPath, basePath, resumeAccessLog, netInfo, resumePolicy, demote)
 		}
 		tRestoreDone = time.Now()
 		if restoreErr != nil {
@@ -2889,6 +2899,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		Int64("restore_ms", tRestoreDone.Sub(tRestore).Milliseconds()).
 		Int64("total_ms", time.Since(tEntry).Milliseconds()).
 		Bool("guest_clock_frozen", resumeClockFrozen).
+		Bool("prefetch", resumeAccessLog != "").
 		Msg("VM resumed from snapshot")
 
 	// Telemetry only: measure how long boxd takes to become reachable after
@@ -2938,7 +2949,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 // clockPolicy is resolved by the caller so the resume log can report what was
 // asked for without stat-ing the marker a second time; beforeLegacy runs
 // before the legacy retry if this Firecracker refuses the option.
-func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo, clockPolicy *bool, beforeLegacy func() error) (dirtyTracked bool, trackingSessionID string, clockFrozen bool, err error) {
+func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath, accessLogPath string, netInfo *network.VMNetInfo, clockPolicy *bool, beforeLegacy func() error) (dirtyTracked bool, trackingSessionID string, clockFrozen bool, err error) {
 	useUffd := m.cfg.ResumeUffdEnabled && m.cfg.UffdEnabled && netInfo != nil && netInfo.TAPDevice != ""
 	if !useUffd {
 		// A layered overlay can only be served by the UFFD layered backend. If this
@@ -2954,8 +2965,6 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 		return false, "", used, rerr
 	}
 
-	// No prefetch access log: only template builds record one (next to the template
-	// snapshot), pause snapshots don't — so resume-side prefetch is future work.
 	// basePath non-empty ⇒ layered restore (memPath is the diff overlay over basePath).
 	trackDirty := m.cfg.IncrementalSnapshotEnabled
 	sessionID := ""
@@ -2966,13 +2975,41 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 		return m.restoreWithClockFallback(clockPolicy, beforeLegacy, func(clock *bool) error {
 			return m.restoreWithSkipZeroHolesFallback(m.skipZeroHolesEnabled(), func(skip bool) error {
 				return RestoreSnapshotUffdInternalWithOverrides(
-					socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
+					socketPath, snapshotPath, memPath, basePath, accessLogPath, "", "eth0", netInfo.TAPDevice, "", trackDirty,
 					m.cfg.HandlerDeathAbortEnabled, false, skip, sid, clock,
 				)
 			})
 		})
 	})
 	return trackDirty, armed, used, rerr
+}
+
+// resumeAccessLog returns the wake trace recorded next to a layered resume's
+// template base, or "" when prefetch is off or the template has none. Pause
+// snapshots record no trace of their own; the template's covers the guest
+// kernel's wake path, which every sandbox built from it shares.
+//
+// Resume never waits on the disk for it: an uncached template resumes without
+// prefetch while a background lookup fills the cache for the next one.
+func (m *Manager) resumeAccessLog(basePath string) string {
+	if basePath == "" || !m.cfg.ResumePrefetchEnabled || !m.cfg.ResumeUffdEnabled || !m.cfg.UffdEnabled {
+		return ""
+	}
+	dir := filepath.Dir(basePath)
+	if v, loaded := m.wakeTraces.LoadOrStore(dir, ""); loaded {
+		return v.(string)
+	}
+	go m.lookupWakeTrace(dir)
+	return ""
+}
+
+// lookupWakeTrace records whether dir holds a wake trace. A failed stat caches
+// "none", which only forgoes prefetch for that template until vmd restarts.
+func (m *Manager) lookupWakeTrace(dir string) {
+	candidate := filepath.Join(dir, accessLogFilename)
+	if fi, err := os.Stat(candidate); err == nil && fi.Mode().IsRegular() {
+		m.wakeTraces.Store(dir, candidate)
+	}
 }
 
 // newTrackingSessionID mints the random token a dirty-tracking session is
@@ -4152,6 +4189,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				if _, err := os.Stat(candidate); err == nil {
 					accessLogPath = candidate
 				}
+				m.wakeTraces.Store(filepath.Dir(memPath), accessLogPath)
 			}
 			// Decide the layered base for this UFFD restore. An overlay (mem.diff) needs
 			// its base reconstructed from the sidecar (else refuse — loading it

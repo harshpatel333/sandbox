@@ -808,6 +808,7 @@ func main() {
 	uffdPrefetchEnabled := envOrDefault("VMD_UFFD_PREFETCH_ENABLED", "true") != "false"
 	uffdRecordMaxSeconds, _ := strconv.Atoi(envOrDefault("VMD_UFFD_RECORD_MAX_SECONDS", "10"))
 	resumeUffdEnabled := envOrDefault("VMD_RESUME_UFFD", "false") == "true"
+	resumePrefetchEnabled := envOrDefault("VMD_RESUME_PREFETCH", "false") == "true"
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
 	// Safe to enable ahead of the Firecracker rollout: sessions are armed only
@@ -1010,6 +1011,7 @@ func main() {
 		UffdPrefetchEnabled:                 uffdPrefetchEnabled,
 		UffdRecordMaxSeconds:                uffdRecordMaxSeconds,
 		ResumeUffdEnabled:                   resumeUffdEnabled,
+		ResumePrefetchEnabled:               resumePrefetchEnabled,
 		VerifySnapshotEnabled:               verifySnapshotEnabled,
 		IncrementalSnapshotEnabled:          incrementalSnapshotEnabled,
 		DirtyTrackingSessionEnabled:         dirtyTrackingSessionEnabled,
