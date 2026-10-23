@@ -7,10 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
@@ -426,5 +430,111 @@ func TestPrepaidAutoRechargeRecoversAcceptedChargeAfterDeparture(t *testing.T) {
 	current, _, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
 	if err != nil || current.ID != newer.ID || f.rows()[0].Credit != "issued" {
 		t.Fatal("accepted charge overwrote departure or lost credit", current, err)
+	}
+}
+
+func TestPrepaidAutoRechargeDispatchWaitsForDisable(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(2000, 5000)
+	f.observe(0, true)
+	if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var id uuid.UUID
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT id FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.WithoutCancel(t.Context()))
+	if _, err = tx.Exec(t.Context(), `UPDATE billing_prepaid_auto_recharge SET enabled=false WHERE team_id=$1`, f.team); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- f.h.chargeAutoRecharge(t.Context(), f.client, id) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err = f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='SELECT enabled FROM billing_prepaid_auto_recharge WHERE team_id=$1 FOR SHARE')`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatal("dispatch did not wait for disable", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("dispatch never reached settings lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err = tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+	if len(f.intentPosts) != 0 || f.rows()[0].Payment != "failed" {
+		t.Fatal("concurrent disable dispatched charge", f.rows())
+	}
+}
+
+func TestPrepaidAutoRechargeEnableWaitsForDeparture(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(2000, 5000)
+	actor := uuid.New()
+	f.exec(`INSERT INTO profile(id,email,provider,provider_id) VALUES($1,$2,'google',$3)`, actor, actor.String()+"@example.com", actor.String())
+	f.exec(`INSERT INTO team_memberships(team_id,user_id,status) VALUES($1,$2,'active')`, f.team, actor)
+	f.exec(`INSERT INTO user_role_assignments(user_id,role_id,scope_type,team_id) SELECT $1,id,'team',$2 FROM roles WHERE name='team_owner'`, actor, f.team)
+	tx, err := f.h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.WithoutCancel(t.Context()))
+	if _, err = assignTeamPlan(t.Context(), tx, planAssignment{Team: f.team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceStaff, Reason: "departure during enable"}); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest(http.MethodPut, "/billing/prepaid/auto-recharge", strings.NewReader(`{"enabled":true,"threshold_cents":2000,"amount_cents":5000}`)).WithContext(t.Context())
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("team_id", f.team.String())
+	c.Set("actor_id", actor)
+	done := make(chan struct{})
+	go func() { defer close(done); f.h.PutPrepaidAutoRecharge(c) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err = f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND (query='SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE' OR query LIKE 'INSERT INTO billing_prepaid_auto_recharge%'))`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case <-done:
+			t.Fatal("enable did not wait for departure", response.Code, response.Body.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("enable never reached authority lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err = tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if response.Code != http.StatusConflict {
+		t.Fatal("enable accepted after departure", response.Code, response.Body.String())
+	}
+	var enabled bool
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT enabled FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&enabled); err != nil || enabled {
+		t.Fatal("enable revived departed settings", enabled, err)
 	}
 }

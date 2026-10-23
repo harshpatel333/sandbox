@@ -197,13 +197,15 @@ func (h *Handlers) chargeAutoRecharge(ctx context.Context, client *stripeHTTPCli
 		return err
 	}
 	var state, key string
-	var enabled bool
-	err = tx.QueryRow(ctx, `SELECT p.payment_state,p.payment_idempotency_key,COALESCE(a.enabled,false) FROM billing_prepaid_purchase p
- LEFT JOIN billing_prepaid_auto_recharge a USING(team_id) WHERE p.id=$1 FOR UPDATE OF p`, id).Scan(&state, &key, &enabled)
+	err = tx.QueryRow(ctx, `SELECT payment_state,payment_idempotency_key FROM billing_prepaid_purchase WHERE id=$1 FOR UPDATE`, id).Scan(&state, &key)
 	if err != nil {
 		return err
 	}
 	if state == "pending" {
+		var enabled bool
+		if err = tx.QueryRow(ctx, `SELECT enabled FROM billing_prepaid_auto_recharge WHERE team_id=$1 FOR SHARE`, team).Scan(&enabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
 		plan, ok, err := currentTeamPlan(ctx, tx, team)
 		if err != nil {
 			return err

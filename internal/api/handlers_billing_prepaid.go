@@ -195,11 +195,7 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "invalid auto-recharge settings", http.StatusBadRequest)
 		return
 	}
-	ctx := c.Request.Context()
-	if !req.Enabled {
-		_, err = h.Pool.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,updated_by) VALUES($1,false,$2)
- ON CONFLICT(team_id) DO UPDATE SET enabled=false,updated_by=$2,updated_at=clock_timestamp()`, team, actor)
-	} else {
+	if req.Enabled {
 		if !validPrepaidAmount(req.ThresholdCents) || !validPrepaidAmount(req.AmountCents) {
 			respondErrorMsg(c, "bad_request", "threshold_cents and amount_cents must be multiples of 500 between 500 and 100000000", http.StatusBadRequest)
 			return
@@ -207,8 +203,33 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 		if !h.prepaidEntryAllowed(c, team) {
 			return
 		}
+	}
+	ctx := c.Request.Context()
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	if err = tx.QueryRow(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, team).Scan(&team); err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if !req.Enabled {
+		_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,updated_by) VALUES($1,false,$2)
+ ON CONFLICT(team_id) DO UPDATE SET enabled=false,updated_by=$2,updated_at=clock_timestamp()`, team, actor)
+	} else {
+		plan, ok, planErr := currentTeamPlan(ctx, tx, team)
+		if planErr != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if !ok || plan.Kind != planKindPrepaid {
+			respondErrorMsg(c, "conflict", "auto-recharge requires a prepaid plan", http.StatusConflict)
+			return
+		}
 		var ready bool
-		if err = h.Pool.QueryRow(ctx, `SELECT COALESCE((SELECT observe AND payment_method_ready FROM billing_funding_account WHERE team_id=$1),false)`, team).Scan(&ready); err != nil {
+		if err = tx.QueryRow(ctx, `SELECT COALESCE((SELECT observe AND payment_method_ready FROM billing_funding_account WHERE team_id=$1),false)`, team).Scan(&ready); err != nil {
 			respondError(c, ErrInternal)
 			return
 		}
@@ -216,11 +237,15 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 			respondErrorMsg(c, "conflict", "auto-recharge needs a card saved by an earlier credit purchase", http.StatusConflict)
 			return
 		}
-		_, err = h.Pool.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,updated_by) VALUES($1,true,$2,$3,$4)
+		_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,updated_by) VALUES($1,true,$2,$3,$4)
  ON CONFLICT(team_id) DO UPDATE SET enabled=true,threshold_cents=$2,amount_cents=$3,updated_by=$4,updated_at=clock_timestamp(),
   disabled_reason=NULL,disabled_at=NULL,disabled_by=NULL,notified_at=NULL`, team, req.ThresholdCents, req.AmountCents, actor)
 	}
 	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if err = tx.Commit(ctx); err != nil {
 		respondError(c, ErrInternal)
 		return
 	}
