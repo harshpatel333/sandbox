@@ -80,7 +80,8 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
  FROM billing_prepaid_auto_recharge a
  JOIN billing_funding_account f USING(team_id)
  JOIN team_billing_account b USING(team_id)
- WHERE a.enabled AND f.observe AND f.payment_method_ready AND f.payment_method_id IS NOT NULL
+ WHERE a.enabled AND EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=a.team_id AND p.effective_to IS NULL AND p.kind='prepaid')
+ AND f.observe AND f.payment_method_ready AND f.payment_method_id IS NOT NULL
   AND f.observed_generation=f.generation AND f.customer_id=b.stripe_customer_id
   AND f.credit_checked_at>clock_timestamp()-interval '2 minutes' AND f.credit_usd*100<a.threshold_cents
   AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id
@@ -183,27 +184,50 @@ func (h *Handlers) settlePrepaidPurchase(ctx context.Context, client *stripeHTTP
 }
 
 func (h *Handlers) chargeAutoRecharge(ctx context.Context, client *stripeHTTPClient, id uuid.UUID) error {
-	var team uuid.UUID
-	var state, key string
-	var enabled bool
-	err := h.Pool.QueryRow(ctx, `SELECT p.team_id,p.payment_state,p.payment_idempotency_key,COALESCE(a.enabled,false) FROM billing_prepaid_purchase p
- LEFT JOIN billing_prepaid_auto_recharge a USING(team_id) WHERE p.id=$1`, id).Scan(&team, &state, &key, &enabled)
+	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if state == "pending" && !enabled {
-		return h.failPrepaidPayment(ctx, id, "", "auto-recharge was disabled before the charge was sent", false, "pending")
+	defer tx.Rollback(ctx)
+	var team uuid.UUID
+	if err = tx.QueryRow(ctx, `SELECT team_id FROM billing_prepaid_purchase WHERE id=$1`, id).Scan(&team); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, team); err != nil {
+		return err
+	}
+	var state, key string
+	var enabled bool
+	err = tx.QueryRow(ctx, `SELECT p.payment_state,p.payment_idempotency_key,COALESCE(a.enabled,false) FROM billing_prepaid_purchase p
+ LEFT JOIN billing_prepaid_auto_recharge a USING(team_id) WHERE p.id=$1 FOR UPDATE OF p`, id).Scan(&state, &key, &enabled)
+	if err != nil {
+		return err
+	}
+	if state == "pending" {
+		plan, ok, err := currentTeamPlan(ctx, tx, team)
+		if err != nil {
+			return err
+		}
+		if !enabled || !ok || plan.Kind != planKindPrepaid {
+			if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_state='failed',failure_reason='auto-recharge is disabled or the team has left prepaid before dispatch' WHERE id=$1 AND payment_state='pending'`, id); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
 	}
 	var raw []byte
 	var first *time.Time
 	var intentID *string
-	err = h.Pool.QueryRow(ctx, `UPDATE billing_prepaid_purchase SET payment_state=CASE WHEN payment_state='pending' THEN 'uncertain' ELSE payment_state END,
+	err = tx.QueryRow(ctx, `UPDATE billing_prepaid_purchase SET payment_state=CASE WHEN payment_state='pending' THEN 'uncertain' ELSE payment_state END,
  payment_first_attempt_at=COALESCE(payment_first_attempt_at,clock_timestamp())
  WHERE id=$1 AND payment_state IN ('pending','uncertain','processing') RETURNING payment_request,payment_first_attempt_at,payment_intent_id`, id).Scan(&raw, &first, &intentID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
 	var req prepaidPaymentRequest

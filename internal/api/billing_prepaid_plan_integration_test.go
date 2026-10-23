@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -308,5 +309,122 @@ func TestPrepaidTeamDeletionKeepsPurchaseAuditAndDropsSettings(t *testing.T) {
 	}
 	if _, err := h.Pool.Exec(t.Context(), `UPDATE billing_prepaid_purchase SET next_attempt_at='9999-01-01' WHERE id=$1`, id); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPrepaidAutoRechargeStopsOnDeparture(t *testing.T) {
+	for _, kind := range []string{planKindFree, planKindSubscription, planKindCustom} {
+		for _, queued := range []bool{false, true} {
+			t.Run(kind+"/queued="+fmt.Sprint(queued), func(t *testing.T) {
+				f := newPrepaidFixture(t)
+				f.enableAutoRecharge(2000, 5000)
+				f.observe(0, true)
+				if queued {
+					if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+						t.Fatal(err)
+					}
+					if rows := f.rows(); len(rows) != 1 || rows[0].Payment != "pending" {
+						t.Fatal("purchase not queued", rows)
+					}
+				}
+				if _, err := assignInTx(t, f.h, planAssignment{Team: f.team, Terms: testPlanTerms("exit", kind, 1, nil), Source: planSourceStaff, Reason: "leave prepaid"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.tick(); err != nil {
+					t.Fatal(err)
+				}
+				if len(f.intentPosts) != 0 {
+					t.Fatal("charged after prepaid departure", f.intentPosts)
+				}
+				for _, row := range f.rows() {
+					if row.Payment != "failed" {
+						t.Fatal("unsent departure purchase still dispatchable", row)
+					}
+				}
+				var enabled bool
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT enabled FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&enabled); err != nil || enabled {
+					t.Fatal("departure retained auto-recharge authority", enabled, err)
+				}
+			})
+		}
+	}
+}
+
+func TestPrepaidAutoRechargeDispatchWaitsForDeparture(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(2000, 5000)
+	f.observe(0, true)
+	if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var id uuid.UUID
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT id FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.WithoutCancel(t.Context()))
+	if _, err = assignTeamPlan(t.Context(), tx, planAssignment{Team: f.team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceStaff, Reason: "concurrent departure"}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- f.h.chargeAutoRecharge(t.Context(), f.client, id) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err = f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query='SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE')`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatal("dispatch did not wait for assignment", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("dispatch never reached team lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err = tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+	if len(f.intentPosts) != 0 || f.rows()[0].Payment != "failed" {
+		t.Fatal("concurrent departure dispatched charge", f.rows())
+	}
+}
+
+func TestPrepaidAutoRechargeRecoversAcceptedChargeAfterDeparture(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(2000, 5000)
+	f.observe(0, true)
+	f.loseIntent = true
+	if err := f.tick(); err == nil {
+		t.Fatal("expected lost response")
+	}
+	if rows := f.rows(); len(rows) != 1 || rows[0].Payment != "uncertain" {
+		t.Fatal("charge intent not accepted", rows)
+	}
+	newer, err := assignInTx(t, f.h, planAssignment{Team: f.team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceStaff, Reason: "departure after accepted charge"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setPricingVersion(t, f.h, "legacy")
+	if err = f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.intents) != 1 || len(f.grantPosts) != 1 || len(f.intentKeys) != 2 || f.intentKeys[0] != f.intentKeys[1] {
+		t.Fatal("accepted charge lost or duplicated", f.rows(), f.intentKeys)
+	}
+	current, _, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil || current.ID != newer.ID || f.rows()[0].Credit != "issued" {
+		t.Fatal("accepted charge overwrote departure or lost credit", current, err)
 	}
 }
