@@ -650,8 +650,12 @@ func TestMatchingCreditWithheldMatchReleasesCap(t *testing.T) {
 
 func TestMatchingCreditRetiresMalformedPlansDurably(t *testing.T) {
 	m := newMatchingFixture(t, 10000, 8_000_000, 0)
-	m.prices = map[string]any{"unexpected": true}
 	var malformed []string
+	for _, prices := range []any{[]any{nil, "price_cpu"}, []any{1, "price_cpu"}} {
+		m.prices = prices
+		malformed = append(malformed, m.paidInvoice("paid", usageLine("price_cpu", 100)))
+	}
+	m.prices = map[string]any{"unexpected": true}
 	for i := 0; i < 21; i++ {
 		malformed = append(malformed, m.paidInvoice("paid", usageLine("price_cpu", 100)))
 	}
