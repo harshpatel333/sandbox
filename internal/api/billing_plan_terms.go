@@ -124,6 +124,14 @@ func termsOfVersion(v planVersion, months int32) (planTerms, error) {
 		Available: v.sellable() && !retired, Retired: retired}, nil
 }
 
+// planPriced reports whether checkout may sell t in this environment. The
+// seeded first versions reproduce the terms the configured Stripe prices
+// charge, so they stay sold only where those prices are configured; later
+// versions get their own prices on demand.
+func (h *Handlers) planPriced(t planTerms) bool {
+	return t.Version > 1 || (h.Config != nil && h.Config.PlanPriceID(t.OfferKey) != "")
+}
+
 // freezeContractLimits records the limits a contract was sold or assigned
 // with, so later catalog versions do not change them.
 func freezeContractLimits(ctx context.Context, q interface {

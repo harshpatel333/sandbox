@@ -52,17 +52,17 @@ type signupCredits struct {
 	CardBonusCents   int64 `json:"card_bonus_cents"`
 }
 
-func planCard(v planVersion) billingPlanCard {
+func (h *Handlers) planCard(v planVersion) billingPlanCard {
 	card := billingPlanCard{Family: v.Family, Version: v.Version, Name: v.DisplayName, Tagline: v.Tagline, Features: v.Features, DisplayOnly: v.DisplayOnly,
 		CreditSummary: planCreditSummary(v.CreditSchedule), CreditSchedule: v.CreditSchedule, Matching: v.Matching, Limits: v.Limits}
 	if credit, uniform := uniformMonthlyCredit(v.CreditSchedule); uniform {
 		card.MonthlyCreditCents = &credit
 	}
 	if v.MonthlyFeeCents != nil {
-		card.Monthly = &billingPlanPrice{OfferKey: v.Family + "_monthly", PriceCents: *v.MonthlyFeeCents, MonthlyEquivalentCents: *v.MonthlyFeeCents, Available: v.sellable()}
+		card.Monthly = &billingPlanPrice{OfferKey: v.Family + "_monthly", PriceCents: *v.MonthlyFeeCents, MonthlyEquivalentCents: *v.MonthlyFeeCents, Available: v.sellable() && h.planPriced(planTerms{OfferKey: v.Family + "_monthly", Version: v.Version})}
 	}
 	if v.AnnualFeeCents != nil {
-		card.Annual = &billingPlanPrice{OfferKey: v.Family + "_annual", PriceCents: *v.AnnualFeeCents, MonthlyEquivalentCents: *v.AnnualFeeCents / 12, Available: v.sellable()}
+		card.Annual = &billingPlanPrice{OfferKey: v.Family + "_annual", PriceCents: *v.AnnualFeeCents, MonthlyEquivalentCents: *v.AnnualFeeCents / 12, Available: v.sellable() && h.planPriced(planTerms{OfferKey: v.Family + "_annual", Version: v.Version})}
 	}
 	if card.CreditSchedule == nil {
 		card.CreditSchedule = []planGrant{}
@@ -115,7 +115,7 @@ func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-		cards = append(cards, planCard(v))
+		cards = append(cards, h.planCard(v))
 	}
 	if err = rows.Err(); err != nil {
 		log.Error().Err(err).Msg("list billing plans failed")

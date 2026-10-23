@@ -258,10 +258,23 @@ func planPriceLookupKey(versionID uuid.UUID, months int32) string {
 	return "superserve_plan_" + versionID.String() + "_" + interval
 }
 
-// ensurePlanPrice is the one creator of Stripe prices for catalog plans: it
-// returns the licensed price for t's fee and interval, found by lookup key or
-// created once, and verified against t.
-func (c *stripeHTTPClient) ensurePlanPrice(ctx context.Context, t planTerms) (storagePrice, error) {
+// ensurePlanPrice is the one source of Stripe prices for catalog plan fees.
+// A configured price wins while it charges t's fee on t's interval, so a plan
+// keeps one price whichever path sells it; otherwise the version's own price
+// is found by lookup key or created once. It reads only t's VersionID,
+// OfferKey, FeeCents and IntervalMonths, so callers may pass frozen terms.
+func (h *Handlers) ensurePlanPrice(ctx context.Context, c *stripeHTTPClient, t planTerms) (storagePrice, error) {
+	if configured := h.Config.PlanPriceID(t.OfferKey); configured != "" {
+		p, err := c.verifiedPlanPrice(ctx, proOffer{Key: t.OfferKey, Price: configured, Amount: t.FeeCents, Months: t.IntervalMonths})
+		if !errors.Is(err, errProPriceMismatch) {
+			return p, err
+		}
+	}
+	return c.versionPlanPrice(ctx, t)
+}
+
+// versionPlanPrice finds or creates the price keyed by t's version.
+func (c *stripeHTTPClient) versionPlanPrice(ctx context.Context, t planTerms) (storagePrice, error) {
 	if t.VersionID == uuid.Nil || t.FeeCents <= 0 || (t.IntervalMonths != 1 && t.IntervalMonths != 12) {
 		return storagePrice{}, errors.New("plan terms have no fee to price")
 	}
@@ -310,20 +323,3 @@ func (c *stripeHTTPClient) ensurePlanPrice(ctx context.Context, t planTerms) (st
 	return c.verifiedPlanPrice(ctx, o)
 }
 
-// resolvePlanPrice sets the Stripe base price for a checkout. A configured
-// price is kept while it still matches the frozen terms; otherwise the
-// version's own price is used.
-func (c *stripeHTTPClient) resolvePlanPrice(ctx context.Context, o *proOffer) error {
-	if o.Price != "" {
-		err := c.validateProPrice(ctx, *o)
-		if !errors.Is(err, errProPriceMismatch) {
-			return err
-		}
-	}
-	price, err := c.ensurePlanPrice(ctx, planTerms{OfferKey: o.Key, FeeCents: o.Amount, IntervalMonths: o.Months, VersionID: o.VersionID})
-	if err != nil {
-		return err
-	}
-	o.Price = price.ID
-	return nil
-}

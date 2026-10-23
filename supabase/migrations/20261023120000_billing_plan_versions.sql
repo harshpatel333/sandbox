@@ -535,7 +535,7 @@ CREATE FUNCTION apply_contract_limits(p_contract uuid) RETURNS void LANGUAGE plp
 DECLARE c billing_commercial_contract; l billing_contract_limits;
 BEGIN
     SELECT * INTO c FROM billing_commercial_contract WHERE id = p_contract;
-    IF NOT FOUND OR c.status <> 'active' THEN RETURN; END IF;
+    IF NOT FOUND OR c.status <> 'active' OR c.charge_kind = 'sponsored_entitlement' THEN RETURN; END IF;
     SELECT * INTO l FROM billing_contract_limits WHERE contract_id = p_contract;
     IF NOT FOUND THEN
         PERFORM apply_plan_limits(c.team_id, c.offer_key);

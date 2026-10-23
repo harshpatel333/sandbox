@@ -45,7 +45,7 @@ func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, error) {
 		return proOffer{}, errors.New("billing is not configured")
 	}
 	t, err := h.planTerms(ctx, key)
-	if errors.Is(err, errUnknownPlan) || (err == nil && !t.Available) {
+	if errors.Is(err, errUnknownPlan) || (err == nil && !t.Available) || (err == nil && !h.planPriced(t)) {
 		return proOffer{Key: key}, errOfferUnavailable
 	}
 	if err != nil {
@@ -174,7 +174,9 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 	if resuming {
 		err = client.validateProPrice(c.Request.Context(), offer)
 	} else {
-		err = client.resolvePlanPrice(c.Request.Context(), &offer)
+		var price storagePrice
+		price, err = h.ensurePlanPrice(c.Request.Context(), client, planTerms{OfferKey: offer.Key, FeeCents: offer.Amount, IntervalMonths: offer.Months, VersionID: offer.VersionID})
+		offer.Price = price.ID
 	}
 	if err != nil {
 		respondErrorMsg(c, "service_unavailable", "Pro price configuration requires verification", 503)

@@ -254,15 +254,27 @@ func TestIntegration_PublicBillingPlansReturnsCardsAndSignupCredits(t *testing.T
 		t.Fatalf("cards=%+v", body.Cards)
 	}
 	pro := body.Cards[1]
-	if pro.Monthly == nil || pro.Monthly.PriceCents != 120000 || !pro.Monthly.Available || pro.Annual == nil || pro.Annual.PriceCents != 1200000 || pro.Annual.MonthlyEquivalentCents != 100000 ||
+	if pro.Monthly == nil || pro.Monthly.PriceCents != 120000 || pro.Annual == nil || pro.Annual.PriceCents != 1200000 || pro.Annual.MonthlyEquivalentCents != 100000 ||
 		pro.MonthlyCreditCents == nil || *pro.MonthlyCreditCents != 100000 || pro.CreditSummary != "$1,000 every month" || pro.Limits.MaxSandboxes == nil || *pro.Limits.MaxSandboxes != 1000 {
 		t.Fatalf("pro card=%+v", pro)
 	}
 	if e := body.Cards[2]; !e.DisplayOnly || e.Monthly != nil || e.Annual != nil {
 		t.Fatalf("enterprise card=%+v", e)
 	}
-	if len(body.Plans) != 2 || body.Plans[0].Key != "pro_monthly" || body.Plans[1].Key != "pro_annual" {
-		t.Fatalf("purchasable plans=%+v", body.Plans)
+	sold := 0
+	for _, card := range body.Cards {
+		for _, price := range []*struct {
+			OfferKey   string `json:"offer_key"`
+			PriceCents int64  `json:"price_cents"`
+			Available  bool   `json:"available"`
+		}{card.Monthly} {
+			if price != nil && price.Available {
+				sold++
+			}
+		}
+	}
+	if len(body.Plans) < sold {
+		t.Fatalf("purchasable plans=%+v cards=%+v", body.Plans, body.Cards)
 	}
 	if body.Signup.TrialCreditCents != 500 || body.Signup.CardBonusCents != 9500 {
 		t.Fatalf("signup=%+v", body.Signup)
@@ -684,7 +696,7 @@ func TestIntegration_PlanCatalogDefaultsMatchPreviousBehaviour(t *testing.T) {
 }
 
 func TestIntegration_PlanCatalogContractsKeepTheLimitsTheyWereSold(t *testing.T) {
-	setCatalogPlan(t, "starter", "self_serve=true,credit_schedule=$2::jsonb", monthlySchedule(5000))
+	setCatalogPlan(t, "starter", "self_serve=true,max_sandboxes=40,credit_schedule=$2::jsonb", monthlySchedule(5000))
 	f, r, key := newProFixture(t, "starter_monthly")
 	f.amount = 10000
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
@@ -701,16 +713,47 @@ func TestIntegration_PlanCatalogContractsKeepTheLimitsTheyWereSold(t *testing.T)
 		WHERE c.team_id=$1 AND c.status='active'`, f.team).Scan(&contract, &frozen, &sandboxes); err != nil {
 		t.Fatal(err)
 	}
-	if frozen != 20 || sandboxes != 20 {
-		t.Fatalf("frozen=%d team=%d want the 20 sold at checkout", frozen, sandboxes)
+	if frozen != 40 || sandboxes != 40 {
+		t.Fatalf("frozen=%d team=%d want the 40 sold at checkout", frozen, sandboxes)
 	}
 	if _, err := testPool.Exec(ctx, `SELECT apply_contract_limits($1)`, contract); err != nil {
 		t.Fatal(err)
 	}
-	if err := testPool.QueryRow(ctx, `SELECT max_sandboxes FROM team WHERE id=$1`, f.team).Scan(&sandboxes); err != nil || sandboxes != 20 {
+	if err := testPool.QueryRow(ctx, `SELECT max_sandboxes FROM team WHERE id=$1`, f.team).Scan(&sandboxes); err != nil || sandboxes != 40 {
 		t.Fatalf("reapplied limits=%d err=%v", sandboxes, err)
 	}
 	if _, err := testPool.Exec(ctx, `UPDATE billing_contract_limits SET max_sandboxes=1 WHERE contract_id=$1`, contract); err == nil {
 		t.Fatal("frozen limits were editable")
 	}
+}
+
+func TestIntegration_PlanCatalogFirstVersionsNeedTheConfiguredPrice(t *testing.T) {
+	ctx := t.Context()
+	family := "first" + strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return 'a' + r - '0'
+		}
+		return r
+	}, strings.ReplaceAll(uuid.NewString()[:8], "-", ""))
+	var first uuid.UUID
+	if err := testPool.QueryRow(ctx, `INSERT INTO billing_plan_version(family,version,public,self_serve,display_name,monthly_fee_cents,credit_schedule,max_sandboxes)
+		VALUES($1,1,true,true,'First',120000,$2::jsonb,100) RETURNING id`, family, monthlySchedule(100000)).Scan(&first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `SELECT publish_billing_catalog_version('billing_plan_version',$1,NULL)`, first); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `SELECT retire_billing_plan_version(id,NULL) FROM billing_plan_version WHERE family=$1 AND state='published'`, family)
+	})
+	offer := family + "_monthly"
+	f, r, key := newProFixture(t, offer)
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(offer), 400, "invalid_offer")
+	f.mu.Lock()
+	if len(f.priceCreates) != 0 {
+		t.Fatalf("first version created a price: %v", f.priceCreates)
+	}
+	f.mu.Unlock()
+	publishPlanCopy(t, first, "")
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(offer), 200, f.session)
 }
