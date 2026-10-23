@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -201,4 +202,76 @@ func (h *Handlers) GetTeamPlanAssignments(c *gin.Context) {
 		current = &history[0]
 	}
 	c.JSON(http.StatusOK, gin.H{"current": current, "history": history})
+}
+
+// customerPlanLimits are a plan's limits in the names customers see.
+type customerPlanLimits struct {
+	MaxConcurrent int32  `json:"max_concurrent"`
+	MaxVCPU       *int32 `json:"max_vcpu"`
+	MaxMemoryMiB  *int32 `json:"max_memory_mib"`
+	MaxDiskMiB    *int32 `json:"max_disk_mib"`
+	MaxTemplates  *int32 `json:"max_templates"`
+}
+
+type customerPlan struct {
+	PlanKey       string             `json:"plan_key"`
+	Kind          string             `json:"kind"`
+	DisplayName   string             `json:"display_name"`
+	Limits        customerPlanLimits `json:"limits"`
+	EffectiveFrom time.Time          `json:"effective_from"`
+}
+
+type customerPendingPlanChange struct {
+	TargetPlanKey     string    `json:"target_plan_key"`
+	TargetDisplayName string    `json:"target_display_name"`
+	EffectiveAt       time.Time `json:"effective_at"`
+	Undoable          bool      `json:"undoable"`
+}
+
+type customerBillingPeriod struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+// GetBillingPlan tells a team which plan it is on, its limits, the current
+// billing period and any change waiting to take effect. Plan is null until the
+// team has been assigned one, which only happens under pricing v2.
+func (h *Handlers) GetBillingPlan(c *gin.Context) {
+	team, ok := h.requireBillingRead(c)
+	if !ok {
+		return
+	}
+	ctx := c.Request.Context()
+	current, assigned, err := currentTeamPlan(ctx, h.Pool, team)
+	var anchor pgtype.Timestamptz
+	if err == nil {
+		err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = nil
+		}
+	}
+	var start, end time.Time
+	if err == nil {
+		start, end, err = h.currentBillingPeriod(ctx, team, anchor, h.nowUTC())
+	}
+	if err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("load billing plan failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	var plan *customerPlan
+	if assigned {
+		l := current.Limits
+		max := int32(0)
+		if l.MaxSandboxes != nil {
+			max = *l.MaxSandboxes
+		}
+		plan = &customerPlan{PlanKey: current.PlanKey, Kind: current.Kind, DisplayName: current.Terms.DisplayName, EffectiveFrom: current.EffectiveFrom,
+			Limits: customerPlanLimits{MaxConcurrent: max, MaxVCPU: l.MaxTemplateVCPU, MaxMemoryMiB: l.MaxTemplateMemoryMiB, MaxDiskMiB: l.MaxTemplateDiskMiB}}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"plan":           plan,
+		"period":         customerBillingPeriod{Start: start, End: end},
+		"pending_change": (*customerPendingPlanChange)(nil),
+	})
 }
