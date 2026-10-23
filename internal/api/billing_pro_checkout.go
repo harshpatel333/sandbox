@@ -21,39 +21,62 @@ type proOffer struct {
 	Key, Price string
 	Amount     int64
 	Months     int32
+	Credit     int64
 }
 
-func (h *Handlers) proOffer(key string) (proOffer, error) {
-	o, err := proOfferTerms(key)
+// Purchases started before the plan catalog carry no frozen terms.
+var legacyProOffers = map[string]proOffer{
+	"pro_monthly": {Key: "pro_monthly", Amount: 120000, Months: 1, Credit: 100000},
+	"pro_annual":  {Key: "pro_annual", Amount: 1200000, Months: 12, Credit: 100000},
+}
+
+// paidPlanOffers matches every offer_key in the self-serve plan catalog.
+const paidPlanOffers = "(SELECT offer_key FROM billing_plan)"
+
+// proOffer returns a catalog plan's current terms and configured Stripe price.
+func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, bool, error) {
+	if h.Config == nil || h.Pool == nil {
+		return proOffer{}, false, errors.New("billing is not configured")
+	}
+	o := proOffer{Key: key}
+	var available bool
+	err := h.Pool.QueryRow(ctx, `SELECT charge_amount_cents,charge_interval_months,monthly_credit_cents,available FROM billing_plan WHERE offer_key=$1`, key).Scan(&o.Amount, &o.Months, &o.Credit, &available)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return o, false, errors.New("unsupported offer")
+	}
 	if err != nil {
-		return o, err
+		return o, false, err
 	}
-	if h.Config == nil {
-		return o, errors.New("billing is not configured")
-	}
-	switch key {
-	case "pro_monthly":
-		o.Price = h.Config.StripeProMonthlyPriceID
-	case "pro_annual":
-		o.Price = h.Config.StripeProAnnualPriceID
-	default:
-		return o, errors.New("unsupported offer")
-	}
+	o.Price = h.Config.PlanPriceID(key)
 	if o.Price == "" {
-		return o, errors.New("Pro offer is not configured")
+		return o, false, fmt.Errorf("%s offer is not configured", key)
 	}
-	return o, nil
+	return o, available, nil
 }
 
-func proOfferTerms(key string) (proOffer, error) {
-	switch key {
-	case "pro_monthly":
-		return proOffer{Key: key, Amount: 120000, Months: 1}, nil
-	case "pro_annual":
-		return proOffer{Key: key, Amount: 1200000, Months: 12}, nil
-	default:
+// frozenProOffer returns the terms a purchase was started with.
+func frozenProOffer(key string, payload StripeCreateCheckoutSessionParams) (proOffer, error) {
+	t := payload.PlanTerms
+	if t == nil {
+		if o, ok := legacyProOffers[key]; ok {
+			return o, nil
+		}
 		return proOffer{}, errors.New("unsupported offer")
 	}
+	if t.Amount <= 0 || t.Credit <= 0 || (t.Months != 1 && t.Months != 12) {
+		return proOffer{}, errors.New("invalid frozen plan terms")
+	}
+	return proOffer{Key: key, Amount: t.Amount, Months: t.Months, Credit: t.Credit}, nil
+}
+
+func (c proChoice) frozenOffer() (proOffer, error) {
+	var params StripeCreateCheckoutSessionParams
+	if err := json.Unmarshal(c.Payload, &params); err != nil {
+		return proOffer{}, err
+	}
+	o, err := frozenProOffer(c.Offer, params)
+	o.Price = c.Price
+	return o, err
 }
 
 type proChoice struct {
@@ -77,7 +100,7 @@ func scanProChoice(row pgx.Row) (proChoice, error) {
 const proChoiceColumns = "team_id,offer_key,state,base_price_id,generation,actor_id,request_payload,session_id,subscription_id,revision,invoice_cursor"
 
 func (h *Handlers) getProChoice(ctx context.Context, team uuid.UUID) (proChoice, error) {
-	return scanProChoice(h.Pool.QueryRow(ctx, `SELECT `+proChoiceColumns+` FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN ('pro_monthly','pro_annual')`, team))
+	return scanProChoice(h.Pool.QueryRow(ctx, `SELECT `+proChoiceColumns+` FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers, team))
 }
 func proConflict(c *gin.Context) {
 	respondErrorMsg(c, "plan_conflict", "plan selection or payment is already committed or awaiting confirmation", http.StatusConflict)
@@ -88,7 +111,10 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
-	offer, err := h.proOffer(req.Offer)
+	offer, available, err := h.proOffer(c.Request.Context(), req.Offer)
+	if err == nil && !available {
+		err = errors.New("plan is not available")
+	}
 	if err != nil {
 		respondErrorMsg(c, "invalid_offer", err.Error(), http.StatusBadRequest)
 		return
@@ -141,7 +167,8 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
-	params := StripeCreateCheckoutSessionParams{CustomerID: customer, SuccessURL: success, CancelURL: cancelURL, ClientReferenceID: team.String(), PriceIDs: prices, BasePriceID: offer.Price, Flexible: true, ResourceTerms: terms}
+	params := StripeCreateCheckoutSessionParams{CustomerID: customer, SuccessURL: success, CancelURL: cancelURL, ClientReferenceID: team.String(), PriceIDs: prices, BasePriceID: offer.Price, Flexible: true, ResourceTerms: terms,
+		PlanTerms: &StripeCheckoutPlanTerms{Amount: offer.Amount, Months: offer.Months, Credit: offer.Credit}}
 	if offer.Months == 12 {
 		// Checkout cannot mix annual fees with monthly usage. Keep the actual
 		// request frozen so older replicas also replay the base-only session.
@@ -381,7 +408,7 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 		return true, err
 	}
 	var team uuid.UUID
-	err := h.Pool.QueryRow(ctx, `SELECT b.team_id FROM team_billing_account b JOIN billing_signup_choice c USING(team_id) WHERE b.stripe_customer_id=$1 AND c.offer_key IN ('pro_monthly','pro_annual')`, obj.Customer).Scan(&team)
+	err := h.Pool.QueryRow(ctx, `SELECT b.team_id FROM team_billing_account b JOIN billing_signup_choice c USING(team_id) WHERE b.stripe_customer_id=$1 AND c.offer_key IN `+paidPlanOffers, obj.Customer).Scan(&team)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}

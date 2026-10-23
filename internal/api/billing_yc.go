@@ -243,7 +243,7 @@ func (h *Handlers) ycPreflight(ctx context.Context, team uuid.UUID, in ycApprova
 	if err := client.ycMerchant(ctx, in); err != nil {
 		return params, sub, err
 	}
-	offer, err := h.proOffer("pro_annual")
+	offer, _, err := h.proOffer(ctx, "pro_annual")
 	if err != nil {
 		return params, sub, err
 	}

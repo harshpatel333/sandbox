@@ -42,7 +42,8 @@ type Config struct {
 	StripeAPIVersion              string // STRIPE_API_VERSION, required for Stripe requests
 	StripeProMonthlyPriceID       string
 	StripeProAnnualPriceID        string
-	StripeCheckoutPriceIDs        []string // STRIPE_CHECKOUT_PRICE_IDS, required for checkout sessions
+	StripePlanPriceIDs            map[string]string // STRIPE_PLAN_PRICE_IDS, comma-separated offer_key=price_id for catalog plans
+	StripeCheckoutPriceIDs        []string          // STRIPE_CHECKOUT_PRICE_IDS, required for checkout sessions
 	BillingResources              []BillingResourceConfig
 	AppAllowedOrigins             []string // APP_ALLOWED_ORIGINS, comma-separated browser origins allowed in billing redirects
 
@@ -167,6 +168,7 @@ func Load() (*Config, error) {
 		StripeCheckoutPriceIDs:        checkoutPriceIDs,
 		StripeProMonthlyPriceID:       strings.TrimSpace(os.Getenv("STRIPE_PRO_MONTHLY_PRICE_ID")),
 		StripeProAnnualPriceID:        strings.TrimSpace(os.Getenv("STRIPE_PRO_ANNUAL_PRICE_ID")),
+		StripePlanPriceIDs:            planPriceIDs(os.Getenv("STRIPE_PLAN_PRICE_IDS")),
 		BillingResources:              billingResources(checkoutPriceIDs),
 		AppAllowedOrigins:             splitCSV(os.Getenv("APP_ALLOWED_ORIGINS")),
 		SandboxAccessTokenSeed:        seed,
@@ -369,6 +371,32 @@ func defaultBillingResourceDisplayUnit(resourceKey string) string {
 	default:
 		return resourceKey
 	}
+}
+
+func planPriceIDs(raw string) map[string]string {
+	ids := map[string]string{}
+	for _, pair := range splitCSV(raw) {
+		key, price, ok := strings.Cut(pair, "=")
+		if key, price = strings.TrimSpace(key), strings.TrimSpace(price); ok && key != "" && price != "" {
+			ids[key] = price
+		}
+	}
+	return ids
+}
+
+// PlanPriceID returns the Stripe base price for a catalog plan. The Pro
+// variables predate STRIPE_PLAN_PRICE_IDS and stay supported.
+func (c *Config) PlanPriceID(offer string) string {
+	if id := c.StripePlanPriceIDs[offer]; id != "" {
+		return id
+	}
+	switch offer {
+	case "pro_monthly":
+		return c.StripeProMonthlyPriceID
+	case "pro_annual":
+		return c.StripeProAnnualPriceID
+	}
+	return ""
 }
 
 func splitCSV(raw string) []string {

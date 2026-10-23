@@ -95,6 +95,34 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /billing/plans/public:
+    get:
+      operationId: getPublicBillingPlans
+      tags: [Billing]
+      summary: List purchasable subscription plans
+      description: |
+        Returns the subscription plans new customers can currently buy, with
+        their price, included monthly usage credit, and resource limits. This
+        endpoint is unauthenticated so signup pages can render from the same
+        plan catalog used by checkout.
+      responses:
+        "200":
+          description: Purchasable subscription plans
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingPlansResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          description: Plans are not available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /billing/summary:
     get:
       operationId: getBillingSummary
@@ -4978,6 +5006,52 @@ components:
           type: string
           description: Prefix-shaped sample of the proxy token issued for this provider (e.g. `sk-ant-api03-...`).
 
+    BillingPlansResponse:
+      type: object
+      required: [plans]
+      properties:
+        plans:
+          type: array
+          items:
+            $ref: "#/components/schemas/BillingPlan"
+    BillingPlan:
+      type: object
+      required: [key, family, name, interval_months, price_cents, monthly_credit_cents, limits]
+      properties:
+        key:
+          type: string
+          description: Offer key used to start checkout, e.g. `starter_monthly`.
+        family:
+          type: string
+          description: Plan family shared by its monthly and annual offers, e.g. `starter`.
+        name:
+          type: string
+        interval_months:
+          type: integer
+          enum: [1, 12]
+        price_cents:
+          type: integer
+          format: int64
+          description: Subscription price in USD cents per billing interval.
+        monthly_credit_cents:
+          type: integer
+          format: int64
+          description: Metered usage credit in USD cents included each month.
+        limits:
+          type: object
+          required: [max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib]
+          properties:
+            max_sandboxes:
+              type: integer
+            max_template_vcpu:
+              type: integer
+              nullable: true
+            max_template_memory_mib:
+              type: integer
+              nullable: true
+            max_template_disk_mib:
+              type: integer
+              nullable: true
     BillingPricingResponse:
       type: object
       required: [plan_key, plan_name, currency, rates]
