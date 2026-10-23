@@ -104,7 +104,7 @@ END $$;
 -- retries stay idempotent.
 ALTER FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean)
     RENAME TO reserve_stripe_promotion_before_pricing_v2;
-CREATE FUNCTION reserve_stripe_promotion_with_device(p_team_id uuid, p_user_id uuid,
+CREATE OR REPLACE FUNCTION reserve_stripe_promotion_with_device(p_team_id uuid, p_user_id uuid,
     p_event_id text, p_subscription_id text, p_checkout_generation timestamptz,
     p_has_checkout_generation boolean)
 RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
