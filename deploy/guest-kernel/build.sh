@@ -26,6 +26,13 @@ trap 'for m in dev sys proc; do umount "root/$m" 2>/dev/null || true; done' EXIT
 
 chroot root bash -c 'command -v gcc >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends build-essential flex bison bc libelf-dev libssl-dev git ca-certificates python3 >/dev/null; }'
 [ -d root/src/linux ] || chroot root git clone -q --depth 1 --branch "$tag" https://github.com/amazonlinux/linux /src/linux
+# A reused workdir must hold exactly the pinned tag: the config check below
+# cannot see source edits that leave Kconfig alone.
+if ! chroot root git -C /src/linux describe --exact-match --tags HEAD 2>/dev/null | grep -qx "$tag" ||
+   [ -n "$(chroot root git -C /src/linux status --porcelain --untracked-files=no)" ]; then
+  echo "/src/linux in $work is not a clean checkout of $tag; remove it and rerun" >&2
+  exit 1
+fi
 cp "$here/vmlinux-6.1.158.config" root/src/linux/.config
 
 # olddefconfig must leave the committed config untouched: a difference means
@@ -36,7 +43,8 @@ if ! diff -u <(grep '^CONFIG_' root/src/committed.config) <(grep '^CONFIG_' root
   exit 1
 fi
 
-chroot root bash -c "cd /src/linux && nice -n 19 make -s -j$(( $(nproc) / 2 )) vmlinux"
+jobs=$(( $(nproc) / 2 )); [ "$jobs" -ge 1 ] || jobs=1
+chroot root bash -c "cd /src/linux && nice -n 19 make -s -j$jobs vmlinux"
 cp root/src/linux/vmlinux vmlinux-6.1.158
 cp root/src/linux/.config vmlinux-6.1.158.config
 sha256sum vmlinux-6.1.158
