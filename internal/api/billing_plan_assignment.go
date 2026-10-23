@@ -302,15 +302,20 @@ type customerBillingPeriod struct {
 }
 
 // GetBillingPlan tells a team which plan it is on, its limits, the current
-// billing period and any change waiting to take effect. Plan is null until the
-// team has been assigned one, which only happens under pricing v2.
+// billing period and any change waiting to take effect. Plan is null while
+// pricing v2 is off, so turning it off restores today's billing page.
 func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	team, ok := h.requireBillingRead(c)
 	if !ok {
 		return
 	}
 	ctx := c.Request.Context()
-	current, assigned, err := currentTeamPlan(ctx, h.Pool, team)
+	var current teamPlan
+	assigned := false
+	on, err := h.pricingV2Active(ctx)
+	if err == nil && on {
+		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
+	}
 	var anchor pgtype.Timestamptz
 	if err == nil {
 		err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
@@ -420,8 +425,11 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		return
 	}
 	var current teamPlan
-	var assigned bool
+	var assigned, on bool
 	if err == nil {
+		on, err = h.pricingV2Active(ctx)
+	}
+	if err == nil && on {
 		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
 	}
 	if err != nil {

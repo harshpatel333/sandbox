@@ -2058,6 +2058,7 @@ type TeamPlanAssignment struct {
 	AssignedBy     pgtype.UUID        `json:"assigned_by"`
 	Reason         string             `json:"reason"`
 	IdempotencyKey *string            `json:"idempotency_key"`
+	PreviousLimits []byte             `json:"previous_limits"`
 	CreatedAt      time.Time          `json:"created_at"`
 }
 
