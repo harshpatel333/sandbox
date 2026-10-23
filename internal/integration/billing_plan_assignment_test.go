@@ -64,3 +64,37 @@ func TestIntegration_BillingPlanShowsAssignment(t *testing.T) {
 		}
 	}
 }
+
+func TestIntegration_BillingPlanChangePreview(t *testing.T) {
+	ctx := context.Background()
+	teamID, key := seedTeamAndKey(t)
+	r := newRouter(t)
+	type preview struct {
+		Timing        string     `json:"timing"`
+		EffectiveAt   *time.Time `json:"effective_at"`
+		PausesRunning bool       `json:"pauses_running"`
+		Limits        struct {
+			MaxConcurrent int32 `json:"max_concurrent"`
+		} `json:"limits"`
+		Blocked string `json:"blocked"`
+	}
+	get := func(target string) (int, preview) {
+		w := do(r, "GET", "/billing/plan-change-preview?target_plan="+target, key, "")
+		var p preview
+		_ = json.Unmarshal(w.Body.Bytes(), &p)
+		return w.Code, p
+	}
+	if code, p := get("pro_monthly"); code != http.StatusOK || p.Blocked == "" || p.EffectiveAt != nil {
+		t.Fatalf("team without an assignment previewed a change: %d %+v", code, p)
+	}
+	if code, _ := get("pro_annual"); code != http.StatusBadRequest {
+		t.Fatalf("unsupported target accepted: %d", code)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+        VALUES($1,'starter','prepaid','{}','{"max_sandboxes":100}',clock_timestamp(),'credit_purchase','first purchase')`, teamID); err != nil {
+		t.Fatal(err)
+	}
+	if code, p := get("pro_monthly"); code != http.StatusOK || p.Blocked != "" || p.Timing != "after_purchase" || p.EffectiveAt != nil || p.PausesRunning || p.Limits.MaxConcurrent <= 0 {
+		t.Fatalf("starter team's upgrade preview: %d %+v", code, p)
+	}
+}

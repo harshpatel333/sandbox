@@ -261,17 +261,138 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	}
 	var plan *customerPlan
 	if assigned {
-		l := current.Limits
-		max := int32(0)
-		if l.MaxSandboxes != nil {
-			max = *l.MaxSandboxes
-		}
 		plan = &customerPlan{PlanKey: current.PlanKey, Kind: current.Kind, DisplayName: current.Terms.DisplayName, EffectiveFrom: current.EffectiveFrom,
-			Limits: customerPlanLimits{MaxConcurrent: max, MaxVCPU: l.MaxTemplateVCPU, MaxMemoryMiB: l.MaxTemplateMemoryMiB, MaxDiskMiB: l.MaxTemplateDiskMiB}}
+			Limits: customerLimits(current.Limits)}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"plan":           plan,
 		"period":         customerBillingPeriod{Start: start, End: end},
 		"pending_change": (*customerPendingPlanChange)(nil),
 	})
+}
+
+// Plan change timings a preview can report.
+const (
+	planChangeNow           = "immediate"
+	planChangeEndOfPeriod   = "end_of_billing_period"
+	planChangeAfterPurchase = "after_purchase"
+)
+
+// planKindOfOffer is the kind of a self-serve plan by key.
+func planKindOfOffer(offer string) string {
+	switch offer {
+	case "free":
+		return planKindFree
+	case "starter":
+		return planKindPrepaid
+	case "pro_monthly":
+		return planKindSubscription
+	}
+	return ""
+}
+
+// planChangeRule says when a customer's move from one kind of plan to another
+// takes effect, or why it is not self-serve. Upgrades wait only for payment;
+// leaving a paid subscription or custom plan waits for the billing period to
+// end; leaving prepaid credit for Free is immediate.
+func planChangeRule(from, to string) (string, string) {
+	switch {
+	case from == to:
+		return "", "team is already on this kind of plan"
+	case to == planKindSubscription && (from == planKindFree || from == planKindPrepaid):
+		return planChangeAfterPurchase, ""
+	case to == planKindPrepaid && from == planKindFree:
+		return planChangeAfterPurchase, ""
+	case to == planKindPrepaid && from == planKindSubscription:
+		return planChangeEndOfPeriod, ""
+	case to == planKindFree && (from == planKindSubscription || from == planKindCustom):
+		return planChangeEndOfPeriod, ""
+	case to == planKindFree && from == planKindPrepaid:
+		return planChangeNow, ""
+	}
+	return "", "this plan change is not available for the team's current plan"
+}
+
+type customerPlanChangePreview struct {
+	TargetPlanKey     string             `json:"target_plan_key"`
+	TargetDisplayName string             `json:"target_display_name"`
+	TargetKind        string             `json:"target_kind"`
+	Timing            string             `json:"timing,omitempty"`
+	EffectiveAt       *time.Time         `json:"effective_at,omitempty"`
+	PausesRunning     bool               `json:"pauses_running"`
+	Limits            customerPlanLimits `json:"limits"`
+	Blocked           string             `json:"blocked,omitempty"`
+}
+
+func customerLimits(l planLimits) customerPlanLimits {
+	max := int32(0)
+	if l.MaxSandboxes != nil {
+		max = *l.MaxSandboxes
+	}
+	return customerPlanLimits{MaxConcurrent: max, MaxVCPU: l.MaxTemplateVCPU, MaxMemoryMiB: l.MaxTemplateMemoryMiB, MaxDiskMiB: l.MaxTemplateDiskMiB}
+}
+
+// GetBillingPlanChangePreview tells a team when a move to a plan would take
+// effect and the limits it would then have, or why it cannot move.
+func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
+	team, ok := h.requireBillingRead(c)
+	if !ok {
+		return
+	}
+	target := c.Query("target_plan")
+	kind := planKindOfOffer(target)
+	if kind == "" {
+		respondErrorMsg(c, "invalid_plan", "target_plan must be free, starter or pro_monthly", http.StatusBadRequest)
+		return
+	}
+	ctx := c.Request.Context()
+	terms, err := h.planTerms(ctx, target)
+	if errors.Is(err, errUnknownPlan) {
+		respondErrorMsg(c, "invalid_plan", "this plan is not available", http.StatusBadRequest)
+		return
+	}
+	var current teamPlan
+	var assigned bool
+	if err == nil {
+		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
+	}
+	if err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	preview := customerPlanChangePreview{TargetPlanKey: target, TargetDisplayName: terms.DisplayName, TargetKind: kind, Limits: customerLimits(terms.Limits)}
+	switch {
+	case !assigned:
+		preview.Blocked = "plan changes are not available for this team yet"
+	case terms.Retired:
+		preview.Blocked = "this plan is no longer offered"
+	default:
+		preview.Timing, preview.Blocked = planChangeRule(current.Kind, kind)
+	}
+	if preview.Blocked == "" {
+		preview.PausesRunning = kind == planKindFree
+		at := h.nowUTC()
+		if preview.Timing == planChangeEndOfPeriod {
+			var anchor pgtype.Timestamptz
+			err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
+			if errors.Is(err, pgx.ErrNoRows) {
+				err = nil
+			}
+			if err == nil {
+				_, at, err = h.currentBillingPeriod(ctx, team, anchor, at)
+			}
+			if err != nil {
+				log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
+				respondError(c, ErrInternal)
+				return
+			}
+		}
+		if preview.Timing != planChangeAfterPurchase {
+			preview.EffectiveAt = &at
+		}
+	} else {
+		preview.Timing = ""
+	}
+	c.JSON(http.StatusOK, preview)
 }
