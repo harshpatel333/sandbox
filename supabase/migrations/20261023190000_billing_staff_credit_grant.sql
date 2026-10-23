@@ -17,6 +17,7 @@ CREATE TABLE billing_staff_credit_grant (
  issued_at timestamptz,
  issuance_evidence jsonb,
  attempts integer NOT NULL DEFAULT 0 CHECK(attempts>=0),
+ attempted_at timestamptz,
  last_error text,
  UNIQUE(team_id,idempotency_key),
  CHECK((state='issued')=(stripe_credit_grant_id IS NOT NULL) AND (state='issued')=(issued_at IS NOT NULL) AND (state='issued')=(issuance_evidence IS NOT NULL))
@@ -36,19 +37,23 @@ CREATE FUNCTION guard_billing_staff_credit_grant() RETURNS trigger LANGUAGE plpg
 BEGIN
  IF TG_OP='DELETE' THEN RAISE EXCEPTION 'staff credit history is immutable'; END IF;
  IF TG_OP='INSERT' THEN
-  IF NEW.state<>'pending' OR NEW.attempts<>0 OR num_nonnulls(NEW.stripe_credit_grant_id,NEW.issued_at,NEW.issuance_evidence,NEW.last_error)<>0 THEN
+  IF NEW.state<>'pending' OR NEW.attempts<>0 OR num_nonnulls(NEW.stripe_credit_grant_id,NEW.issued_at,NEW.issuance_evidence,NEW.last_error,NEW.attempted_at)<>0 THEN
    RAISE EXCEPTION 'staff credit must start pending';
   END IF;
   RETURN NEW;
  END IF;
  IF OLD.state='issued' THEN RAISE EXCEPTION 'issued staff credit is immutable'; END IF;
  IF NEW.attempts<OLD.attempts THEN RAISE EXCEPTION 'staff credit attempts only grow'; END IF;
- IF (to_jsonb(NEW)-ARRAY['state','stripe_credit_grant_id','issued_at','issuance_evidence','attempts','last_error'])
-  IS DISTINCT FROM (to_jsonb(OLD)-ARRAY['state','stripe_credit_grant_id','issued_at','issuance_evidence','attempts','last_error']) THEN
+ IF NEW.attempted_at IS DISTINCT FROM OLD.attempted_at AND NEW.attempts<>OLD.attempts+1 THEN
+  RAISE EXCEPTION 'staff credit attempt time moves only with a new attempt';
+ END IF;
+ IF (to_jsonb(NEW)-ARRAY['state','stripe_credit_grant_id','issued_at','issuance_evidence','attempts','attempted_at','last_error'])
+  IS DISTINCT FROM (to_jsonb(OLD)-ARRAY['state','stripe_credit_grant_id','issued_at','issuance_evidence','attempts','attempted_at','last_error']) THEN
   RAISE EXCEPTION 'staff credit request is immutable';
  END IF;
  IF NEW.state='issued' AND (NEW.issuance_evidence->>'id' IS DISTINCT FROM NEW.stripe_credit_grant_id
   OR NEW.issuance_evidence->>'customer' IS DISTINCT FROM NEW.customer_id
+  OR NEW.issuance_evidence->>'category' IS DISTINCT FROM 'promotional'
   OR (NEW.issuance_evidence#>>'{amount,monetary,value}')::bigint IS DISTINCT FROM NEW.amount_cents
   OR NEW.issuance_evidence#>>'{metadata,staff_credit_grant}' IS DISTINCT FROM NEW.id::text
   OR NEW.issuance_evidence#>>'{applicability_config,scope,price_type}' IS DISTINCT FROM 'metered'
@@ -63,3 +68,18 @@ END $$;
 CREATE TRIGGER billing_staff_credit_grant_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_staff_credit_grant
  FOR EACH ROW EXECUTE FUNCTION guard_billing_staff_credit_grant();
 REVOKE ALL ON FUNCTION guard_billing_staff_credit_grant() FROM PUBLIC;
+
+-- A staff credit attempt checked the customer under the account lock; keep that
+-- customer bound until the provider call it made has had time to finish.
+CREATE FUNCTION guard_staff_credit_customer_binding() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF OLD.stripe_customer_id IS NOT NULL AND NEW.stripe_customer_id IS DISTINCT FROM OLD.stripe_customer_id
+ AND EXISTS(SELECT 1 FROM billing_staff_credit_grant WHERE team_id=NEW.team_id AND customer_id=OLD.stripe_customer_id
+  AND state='pending' AND attempted_at>clock_timestamp()-interval '5 minutes') THEN
+  RAISE EXCEPTION 'billing customer cannot be replaced while a staff credit is being issued';
+ END IF;
+ RETURN NEW;
+END $$;
+CREATE TRIGGER staff_credit_customer_binding BEFORE UPDATE OF stripe_customer_id ON team_billing_account
+ FOR EACH ROW EXECUTE FUNCTION guard_staff_credit_customer_binding();
+REVOKE ALL ON FUNCTION guard_staff_credit_customer_binding() FROM PUBLIC;

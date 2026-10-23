@@ -979,6 +979,7 @@ type BillingStaffCreditGrant struct {
 	IssuedAt            pgtype.Timestamptz `json:"issued_at"`
 	IssuanceEvidence    []byte             `json:"issuance_evidence"`
 	Attempts            int32              `json:"attempts"`
+	AttemptedAt         pgtype.Timestamptz `json:"attempted_at"`
 	LastError           *string            `json:"last_error"`
 }
 

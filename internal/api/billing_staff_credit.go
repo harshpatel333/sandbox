@@ -87,12 +87,13 @@ func (h *Handlers) CreateStaffCreditGrant(c *gin.Context) {
 	c.JSON(http.StatusOK, credit)
 }
 
-// usageLedgerPeriodClosing reports a recently ended period still being closed
-// through the usage-only credit ledger, which cannot place credit that became
-// effective after the period ended into that period's held invoice.
+// usageLedgerPeriodClosing reports a period ending within the attempt window or
+// recently ended and still being closed through the usage-only credit ledger,
+// which cannot place credit that became effective after the period ended into
+// that period's held invoice.
 func (h *Handlers) usageLedgerPeriodClosing(ctx context.Context, team uuid.UUID) (bool, error) {
 	rows, err := h.Pool.Query(ctx, `SELECT p.period_start,p.period_end FROM team_billing_period p JOIN billing_invoice_account i USING(team_id)
-        WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp() AND p.period_end>clock_timestamp()-interval '7 days'
+        WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp()+interval '5 minutes' AND p.period_end>clock_timestamp()-interval '7 days'
         AND NOT EXISTS(SELECT 1 FROM billing_invoice_close c WHERE c.team_id=p.team_id AND c.period_start=p.period_start AND c.period_end=p.period_end AND c.state='released')`, team)
 	if err != nil {
 		return false, err
@@ -121,7 +122,7 @@ func decodeStaffCreditRequest(body io.Reader) (staffCreditRequest, error) {
 	var req staffCreditRequest
 	decoder := json.NewDecoder(body)
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&req) != nil {
+	if decoder.Decode(&req) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return req, errors.New("invalid credit grant; staff credit takes idempotency_key, amount_cents and reason and never expires")
 	}
 	req.Reason = strings.TrimSpace(req.Reason)
@@ -178,7 +179,7 @@ func (h *Handlers) grantStaffCredit(ctx context.Context, team, actor uuid.UUID, 
 	if err != nil {
 		return staffCredit{}, err
 	}
-	if credit.AmountCents != req.AmountCents {
+	if credit.AmountCents != req.AmountCents || credit.Reason != req.Reason {
 		return staffCredit{}, errors.Join(errStaffCreditConflict, errors.New("idempotency key was used for a different credit"))
 	}
 	if credit.State == "issued" {
@@ -187,18 +188,14 @@ func (h *Handlers) grantStaffCredit(ctx context.Context, team, actor uuid.UUID, 
 	grant, err := client.issueStaffCredit(ctx, credit, func() error {
 		// Only a new grant needs these checks; one already created for this
 		// request is adopted above even if the team's customer has changed.
-		if credit.customer != *customer {
-			return errors.Join(errStaffCreditConflict, errors.New("team's billing customer changed since the credit was requested"))
-		}
 		closing, e := h.usageLedgerPeriodClosing(ctx, team)
 		if e != nil {
 			return e
 		}
 		if closing {
-			return errors.Join(errStaffCreditConflict, errors.New("the team's previous invoice is still being closed; retry once it is finalized"))
+			return errors.Join(errStaffCreditConflict, errors.New("the team's invoice period is ending or still being closed; retry once it is finalized"))
 		}
-		_, e = h.Pool.Exec(ctx, `UPDATE billing_staff_credit_grant SET attempts=attempts+1 WHERE id=$1 AND state='pending'`, credit.ID)
-		return e
+		return h.beginStaffCreditAttempt(ctx, credit)
 	})
 	if err != nil {
 		_, _ = h.Pool.Exec(context.WithoutCancel(ctx), `UPDATE billing_staff_credit_grant SET last_error=$2 WHERE id=$1 AND state='pending'`, credit.ID, err.Error())
@@ -212,6 +209,28 @@ func (h *Handlers) grantStaffCredit(ctx context.Context, team, actor uuid.UUID, 
 		return credit, err
 	}
 	return scanStaffCredit(h.Pool.QueryRow(ctx, `SELECT `+staffCreditColumns+` FROM billing_staff_credit_grant WHERE id=$1`, credit.ID))
+}
+
+// beginStaffCreditAttempt confirms the team still bills the credit's customer
+// and stamps the attempt; the customer binding trigger then refuses to replace
+// that customer until the provider call has had time to finish.
+func (h *Handlers) beginStaffCreditAttempt(ctx context.Context, credit staffCredit) error {
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var customer *string
+	if err = tx.QueryRow(ctx, `SELECT stripe_customer_id FROM team_billing_account WHERE team_id=(SELECT team_id FROM billing_staff_credit_grant WHERE id=$1) FOR UPDATE`, credit.ID).Scan(&customer); err != nil {
+		return err
+	}
+	if customer == nil || *customer != credit.customer {
+		return errors.Join(errStaffCreditConflict, errors.New("team's billing customer changed since the credit was requested"))
+	}
+	if _, err = tx.Exec(ctx, `UPDATE billing_staff_credit_grant SET attempts=attempts+1,attempted_at=clock_timestamp() WHERE id=$1 AND state='pending'`, credit.ID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // issueStaffCredit adopts the grant already carrying this credit's id, or
@@ -270,7 +289,7 @@ func (c *stripeHTTPClient) findStaffCreditGrant(ctx context.Context, credit staf
 }
 
 func validStaffCreditGrant(g entitlementGrant, credit staffCredit) error {
-	if g.ID == "" || g.Customer != credit.customer || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != credit.AmountCents ||
+	if g.ID == "" || g.Customer != credit.customer || g.Category != "promotional" || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != credit.AmountCents ||
 		g.VoidedAt != 0 || g.Priority != 50 || g.ExpiresAt != 0 || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 ||
 		g.Metadata["staff_credit_grant"] != credit.ID.String() {
 		return fmt.Errorf("%w: grant %s", errStaffCreditReview, g.ID)

@@ -127,6 +127,11 @@ func TestStaffCreditGrantIssuesOnce(t *testing.T) {
 	if _, err = h.grantStaffCredit(t.Context(), team, actor, other); !errors.Is(err, errStaffCreditConflict) {
 		t.Fatalf("idempotency key reused for a different amount: %v", err)
 	}
+	other = req
+	other.Reason = "A different reason"
+	if _, err = h.grantStaffCredit(t.Context(), team, actor, other); !errors.Is(err, errStaffCreditConflict) {
+		t.Fatalf("idempotency key reused for a different reason: %v", err)
+	}
 	if _, err = h.Pool.Exec(t.Context(), `UPDATE billing_staff_credit_grant SET amount_cents=1 WHERE id=$1`, credit.ID); err == nil {
 		t.Fatal("issued credit was edited")
 	}
@@ -163,6 +168,22 @@ func TestStaffCreditGrantRejectsMismatchedProviderGrant(t *testing.T) {
 	}
 }
 
+func expireStaffCreditAttempts(t *testing.T, h *Handlers, team uuid.UUID) {
+	t.Helper()
+	conn, err := h.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err = conn.Exec(t.Context(), `SET session_replication_role=replica`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(t.Context(), `RESET session_replication_role`)
+	if _, err = conn.Exec(t.Context(), `UPDATE billing_staff_credit_grant SET attempted_at=attempted_at-interval '10 minutes' WHERE team_id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStaffCreditGrantFollowsCurrentCustomer(t *testing.T) {
 	h, team, s := newStaffCreditFixture(t, true)
 	s.lose = true
@@ -171,6 +192,10 @@ func TestStaffCreditGrantFollowsCurrentCustomer(t *testing.T) {
 		t.Fatal("lost response treated as issued")
 	}
 	replacement := "cus_replacement_" + uuid.NewString()
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team, replacement); err == nil {
+		t.Fatal("billing customer replaced while a staff credit attempt could still reach Stripe")
+	}
+	expireStaffCreditAttempts(t, h, team)
 	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team, replacement); err != nil {
 		t.Fatal(err)
 	}
@@ -191,6 +216,7 @@ func TestStaffCreditGrantFollowsCurrentCustomer(t *testing.T) {
 	s.mu.Lock()
 	s.grants = s.grants[:1]
 	s.mu.Unlock()
+	expireStaffCreditAttempts(t, h, team)
 	if _, err = h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team, replacement); err != nil {
 		t.Fatal(err)
 	}
@@ -228,6 +254,15 @@ func TestStaffCreditGrantWaitsForPeriodClose(t *testing.T) {
 		t.Fatalf("a team back on the usage-only ledger after its contract ended was not held: %v", err)
 	}
 	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_period SET period_start=period_start-interval '8 days',period_end=period_end-interval '8 days' WHERE team_id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,clock_timestamp()-interval '1 day',clock_timestamp()+interval '2 minutes','open')`, team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "ending", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
+		t.Fatalf("credit granted moments before the period it would land after ends: %v", err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `DELETE FROM team_billing_period WHERE team_id=$1 AND period_end>clock_timestamp()`, team); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k2", AmountCents: 100, Reason: "r"}); err != nil || s.creates != 1 {
@@ -285,6 +320,9 @@ func TestStaffCreditGrantRejectsExpiry(t *testing.T) {
 	if _, err := decodeStaffCreditRequest(strings.NewReader(`{"idempotency_key":"k","amount_cents":100,"reason":"r","expires_at":"2030-01-01T00:00:00Z"}`)); err == nil {
 		t.Fatal("expiring credit request accepted")
 	}
+	if _, err := decodeStaffCreditRequest(strings.NewReader(`{"idempotency_key":"k","amount_cents":100,"reason":"r"}{"expires_at":"2030-01-01T00:00:00Z"}`)); err == nil {
+		t.Fatal("trailing request accepted")
+	}
 	if _, err := decodeStaffCreditRequest(strings.NewReader(`{"idempotency_key":"k","amount_cents":100,"reason":"r"}`)); err != nil {
 		t.Fatalf("valid credit request rejected: %v", err)
 	}
@@ -299,7 +337,9 @@ func TestStaffCreditGrantRejectsExpiry(t *testing.T) {
 	}
 	g := s.grants[0]
 	g.Metadata = map[string]string{"staff_credit_grant": uuid.NewString()}
-	if isStaffCredit(g, staff) || !isStaffCredit(s.grants[0], staff) || tampered.GrantID == nil {
+	paid := s.grants[0]
+	paid.Category = "paid"
+	if isStaffCredit(g, staff) || isStaffCredit(paid, staff) || !isStaffCredit(s.grants[0], staff) || tampered.GrantID == nil {
 		t.Fatal("staff credit recognition ignored the issued terms")
 	}
 }
