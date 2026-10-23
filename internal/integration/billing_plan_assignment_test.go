@@ -30,31 +30,6 @@ func TestIntegration_BillingPlanWithoutAssignment(t *testing.T) {
 	}
 }
 
-func TestIntegration_BillingPlanIgnoresAssignmentsWhilePricingV2IsOff(t *testing.T) {
-	ctx := context.Background()
-	teamID, key := seedTeamAndKey(t)
-	if _, err := testPool.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
-        VALUES($1,'starter','prepaid','{"display_name":"Starter"}','{"max_concurrent":100}',clock_timestamp(),'credit_purchase','first purchase')`, teamID); err != nil {
-		t.Fatal(err)
-	}
-	r := newRouter(t)
-	w := do(r, "GET", "/billing/plan", key, "")
-	var body struct {
-		Plan *json.RawMessage `json:"plan"`
-	}
-	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &body) != nil || body.Plan != nil {
-		t.Fatalf("assignment shown while pricing v2 is off: %d %s", w.Code, w.Body.String())
-	}
-	w = do(r, "GET", "/billing/plan-change-preview?target_plan=pro_monthly", key, "")
-	var preview struct {
-		Blocked string `json:"blocked"`
-	}
-	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &preview) != nil || preview.Blocked == "" {
-		t.Fatalf("plan change previewed while pricing v2 is off: %d %s", w.Code, w.Body.String())
-	}
-}
-
-
 func TestIntegration_BillingPlanUnderPricingV2(t *testing.T) {
 	ctx := context.Background()
 	internal := newInternalRouter(t)
@@ -75,6 +50,9 @@ func TestIntegration_BillingPlanUnderPricingV2(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
         VALUES($1,'starter','prepaid','{"display_name":"Starter"}','{"max_concurrent":100,"max_vcpu":2}',clock_timestamp(),'credit_purchase','first purchase')`, teamID); err != nil {
 		t.Fatal(err)
+	}
+	if w := operatorRequest(internal, http.MethodPost, "/internal/billing/pricing-version", admin, `{"pricing_version":"legacy","reason":"test entry gate"}`); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
 	}
 	r := newRouter(t)
 	for _, k := range []string{key, viewerKey} {
@@ -98,12 +76,12 @@ func TestIntegration_BillingPlanUnderPricingV2(t *testing.T) {
 			t.Fatalf("plan not reported: %s", w.Body.String())
 		}
 	}
-	w := do(r, "GET", "/billing/plan-change-preview?target_plan=pro_monthly", key, "")
+	w := do(r, "GET", "/billing/plan-change-preview?target_plan=free", key, "")
 	var preview struct {
 		Timing  string `json:"timing"`
 		Blocked string `json:"blocked"`
 	}
-	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &preview) != nil || preview.Blocked != "" || preview.Timing != "after_purchase" {
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &preview) != nil || preview.Blocked != "" || preview.Timing != "immediate" {
 		t.Fatalf("starter team's upgrade preview: %d %s", w.Code, w.Body.String())
 	}
 }

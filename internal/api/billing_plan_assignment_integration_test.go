@@ -69,6 +69,7 @@ func limitsOf(t *testing.T, h *Handlers, team uuid.UUID) (int32, *int32) {
 
 func TestPlanAssignmentMovesTeamAndAppliesLimits(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
 	if _, ok, err := currentTeamPlan(t.Context(), h.Pool, team); err != nil || ok {
 		t.Fatalf("new team already has a plan: %v %v", ok, err)
 	}
@@ -100,6 +101,7 @@ func TestPlanAssignmentMovesTeamAndAppliesLimits(t *testing.T) {
 
 func TestPlanAssignmentKeepsCustomizedLimits(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
 	if _, err := h.Pool.Exec(t.Context(), `UPDATE team SET max_sandboxes=77 WHERE id=$1`, team); err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +115,7 @@ func TestPlanAssignmentKeepsCustomizedLimits(t *testing.T) {
 
 func TestPlanAssignmentRefusesRetiredAndReusedKeys(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
 	retired := testPlanTerms("custom_example", planKindCustom, 50, nil)
 	retired.Retired = true
 	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: retired, Source: planSourceStaff, Reason: "r"}); !errors.Is(err, errPlanRetired) {
@@ -136,6 +139,7 @@ func TestPlanAssignmentRefusesRetiredAndReusedKeys(t *testing.T) {
 
 func TestPlanAssignmentHistoryIsImmutable(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
 	p, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceSignup, Reason: "signed up"})
 	if err != nil {
 		t.Fatal(err)
@@ -188,9 +192,11 @@ func TestPlanAssignmentStaffViewRequiresStaff(t *testing.T) {
 
 func TestPlanAssignmentInitialBackfill(t *testing.T) {
 	h, assigned := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
 	if _, err := assignInTx(t, h, planAssignment{Team: assigned, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceSignup, Reason: "signed up"}); err != nil {
 		t.Fatal(err)
 	}
+	setPricingVersion(t, h, "legacy")
 	var fresh []uuid.UUID
 	for range 3 {
 		team, err := h.DB.CreateTeam(t.Context(), "plan-backfill-"+uuid.NewString())
@@ -199,6 +205,7 @@ func TestPlanAssignmentInitialBackfill(t *testing.T) {
 		}
 		fresh = append(fresh, team.ID)
 	}
+	setPricingVersion(t, h, "v2")
 	busy := fresh[2]
 	locker, err := h.Pool.Begin(t.Context())
 	if err != nil {
@@ -315,48 +322,36 @@ func TestPlanAssignmentNewTeamStartsOnFreeOnlyUnderV2(t *testing.T) {
 	}
 }
 
-func TestPlanAssignmentOwnsLimitsUnderV2AndRestoresLegacyLimits(t *testing.T) {
+func TestPlanAssignmentOwnsLimitsAfterSwitchOff(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
-	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("starter", planKindPrepaid, 5, nil), Source: planSourceCreditPurchase, Reason: "bought credit"}); err != nil {
-		t.Fatal(err)
-	}
-	var legacyFree int32
-	if err := h.Pool.QueryRow(t.Context(), `SELECT max_sandboxes FROM plan_limits WHERE offer_key='free'`).Scan(&legacyFree); err != nil {
-		t.Fatal(err)
+	terms := testPlanTerms("starter", planKindPrepaid, 5, nil)
+	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: terms, Source: planSourceCreditPurchase, Reason: "credit"}); !errors.Is(err, errPricingV2Off) {
+		t.Fatalf("first assignment with switch off: %v", err)
 	}
 	setPricingVersion(t, h, "v2")
-	if _, err := h.Pool.Exec(t.Context(), `SELECT apply_plan_limits($1,'free')`, team); err != nil {
+	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: terms, Source: planSourceCreditPurchase, Reason: "credit"}); err != nil {
 		t.Fatal(err)
 	}
-	if max, _ := limitsOf(t, h, team); max != 5 {
-		t.Fatalf("legacy limits overwrote the assignment's under v2: %d", max)
-	}
-	if _, err := h.Pool.Exec(t.Context(), `SELECT restore_legacy_team_limits('00000000-0000-0000-0000-000000000000',10)`); err == nil {
-		t.Fatal("legacy limits restored while pricing v2 is on")
-	}
-	setPricingVersion(t, h, "legacy")
-	var after uuid.UUID
-	for {
-		var next *uuid.UUID
-		if err := h.Pool.QueryRow(t.Context(), `SELECT restore_legacy_team_limits($1,500)`, after).Scan(&next); err != nil {
+	for _, version := range []string{"v2", "legacy"} {
+		setPricingVersion(t, h, version)
+		if _, err := h.Pool.Exec(t.Context(), `SELECT apply_plan_limits($1,'free')`, team); err != nil {
 			t.Fatal(err)
 		}
-		if next == nil {
-			break
+		if max, _ := limitsOf(t, h, team); max != 5 {
+			t.Fatalf("%s overwrote assigned limits: %d", version, max)
 		}
-		after = *next
 	}
-	if max, _ := limitsOf(t, h, team); max != legacyFree {
-		t.Fatalf("legacy limits not restored after turning pricing v2 off: %d want %d", max, legacyFree)
+	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourcePlanChange, Reason: "exit"}); err != nil {
+		t.Fatal(err)
 	}
-	var customized bool
-	if err := h.Pool.QueryRow(t.Context(), `SELECT limits_customized FROM team WHERE id=$1`, team).Scan(&customized); err != nil || customized {
-		t.Fatalf("restoring marked limits as hand-set: %v %v", customized, err)
+	if max, _ := limitsOf(t, h, team); max != 1 {
+		t.Fatalf("exit after switch off failed: %d", max)
 	}
 }
 
 func TestPlanAssignmentConcurrentSameKeyReturnsOneAssignment(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
 	a := planAssignment{Team: team, Terms: testPlanTerms("custom_example", planKindCustom, 50, nil), Source: planSourceStaff, Reason: "r", Key: "same"}
 	first, err := h.Pool.Begin(t.Context())
 	if err != nil {

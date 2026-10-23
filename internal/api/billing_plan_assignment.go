@@ -238,6 +238,13 @@ func assignTeamPlan(ctx context.Context, tx pgx.Tx, a planAssignment) (teamPlan,
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp() FROM team WHERE id=$1 FOR NO KEY UPDATE`, a.Team).Scan(&now); err != nil {
 		return teamPlan{}, err
 	}
+	var allowed bool
+	if err := tx.QueryRow(ctx, `SELECT billing_pricing_version()='v2' OR EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1)`, a.Team).Scan(&allowed); err != nil {
+		return teamPlan{}, err
+	}
+	if !allowed {
+		return teamPlan{}, errPricingV2Off
+	}
 	var key *string
 	if a.Key != "" {
 		key = &a.Key
@@ -309,20 +316,14 @@ type customerBillingPeriod struct {
 }
 
 // GetBillingPlan tells a team which plan it is on, its limits, the current
-// billing period and any change waiting to take effect. Plan is null while
-// pricing v2 is off, so turning it off restores today's billing page.
+// billing period and any change waiting to take effect.
 func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	team, ok := h.requireBillingRead(c)
 	if !ok {
 		return
 	}
 	ctx := c.Request.Context()
-	var current teamPlan
-	assigned := false
-	on, err := h.pricingV2Enabled(ctx)
-	if err == nil && on {
-		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
-	}
+	current, assigned, err := currentTeamPlan(ctx, h.Pool, team)
 	var limits teamLimits
 	if err == nil && assigned {
 		limits, err = h.teamEffectiveLimits(ctx, team)
@@ -417,11 +418,8 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		return
 	}
 	var current teamPlan
-	var assigned, on bool
+	var assigned bool
 	if err == nil {
-		on, err = h.pricingV2Enabled(ctx)
-	}
-	if err == nil && on {
 		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
 	}
 	if err != nil {
@@ -521,11 +519,11 @@ func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 var errPricingV2Off = errors.New("pricing v2 is off")
 
 func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, body staffPlanAssignmentBody) (teamPlan, error) {
-	on, err := h.pricingV2Enabled(ctx)
-	if err != nil {
+	var allowed bool
+	if err := h.Pool.QueryRow(ctx, `SELECT billing_pricing_version()='v2' OR EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1)`, team).Scan(&allowed); err != nil {
 		return teamPlan{}, err
 	}
-	if !on {
+	if !allowed {
 		return teamPlan{}, errPricingV2Off
 	}
 	terms, err := h.planTermsVersion(ctx, body.VersionID, 0)
