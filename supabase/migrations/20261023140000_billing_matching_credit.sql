@@ -154,6 +154,9 @@ BEGIN
     IF NEW.state IS DISTINCT FROM OLD.state OR NEW.first_attempt_at IS DISTINCT FROM OLD.first_attempt_at
         OR (NEW.stripe_credit_grant_id, NEW.issuance_evidence, NEW.issued_at) IS DISTINCT FROM (OLD.stripe_credit_grant_id, OLD.issuance_evidence, OLD.issued_at) THEN
         IF OLD.state = 'pending' AND NEW.state = 'uncertain' THEN
+            IF OLD.flagged_at IS NOT NULL THEN
+                RAISE EXCEPTION 'a flagged match is held for staff and cannot be issued';
+            END IF;
             IF NEW.first_attempt_at IS NULL OR NEW.first_attempt_at > clock_timestamp() OR NEW.first_attempt_at < clock_timestamp() - interval '1 minute' THEN
                 RAISE EXCEPTION 'issuance intent must be recorded at dispatch';
             END IF;

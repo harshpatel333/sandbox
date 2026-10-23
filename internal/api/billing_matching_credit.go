@@ -35,8 +35,9 @@ type matchingRule struct {
 	Reason            *string
 }
 
-// insertContractMatchingRule freezes matching terms onto a contract. Plan
-// assignment calls it with the plan's terms; staff call it for bespoke deals.
+// insertContractMatchingRule freezes matching terms onto a contract. A caller
+// creating a contract from plan terms that include matching must call it in
+// the same transaction; staff call it to attach a rule to an existing deal.
 func insertContractMatchingRule(ctx context.Context, q db.DBTX, r matchingRule) error {
 	_, err := q.Exec(ctx, `INSERT INTO billing_contract_matching_rule(contract_id,team_id,matching_bps,cap_cents,prior_matched_cents,effective_from,source,created_by,reason)
  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, r.ContractID, r.TeamID, r.Terms.MatchingBps, r.Terms.CapCents, r.PriorMatchedCents, r.EffectiveFrom, r.Source, r.Actor, r.Reason)
@@ -220,6 +221,13 @@ func (h *Handlers) recordMatchingInvoice(ctx context.Context, client *stripeHTTP
 	if u.SkipReason == "" && invoiceSettlementHash(inv) != m.Hash {
 		u.SkipReason = "invoice changed after its verified settlement"
 	}
+	if u.SkipReason == "" {
+		reversal, _, err := client.matchedInvoiceReversal(ctx, m.Invoice, m.Customer)
+		if err != nil {
+			return err
+		}
+		u.SkipReason = reversal
+	}
 	evidence, err := json.Marshal(inv)
 	if err != nil {
 		return err
@@ -252,7 +260,8 @@ func (h *Handlers) recordMatchingInvoice(ctx context.Context, client *stripeHTTP
 }
 
 func (h *Handlers) issueDueMatchingCredits(ctx context.Context, client *stripeHTTPClient) error {
-	rows, err := h.Pool.Query(ctx, `SELECT id FROM billing_matching_credit WHERE state IN ('pending','uncertain') AND next_attempt_at<=clock_timestamp() ORDER BY next_attempt_at,id LIMIT 20`)
+	rows, err := h.Pool.Query(ctx, `SELECT id FROM billing_matching_credit WHERE state IN ('pending','uncertain') AND next_attempt_at<=clock_timestamp()
+ AND (state='uncertain' OR flagged_at IS NULL) ORDER BY next_attempt_at,id LIMIT 20`)
 	if err != nil {
 		return err
 	}
@@ -298,8 +307,8 @@ func (h *Handlers) issueDueMatchingCredits(ctx context.Context, client *stripeHT
 // grant issued while no period awaits closing simply funds the next invoice.
 func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPClient, id uuid.UUID) error {
 	var team, contract uuid.UUID
-	var customer, key string
-	if err := h.Pool.QueryRow(ctx, `SELECT team_id,contract_id,customer_id,idempotency_key FROM billing_matching_credit WHERE id=$1`, id).Scan(&team, &contract, &customer, &key); err != nil {
+	var customer, key, invoice, current string
+	if err := h.Pool.QueryRow(ctx, `SELECT team_id,contract_id,customer_id,idempotency_key,invoice_id,state FROM billing_matching_credit WHERE id=$1`, id).Scan(&team, &contract, &customer, &key, &invoice, &current); err != nil {
 		return err
 	}
 	lock, err := h.Pool.Begin(ctx)
@@ -326,11 +335,24 @@ func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPCl
 	if closing {
 		return fmt.Errorf("%w: an ended billing period is not yet released", errMatchingDeferred)
 	}
+	// A refund or dispute can land while the match waits; a grant that was never
+	// sent must not be sent for reversed payment. An attempted one may exist.
+	if current == "pending" {
+		reason, evidence, err := client.matchedInvoiceReversal(ctx, invoice, customer)
+		if err != nil {
+			return err
+		}
+		if reason != "" {
+			log.Warn().Str("matching_credit_id", id.String()).Str("invoice_id", invoice).Str("reason", reason).Msg("matched invoice was reversed before issuance; staff review required")
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET flagged_at=clock_timestamp(),flag_reason=$2,flag_evidence=$3 WHERE id=$1 AND state='pending' AND flagged_at IS NULL`, id, reason, evidence)
+			return err
+		}
+	}
 	var state string
 	var payload []byte
 	var first *time.Time
 	err = h.Pool.QueryRow(ctx, `UPDATE billing_matching_credit SET state='uncertain',first_attempt_at=COALESCE(first_attempt_at,clock_timestamp())
- WHERE id=$1 AND state IN ('pending','uncertain') RETURNING state,request_payload,first_attempt_at`, id).Scan(&state, &payload, &first)
+ WHERE id=$1 AND (state='uncertain' OR (state='pending' AND flagged_at IS NULL)) RETURNING state,request_payload,first_attempt_at`, id).Scan(&state, &payload, &first)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}

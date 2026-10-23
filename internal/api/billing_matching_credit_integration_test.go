@@ -548,3 +548,43 @@ func TestMatchingCreditLedgerIsImmutable(t *testing.T) {
 		t.Fatal("ledger accepted an unpaid invoice")
 	}
 }
+
+func TestMatchingCreditWithholdsReversedPayments(t *testing.T) {
+	m := newMatchingFixture(t, 10000, 8_000_000, 0)
+	m.refunded = true
+	early := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := m.row(early); r.State != "skipped" || r.Paid != 0 || r.Flag == "" || len(m.posts) != 0 {
+		t.Fatalf("invoice refunded before matching earned credit: %+v", r)
+	}
+	m.mu.Lock()
+	m.refunded = false
+	m.mu.Unlock()
+	prior, ended := m.f.start.AddDate(0, -2, 0), m.f.start.AddDate(0, -1, 0)
+	m.exec(`UPDATE billing_invoice_account SET enrolled_at=$2 WHERE team_id=$1`, m.f.c.TeamID, prior)
+	m.exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),0,0,0)`, m.f.c.TeamID, ended, m.f.start)
+	waiting := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := m.row(waiting); r.State != "pending" || r.Paid != 70000 {
+		t.Fatalf("match not recorded behind the close fence: %+v", r)
+	}
+	m.mu.Lock()
+	m.refunded = true
+	m.mu.Unlock()
+	m.exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence) VALUES($1,$2,$3,$4,'released',clock_timestamp(),'{}','{}')`, m.f.c.TeamID, ended, m.f.start, "in_"+strings.ReplaceAll(uuid.NewString(), "-", ""))
+	for i := 0; i < 2; i++ {
+		if err := m.tick(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r := m.row(waiting); r.State != "pending" || r.Flag == "" || len(m.posts) != 0 {
+		t.Fatalf("grant sent for a payment reversed while the match waited: %+v", r)
+	}
+	if _, err := m.f.h.Pool.Exec(t.Context(), `UPDATE billing_matching_credit SET state='uncertain',first_attempt_at=clock_timestamp() WHERE invoice_id=$1`, waiting); err == nil {
+		t.Fatal("database allowed a flagged match to be dispatched")
+	}
+}
