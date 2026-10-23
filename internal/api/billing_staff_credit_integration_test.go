@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -239,18 +240,20 @@ func TestStaffCreditGrantWaitsForPeriodClose(t *testing.T) {
 		t.Fatalf("credit granted while the previous invoice was closing: %v", err)
 	}
 	contract := uuid.New()
-	conn, err := h.Pool.Acquire(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = conn.Exec(t.Context(), `SET session_replication_role=replica`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = conn.Exec(t.Context(), `INSERT INTO billing_commercial_contract(id,team_id,offer_key,status,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor) VALUES($1,$2,'pro_monthly','ended',$3::timestamptz-interval '6 months',$3::timestamptz-interval '2 months',$4,'sub_ended','price_base',120000,1,100000,$3::timestamptz-interval '6 months')`, contract, team, end, s.customer); err != nil {
-		t.Fatal(err)
-	}
-	_, _ = conn.Exec(t.Context(), `RESET session_replication_role`)
-	conn.Release()
+	func() {
+		conn, err := h.Pool.Acquire(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		if _, err = conn.Exec(t.Context(), `SET session_replication_role=replica`); err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Exec(context.WithoutCancel(t.Context()), `RESET session_replication_role`)
+		if _, err = conn.Exec(t.Context(), `INSERT INTO billing_commercial_contract(id,team_id,offer_key,status,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor) VALUES($1,$2,'pro_monthly','ended',$3::timestamptz-interval '6 months',$3::timestamptz-interval '2 months',$4,'sub_ended','price_base',120000,1,100000,$3::timestamptz-interval '6 months')`, contract, team, end, s.customer); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "after-contract", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
 		t.Fatalf("a team back on the usage-only ledger after its contract ended was not held: %v", err)
 	}
