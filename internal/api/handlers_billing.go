@@ -1068,7 +1068,9 @@ func (h *Handlers) requireSandboxAdmission(c *gin.Context, teamID uuid.UUID) (*s
 		return nil, false
 	}
 	if !admission.eligible {
-		if !h.respondFreeAllowanceExhausted(c, teamID) {
+		if admission.allowanceResetsAt != nil {
+			respondFreeAllowanceExhausted(c, *admission.allowanceResetsAt)
+		} else {
 			respondErrorMsg(c, "billing_ineligible", "Sandbox usage is unavailable until billing is active", http.StatusPaymentRequired)
 		}
 		return nil, false

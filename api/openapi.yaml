@@ -1199,6 +1199,18 @@ paths:
                 $ref: "#/components/schemas/Error"
         "409":
           $ref: "#/components/responses/Conflict"
+        "402":
+          description: |
+            Sandbox usage is refused for billing. `error.code` is
+            `billing_ineligible`; `free_allowance_exhausted` when the Free
+            plan's daily compute allowance is used up (`error.resets_at` says
+            when it resets); or `sandbox_exceeds_plan_limits` when the sandbox
+            is larger than the team's plan allows (`error.limits` gives the
+            plan's `max_vcpu`, `max_memory_mib` and `max_disk_mib`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "429":
           description: |
             Rate-limited or quota reached. The `error.code` distinguishes:
@@ -1856,6 +1868,18 @@ paths:
                 $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "402":
+          description: |
+            Sandbox usage is refused for billing. `error.code` is
+            `billing_ineligible`; `free_allowance_exhausted` when the Free
+            plan's daily compute allowance is used up (`error.resets_at` says
+            when it resets); or `sandbox_exceeds_plan_limits` when the sandbox
+            is larger than the team's plan allows (`error.limits` gives the
+            plan's `max_vcpu`, `max_memory_mib` and `max_disk_mib`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "429":
           description: "`too_many_sandboxes` — resuming would exceed the team's active sandbox limit; free a slot or contact support to raise it."
           content:

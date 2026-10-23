@@ -125,9 +125,9 @@ func TestIntegration_FreeAllowance_CapPausesAndRefusesUntilReset(t *testing.T) {
 	if eligible(t, team) {
 		t.Fatal("a capped Free team is still eligible")
 	}
-	resets, err := testQueries.GetFreeAllowanceBlockedUntil(ctx, team)
-	if err != nil || resets.Sub(started.Add(24*time.Hour)).Abs() > time.Millisecond {
-		t.Fatalf("blocked until %v (err %v), want window start + 24h = %v", resets, err, started.Add(24*time.Hour))
+	admission, err := testQueries.GetTeamSandboxAdmission(ctx, team)
+	if err != nil || !admission.AllowanceBlocked || admission.AllowanceResetsAt.Sub(started.Add(24*time.Hour)).Abs() > time.Millisecond {
+		t.Fatalf("admission %+v (err %v), want the cap until window start + 24h = %v", admission, err, started.Add(24*time.Hour))
 	}
 	row, err := testQueries.GetFreeAllowance(ctx, team)
 	if err != nil {
@@ -214,46 +214,65 @@ func TestIntegration_FreeAllowance_UsageBeforeFreeIsNotCounted(t *testing.T) {
 	}
 }
 
-func TestIntegration_TeamPauseAll_PausesSandboxesRunningAtEffect(t *testing.T) {
+func TestIntegration_TeamPauseAll_RetriesRevertsAndSparesLaterResumes(t *testing.T) {
 	ctx := context.Background()
 	team, _ := seedTeamAndKey(t)
-	now := time.Now()
 	before := seedActiveSandbox(t, team, "pause-all-before")
-	seedComputeInterval(t, team, before, 1, 1024, now.Add(-time.Hour), nil)
+
+	if n, err := testQueries.RequestTeamPauseAll(ctx, db.RequestTeamPauseAllParams{TeamID: team, Reason: "plan_switch_free"}); err != nil || n != 1 {
+		t.Fatalf("request named %d sandboxes (err %v), want the one running", n, err)
+	}
+	if n, err := testQueries.RequestTeamPauseAll(ctx, db.RequestTeamPauseAllParams{TeamID: team, Reason: "plan_switch_free"}); err != nil || n != 0 {
+		t.Fatalf("repeated request named %d more (err %v), want none", n, err)
+	}
 	after := seedActiveSandbox(t, team, "pause-all-after")
-	seedComputeInterval(t, team, after, 1, 1024, now.Add(time.Second), nil)
-	effective := now.Add(-time.Minute)
-	if !eligible(t, team) {
-		t.Fatal("seeded team is not eligible before the request")
+	due := func() []uuid.UUID {
+		t.Helper()
+		ids, err := testQueries.ListBillingPauseSandboxes(ctx, db.ListBillingPauseSandboxesParams{TeamID: team, Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ids
+	}
+	if ids := due(); !slices.Equal(ids, []uuid.UUID{before}) {
+		t.Fatalf("due = %v, want only the sandbox running at the request", ids)
+	}
+	teams, err := testQueries.ListTeamsWithBillingPauseDue(ctx, db.ListTeamsWithBillingPauseDueParams{BatchLimit: 100000})
+	if err != nil || !slices.Contains(teams, team) {
+		t.Fatalf("teams with pauses due = %v (err %v)", teams, err)
 	}
 
-	if err := testQueries.RequestTeamPauseAll(ctx, db.RequestTeamPauseAllParams{TeamID: team, Reason: "plan_switch_free", EffectiveAt: effective}); err != nil {
-		t.Fatal(err)
-	}
-	if err := testQueries.RequestTeamPauseAll(ctx, db.RequestTeamPauseAllParams{TeamID: team, Reason: "plan_switch_free", EffectiveAt: effective}); err != nil {
-		t.Fatalf("repeated request: %v", err)
-	}
-	ids, err := testQueries.ListBillingPauseSandboxes(ctx, db.ListBillingPauseSandboxesParams{TeamID: team, Limit: 10})
-	if err != nil || !slices.Contains(ids, before) || slices.Contains(ids, after) {
-		t.Fatalf("pause candidates = %v (err %v), want only the sandbox running at effect", ids, err)
-	}
-	if n, err := testQueries.CompleteTeamPauseRequests(ctx, team); err != nil || n != 0 {
-		t.Fatalf("completed %d requests (err %v) while a sandbox is still due", n, err)
-	}
 	claimed, err := testQueries.ClaimBillingPauseSandbox(ctx, db.ClaimBillingPauseSandboxParams{ID: before, TeamID: team, LeaseSeconds: 90})
 	if err != nil || claimed.PauseOpTrigger == nil || *claimed.PauseOpTrigger != "plan_switch_free" {
 		t.Fatalf("claim = %+v, %v; want trigger plan_switch_free", claimed, err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'paused', pause_op_id = NULL WHERE id = $1`, before); err != nil {
+	if _, err := testQueries.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{SandboxID: before, TeamID: team, PauseOpID: claimed.PauseOpID, PauseOpLeaseVersion: &claimed.PauseOpLeaseVersion}); err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	if n, err := testQueries.SettleTeamPauseTargets(ctx, team); err != nil || n != 0 {
+		t.Fatalf("settled %d targets (err %v) after a revert, want the target kept", n, err)
+	}
+	if ids := due(); !slices.Equal(ids, []uuid.UUID{before}) {
+		t.Fatalf("due after revert = %v, want the reverted sandbox again", ids)
+	}
+
+	claimed, err = testQueries.ClaimBillingPauseSandbox(ctx, db.ClaimBillingPauseSandboxParams{ID: before, TeamID: team, LeaseSeconds: 90})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if n, err := testQueries.CompleteTeamPauseRequests(ctx, team); err != nil || n != 1 {
-		t.Fatalf("completed %d requests (err %v), want the request closed", n, err)
+	if err := finalize(before, team, uuid.UUID(claimed.PauseOpID.Bytes), claimed.PauseOpLeaseVersion); err != nil {
+		t.Fatalf("finalize: %v", err)
 	}
-	ids, err = testQueries.ListBillingPauseSandboxes(ctx, db.ListBillingPauseSandboxesParams{TeamID: team, Limit: 10})
-	if err != nil || len(ids) != 0 {
-		t.Fatalf("pause candidates after completion = %v (err %v), want none", ids, err)
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active' WHERE id = $1`, before); err != nil {
+		t.Fatal(err)
 	}
+	if ids := due(); len(ids) != 0 {
+		t.Fatalf("due after the pause landed and the customer resumed = %v, want none", ids)
+	}
+	if n, err := testQueries.SettleTeamPauseTargets(ctx, team); err != nil || n != 1 {
+		t.Fatalf("settled %d targets (err %v), want the paused one closed", n, err)
+	}
+	_ = after
 }
 
 func activationBucket(t *testing.T, teamID uuid.UUID) (string, string) {
@@ -368,5 +387,46 @@ func TestIntegration_FreeAllowance_MissingAllowanceCapsAtOnce(t *testing.T) {
 	seedComputeInterval(t, team, sbx, 1, 1024, time.Now().Add(-time.Minute), nil)
 	if blocked, err := testQueries.RefreshFreeAllowance(ctx, team); err != nil || !blocked {
 		t.Fatalf("refresh with no frozen allowance = %v, %v; want capped rather than unlimited", blocked, err)
+	}
+}
+
+func TestIntegration_FreeShape_AbsentCapsDoNotLimit(t *testing.T) {
+	ctx := context.Background()
+	team, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_plan_assignment (team_id, plan_key, kind, terms, limits, effective_from, source, reason)
+		VALUES ($1, 'free', 'free', '{}', '{"max_sandboxes":1,"max_vcpu":2}', now(), 'migration', 'test')`, team); err != nil {
+		t.Fatal(err)
+	}
+	row, err := testQueries.GetTeamSandboxAdmission(ctx, team)
+	if err != nil || !row.ShapeLimited || row.MaxVcpu != 2 || row.MaxMemoryMib != 0 || row.MaxDiskMib != 0 {
+		t.Fatalf("admission = %+v, %v; want only the vCPU cap", row, err)
+	}
+	sbx := seedPausedSandbox(t, team)
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET vcpu_count = 2, memory_mib = 8192, disk_mib = 65536 WHERE id = $1`, sbx); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := testQueries.ClaimResume(ctx, db.ClaimResumeParams{ID: sbx, TeamID: team, LockKey: sbx.String(), MaxVcpu: &row.MaxVcpu}); err != nil || c.Sandbox.Status != db.SandboxStatusResuming {
+		t.Fatalf("claim within the only cap = %+v, %v", c, err)
+	}
+}
+
+func TestIntegration_FreeAllowance_CapLabelEndsWhenTeamLeavesFree(t *testing.T) {
+	ctx := context.Background()
+	team, _ := seedTeamAndKey(t)
+	assignFreePlan(t, team, time.Now().Add(-48*time.Hour))
+	sbx := seedActiveSandbox(t, team, "free-left")
+	seedComputeInterval(t, team, sbx, 1, 1024, time.Now().Add(-3*time.Hour), nil)
+	if blocked, err := testQueries.RefreshFreeAllowance(ctx, team); err != nil || !blocked {
+		t.Fatalf("refresh = %v, %v; want capped", blocked, err)
+	}
+	if row, err := testQueries.GetTeamSandboxAdmission(ctx, team); err != nil || !row.AllowanceBlocked {
+		t.Fatalf("admission = %+v, %v; want the cap reported", row, err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE team_plan_assignment SET effective_to = now() WHERE team_id = $1 AND effective_to IS NULL`, team); err != nil {
+		t.Fatal(err)
+	}
+	if row, err := testQueries.GetTeamSandboxAdmission(ctx, team); err != nil || row.AllowanceBlocked || row.ShapeLimited {
+		t.Fatalf("admission after leaving Free = %+v, %v; want no Free cap or shape", row, err)
 	}
 }

@@ -51,13 +51,30 @@ type sandboxShapeLimit struct {
 	vcpu, memoryMib, diskMib int32
 }
 
+// A zero cap is absent: that dimension is not limited by the plan.
 func (l *sandboxShapeLimit) admits(vcpu, memoryMib, diskMib int32) bool {
-	return l == nil || (vcpu <= l.vcpu && memoryMib <= l.memoryMib && diskMib <= l.diskMib)
+	within := func(v, limit int32) bool { return limit <= 0 || v <= limit }
+	return l == nil || (within(vcpu, l.vcpu) && within(memoryMib, l.memoryMib) && within(diskMib, l.diskMib))
 }
 
+func (l *sandboxShapeLimit) claimCaps() (vcpu, memoryMib, diskMib *int32) {
+	if l == nil {
+		return nil, nil, nil
+	}
+	present := func(limit int32) *int32 {
+		if limit <= 0 {
+			return nil
+		}
+		return &limit
+	}
+	return present(l.vcpu), present(l.memoryMib), present(l.diskMib)
+}
+
+// allowanceResetsAt is set when the refusal is the Free allowance cap.
 type sandboxAdmission struct {
-	eligible bool
-	limit    *sandboxShapeLimit
+	eligible          bool
+	limit             *sandboxShapeLimit
+	allowanceResetsAt *time.Time
 }
 
 type billingEligEntry struct {
@@ -149,6 +166,9 @@ func (h *Handlers) teamSandboxAdmissionCached(ctx context.Context, teamID uuid.U
 		admission := sandboxAdmission{eligible: row.Eligible}
 		if row.ShapeLimited {
 			admission.limit = &sandboxShapeLimit{vcpu: row.MaxVcpu, memoryMib: row.MaxMemoryMib, diskMib: row.MaxDiskMib}
+		}
+		if row.AllowanceBlocked {
+			admission.allowanceResetsAt = &row.AllowanceResetsAt
 		}
 		c.put(teamID, admission, start)
 		return admission, nil

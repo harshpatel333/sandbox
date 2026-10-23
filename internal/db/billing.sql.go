@@ -571,36 +571,6 @@ func (q *Queries) CompleteTeamBillingCheckoutWithoutSubscription(ctx context.Con
 	return err
 }
 
-const completeTeamPauseRequests = `-- name: CompleteTeamPauseRequests :execrows
-UPDATE billing_team_pause_request r
-SET completed_at = now()
-WHERE r.team_id = $1
-  AND r.completed_at IS NULL
-  AND r.effective_at <= now()
-  AND NOT EXISTS (
-      SELECT 1 FROM sandbox s
-      JOIN sandbox_compute_billing_interval i ON i.sandbox_id = s.id AND i.ended_at IS NULL
-      WHERE s.team_id = r.team_id
-        AND s.destroyed_at IS NULL
-        AND s.status = 'active'
-        AND i.started_at < r.effective_at
-  )
-  AND NOT EXISTS (
-      SELECT 1 FROM sandbox s
-      WHERE s.team_id = r.team_id
-        AND s.destroyed_at IS NULL
-        AND s.status = 'pausing'
-  )
-`
-
-func (q *Queries) CompleteTeamPauseRequests(ctx context.Context, teamID uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, completeTeamPauseRequests, teamID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const completeTrialCreditWarning = `-- name: CompleteTrialCreditWarning :exec
 UPDATE trial_credit_warning_state
 SET status = CASE WHEN EXISTS (
@@ -1076,19 +1046,6 @@ func (q *Queries) GetFreeAllowance(ctx context.Context, teamID uuid.UUID) (GetFr
 		&i.AsOf,
 	)
 	return i, err
-}
-
-const getFreeAllowanceBlockedUntil = `-- name: GetFreeAllowanceBlockedUntil :one
-SELECT a.blocked_until::timestamptz AS blocked_until
-FROM billing_free_allowance a
-WHERE a.team_id = $1 AND a.blocked_until > now()
-`
-
-func (q *Queries) GetFreeAllowanceBlockedUntil(ctx context.Context, teamID uuid.UUID) (time.Time, error) {
-	row := q.db.QueryRow(ctx, getFreeAllowanceBlockedUntil, teamID)
-	var blocked_until time.Time
-	err := row.Scan(&blocked_until)
-	return blocked_until, err
 }
 
 const getLegacyStripeActivationUser = `-- name: GetLegacyStripeActivationUser :one
@@ -1873,22 +1830,27 @@ func (q *Queries) GetTeamCreditBalance(ctx context.Context, teamID uuid.UUID) (p
 
 const getTeamSandboxAdmission = `-- name: GetTeamSandboxAdmission :one
 SELECT team_sandbox_billing_eligible($1) AS eligible,
-       (f.max_vcpu IS NOT NULL OR f.max_memory_mib IS NOT NULL OR f.max_disk_mib IS NOT NULL)::boolean AS shape_limited,
+       (f.free_since IS NOT NULL)::boolean AS shape_limited,
        COALESCE(f.max_vcpu, 0)::int AS max_vcpu,
        COALESCE(f.max_memory_mib, 0)::int AS max_memory_mib,
-       COALESCE(f.max_disk_mib, 0)::int AS max_disk_mib
+       COALESCE(f.max_disk_mib, 0)::int AS max_disk_mib,
+       (billing_free_allowance_blocked_until($1) IS NOT NULL)::boolean AS allowance_blocked,
+       COALESCE(billing_free_allowance_blocked_until($1), now())::timestamptz AS allowance_resets_at
 FROM (SELECT 1) one
 LEFT JOIN billing_free_plan($1) f ON true
 `
 
 type GetTeamSandboxAdmissionRow struct {
-	Eligible     bool  `json:"eligible"`
-	ShapeLimited bool  `json:"shape_limited"`
-	MaxVcpu      int32 `json:"max_vcpu"`
-	MaxMemoryMib int32 `json:"max_memory_mib"`
-	MaxDiskMib   int32 `json:"max_disk_mib"`
+	Eligible          bool      `json:"eligible"`
+	ShapeLimited      bool      `json:"shape_limited"`
+	MaxVcpu           int32     `json:"max_vcpu"`
+	MaxMemoryMib      int32     `json:"max_memory_mib"`
+	MaxDiskMib        int32     `json:"max_disk_mib"`
+	AllowanceBlocked  bool      `json:"allowance_blocked"`
+	AllowanceResetsAt time.Time `json:"allowance_resets_at"`
 }
 
+// A zero cap is an absent one; plan and team caps are positive.
 func (q *Queries) GetTeamSandboxAdmission(ctx context.Context, teamID uuid.UUID) (GetTeamSandboxAdmissionRow, error) {
 	row := q.db.QueryRow(ctx, getTeamSandboxAdmission, teamID)
 	var i GetTeamSandboxAdmissionRow
@@ -1898,6 +1860,8 @@ func (q *Queries) GetTeamSandboxAdmission(ctx context.Context, teamID uuid.UUID)
 		&i.MaxVcpu,
 		&i.MaxMemoryMib,
 		&i.MaxDiskMib,
+		&i.AllowanceBlocked,
+		&i.AllowanceResetsAt,
 	)
 	return i, err
 }
@@ -2444,27 +2408,26 @@ func (q *Queries) ListExportedTeamBillingPeriods(ctx context.Context, batchSize 
 }
 
 const listFreeTeamsWithActiveSandboxes = `-- name: ListFreeTeamsWithActiveSandboxes :many
-WITH active_teams AS MATERIALIZED (
-    SELECT DISTINCT s.team_id
-    FROM sandbox s
-    WHERE s.destroyed_at IS NULL
-      AND s.status = 'active'
-      AND s.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-)
 SELECT a.team_id
-FROM active_teams a
-WHERE EXISTS (SELECT 1 FROM billing_free_plan(a.team_id))
+FROM team_plan_assignment a
+WHERE a.effective_to IS NULL
+  AND a.kind = 'free'
+  AND a.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+  AND EXISTS (
+      SELECT 1 FROM sandbox s
+      WHERE s.team_id = a.team_id AND s.destroyed_at IS NULL AND s.status = 'active'
+  )
 ORDER BY a.team_id
-LIMIT $1
+LIMIT $2
 `
 
 type ListFreeTeamsWithActiveSandboxesParams struct {
-	BatchLimit  int32       `json:"batch_limit"`
 	AfterTeamID pgtype.UUID `json:"after_team_id"`
+	BatchLimit  int32       `json:"batch_limit"`
 }
 
 func (q *Queries) ListFreeTeamsWithActiveSandboxes(ctx context.Context, arg ListFreeTeamsWithActiveSandboxesParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listFreeTeamsWithActiveSandboxes, arg.BatchLimit, arg.AfterTeamID)
+	rows, err := q.db.Query(ctx, listFreeTeamsWithActiveSandboxes, arg.AfterTeamID, arg.BatchLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -2749,8 +2712,8 @@ SELECT a.team_id
 FROM active_teams a
 WHERE NOT team_sandbox_billing_eligible(a.team_id)
    OR EXISTS (
-       SELECT 1 FROM billing_team_pause_request r
-       WHERE r.team_id = a.team_id AND r.completed_at IS NULL AND r.effective_at <= now()
+       SELECT 1 FROM billing_team_pause_target t
+       WHERE t.team_id = a.team_id AND t.done_at IS NULL
    )
 ORDER BY a.team_id
 LIMIT $1
@@ -3660,19 +3623,20 @@ func (q *Queries) RequestStripeActivationCreditRevocation(ctx context.Context, t
 	return err
 }
 
-const requestTeamPauseAll = `-- name: RequestTeamPauseAll :exec
-SELECT request_team_pause_all($1::uuid, $2::text, $3::timestamptz)
+const requestTeamPauseAll = `-- name: RequestTeamPauseAll :one
+SELECT request_team_pause_all($1::uuid, $2::text)::int AS targets
 `
 
 type RequestTeamPauseAllParams struct {
-	TeamID      uuid.UUID `json:"team_id"`
-	Reason      string    `json:"reason"`
-	EffectiveAt time.Time `json:"effective_at"`
+	TeamID uuid.UUID `json:"team_id"`
+	Reason string    `json:"reason"`
 }
 
-func (q *Queries) RequestTeamPauseAll(ctx context.Context, arg RequestTeamPauseAllParams) error {
-	_, err := q.db.Exec(ctx, requestTeamPauseAll, arg.TeamID, arg.Reason, arg.EffectiveAt)
-	return err
+func (q *Queries) RequestTeamPauseAll(ctx context.Context, arg RequestTeamPauseAllParams) (int32, error) {
+	row := q.db.QueryRow(ctx, requestTeamPauseAll, arg.TeamID, arg.Reason)
+	var targets int32
+	err := row.Scan(&targets)
+	return targets, err
 }
 
 const reserveStripePromotion = `-- name: ReserveStripePromotion :one
@@ -3988,6 +3952,22 @@ func (q *Queries) SetTeamFeatureFlag(ctx context.Context, arg SetTeamFeatureFlag
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const settleTeamPauseTargets = `-- name: SettleTeamPauseTargets :execrows
+UPDATE billing_team_pause_target t
+SET done_at = now()
+WHERE t.team_id = $1
+  AND t.done_at IS NULL
+  AND billing_pause_target_settled(t)
+`
+
+func (q *Queries) SettleTeamPauseTargets(ctx context.Context, teamID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, settleTeamPauseTargets, teamID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const stripeCheckoutPublicationFailed = `-- name: StripeCheckoutPublicationFailed :one

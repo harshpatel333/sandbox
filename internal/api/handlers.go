@@ -980,9 +980,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		TeamID:  teamID,
 		LockKey: sandboxID.String(),
 	}
-	if shapeLimit != nil {
-		claimParams.MaxVcpu, claimParams.MaxMemoryMib, claimParams.MaxDiskMib = &shapeLimit.vcpu, &shapeLimit.memoryMib, &shapeLimit.diskMib
-	}
+	claimParams.MaxVcpu, claimParams.MaxMemoryMib, claimParams.MaxDiskMib = shapeLimit.claimCaps()
 	if caller, machine := machineCallerFromContext(c); machine {
 		if caller.PrincipalID == uuid.Nil || caller.TeamID != teamID {
 			respondError(c, ErrForbidden)
@@ -3212,7 +3210,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// snapshot was built with exactly these values, so they're the
 	// authoritative shape.
 	var imageVcpu, imageMemMiB uint32
-	var imageDiskMiB int32
 	var fromTemplateName, fromTemplateID string
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
@@ -3243,9 +3240,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			deltaDir = filepath.Dir(deltaPath)
 		}
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
+		if !shapeLimit.admits(tpl.Vcpu, tpl.MemoryMib, tpl.DiskMib) {
+			respondSandboxExceedsPlan(c, shapeLimit, tpl.Vcpu, tpl.MemoryMib, tpl.DiskMib)
+			return
+		}
 		imageVcpu = uint32(tpl.Vcpu)
 		imageMemMiB = uint32(tpl.MemoryMib)
-		imageDiskMiB = tpl.DiskMib
 		fromTemplateName = tpl.Name
 		fromTemplateID = tpl.ID.String()
 	}
@@ -3279,10 +3279,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			respondErrorMsg(c, "conflict", fmt.Sprintf("a %q snapshot cannot create a sandbox yet", snap.Kind), http.StatusConflict)
 			return
 		}
+		if !shapeLimit.admits(snap.VcpuCount, snap.MemoryMib, snap.DiskMib) {
+			respondSandboxExceedsPlan(c, shapeLimit, snap.VcpuCount, snap.MemoryMib, snap.DiskMib)
+			return
+		}
 		source = snap
 		basePath = snap.BasePath
 		imageVcpu, imageMemMiB = uint32(snap.VcpuCount), uint32(snap.MemoryMib)
-		imageDiskMiB = snap.DiskMib
 		// Inherited unless the request sets them.
 		if req.TimeoutSeconds == nil {
 			req.TimeoutSeconds = snap.TimeoutSeconds
@@ -3311,11 +3314,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	secretBindings, secretMeta := secrets.bindings, secrets.meta
 	tLookupDone = time.Now()
-
-	if !shapeLimit.admits(int32(imageVcpu), int32(imageMemMiB), imageDiskMiB) {
-		respondSandboxExceedsPlan(c, shapeLimit, int32(imageVcpu), int32(imageMemMiB), imageDiskMiB)
-		return
-	}
 
 	// Select a host for this sandbox.
 	tSchedStart = time.Now()

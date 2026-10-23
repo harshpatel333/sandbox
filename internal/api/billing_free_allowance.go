@@ -23,8 +23,10 @@ const (
 	teamPauseReasonPlanSwitchFree       = "plan_switch_free"
 )
 
-// refreshFreeAllowances meters one page of Free teams with running sandboxes
-// per tick and pauses the ones whose allowance is exhausted. Admission only
+// refreshFreeAllowances meters Free teams with running sandboxes, a page at a
+// time until the population or the tick runs out, and pauses the ones whose
+// allowance is exhausted. A team whose refresh fails is logged and passed
+// over, so one bad row cannot hold every later team back. Admission only
 // reads the stored verdict, so nothing here runs on sandbox start or resume.
 func (h *Handlers) refreshFreeAllowances(ctx context.Context) {
 	afterID, err := h.DB.ClaimSweepLease(ctx, db.ClaimSweepLeaseParams{
@@ -37,45 +39,44 @@ func (h *Handlers) refreshFreeAllowances(ctx context.Context) {
 		}
 		return
 	}
-	teams, err := h.DB.ListFreeTeamsWithActiveSandboxes(ctx, db.ListFreeTeamsWithActiveSandboxesParams{AfterTeamID: afterID, BatchLimit: freeAllowancePageSize})
-	if err != nil {
-		log.Error().Err(err).Msg("billing: list free teams with active sandboxes failed")
-		return
-	}
-	next, advance := processSweepPage(ctx, teams, freeAllowancePageSize, func(teamID uuid.UUID) bool {
-		blocked, err := h.DB.RefreshFreeAllowance(ctx, teamID)
+	for ctx.Err() == nil {
+		teams, err := h.DB.ListFreeTeamsWithActiveSandboxes(ctx, db.ListFreeTeamsWithActiveSandboxesParams{AfterTeamID: afterID, BatchLimit: freeAllowancePageSize})
 		if err != nil {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh free allowance failed")
-			return false
+			log.Error().Err(err).Msg("billing: list free teams with active sandboxes failed")
+			return
 		}
-		if blocked {
-			h.pauseBillingTeam(ctx, teamID)
+		next, advance := processSweepPage(ctx, teams, freeAllowancePageSize, func(teamID uuid.UUID) bool {
+			blocked, err := h.DB.RefreshFreeAllowance(ctx, teamID)
+			if err != nil {
+				log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh free allowance failed")
+				return true
+			}
+			if blocked {
+				h.pauseBillingTeam(ctx, teamID)
+			}
+			return true
+		})
+		if advance {
+			h.advanceSweepCursor(ctx, freeAllowanceSweepName, next)
 		}
-		return true
-	})
-	if advance {
-		h.advanceSweepCursor(ctx, freeAllowanceSweepName, next)
+		if !advance || !next.Valid {
+			return
+		}
+		afterID = next
 	}
 }
 
-// requestTeamPauseAll durably asks for every sandbox the team has running at
-// effectiveAt to be paused. Callers pass their own transaction so the request
-// commits with the plan change that needs it; repeating a request is a no-op.
-func requestTeamPauseAll(ctx context.Context, q *db.Queries, teamID uuid.UUID, reason string, effectiveAt time.Time) error {
-	return q.RequestTeamPauseAll(ctx, db.RequestTeamPauseAllParams{TeamID: teamID, Reason: reason, EffectiveAt: effectiveAt})
+// requestTeamPauseAll durably asks for every sandbox the team has running
+// now to be paused, and answers how many it named. Callers pass their own
+// transaction so the request commits with the plan change that needs it;
+// repeating a request adds only sandboxes not already named.
+func requestTeamPauseAll(ctx context.Context, q *db.Queries, teamID uuid.UUID, reason string) (int32, error) {
+	return q.RequestTeamPauseAll(ctx, db.RequestTeamPauseAllParams{TeamID: teamID, Reason: reason})
 }
 
-// respondFreeAllowanceExhausted refuses a start or resume when the refusal is
-// the Free allowance cap, so the console can show when it resets. It answers
-// false when the team is not capped and the caller's generic refusal applies.
-func (h *Handlers) respondFreeAllowanceExhausted(c *gin.Context, teamID uuid.UUID) bool {
-	resetsAt, err := h.DB.GetFreeAllowanceBlockedUntil(c.Request.Context(), teamID)
-	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: read free allowance cap failed")
-		}
-		return false
-	}
+// respondFreeAllowanceExhausted refuses a start or resume at the Free
+// allowance cap, so the console can show when it resets.
+func respondFreeAllowanceExhausted(c *gin.Context, resetsAt time.Time) {
 	c.JSON(http.StatusPaymentRequired, gin.H{
 		"error": gin.H{
 			"code":      freeAllowanceExhaustedCode,
@@ -83,7 +84,6 @@ func (h *Handlers) respondFreeAllowanceExhausted(c *gin.Context, teamID uuid.UUI
 			"resets_at": resetsAt.UTC().Format(time.RFC3339),
 		},
 	})
-	return true
 }
 
 type freeAllowanceResponse struct {

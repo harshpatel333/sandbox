@@ -153,8 +153,8 @@ func (h *Handlers) pauseBillingTeam(ctx context.Context, teamID uuid.UUID) {
 		return
 	}
 	if claimed == 0 {
-		if _, err := h.DB.CompleteTeamPauseRequests(ctx, teamID); err != nil {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: complete team pause requests failed")
+		if _, err := h.DB.SettleTeamPauseTargets(ctx, teamID); err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: settle team pause targets failed")
 		}
 		return
 	}

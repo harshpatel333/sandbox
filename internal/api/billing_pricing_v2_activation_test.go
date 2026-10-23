@@ -35,8 +35,12 @@ func TestResolveActivationTeamsSettlesLapsedSubscriptionsByCredit(t *testing.T) 
 		{TeamID: ids[4], Bucket: "free"},
 		{TeamID: ids[5], Bucket: "skipped", Reason: "commercial_contract"},
 	}
-	r := summarizeActivation("use", time.Unix(0, 0), h.resolveActivationTeams(context.Background(), rows))
-	if r.ToLegacyPAYG != 1 || r.ToFree != 3 || r.Skipped != 2 || r.Pending != 4 {
+	teams, reads := h.resolveActivationTeams(context.Background(), rows)
+	r := summarizeActivation("use", time.Unix(0, 0), teams)
+	if reads != 3 {
+		t.Fatalf("credit reads = %d, want one per lapsed team with a customer", reads)
+	}
+	if r.ToLegacyPAYG != 1 || r.ToFree != 3 || r.Skipped != 2 || r.Pending != 5 {
 		t.Fatalf("report = %+v, want 1 legacy PAYG, 3 Free, 2 skipped", r)
 	}
 	if len(r.LapsedWithCredit) != 1 || r.LapsedWithCredit[0].TeamID != ids[0] || r.LapsedWithCredit[0].CreditCents != 1250 {

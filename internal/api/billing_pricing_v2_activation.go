@@ -18,6 +18,8 @@ const (
 	activationTargetFree       = "free"
 	activationTargetLegacyPAYG = "legacy_payg"
 	activationCreditReads      = 8
+	activationCreditReadCap    = 200
+	activationCreditBudget     = 20 * time.Second
 )
 
 // activationTeam is one team's activation outcome. Target is empty for teams
@@ -42,6 +44,7 @@ type activationLapsedTeam struct {
 
 type activationReport struct {
 	Region           string                  `json:"region"`
+	PricingVersion   string                  `json:"pricing_version"`
 	AsOf             time.Time               `json:"as_of"`
 	ToFree           int                     `json:"to_free"`
 	ToLegacyPAYG     int                     `json:"to_legacy_payg"`
@@ -51,16 +54,24 @@ type activationReport struct {
 	SkippedTeams     []activationSkippedTeam `json:"skipped_teams"`
 	LapsedWithCredit []activationLapsedTeam  `json:"lapsed_with_credit"`
 	LapsedNoCredit   []activationLapsedTeam  `json:"lapsed_no_credit"`
+	LapsedUnchecked  []uuid.UUID             `json:"lapsed_unchecked"`
+	CreditReads      int                     `json:"credit_reads"`
+	ElapsedMS        int64                   `json:"elapsed_ms"`
 	Pending          int                     `json:"pending"`
 }
 
 // resolveActivationTeams settles each team's target. Teams whose subscription
 // has lapsed keep pay-as-you-go while they hold unexpired Stripe credit and
-// move to Free once they have none; a credit read that fails leaves the team
-// for a later pass rather than guessing.
-func (h *Handlers) resolveActivationTeams(ctx context.Context, rows []db.ListPricingV2ActivationBucketsRow) []activationTeam {
+// move to Free once they have none. Credit reads are capped in number and in
+// time so one request stays well inside proxy timeouts and Stripe rate limits:
+// a lapsed team past the cap is left "unchecked" and a failed or throttled
+// read "credit_unknown", both untouched for a later pass rather than guessed.
+func (h *Handlers) resolveActivationTeams(ctx context.Context, rows []db.ListPricingV2ActivationBucketsRow) ([]activationTeam, int) {
 	teams := make([]activationTeam, len(rows))
 	reader, _ := h.Stripe.(stripeCreditBalanceReader)
+	ctx, cancel := context.WithTimeout(ctx, activationCreditBudget)
+	defer cancel()
+	reads := 0
 	sem := make(chan struct{}, activationCreditReads)
 	var wg sync.WaitGroup
 	for i, row := range rows {
@@ -78,8 +89,18 @@ func (h *Handlers) resolveActivationTeams(ctx context.Context, rows []db.ListPri
 				teams[i].Bucket, teams[i].Reason = "skipped", "credit_unknown"
 				continue
 			}
+			if reads >= activationCreditReadCap {
+				teams[i].Reason = "lapsed_unchecked"
+				continue
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				teams[i].Reason = "lapsed_unchecked"
+				continue
+			}
+			reads++
 			wg.Add(1)
-			sem <- struct{}{}
 			go func(t *activationTeam, customer string) {
 				defer wg.Done()
 				defer func() { <-sem }()
@@ -100,14 +121,16 @@ func (h *Handlers) resolveActivationTeams(ctx context.Context, rows []db.ListPri
 		}
 	}
 	wg.Wait()
-	return teams
+	return teams, reads
 }
 
 func summarizeActivation(region string, asOf time.Time, teams []activationTeam) activationReport {
 	r := activationReport{Region: region, AsOf: asOf, SkippedReasons: map[string]int{}, SkippedTeams: []activationSkippedTeam{},
-		LapsedWithCredit: []activationLapsedTeam{}, LapsedNoCredit: []activationLapsedTeam{}}
+		LapsedWithCredit: []activationLapsedTeam{}, LapsedNoCredit: []activationLapsedTeam{}, LapsedUnchecked: []uuid.UUID{}}
 	for _, t := range teams {
 		switch {
+		case t.Reason == "lapsed_unchecked":
+			r.LapsedUnchecked = append(r.LapsedUnchecked, t.TeamID)
 		case t.Target == activationTargetFree:
 			r.ToFree++
 		case t.Target == activationTargetLegacyPAYG:
@@ -128,7 +151,7 @@ func summarizeActivation(region string, asOf time.Time, teams []activationTeam) 
 			}
 		}
 	}
-	r.Pending = r.ToFree + r.ToLegacyPAYG
+	r.Pending = r.ToFree + r.ToLegacyPAYG + len(r.LapsedUnchecked) + r.SkippedReasons["credit_unknown"]
 	return r
 }
 
@@ -151,5 +174,9 @@ func (h *Handlers) GetPricingV2ActivationReport(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	c.JSON(http.StatusOK, summarizeActivation(h.Config.TeamCreationRegion, h.nowUTC(), h.resolveActivationTeams(c.Request.Context(), rows)))
+	started := time.Now()
+	teams, reads := h.resolveActivationTeams(c.Request.Context(), rows)
+	report := summarizeActivation(h.Config.TeamCreationRegion, h.nowUTC(), teams)
+	report.CreditReads, report.ElapsedMS = reads, time.Since(started).Milliseconds()
+	c.JSON(http.StatusOK, report)
 }

@@ -495,6 +495,12 @@ WITH locked AS (
     AND candidates.reason IS NOT NULL
   RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config,
             sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until, sandbox.pause_op_trigger
+), claimed_targets AS (
+  UPDATE billing_team_pause_target t
+  SET claimed_at = now()
+  FROM paused p
+  WHERE t.sandbox_id = p.id AND t.reason = p.pause_op_trigger AND t.done_at IS NULL
+  RETURNING t.sandbox_id
 ), closed_intervals AS (
   UPDATE sandbox_active_interval
   SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'

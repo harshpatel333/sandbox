@@ -1039,12 +1039,13 @@ type BillingSponsoredPromotionRecovery struct {
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
 }
 
-type BillingTeamPauseRequest struct {
+type BillingTeamPauseTarget struct {
+	SandboxID   uuid.UUID          `json:"sandbox_id"`
 	TeamID      uuid.UUID          `json:"team_id"`
 	Reason      string             `json:"reason"`
-	EffectiveAt time.Time          `json:"effective_at"`
 	RequestedAt time.Time          `json:"requested_at"`
-	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+	ClaimedAt   pgtype.Timestamptz `json:"claimed_at"`
+	DoneAt      pgtype.Timestamptz `json:"done_at"`
 }
 
 type BillingUsageEntitlement struct {

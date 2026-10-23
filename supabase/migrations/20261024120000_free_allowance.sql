@@ -2,15 +2,22 @@
 -- a precomputed cap read by admission, and durable team-wide pause requests.
 -- Inert until a team holds a Free plan assignment.
 
+CREATE OR REPLACE FUNCTION billing_json_number(p jsonb)
+RETURNS numeric LANGUAGE sql IMMUTABLE AS $$
+ SELECT CASE WHEN jsonb_typeof(p) = 'number' THEN p::text::numeric END;
+$$;
+
+-- Staff-customised team limits win over the plan's frozen caps, as they do
+-- for templates; an absent cap leaves that dimension unlimited.
 CREATE OR REPLACE FUNCTION billing_free_plan(p_team uuid)
 RETURNS TABLE(free_since timestamptz, allowance jsonb, max_vcpu int, max_memory_mib int, max_disk_mib int)
 LANGUAGE sql STABLE AS $$
  SELECT a.effective_from,
-        COALESCE(a.terms->'allowance', '{}'::jsonb),
-        (a.limits->>'max_vcpu')::int,
-        (a.limits->>'max_memory_mib')::int,
-        (a.limits->>'max_disk_mib')::int
- FROM team_plan_assignment a
+        CASE WHEN jsonb_typeof(a.terms->'allowance') = 'object' THEN a.terms->'allowance' ELSE '{}'::jsonb END,
+        CASE WHEN t.limits_customized THEN t.max_template_vcpu ELSE billing_json_number(a.limits->'max_vcpu')::int END,
+        CASE WHEN t.limits_customized THEN t.max_template_memory_mib ELSE billing_json_number(a.limits->'max_memory_mib')::int END,
+        CASE WHEN t.limits_customized THEN t.max_template_disk_mib ELSE billing_json_number(a.limits->'max_disk_mib')::int END
+ FROM team_plan_assignment a JOIN team t ON t.id = a.team_id
  WHERE a.team_id = p_team AND a.effective_to IS NULL AND a.kind = 'free';
 $$;
 
@@ -31,6 +38,8 @@ LANGUAGE sql STABLE AS $$
         COALESCE(MAX(price_usd) FILTER (WHERE resource = 'memory_gib'), 0)::numeric
  FROM ranked WHERE rate_rank = 1;
 $$;
+
+CREATE INDEX team_plan_assignment_open_free ON team_plan_assignment(team_id) WHERE effective_to IS NULL AND kind = 'free';
 
 CREATE TABLE billing_free_allowance (
  team_id uuid PRIMARY KEY REFERENCES team(id) ON DELETE CASCADE,
@@ -91,11 +100,11 @@ LANGUAGE sql STABLE AS $$
  )
  SELECT win.started,
         win.started + interval '24 hours',
-        round(CASE WHEN plan.allowance ? 'compute'
-              THEN (plan.allowance->'compute'->>'seconds')::numeric
-                   * ((plan.allowance->'compute'->>'vcpu')::numeric * rates.vcpu_usd
-                      + (plan.allowance->'compute'->>'memory_gib')::numeric * rates.memory_gib_usd)
-              ELSE COALESCE((plan.allowance->>'amount_cents')::numeric / 100, 0) END, 6),
+        round(GREATEST(COALESCE(CASE WHEN jsonb_typeof(plan.allowance->'compute') = 'object'
+              THEN billing_json_number(plan.allowance->'compute'->'seconds')
+                   * (billing_json_number(plan.allowance->'compute'->'vcpu') * rates.vcpu_usd
+                      + billing_json_number(plan.allowance->'compute'->'memory_gib') * rates.memory_gib_usd)
+              ELSE billing_json_number(plan.allowance->'amount_cents') / 100 END, 0), 0), 6),
         round(COALESCE((SELECT usd FROM used), 0), 6)
  FROM plan, rates, win;
 $$;
@@ -127,28 +136,52 @@ BEGIN
  RETURN EXISTS(SELECT 1 FROM billing_free_allowance WHERE team_id = p_team AND blocked_until > now());
 END $$;
 
-CREATE OR REPLACE FUNCTION billing_free_allowance_blocked(p_team uuid)
-RETURNS boolean LANGUAGE sql STABLE AS $$
- SELECT EXISTS(SELECT 1 FROM billing_free_allowance a WHERE a.team_id = p_team AND a.blocked_until > now());
+CREATE OR REPLACE FUNCTION billing_free_allowance_blocked_until(p_team uuid)
+RETURNS timestamptz LANGUAGE sql STABLE AS $$
+ SELECT a.blocked_until FROM billing_free_allowance a
+ WHERE a.team_id = p_team AND a.blocked_until > now() AND EXISTS(SELECT 1 FROM billing_free_plan(p_team));
 $$;
 
-CREATE TABLE billing_team_pause_request (
+CREATE OR REPLACE FUNCTION billing_free_allowance_blocked(p_team uuid)
+RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT billing_free_allowance_blocked_until(p_team) IS NOT NULL;
+$$;
+
+-- A team-wide pause names the sandboxes that were running when it was
+-- requested. A target stays due until it has been paused since then (a newer
+-- snapshot), stopped or destroyed, so a pause that reverts to active is retried
+-- and a sandbox the customer resumes afterwards is left alone.
+CREATE TABLE billing_team_pause_target (
+ sandbox_id uuid NOT NULL REFERENCES sandbox(id) ON DELETE CASCADE,
  team_id uuid NOT NULL REFERENCES team(id) ON DELETE CASCADE,
  reason text NOT NULL CHECK (reason IN ('plan_switch_free')),
- effective_at timestamptz NOT NULL,
  requested_at timestamptz NOT NULL DEFAULT now(),
- completed_at timestamptz,
- PRIMARY KEY (team_id, reason, effective_at)
+ claimed_at timestamptz,
+ done_at timestamptz,
+ PRIMARY KEY (sandbox_id, reason, requested_at)
 );
-CREATE INDEX billing_team_pause_request_open ON billing_team_pause_request(effective_at, team_id) WHERE completed_at IS NULL;
-ALTER TABLE billing_team_pause_request ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON billing_team_pause_request FROM PUBLIC;
+CREATE INDEX billing_team_pause_target_open ON billing_team_pause_target(team_id) WHERE done_at IS NULL;
+ALTER TABLE billing_team_pause_target ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON billing_team_pause_target FROM PUBLIC;
 
-CREATE OR REPLACE FUNCTION request_team_pause_all(p_team uuid, p_reason text, p_effective_at timestamptz)
-RETURNS void LANGUAGE sql AS $$
- INSERT INTO billing_team_pause_request (team_id, reason, effective_at)
- VALUES (p_team, p_reason, p_effective_at)
- ON CONFLICT (team_id, reason, effective_at) DO NOTHING;
+CREATE OR REPLACE FUNCTION request_team_pause_all(p_team uuid, p_reason text)
+RETURNS integer LANGUAGE sql AS $$
+ WITH added AS (
+  INSERT INTO billing_team_pause_target (sandbox_id, team_id, reason)
+  SELECT s.id, s.team_id, p_reason FROM sandbox s
+  WHERE s.team_id = p_team AND s.destroyed_at IS NULL AND s.status NOT IN ('paused', 'failed', 'deleted')
+    AND NOT EXISTS (SELECT 1 FROM billing_team_pause_target t WHERE t.sandbox_id = s.id AND t.reason = p_reason AND t.done_at IS NULL)
+  ON CONFLICT DO NOTHING
+  RETURNING 1
+ )
+ SELECT count(*)::int FROM added;
+$$;
+
+CREATE OR REPLACE FUNCTION billing_pause_target_settled(p_target billing_team_pause_target)
+RETURNS boolean LANGUAGE sql STABLE AS $$
+ SELECT NOT EXISTS (SELECT 1 FROM sandbox s WHERE s.id = p_target.sandbox_id AND s.destroyed_at IS NULL AND s.status NOT IN ('paused', 'failed', 'deleted'))
+     OR EXISTS (SELECT 1 FROM snapshot n WHERE n.sandbox_id = p_target.sandbox_id
+                AND n.created_at >= COALESCE(p_target.claimed_at, p_target.requested_at));
 $$;
 
 CREATE OR REPLACE FUNCTION billing_pause_reason(p_team uuid, p_sandbox uuid)
@@ -156,10 +189,9 @@ RETURNS text LANGUAGE sql STABLE AS $$
  SELECT CASE
   WHEN NOT team_sandbox_billing_eligible(p_team) THEN
    CASE WHEN billing_free_allowance_blocked(p_team) THEN 'free_allowance_exhausted' ELSE 'billing_ineligible' END
-  ELSE (SELECT r.reason FROM billing_team_pause_request r
-        JOIN sandbox_compute_billing_interval i ON i.sandbox_id = p_sandbox AND i.ended_at IS NULL
-        WHERE r.team_id = p_team AND r.completed_at IS NULL AND r.effective_at <= now() AND i.started_at < r.effective_at
-        ORDER BY r.effective_at LIMIT 1)
+  ELSE (SELECT t.reason FROM billing_team_pause_target t
+        WHERE t.sandbox_id = p_sandbox AND t.done_at IS NULL AND NOT billing_pause_target_settled(t)
+        ORDER BY t.requested_at LIMIT 1)
  END;
 $$;
 
@@ -184,19 +216,20 @@ $$;
 DO $$ DECLARE r text; f regprocedure; BEGIN
  FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
-   EXECUTE format('REVOKE ALL ON billing_free_allowance,billing_team_pause_request FROM %I',r);
+   EXECUTE format('REVOKE ALL ON billing_free_allowance,billing_team_pause_target FROM %I',r);
    IF r='service_role' THEN
     GRANT SELECT,INSERT,UPDATE,DELETE ON billing_free_allowance TO service_role;
-    GRANT SELECT,INSERT,UPDATE ON billing_team_pause_request TO service_role;
+    GRANT SELECT,INSERT,UPDATE ON billing_team_pause_target TO service_role;
     CREATE POLICY free_allowance_backend ON billing_free_allowance TO service_role USING(true) WITH CHECK(true);
-    CREATE POLICY team_pause_request_backend ON billing_team_pause_request TO service_role USING(true) WITH CHECK(true);
+    CREATE POLICY team_pause_target_backend ON billing_team_pause_target TO service_role USING(true) WITH CHECK(true);
    END IF;
   END IF;
  END LOOP;
  FOREACH f IN ARRAY ARRAY['billing_free_plan(uuid)'::regprocedure,'billing_compute_rates(uuid)'::regprocedure,
   'billing_free_window_start(uuid,timestamptz,timestamptz,timestamptz)'::regprocedure,'billing_free_allowance_eval(uuid)'::regprocedure,
   'billing_free_allowance_refresh(uuid)'::regprocedure,'billing_free_allowance_blocked(uuid)'::regprocedure,
-  'request_team_pause_all(uuid,text,timestamptz)'::regprocedure,'billing_pause_reason(uuid,uuid)'::regprocedure] LOOP
+  'request_team_pause_all(uuid,text)'::regprocedure,'billing_pause_target_settled(billing_team_pause_target)'::regprocedure,
+  'billing_json_number(jsonb)'::regprocedure,'billing_free_allowance_blocked_until(uuid)'::regprocedure,'billing_pause_reason(uuid,uuid)'::regprocedure] LOOP
   EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC',f);
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role',f); END IF;
  END LOOP;
@@ -208,7 +241,7 @@ LANGUAGE sql STABLE AS $$
  SELECT CASE
     WHEN x.reason = 'already_assigned' THEN 'assigned'
     WHEN x.reason IS NOT NULL THEN 'skipped'
-    WHEN lower(COALESCE(x.status, '')) IN ('active','trialing','past_due','unpaid','paused') THEN 'legacy_payg'
+    WHEN x.subscription IS NOT NULL AND lower(COALESCE(x.status, '')) IN ('active','trialing','past_due','unpaid','paused') THEN 'legacy_payg'
     WHEN x.customer IS NOT NULL OR x.subscription IS NOT NULL THEN 'lapsed'
     ELSE 'free' END,
   x.reason, x.customer
