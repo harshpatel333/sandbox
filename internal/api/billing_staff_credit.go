@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -62,16 +63,9 @@ func (h *Handlers) CreateStaffCreditGrant(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var req staffCreditRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 8192))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&req) != nil {
-		respondErrorMsg(c, "bad_request", "invalid credit grant; staff credit takes idempotency_key, amount_cents and reason and never expires", http.StatusBadRequest)
-		return
-	}
-	req.Reason = strings.TrimSpace(req.Reason)
-	if strings.TrimSpace(req.Key) == "" || len(req.Key) > 200 || req.AmountCents < 1 || req.AmountCents > 100000000 || req.Reason == "" || len(req.Reason) > 2000 {
-		respondErrorMsg(c, "bad_request", "idempotency_key, amount_cents (1 to 100000000) and reason are required", http.StatusBadRequest)
+	req, err := decodeStaffCreditRequest(http.MaxBytesReader(c.Writer, c.Request.Body, 8192))
+	if err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
 	credit, err := h.grantStaffCredit(c.Request.Context(), team, actor, req)
@@ -89,6 +83,20 @@ func (h *Handlers) CreateStaffCreditGrant(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, credit)
+}
+
+func decodeStaffCreditRequest(body io.Reader) (staffCreditRequest, error) {
+	var req staffCreditRequest
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&req) != nil {
+		return req, errors.New("invalid credit grant; staff credit takes idempotency_key, amount_cents and reason and never expires")
+	}
+	req.Reason = strings.TrimSpace(req.Reason)
+	if strings.TrimSpace(req.Key) == "" || len(req.Key) > 200 || req.AmountCents < 1 || req.AmountCents > 100000000 || req.Reason == "" || len(req.Reason) > 2000 {
+		return req, errors.New("idempotency_key, amount_cents (1 to 100000000) and reason are required")
+	}
+	return req, nil
 }
 
 func (h *Handlers) ListStaffCreditGrants(c *gin.Context) {
@@ -150,15 +158,18 @@ func (h *Handlers) grantStaffCredit(ctx context.Context, team, actor uuid.UUID, 
 		if credit.customer != *customer {
 			return errors.Join(errStaffCreditConflict, errors.New("team's billing customer changed since the credit was requested"))
 		}
+		// Usage-only invoices reconcile credit through a ledger that cannot
+		// place credit becoming effective after a period ended into that
+		// period's held invoice; wait while a recent close is outstanding.
 		var closing bool
 		if e := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_account i USING(team_id)
-            WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp()
-            AND NOT EXISTS(SELECT 1 FROM billing_invoice_close c WHERE c.team_id=p.team_id AND c.period_start=p.period_start AND c.period_end=p.period_end AND c.state='released'))`, team).Scan(&closing); e != nil {
+            WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp() AND p.period_end>clock_timestamp()-interval '7 days'
+            AND NOT EXISTS(SELECT 1 FROM billing_invoice_close c WHERE c.team_id=p.team_id AND c.period_start=p.period_start AND c.period_end=p.period_end AND c.state='released'))
+            AND NOT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1)
+            AND NOT EXISTS(SELECT 1 FROM billing_sponsored_operation WHERE team_id=$1)`, team).Scan(&closing); e != nil {
 			return e
 		}
 		if closing {
-			// Credit that becomes effective after a period ended cannot be
-			// reconciled into that period's held invoice.
 			return errors.Join(errStaffCreditConflict, errors.New("the team's previous invoice is still being closed; retry once it is finalized"))
 		}
 		_, e := h.Pool.Exec(ctx, `UPDATE billing_staff_credit_grant SET attempts=attempts+1 WHERE id=$1 AND state='pending'`, credit.ID)

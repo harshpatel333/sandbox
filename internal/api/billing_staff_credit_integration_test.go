@@ -211,6 +211,12 @@ func TestStaffCreditGrantWaitsForPeriodClose(t *testing.T) {
 	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
 		t.Fatalf("credit granted while the previous invoice was closing: %v", err)
 	}
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_period SET period_start=period_start-interval '8 days',period_end=period_end-interval '8 days' WHERE team_id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k2", AmountCents: 100, Reason: "r"}); err != nil || s.creates != 1 {
+		t.Fatalf("an old unreleased period blocked staff credit: %v", err)
+	}
 }
 
 func TestStaffCreditIsRecognizedByAllowanceChecks(t *testing.T) {
@@ -260,16 +266,13 @@ func TestStaffCreditGrantRequiresCustomerAndStaff(t *testing.T) {
 }
 
 func TestStaffCreditGrantRejectsExpiry(t *testing.T) {
-	h, team, s := newStaffCreditFixture(t, true)
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"idempotency_key":"k","amount_cents":100,"reason":"r","expires_at":"2030-01-01T00:00:00Z"}`))
-	c.Params = gin.Params{{Key: "team_id", Value: team.String()}}
-	c.Set("actor_id", uuid.New())
-	h.CreateStaffCreditGrant(c)
-	if w.Code < 400 || s.creates != 0 {
-		t.Fatalf("expiring credit request accepted: %d", w.Code)
+	if _, err := decodeStaffCreditRequest(strings.NewReader(`{"idempotency_key":"k","amount_cents":100,"reason":"r","expires_at":"2030-01-01T00:00:00Z"}`)); err == nil {
+		t.Fatal("expiring credit request accepted")
 	}
+	if _, err := decodeStaffCreditRequest(strings.NewReader(`{"idempotency_key":"k","amount_cents":100,"reason":"r"}`)); err != nil {
+		t.Fatalf("valid credit request rejected: %v", err)
+	}
+	h, team, s := newStaffCreditFixture(t, true)
 	tampered, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "ok", AmountCents: 100, Reason: "r"})
 	if err != nil {
 		t.Fatal(err)
