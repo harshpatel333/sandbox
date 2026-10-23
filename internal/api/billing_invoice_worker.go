@@ -713,7 +713,10 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	case invoiceCreditsEntitlement:
 		err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
 	case invoiceCreditsReleasedFunding:
-		_, err = h.prepareReleasedFundingCredits(ctx, p, a, inv.ID, &plan, client)
+		var released bool
+		if released, err = h.prepareReleasedFundingCredits(ctx, p, a, inv.ID, &plan, client); err == nil && !released {
+			err = errors.New("released funding credit changed while planning the invoice")
+		}
 	default:
 		plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
 	}
