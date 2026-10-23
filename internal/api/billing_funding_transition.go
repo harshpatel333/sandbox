@@ -94,6 +94,8 @@ func (h *Handlers) commitFreeFundingPlan(ctx context.Context, team, actor uuid.U
 	}
 	needsRelease := (operation.Valid && !ycReleased) || (offer != nil && *offer != "free")
 	if !needsRelease {
+		// "free" here is the legacy pay-as-you-go choice, not the v2 Free
+		// plan family; v2 code reads a team's plan from its plan assignment.
 		_, err = tx.Exec(ctx, `INSERT INTO billing_signup_choice(team_id,offer_key,state) VALUES($1,'free','committed') ON CONFLICT(team_id) DO UPDATE SET offer_key='free',state='committed',revision=billing_signup_choice.revision+1`, team)
 		if err != nil {
 			return err
