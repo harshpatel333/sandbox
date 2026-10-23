@@ -4,7 +4,14 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"testing"
+
+	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func setCatalogPlan(t *testing.T, offer string, amount, credit int64, available bool) {
@@ -83,4 +90,40 @@ func TestIntegration_PlanCatalogResumeUsesCheckoutTerms(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
+}
+
+func TestIntegration_PublicBillingPlansListTodaysPurchasablePlans(t *testing.T) {
+	t.Setenv("INTERNAL_API_TOKEN", internalRBACToken)
+	cfg := &config.Config{
+		Port:                    "0",
+		VMDAddress:              "localhost:0",
+		SystemTeamID:            testSystemTeamID.String(),
+		StripePlanPriceIDs:      map[string]string{"starter_monthly": "price_starter_monthly"},
+		StripeProMonthlyPriceID: "price_pro_monthly",
+		StripeProAnnualPriceID:  "price_pro_annual",
+	}
+	h := api.NewHandlers(&stubVMD{}, db.New(testPool), cfg)
+	h.Pool = testPool
+	w := do(api.SetupRouter(t.Context(), h, testPool), "GET", "/billing/plans/public", "", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("plans: %d %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Plans []struct {
+			Key                string `json:"key"`
+			IntervalMonths     int32  `json:"interval_months"`
+			PriceCents         int64  `json:"price_cents"`
+			MonthlyCreditCents int64  `json:"monthly_credit_cents"`
+		} `json:"plans"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	// Starter stays unavailable, even where a price is configured, so only
+	// the Pro offers checkout already sells are listed, at their current terms.
+	got := fmt.Sprint(body.Plans)
+	want := "[{pro_monthly 1 120000 100000} {pro_annual 12 1200000 100000}]"
+	if got != want {
+		t.Fatalf("plans = %s, want %s", got, want)
+	}
 }
