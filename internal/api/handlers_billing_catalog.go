@@ -469,13 +469,29 @@ func (h *Handlers) PublishPlanVersion(c *gin.Context) {
 	if !ok {
 		return
 	}
-	reason, ok := bindCatalogReason(c)
+	var req struct {
+		Reason   string       `json:"reason"`
+		Expected *planVersion `json:"expected"`
+	}
+	if c.ShouldBindJSON(&req) != nil {
+		respondErrorMsg(c, "bad_request", "a JSON body with a reason is required", http.StatusBadRequest)
+		return
+	}
+	reason, ok := checkCatalogReason(c, req.Reason)
 	if !ok {
 		return
 	}
 	v, err := scanPlanVersion(h.Pool.QueryRow(c.Request.Context(), `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1`, id))
 	if err != nil {
 		respondCatalogWriteError(c, err)
+		return
+	}
+	expected := v
+	if req.Expected != nil {
+		expected = *req.Expected
+	}
+	if v.contentKey() != expected.contentKey() {
+		respondErrorMsg(c, "conflict", "catalog terms changed; refresh and retry", http.StatusConflict)
 		return
 	}
 	if v.State == "published" {
@@ -487,6 +503,19 @@ func (h *Handlers) PublishPlanVersion(c *gin.Context) {
 		return
 	}
 	if _, ok = h.catalogWrite(c, actor, "publish", reason, func(ctx context.Context, tx pgx.Tx) (uuid.UUID, []byte, error) {
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM billing_pricing_switch FOR SHARE`); err != nil {
+			return id, nil, err
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('billing-catalog:' || $1 || ':' || $2)::bigint)`, v.Family, v.PricingVersion); err != nil {
+			return id, nil, err
+		}
+		current, err := scanPlanVersion(tx.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1 FOR UPDATE`, id))
+		if err != nil {
+			return id, nil, err
+		}
+		if current.contentKey() != expected.contentKey() {
+			return id, nil, &pgconn.PgError{Code: "55000", Message: "catalog terms changed; refresh and retry"}
+		}
 		if _, err := tx.Exec(ctx, `SELECT publish_billing_plan_version($1,$2)`, id, actor); err != nil {
 			return id, nil, err
 		}

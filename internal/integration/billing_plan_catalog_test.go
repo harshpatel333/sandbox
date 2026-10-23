@@ -363,13 +363,17 @@ func TestIntegration_BillingCatalogStaffAPI(t *testing.T) {
 	if w = do(http.MethodPut, "/internal/billing/catalog/plans/"+draft.ID, admin, strings.Replace(draftBody, "Talk to us", "Custom pricing", 1)); w.Code != 200 || !strings.Contains(w.Body.String(), "Custom pricing") {
 		t.Fatalf("update draft = %d %s", w.Code, w.Body)
 	}
+	expected := w.Body.String()
+	if stale := do(http.MethodPost, "/internal/billing/catalog/plans/"+draft.ID+"/publish", admin, `{"reason":"stale approval","expected":`+draftBody+`}`); stale.Code != http.StatusConflict {
+		t.Fatalf("published changed draft from stale approval: %d %s", stale.Code, stale.Body)
+	}
 	if w = do(http.MethodPost, "/internal/billing/catalog/plans", admin, `{"family":"pro","kind":"subscription","display_name":"Pro","monthly_fee_cents":100,"limits":{"max_concurrent":1},"credit_schedule":[{"start_months":0,"every_months":0,"amount_cents":1,"expires_after_months":1}]}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("invalid draft = %d %s", w.Code, w.Body)
 	}
 	if w = do(http.MethodPost, "/internal/billing/catalog/plans/"+draft.ID+"/publish", admin, `{"reason":" "}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("publish without a reason = %d %s", w.Code, w.Body)
 	}
-	if w = do(http.MethodPost, "/internal/billing/catalog/plans/"+draft.ID+"/publish", admin, `{"reason":"Approved card copy"}`); w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"published"`) {
+	if w = do(http.MethodPost, "/internal/billing/catalog/plans/"+draft.ID+"/publish", admin, `{"reason":"Approved card copy","expected":`+expected+`}`); w.Code != 200 || !strings.Contains(w.Body.String(), `"state":"published"`) {
 		t.Fatalf("publish = %d %s", w.Code, w.Body)
 	}
 	t.Cleanup(func() { publishPlanCopy(t, previous, "") })
