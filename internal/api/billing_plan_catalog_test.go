@@ -98,14 +98,17 @@ func TestPlanVersionValidate(t *testing.T) {
 		"zero fee":            func(v *planVersion) { v.MonthlyFeeCents = int64p(0) },
 		"limits":              func(v *planVersion) { v.Limits.MaxConcurrent = nil },
 		"zero templates":      func(v *planVersion) { v.Limits.MaxTemplates = int32p(0) },
-		"grant every":         func(v *planVersion) { v.CreditSchedule[0].EveryMonths = 0 },
-		"grant repeat":        func(v *planVersion) { v.CreditSchedule[0].Repeat = int32p(0) },
-		"display-only terms":  func(v *planVersion) { v.DisplayOnly = true },
-		"blank feature":       func(v *planVersion) { v.Features = []string{""} },
-		"allowance period":    func(v *planVersion) { v.Allowance.Period = "week" },
-		"allowance both":      func(v *planVersion) { v.Allowance.Compute = &planCompute{Seconds: 1, VCPU: 1, MemoryGiB: 1} },
-		"allowance neither":   func(v *planVersion) { v.Allowance.AmountCents = 0 },
-		"matching bps":        func(v *planVersion) { v.Matching = &planMatching{MatchingBps: 10001, CapCents: 1} },
+		"payg without caps": func(v *planVersion) {
+			v.Kind, v.Family, v.PricingVersion, v.MonthlyFeeCents, v.CreditSchedule, v.Allowance = "legacy_payg", "payg", "legacy", nil, nil, nil
+		},
+		"grant every":        func(v *planVersion) { v.CreditSchedule[0].EveryMonths = 0 },
+		"grant repeat":       func(v *planVersion) { v.CreditSchedule[0].Repeat = int32p(0) },
+		"display-only terms": func(v *planVersion) { v.DisplayOnly = true },
+		"blank feature":      func(v *planVersion) { v.Features = []string{""} },
+		"allowance period":   func(v *planVersion) { v.Allowance.Period = "week" },
+		"allowance both":     func(v *planVersion) { v.Allowance.Compute = &planCompute{Seconds: 1, VCPU: 1, MemoryGiB: 1} },
+		"allowance neither":  func(v *planVersion) { v.Allowance.AmountCents = 0 },
+		"matching bps":       func(v *planVersion) { v.Matching = &planMatching{MatchingBps: 10001, CapCents: 1} },
 		"unsellable self-serve": func(v *planVersion) {
 			v.SelfServe, v.Public, v.Matching = true, true, &planMatching{MatchingBps: 1, CapCents: 1}
 		},

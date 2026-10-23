@@ -191,6 +191,9 @@ func (v planVersion) validate() error {
 			return errors.New("limits must be positive")
 		}
 	}
+	if v.Kind == "legacy_payg" && (v.Limits.MaxVCPU == nil || v.Limits.MaxMemoryMiB == nil || v.Limits.MaxDiskMiB == nil || v.Limits.MaxTemplates == nil) {
+		return errors.New("pay as you go needs every template limit: teams without their own limits use it")
+	}
 	if a := v.Allowance; a != nil {
 		if (a.Period != "day_window" && a.Period != "month") || (a.OnExhausted != "pause" && a.OnExhausted != "payg") {
 			return errors.New("an allowance needs a period (day_window or month) and what happens when it runs out (pause or payg)")
@@ -315,14 +318,19 @@ func planPriceLookupKey(versionID uuid.UUID, months int32) string {
 // ensurePlanPrice is the one source of Stripe prices for catalog plan fees.
 // A configured price wins while it charges t's fee on t's interval, so a plan
 // keeps one price whichever path sells it; otherwise the version's own price
-// is found by lookup key or created once. It reads only t's VersionID,
-// OfferKey, FeeCents and IntervalMonths, so callers may pass frozen terms.
+// is found by lookup key or created once. Versions that do not own a price
+// (see ownsPrice) are sold only on the configured price. It reads only t's
+// VersionID, Version, PricingVersion, OfferKey, FeeCents and IntervalMonths,
+// so callers may pass frozen terms.
 func (h *Handlers) ensurePlanPrice(ctx context.Context, c *stripeHTTPClient, t planTerms) (storagePrice, error) {
 	if configured := h.Config.PlanPriceID(t.OfferKey); configured != "" {
 		p, err := c.verifiedPlanPrice(ctx, proOffer{Key: t.OfferKey, Price: configured, Amount: t.FeeCents, Months: t.IntervalMonths})
-		if !errors.Is(err, errProPriceMismatch) {
+		if !errors.Is(err, errProPriceMismatch) || !t.ownsPrice() {
 			return p, err
 		}
+	}
+	if !t.ownsPrice() {
+		return storagePrice{}, errProPriceMismatch
 	}
 	return c.versionPlanPrice(ctx, t)
 }

@@ -125,6 +125,9 @@ CREATE TABLE billing_plan_version (
     CHECK ((monthly_fee_cents IS NULL AND annual_fee_cents IS NULL) OR (max_sandboxes IS NOT NULL AND family ~ '^[a-z][a-z0-9]*$')),
     CHECK (NOT self_serve OR kind = 'subscription'),
     CHECK (display_only OR max_sandboxes IS NOT NULL OR kind = 'custom'),
+    -- Every team without its own limits falls back to the pay-as-you-go caps.
+    CHECK (kind <> 'legacy_payg' OR (max_template_vcpu IS NOT NULL AND max_template_memory_mib IS NOT NULL
+        AND max_template_disk_mib IS NOT NULL AND max_templates IS NOT NULL)),
     CHECK ((state = 'draft') = (published_at IS NULL)),
     CHECK ((state = 'retired') = (retired_at IS NOT NULL))
 );
@@ -203,9 +206,12 @@ BEGIN
         END IF;
         INSERT INTO plan_limits(offer_key, max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates)
         VALUES (k, v.max_sandboxes, v.max_template_vcpu, v.max_template_memory_mib, v.max_template_disk_mib, v.max_templates)
+        -- Contracts without frozen limits activate on their offer's
+        -- plan_limits, so v2 never rewrites the limits legacy offers sold.
         ON CONFLICT (offer_key) DO UPDATE SET max_sandboxes = EXCLUDED.max_sandboxes, max_template_vcpu = EXCLUDED.max_template_vcpu,
             max_template_memory_mib = EXCLUDED.max_template_memory_mib, max_template_disk_mib = EXCLUDED.max_template_disk_mib,
-            max_templates = EXCLUDED.max_templates;
+            max_templates = EXCLUDED.max_templates
+        WHERE v.pricing_version = 'legacy';
         INSERT INTO billing_plan(offer_key, family, display_name, charge_interval_months, charge_amount_cents, monthly_credit_cents, available, sort_order)
         VALUES (k, p_family, v.display_name, i, fee, COALESCE(credit, 1), v.self_serve AND v.public AND credit IS NOT NULL AND v.matching_bps IS NULL,
             v.sort_order * 10 + CASE i WHEN 1 THEN 0 ELSE 1 END)
@@ -222,6 +228,9 @@ DECLARE d billing_plan_version;
 BEGIN
     SELECT * INTO d FROM billing_plan_version WHERE id = p_id;
     IF NOT FOUND THEN RAISE EXCEPTION 'catalog version not found' USING ERRCODE = 'no_data_found'; END IF;
+    -- A pricing switch flip resyncs every family; holding the switch row
+    -- keeps this sync from interleaving with it.
+    PERFORM 1 FROM billing_pricing_switch FOR SHARE;
     PERFORM pg_advisory_xact_lock(hashtext('billing-catalog:' || d.family || ':' || d.pricing_version)::bigint);
     SELECT * INTO d FROM billing_plan_version WHERE id = p_id FOR UPDATE;
     IF d.state IS DISTINCT FROM 'draft' THEN
@@ -243,6 +252,9 @@ DECLARE d billing_plan_version;
 BEGIN
     SELECT * INTO d FROM billing_plan_version WHERE id = p_id;
     IF NOT FOUND THEN RAISE EXCEPTION 'catalog version not found' USING ERRCODE = 'no_data_found'; END IF;
+    -- A pricing switch flip resyncs every family; holding the switch row
+    -- keeps this sync from interleaving with it.
+    PERFORM 1 FROM billing_pricing_switch FOR SHARE;
     PERFORM pg_advisory_xact_lock(hashtext('billing-catalog:' || d.family || ':' || d.pricing_version)::bigint);
     SELECT * INTO d FROM billing_plan_version WHERE id = p_id FOR UPDATE;
     IF d.state IS DISTINCT FROM 'published' THEN

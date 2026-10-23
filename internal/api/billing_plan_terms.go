@@ -3,7 +3,7 @@ package api
 import (
 	"context"
 	"errors"
-	"math"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // planTerms are a catalog plan's current terms. Contracts and plan
@@ -68,15 +69,21 @@ func (h *Handlers) pricingVersion(ctx context.Context) (string, error) {
 		return "legacy", nil
 	}
 	pricingSwitch.mu.Lock()
-	defer pricingSwitch.mu.Unlock()
-	if pricingSwitch.version != "" && time.Since(pricingSwitch.readAt) < pricingSwitchCacheTTL {
-		return pricingSwitch.version, nil
+	cached, fresh := pricingSwitch.version, time.Since(pricingSwitch.readAt) < pricingSwitchCacheTTL
+	pricingSwitch.mu.Unlock()
+	if cached != "" && fresh {
+		return cached, nil
 	}
+	readAt := time.Now()
 	var version string
 	if err := h.Pool.QueryRow(ctx, `SELECT billing_pricing_version()`).Scan(&version); err != nil {
 		return "", err
 	}
-	pricingSwitch.version, pricingSwitch.readAt = version, time.Now()
+	pricingSwitch.mu.Lock()
+	if readAt.After(pricingSwitch.readAt) {
+		pricingSwitch.version, pricingSwitch.readAt = version, readAt
+	}
+	pricingSwitch.mu.Unlock()
 	return version, nil
 }
 
@@ -88,13 +95,14 @@ func (h *Handlers) pricingV2Enabled(ctx context.Context) (bool, error) {
 
 func forgetPricingVersion() {
 	pricingSwitch.mu.Lock()
-	pricingSwitch.version = ""
+	pricingSwitch.version, pricingSwitch.readAt = "", time.Now()
 	pricingSwitch.mu.Unlock()
 }
 
 // planTerms is the one lookup for a plan's current terms. It reads the
-// family's published version in the live pricing model, or its most recently
-// retired one when the family is no longer offered. Subscriptions are keyed
+// family's published version in the live pricing model; a family the live
+// model does not offer answers with its most recently retired or other-model
+// version, flagged Retired. Subscriptions are keyed
 // "<family>_monthly" or "<family>_annual"; every other kind is keyed by its
 // bare family and has FeeCents and IntervalMonths of zero.
 func (h *Handlers) planTerms(ctx context.Context, offerKey string) (planTerms, error) {
@@ -110,14 +118,18 @@ func (h *Handlers) planTerms(ctx context.Context, offerKey string) (planTerms, e
 		return planTerms{}, err
 	}
 	v, err := scanPlanVersion(h.Pool.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version
- WHERE family=$1 AND pricing_version=$2 AND state<>'draft' ORDER BY state='published' DESC, retired_at DESC LIMIT 1`, family, model))
+ WHERE family=$1 AND state<>'draft' ORDER BY (pricing_version=$2 AND state='published') DESC, pricing_version=$2 DESC, state='published' DESC, retired_at DESC NULLS LAST, version DESC LIMIT 1`, family, model))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return planTerms{}, errUnknownPlan
 	}
 	if err != nil {
 		return planTerms{}, err
 	}
-	return h.termsOfVersion(ctx, v, months)
+	t, err := h.termsOfVersion(ctx, v, months)
+	if v.PricingVersion != model {
+		t.Available, t.Retired = false, true
+	}
+	return t, err
 }
 
 // planTermsVersion returns the terms of one exact version, for staff who
@@ -183,31 +195,63 @@ func (h *Handlers) termsOfVersion(ctx context.Context, v planVersion, months int
 		Matching: v.Matching, Allowance: allowance, Limits: v.Limits, Available: v.sellable() && !retired, Retired: retired}, nil
 }
 
-// resolveAllowance prices a compute allowance at the current public rate
-// card, rounded to the nearest cent.
+// resolveAllowance prices a compute allowance at the public rate card, the
+// same rates public pricing shows, rounded half up to the cent.
 func (h *Handlers) resolveAllowance(ctx context.Context, a *planAllowance) (*planAllowance, error) {
 	if a == nil || a.Compute == nil {
 		return a, nil
 	}
-	var vcpu, memory float64
-	err := h.Pool.QueryRow(ctx, `SELECT
- COALESCE(MAX(price_usd) FILTER (WHERE resource='vcpu'),0)::float8, COALESCE(MAX(price_usd) FILTER (WHERE resource='memory_gib'),0)::float8
- FROM pricing_rate WHERE plan_key=$1 AND unit='second' AND effective_from<=now() AND (effective_to IS NULL OR effective_to>now())`, publicPricingPlanKey).Scan(&vcpu, &memory)
+	rows, err := h.DB.ListActivePricingRates(ctx, publicPricingPlanKey)
 	if err != nil {
 		return nil, err
 	}
+	rates := map[string]*big.Rat{}
+	for _, r := range rows {
+		if r.Unit == "second" {
+			rates[r.Resource] = numericRat(r.PriceUsd)
+		}
+	}
+	vcpu, memory := rates["vcpu"], rates["memory_gib"]
+	if vcpu == nil || memory == nil {
+		return nil, errors.New("rate card has no per-second vcpu and memory rates")
+	}
+	perSecond := new(big.Rat).Add(new(big.Rat).Mul(big.NewRat(int64(a.Compute.VCPU), 1), vcpu), new(big.Rat).Mul(big.NewRat(int64(a.Compute.MemoryGiB), 1), memory))
+	cents := new(big.Rat).Mul(perSecond, big.NewRat(int64(a.Compute.Seconds)*100, 1))
+	cents.Add(cents, big.NewRat(1, 2))
 	resolved := *a
-	usd := float64(a.Compute.Seconds) * (float64(a.Compute.VCPU)*vcpu + float64(a.Compute.MemoryGiB)*memory)
-	resolved.AmountCents = int64(math.Round(usd * 100))
+	resolved.AmountCents = new(big.Int).Quo(cents.Num(), cents.Denom()).Int64()
 	return &resolved, nil
 }
 
-// planPriced reports whether checkout may sell t in this environment. The
-// seeded legacy versions reproduce what the configured Stripe prices charge,
-// so they stay sold only where those prices are configured; later versions
-// get their own prices on demand.
+func numericRat(n pgtype.Numeric) *big.Rat {
+	if !n.Valid || n.Int == nil || n.NaN {
+		return nil
+	}
+	r := new(big.Rat).SetInt(n.Int)
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(abs32(n.Exp))), nil)
+	if n.Exp >= 0 {
+		return r.Mul(r, new(big.Rat).SetInt(scale))
+	}
+	return r.Quo(r, new(big.Rat).SetInt(scale))
+}
+
+func abs32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// ownsPrice reports whether t gets its own Stripe price. The seeded legacy
+// versions reproduce what the configured Stripe prices charge, so they are
+// sold only on those prices; later versions get their own prices on demand.
+func (t planTerms) ownsPrice() bool {
+	return t.PricingVersion == "v2" || t.Version > 1
+}
+
+// planPriced reports whether checkout may sell t in this environment.
 func (h *Handlers) planPriced(t planTerms) bool {
-	return t.PricingVersion == "v2" || t.Version > 1 || (h.Config != nil && h.Config.PlanPriceID(t.OfferKey) != "")
+	return t.ownsPrice() || (h.Config != nil && h.Config.PlanPriceID(t.OfferKey) != "")
 }
 
 // freezeContractLimits records the limits a contract was sold or assigned

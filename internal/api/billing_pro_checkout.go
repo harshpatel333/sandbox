@@ -23,6 +23,8 @@ type proOffer struct {
 	Months     int32
 	Credit     int64
 	VersionID  uuid.UUID
+	Version    int32
+	Pricing    string
 	Matching   *planMatching
 	Limits     *planLimits
 }
@@ -51,7 +53,7 @@ func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, error) {
 	if err != nil {
 		return proOffer{Key: key}, err
 	}
-	return proOffer{Key: key, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents, VersionID: t.VersionID, Matching: t.Matching, Limits: &t.Limits, Price: h.Config.PlanPriceID(key)}, nil
+	return proOffer{Key: key, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Pricing: t.PricingVersion, Matching: t.Matching, Limits: &t.Limits, Price: h.Config.PlanPriceID(key)}, nil
 }
 
 // checkoutOffer returns the frozen terms of the team's pending purchase of key,
@@ -175,7 +177,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		err = client.validateProPrice(c.Request.Context(), offer)
 	} else {
 		var price storagePrice
-		price, err = h.ensurePlanPrice(c.Request.Context(), client, planTerms{OfferKey: offer.Key, FeeCents: offer.Amount, IntervalMonths: offer.Months, VersionID: offer.VersionID})
+		price, err = h.ensurePlanPrice(c.Request.Context(), client, planTerms{OfferKey: offer.Key, FeeCents: offer.Amount, IntervalMonths: offer.Months, VersionID: offer.VersionID, Version: offer.Version, PricingVersion: offer.Pricing})
 		offer.Price = price.ID
 	}
 	if err != nil {

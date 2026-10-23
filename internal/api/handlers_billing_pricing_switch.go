@@ -19,6 +19,10 @@ func (h *Handlers) GetPlatformPricingVersion(c *gin.Context) {
 	if _, ok := h.requirePlatformBilling(c, platformBillingReadPermission); !ok {
 		return
 	}
+	h.writePricingSwitch(c)
+}
+
+func (h *Handlers) writePricingSwitch(c *gin.Context) {
 	var s pricingSwitchState
 	err := h.Pool.QueryRow(c.Request.Context(), `SELECT pricing_version,changed_by::text,reason,to_char(changed_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS"Z"') FROM billing_pricing_switch`).
 		Scan(&s.PricingVersion, &s.ChangedBy, &s.Reason, &s.ChangedAt)
@@ -62,19 +66,21 @@ func (h *Handlers) SetPlatformPricingVersion(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	if current != req.PricingVersion {
+	if current == req.PricingVersion {
+		err = tx.Rollback(ctx)
+	} else {
 		if _, err = tx.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version=$1,changed_by=$2,reason=$3,changed_at=clock_timestamp()`, req.PricingVersion, actor, reason); err == nil {
 			_, err = tx.Exec(ctx, `INSERT INTO billing_pricing_switch_audit(actor_id,from_version,to_version,reason) VALUES($1,$2,$3,$4)`, actor, current, req.PricingVersion, reason)
 		}
 		if err == nil {
 			err = tx.Commit(ctx)
 		}
-		if err != nil {
-			log.Error().Err(err).Msg("flip pricing switch failed")
-			respondError(c, ErrInternal)
-			return
-		}
 		forgetPricingVersion()
 	}
-	h.GetPlatformPricingVersion(c)
+	if err != nil {
+		log.Error().Err(err).Msg("flip pricing switch failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	h.writePricingSwitch(c)
 }

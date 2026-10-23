@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -714,11 +713,20 @@ func TestIntegration_PlanCatalogFirstVersionsNeedTheConfiguredPrice(t *testing.T
 	offer := family + "_monthly"
 	f, r, key := newProFixture(t, offer)
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(offer), 400, "invalid_offer")
+	// A configured price that no longer matches stops sales of the first
+	// version rather than being replaced by a price of its own.
+	sellFamily(f, offer)
+	f.mu.Lock()
+	f.amount = 99
+	f.mu.Unlock()
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(offer), 503, "service_unavailable")
 	f.mu.Lock()
 	if len(f.priceCreates) != 0 {
 		t.Fatalf("first version created a price: %v", f.priceCreates)
 	}
+	f.amount = 120000
 	f.mu.Unlock()
+	delete(f.handlers.Config.StripePlanPriceIDs, offer)
 	publishPlanCopy(t, first, "")
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(offer), 200, f.session)
 }
@@ -773,14 +781,16 @@ func TestIntegration_PricingSwitchActivatesTheV2Catalog(t *testing.T) {
 	if body.PricingVersion != "v2" || strings.Join(families, ",") != "free:free,starter:prepaid,pro:subscription,enterprise:custom" {
 		t.Fatalf("v2 cards=%v version=%s", families, body.PricingVersion)
 	}
-	var vcpu, memory float64
-	if err := testPool.QueryRow(ctx, `SELECT COALESCE(MAX(price_usd) FILTER (WHERE resource='vcpu'),0)::float8, COALESCE(MAX(price_usd) FILTER (WHERE resource='memory_gib'),0)::float8
-		FROM pricing_rate WHERE plan_key='payg' AND unit='second' AND effective_from<=now() AND (effective_to IS NULL OR effective_to>now())`).Scan(&vcpu, &memory); err != nil {
+	var freeCents int64
+	if err := testPool.QueryRow(ctx, `WITH r AS (SELECT DISTINCT ON (resource) resource, price_usd FROM pricing_rate r JOIN pricing_plan p ON p.key = r.plan_key
+		WHERE r.plan_key = 'payg' AND p.active AND unit = 'second' AND effective_from <= now() AND (effective_to IS NULL OR effective_to > now())
+		ORDER BY resource, effective_from DESC, r.created_at DESC, r.id DESC)
+		SELECT round(7200 * 100 * ((SELECT price_usd FROM r WHERE resource = 'vcpu') + (SELECT price_usd FROM r WHERE resource = 'memory_gib')))::bigint`).Scan(&freeCents); err != nil {
 		t.Fatal(err)
 	}
 	free, pro := body.Cards[0], body.Cards[2]
 	if free.Allowance == nil || free.Allowance.Period != "day_window" || free.Allowance.OnExhausted != "pause" ||
-		free.Allowance.AmountCents != int64(math.Round(7200*(vcpu+memory)*100)) || *free.Limits.MaxConcurrent != 1 || *free.Limits.MaxDiskMiB != 4096 {
+		free.Allowance.AmountCents != freeCents || freeCents <= 0 || *free.Limits.MaxConcurrent != 1 || *free.Limits.MaxDiskMiB != 4096 {
 		t.Fatalf("free card=%+v", free)
 	}
 	if pro.Monthly == nil || pro.Monthly.PriceCents != 25000 || pro.Annual != nil || pro.Allowance == nil || pro.Allowance.AmountCents != 25000 ||
@@ -792,6 +802,12 @@ func TestIntegration_PricingSwitchActivatesTheV2Catalog(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `SELECT (SELECT charge_amount_cents FROM billing_plan WHERE offer_key='pro_monthly'),(SELECT available FROM billing_plan WHERE offer_key='pro_annual')`).Scan(&monthly, &annualAvailable); err != nil ||
 		monthly != 25000 || annualAvailable {
 		t.Fatalf("v2 offers monthly=%d annual available=%v err=%v", monthly, annualAvailable, err)
+	}
+	// Contracts without frozen limits activate on plan_limits, so the flip
+	// keeps the limits legacy Pro was sold with.
+	var proVCPU int32
+	if err := testPool.QueryRow(ctx, `SELECT max_template_vcpu FROM plan_limits WHERE offer_key='pro_monthly'`).Scan(&proVCPU); err != nil || proVCPU == 8 {
+		t.Fatalf("pro_monthly plan_limits vcpu after flip = %d err=%v", proVCPU, err)
 	}
 	if w := operatorRequest(r, http.MethodPost, "/internal/billing/pricing-version", admin, `{"pricing_version":"legacy","reason":"roll back"}`); w.Code != 200 {
 		t.Fatalf("flip back = %d %s", w.Code, w.Body)
