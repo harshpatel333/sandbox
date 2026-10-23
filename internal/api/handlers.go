@@ -969,7 +969,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		respondErrorMsg(c, "abuse_denied", "Sandbox operation is not permitted", http.StatusForbidden)
 		return "", false
 	}
-	if !h.requireBillingEligible(c, teamID) {
+	shapeLimit, admitted := h.requireSandboxAdmission(c, teamID)
+	if !admitted {
 		return "", false
 	}
 
@@ -978,6 +979,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		ID:      sandboxID,
 		TeamID:  teamID,
 		LockKey: sandboxID.String(),
+	}
+	if shapeLimit != nil {
+		claimParams.MaxVcpu, claimParams.MaxMemoryMib, claimParams.MaxDiskMib = &shapeLimit.vcpu, &shapeLimit.memoryMib, &shapeLimit.diskMib
 	}
 	if caller, machine := machineCallerFromContext(c); machine {
 		if caller.PrincipalID == uuid.Nil || caller.TeamID != teamID {
@@ -992,6 +996,14 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// polling or exposing another principal's sandbox state.
 	if errors.Is(err, pgx.ErrNoRows) && claimParams.MachinePrincipalID.Valid && !h.requireMachineSandboxOwner(c, sandboxID, teamID) {
 		return "", false
+	}
+	if errors.Is(err, pgx.ErrNoRows) && shapeLimit != nil {
+		// Only a refused claim of a shape-limited team reads the row, to tell
+		// a sandbox larger than the plan from one that is not resumable.
+		if sbx, readErr := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{ID: sandboxID, TeamID: teamID}); readErr == nil && !shapeLimit.admits(sbx.VcpuCount, sbx.MemoryMib, sbx.DiskMib) {
+			respondSandboxExceedsPlan(c, shapeLimit, sbx.VcpuCount, sbx.MemoryMib, sbx.DiskMib)
+			return "", false
+		}
 	}
 	if err == pgx.ErrNoRows && settled != nil {
 		// The caller's wait is its lookup, not this claim.
@@ -3154,7 +3166,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
-	if !h.requireComputeAllowed(c, teamID, abuse.ActionCreate) || !h.requireBillingEligible(c, teamID) {
+	if !h.requireComputeAllowed(c, teamID, abuse.ActionCreate) {
+		return
+	}
+	shapeLimit, billingAdmitted := h.requireSandboxAdmission(c, teamID)
+	if !billingAdmitted {
 		return
 	}
 
@@ -3196,6 +3212,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// snapshot was built with exactly these values, so they're the
 	// authoritative shape.
 	var imageVcpu, imageMemMiB uint32
+	var imageDiskMiB int32
 	var fromTemplateName, fromTemplateID string
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
@@ -3228,6 +3245,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
 		imageVcpu = uint32(tpl.Vcpu)
 		imageMemMiB = uint32(tpl.MemoryMib)
+		imageDiskMiB = tpl.DiskMib
 		fromTemplateName = tpl.Name
 		fromTemplateID = tpl.ID.String()
 	}
@@ -3264,6 +3282,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		source = snap
 		basePath = snap.BasePath
 		imageVcpu, imageMemMiB = uint32(snap.VcpuCount), uint32(snap.MemoryMib)
+		imageDiskMiB = snap.DiskMib
 		// Inherited unless the request sets them.
 		if req.TimeoutSeconds == nil {
 			req.TimeoutSeconds = snap.TimeoutSeconds
@@ -3292,6 +3311,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	secretBindings, secretMeta := secrets.bindings, secrets.meta
 	tLookupDone = time.Now()
+
+	if !shapeLimit.admits(int32(imageVcpu), int32(imageMemMiB), imageDiskMiB) {
+		respondSandboxExceedsPlan(c, shapeLimit, int32(imageVcpu), int32(imageMemMiB), imageDiskMiB)
+		return
+	}
 
 	// Select a host for this sandbox.
 	tSchedStart = time.Now()

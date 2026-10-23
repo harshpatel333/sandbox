@@ -1319,6 +1319,15 @@ WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.
 -- name: IsTeamSandboxBillingEligible :one
 SELECT team_sandbox_billing_eligible(sqlc.arg(team_id)) AS eligible;
 
+-- name: GetTeamSandboxAdmission :one
+SELECT team_sandbox_billing_eligible(sqlc.arg(team_id)) AS eligible,
+       (f.max_vcpu IS NOT NULL OR f.max_memory_mib IS NOT NULL OR f.max_disk_mib IS NOT NULL)::boolean AS shape_limited,
+       COALESCE(f.max_vcpu, 0)::int AS max_vcpu,
+       COALESCE(f.max_memory_mib, 0)::int AS max_memory_mib,
+       COALESCE(f.max_disk_mib, 0)::int AS max_disk_mib
+FROM (SELECT 1) one
+LEFT JOIN billing_free_plan(sqlc.arg(team_id)) f ON true;
+
 -- name: RefreshTeamTrialEligibility :exec
 INSERT INTO team_trial_eligibility_cache (team_id, eligible, updated_at)
 SELECT sqlc.arg(team_id), refresh_team_trial_eligibility(sqlc.arg(team_id)), now()
@@ -1372,7 +1381,7 @@ WHERE EXISTS (
 ORDER BY c.team_id
 LIMIT sqlc.arg(batch_limit);
 
--- name: ListTeamsWithActiveIneligibleSandboxes :many
+-- name: ListTeamsWithBillingPauseDue :many
 -- MATERIALIZED fence, same reason as the rollup's interval_team_set: dedupe
 -- the active-team set first so team_sandbox_billing_eligible() runs once per
 -- team. Inlined in the WHERE clause the planner may evaluate it per active
@@ -1385,10 +1394,14 @@ WITH active_teams AS MATERIALIZED (
       AND s.status = 'active'
       AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 )
-SELECT team_id
-FROM active_teams
-WHERE NOT team_sandbox_billing_eligible(team_id)
-ORDER BY team_id
+SELECT a.team_id
+FROM active_teams a
+WHERE NOT team_sandbox_billing_eligible(a.team_id)
+   OR EXISTS (
+       SELECT 1 FROM billing_team_pause_request r
+       WHERE r.team_id = a.team_id AND r.completed_at IS NULL AND r.effective_at <= now()
+   )
+ORDER BY a.team_id
 LIMIT sqlc.arg(batch_limit);
 
 -- name: ActivateTeamBilling :exec
@@ -1642,3 +1655,69 @@ RETURNING cursor_id;
 UPDATE sweep_lease
 SET cursor_id = sqlc.narg(cursor_id), updated_at = now()
 WHERE name = sqlc.arg(name) AND locked_by = sqlc.arg(locked_by);
+
+-- name: ListFreeTeamsWithActiveSandboxes :many
+WITH active_teams AS MATERIALIZED (
+    SELECT DISTINCT s.team_id
+    FROM sandbox s
+    WHERE s.destroyed_at IS NULL
+      AND s.status = 'active'
+      AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+)
+SELECT a.team_id
+FROM active_teams a
+WHERE EXISTS (SELECT 1 FROM billing_free_plan(a.team_id))
+ORDER BY a.team_id
+LIMIT sqlc.arg(batch_limit);
+
+-- name: RefreshFreeAllowance :one
+SELECT billing_free_allowance_refresh(sqlc.arg(team_id)::uuid) AS blocked;
+
+-- name: GetFreeAllowance :one
+SELECT (e.window_started_at IS NOT NULL)::boolean AS has_window,
+       COALESCE(e.window_started_at, now())::timestamptz AS window_started_at,
+       COALESCE(e.resets_at, now())::timestamptz AS resets_at,
+       e.allowance_usd::numeric AS allowance_usd,
+       e.used_usd::numeric AS used_usd,
+       (a.team_id IS NOT NULL OR e.used_usd >= e.allowance_usd)::boolean AS exhausted,
+       now()::timestamptz AS as_of
+FROM billing_free_allowance_eval(sqlc.arg(team_id)::uuid) e
+LEFT JOIN billing_free_allowance a
+  ON a.team_id = sqlc.arg(team_id)::uuid AND a.window_started_at = e.window_started_at AND a.blocked_until > now();
+
+-- name: GetFreeAllowanceBlockedUntil :one
+SELECT a.blocked_until::timestamptz AS blocked_until
+FROM billing_free_allowance a
+WHERE a.team_id = sqlc.arg(team_id) AND a.blocked_until > now();
+
+-- name: RequestTeamPauseAll :exec
+SELECT request_team_pause_all(sqlc.arg(team_id)::uuid, sqlc.arg(reason)::text, sqlc.arg(effective_at)::timestamptz);
+
+-- name: CompleteTeamPauseRequests :execrows
+UPDATE billing_team_pause_request r
+SET completed_at = now()
+WHERE r.team_id = sqlc.arg(team_id)
+  AND r.completed_at IS NULL
+  AND r.effective_at <= now()
+  AND NOT EXISTS (
+      SELECT 1 FROM sandbox s
+      JOIN sandbox_compute_billing_interval i ON i.sandbox_id = s.id AND i.ended_at IS NULL
+      WHERE s.team_id = r.team_id
+        AND s.destroyed_at IS NULL
+        AND s.status = 'active'
+        AND i.started_at < r.effective_at
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM sandbox s
+      WHERE s.team_id = r.team_id
+        AND s.destroyed_at IS NULL
+        AND s.status = 'pausing'
+  );
+
+-- name: ListPricingV2ActivationBuckets :many
+SELECT t.id AS team_id, b.bucket::text AS bucket, COALESCE(b.reason, '')::text AS reason
+FROM team t
+CROSS JOIN LATERAL pricing_v2_activation_bucket(t.id) b
+WHERE t.home_region = sqlc.arg(region)
+  AND t.id <> sqlc.arg(system_team_id)
+ORDER BY t.id;
