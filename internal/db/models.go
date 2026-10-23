@@ -388,9 +388,11 @@ type BillingContractMatchingRule struct {
 	EffectiveFrom     time.Time          `json:"effective_from"`
 	Source            string             `json:"source"`
 	CreatedBy         pgtype.UUID        `json:"created_by"`
+	Reason            *string            `json:"reason"`
 	CreatedAt         time.Time          `json:"created_at"`
 	RevokedAt         pgtype.Timestamptz `json:"revoked_at"`
 	RevokedBy         pgtype.UUID        `json:"revoked_by"`
+	RevokeReason      *string            `json:"revoke_reason"`
 }
 
 type BillingContractPayment struct {
@@ -733,37 +735,38 @@ type BillingInvoiceEnrollment struct {
 }
 
 type BillingMatchingCredit struct {
-	ID                  uuid.UUID          `json:"id"`
-	TeamID              uuid.UUID          `json:"team_id"`
-	ContractID          uuid.UUID          `json:"contract_id"`
-	InvoiceID           string             `json:"invoice_id"`
-	CustomerID          string             `json:"customer_id"`
-	PeriodStart         time.Time          `json:"period_start"`
-	PeriodEnd           time.Time          `json:"period_end"`
-	UsageCents          int64              `json:"usage_cents"`
-	CreditAppliedCents  int64              `json:"credit_applied_cents"`
-	DiscountCents       int64              `json:"discount_cents"`
-	MatchableCents      int64              `json:"matchable_cents"`
-	AmountCents         int64              `json:"amount_cents"`
-	SkipReason          *string            `json:"skip_reason"`
-	InvoiceEvidence     []byte             `json:"invoice_evidence"`
-	State               string             `json:"state"`
-	IdempotencyKey      string             `json:"idempotency_key"`
-	RequestPayload      []byte             `json:"request_payload"`
-	FirstAttemptAt      pgtype.Timestamptz `json:"first_attempt_at"`
-	StripeCreditGrantID *string            `json:"stripe_credit_grant_id"`
-	IssuanceEvidence    []byte             `json:"issuance_evidence"`
-	IssuedAt            pgtype.Timestamptz `json:"issued_at"`
-	NextAttemptAt       time.Time          `json:"next_attempt_at"`
-	Failures            int32              `json:"failures"`
-	LastError           *string            `json:"last_error"`
-	ReviewCheckedAt     pgtype.Timestamptz `json:"review_checked_at"`
-	FlaggedAt           pgtype.Timestamptz `json:"flagged_at"`
-	FlagReason          *string            `json:"flag_reason"`
-	FlagEvidence        []byte             `json:"flag_evidence"`
-	AcknowledgedAt      pgtype.Timestamptz `json:"acknowledged_at"`
-	AcknowledgedBy      pgtype.UUID        `json:"acknowledged_by"`
-	CreatedAt           time.Time          `json:"created_at"`
+	ID                    uuid.UUID          `json:"id"`
+	TeamID                uuid.UUID          `json:"team_id"`
+	ContractID            uuid.UUID          `json:"contract_id"`
+	InvoiceID             string             `json:"invoice_id"`
+	CustomerID            string             `json:"customer_id"`
+	PeriodStart           time.Time          `json:"period_start"`
+	PeriodEnd             time.Time          `json:"period_end"`
+	UsageCents            int64              `json:"usage_cents"`
+	CreditAppliedCents    int64              `json:"credit_applied_cents"`
+	DiscountCents         int64              `json:"discount_cents"`
+	MatchableCents        int64              `json:"matchable_cents"`
+	AmountCents           int64              `json:"amount_cents"`
+	SkipReason            *string            `json:"skip_reason"`
+	InvoiceEvidence       []byte             `json:"invoice_evidence"`
+	State                 string             `json:"state"`
+	IdempotencyKey        string             `json:"idempotency_key"`
+	RequestPayload        []byte             `json:"request_payload"`
+	FirstAttemptAt        pgtype.Timestamptz `json:"first_attempt_at"`
+	StripeCreditGrantID   *string            `json:"stripe_credit_grant_id"`
+	IssuanceEvidence      []byte             `json:"issuance_evidence"`
+	IssuedAt              pgtype.Timestamptz `json:"issued_at"`
+	NextAttemptAt         time.Time          `json:"next_attempt_at"`
+	Failures              int32              `json:"failures"`
+	LastError             *string            `json:"last_error"`
+	ReviewCheckedAt       pgtype.Timestamptz `json:"review_checked_at"`
+	FlaggedAt             pgtype.Timestamptz `json:"flagged_at"`
+	FlagReason            *string            `json:"flag_reason"`
+	FlagEvidence          []byte             `json:"flag_evidence"`
+	AcknowledgedAt        pgtype.Timestamptz `json:"acknowledged_at"`
+	AcknowledgedBy        pgtype.UUID        `json:"acknowledged_by"`
+	AcknowledgementReason *string            `json:"acknowledgement_reason"`
+	CreatedAt             time.Time          `json:"created_at"`
 }
 
 type BillingMeterReconciliation struct {

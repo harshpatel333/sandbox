@@ -2,7 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"net/http"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func TestMatchingUsageExcludesFeeDiscountsAndCredits(t *testing.T) {
@@ -39,6 +42,19 @@ func TestMatchingGrantFormRejectsExpiringOrScopedRequests(t *testing.T) {
 	} {
 		if _, err = matchingGrantForm([]byte(bad)); err == nil {
 			t.Fatal("accepted", bad)
+		}
+	}
+}
+
+func TestMatchingWritesRequireOperatorCredential(t *testing.T) {
+	router := machineAdminRouter(t, nil)
+	team, credit := uuid.NewString(), uuid.NewString()
+	for _, path := range []string{"/billing/matching", "/billing/matching/revoke", "/billing/matching/credits/" + credit + "/acknowledge"} {
+		for _, token := range []string{"", "test-infrastructure-only"} {
+			response := machineAdminRequest(router, http.MethodPost, "/internal/teams/"+team+path, `{"reason":"test"}`, token, false)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("%s with token %q got %d", path, token, response.Code)
+			}
 		}
 	}
 }

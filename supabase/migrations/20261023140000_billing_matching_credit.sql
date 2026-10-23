@@ -12,12 +12,15 @@ CREATE TABLE billing_contract_matching_rule (
     effective_from timestamptz NOT NULL CHECK (isfinite(effective_from)),
     source text NOT NULL CHECK (source IN ('plan', 'staff')),
     created_by uuid,
+    reason text CHECK (btrim(reason) <> ''),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     revoked_at timestamptz CHECK (isfinite(revoked_at)),
     revoked_by uuid,
+    revoke_reason text CHECK (btrim(revoke_reason) <> ''),
     UNIQUE (team_id, contract_id),
     FOREIGN KEY (team_id, contract_id) REFERENCES billing_commercial_contract(team_id, id),
-    CHECK (source = 'plan' OR created_by IS NOT NULL)
+    CHECK (source = 'plan' OR (created_by IS NOT NULL AND reason IS NOT NULL)),
+    CHECK ((revoked_at IS NULL) = (revoked_by IS NULL) AND (revoked_at IS NULL) = (revoke_reason IS NULL))
 );
 
 -- One row per paid usage invoice, including invoices that earned nothing, so a
@@ -53,6 +56,7 @@ CREATE TABLE billing_matching_credit (
     flag_evidence jsonb,
     acknowledged_at timestamptz,
     acknowledged_by uuid,
+    acknowledgement_reason text CHECK (btrim(acknowledgement_reason) <> ''),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     FOREIGN KEY (team_id, contract_id) REFERENCES billing_contract_matching_rule(team_id, contract_id),
     CHECK ((state = 'skipped') = (amount_cents = 0)),
@@ -61,7 +65,8 @@ CREATE TABLE billing_matching_credit (
     CHECK ((state IN ('pending', 'skipped')) = (first_attempt_at IS NULL)),
     CHECK ((state = 'issued') = (stripe_credit_grant_id IS NOT NULL AND issuance_evidence IS NOT NULL AND issued_at IS NOT NULL)),
     CHECK ((flagged_at IS NULL) = (flag_reason IS NULL)),
-    CHECK (acknowledged_at IS NULL OR flagged_at IS NOT NULL)
+    CHECK (acknowledged_at IS NULL OR flagged_at IS NOT NULL),
+    CHECK ((acknowledged_at IS NULL) = (acknowledged_by IS NULL) AND (acknowledged_at IS NULL) = (acknowledgement_reason IS NULL))
 );
 CREATE INDEX billing_matching_credit_contract ON billing_matching_credit(contract_id, created_at);
 CREATE INDEX billing_matching_credit_due ON billing_matching_credit(next_attempt_at) WHERE state IN ('pending', 'uncertain');
@@ -74,7 +79,7 @@ BEGIN
     IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'matching rules are immutable'; END IF;
     IF TG_OP = 'UPDATE' THEN
         IF OLD.revoked_at IS NOT NULL OR NEW.revoked_at IS NULL
-            OR (to_jsonb(NEW) - ARRAY['revoked_at','revoked_by']) IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['revoked_at','revoked_by']) THEN
+            OR (to_jsonb(NEW) - ARRAY['revoked_at','revoked_by','revoke_reason']) IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['revoked_at','revoked_by','revoke_reason']) THEN
             RAISE EXCEPTION 'matching rule terms are immutable; only an unrevoked rule can be revoked';
         END IF;
     END IF;
@@ -117,6 +122,8 @@ BEGIN
         NEW.flagged_at := NULL;
         NEW.flag_reason := NULL;
         NEW.acknowledged_at := NULL;
+        NEW.acknowledged_by := NULL;
+        NEW.acknowledgement_reason := NULL;
         IF NEW.amount_cents = 0 THEN
             NEW.state := 'skipped';
             NEW.request_payload := NULL;
@@ -132,14 +139,14 @@ BEGIN
         END IF;
         RETURN NEW;
     END IF;
-    IF (to_jsonb(NEW) - ARRAY['state','first_attempt_at','stripe_credit_grant_id','issuance_evidence','issued_at','next_attempt_at','failures','last_error','review_checked_at','flagged_at','flag_reason','flag_evidence','acknowledged_at','acknowledged_by'])
-        IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['state','first_attempt_at','stripe_credit_grant_id','issuance_evidence','issued_at','next_attempt_at','failures','last_error','review_checked_at','flagged_at','flag_reason','flag_evidence','acknowledged_at','acknowledged_by']) THEN
+    IF (to_jsonb(NEW) - ARRAY['state','first_attempt_at','stripe_credit_grant_id','issuance_evidence','issued_at','next_attempt_at','failures','last_error','review_checked_at','flagged_at','flag_reason','flag_evidence','acknowledged_at','acknowledged_by','acknowledgement_reason'])
+        IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['state','first_attempt_at','stripe_credit_grant_id','issuance_evidence','issued_at','next_attempt_at','failures','last_error','review_checked_at','flagged_at','flag_reason','flag_evidence','acknowledged_at','acknowledged_by','acknowledgement_reason']) THEN
         RAISE EXCEPTION 'matching credit terms and identity are immutable';
     END IF;
     IF OLD.flagged_at IS NOT NULL AND (NEW.flagged_at, NEW.flag_reason, NEW.flag_evidence) IS DISTINCT FROM (OLD.flagged_at, OLD.flag_reason, OLD.flag_evidence) THEN
         RAISE EXCEPTION 'a staff flag cannot be replaced';
     END IF;
-    IF OLD.acknowledged_at IS NOT NULL AND (NEW.acknowledged_at, NEW.acknowledged_by) IS DISTINCT FROM (OLD.acknowledged_at, OLD.acknowledged_by) THEN
+    IF OLD.acknowledged_at IS NOT NULL AND (NEW.acknowledged_at, NEW.acknowledged_by, NEW.acknowledgement_reason) IS DISTINCT FROM (OLD.acknowledged_at, OLD.acknowledged_by, OLD.acknowledgement_reason) THEN
         RAISE EXCEPTION 'a staff acknowledgement cannot be replaced';
     END IF;
     IF NEW.state IS DISTINCT FROM OLD.state OR NEW.first_attempt_at IS DISTINCT FROM OLD.first_attempt_at
