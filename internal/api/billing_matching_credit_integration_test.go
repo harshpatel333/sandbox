@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -834,6 +835,81 @@ func TestMatchingCreditFinalReviewChecksReversals(t *testing.T) {
 			var retired bool
 			if err = m.f.h.Pool.QueryRow(t.Context(), `SELECT review_checked_at='infinity'::timestamptz FROM billing_matching_credit WHERE invoice_id=$1`, invoice).Scan(&retired); err != nil || retired == refunded {
 				t.Fatal("final review retirement", retired, err)
+			}
+		})
+	}
+}
+
+func TestMatchingCreditInspectionFailuresDoNotStarveQueue(t *testing.T) {
+	for _, stage := range []string{"invoice", "reversal"} {
+		t.Run(stage, func(t *testing.T) {
+			m := newMatchingFixture(t, 10000, 8_000_000, 0)
+			bad := map[string]bool{}
+			for i := 0; i < 20; i++ {
+				bad[m.paidInvoice("paid", usageLine("price_cpu", 100))] = true
+			}
+			valid := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+			var recovered atomic.Bool
+			var failedRequests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				invoice := strings.TrimPrefix(r.URL.Path, "/v1/invoices/")
+				if stage == "reversal" {
+					invoice = r.URL.Query().Get("invoice")
+				}
+				if bad[invoice] && !recovered.Load() {
+					var durable bool
+					if err := m.f.h.Pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM billing_matching_invoice_inspection WHERE invoice_id=$1 AND next_attempt_at>clock_timestamp())`, invoice).Scan(&durable); err != nil || !durable {
+						t.Errorf("provider inspection preceded durable retry claim: %v %v", durable, err)
+					}
+					failedRequests.Add(1)
+					if stage == "invoice" {
+						http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+					} else {
+						fmt.Fprint(w, `{"data":{}}`)
+					}
+					return
+				}
+				m.serve(w, r)
+			}))
+			defer srv.Close()
+			m.client.baseURL = srv.URL
+			if err := m.tick(); err == nil {
+				t.Fatal("provider failures were not reported")
+			}
+			if got := failedRequests.Load(); got != 20 {
+				t.Fatalf("failed provider requests = %d", got)
+			}
+			var deferred int
+			if err := m.f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_matching_invoice_inspection i JOIN billing_invoice_close j USING(invoice_id) WHERE j.team_id=$1 AND i.next_attempt_at>clock_timestamp() AND i.last_error IS NOT NULL`, m.f.c.TeamID).Scan(&deferred); err != nil || deferred != 20 {
+				t.Fatal("failed candidates lack durable backoff", deferred, err)
+			}
+			if err := m.tick(); err != nil {
+				t.Fatal(err)
+			}
+			if r := m.row(valid); r.State != "issued" || failedRequests.Load() != 20 {
+				t.Fatalf("failed inspections starved or retried ahead of a valid invoice: %+v requests=%d", r, failedRequests.Load())
+			}
+			recovered.Store(true)
+			m.exec(`UPDATE billing_matching_invoice_inspection SET next_attempt_at=clock_timestamp() WHERE invoice_id=ANY($1)`, func() []string {
+				var ids []string
+				for id := range bad {
+					ids = append(ids, id)
+				}
+				return ids
+			}())
+			if err := m.tick(); err != nil {
+				t.Fatal(err)
+			}
+			for invoice := range bad {
+				if r := m.row(invoice); r.State != "issued" {
+					t.Fatalf("recovered inspection never issued: %+v", r)
+				}
+			}
+			if err := m.tick(); err != nil {
+				t.Fatal(err)
+			}
+			if len(m.posts) != 21 {
+				t.Fatalf("recovery duplicated grants: %d", len(m.posts))
 			}
 		})
 	}

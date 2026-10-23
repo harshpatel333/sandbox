@@ -770,6 +770,13 @@ type BillingMatchingCredit struct {
 	CreatedAt             time.Time          `json:"created_at"`
 }
 
+type BillingMatchingInvoiceInspection struct {
+	InvoiceID     string    `json:"invoice_id"`
+	Failures      int32     `json:"failures"`
+	NextAttemptAt time.Time `json:"next_attempt_at"`
+	LastError     *string   `json:"last_error"`
+}
+
 type BillingMeterReconciliation struct {
 	ID                 uuid.UUID      `json:"id"`
 	TeamID             uuid.UUID      `json:"team_id"`
