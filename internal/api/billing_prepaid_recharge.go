@@ -269,7 +269,7 @@ func (h *Handlers) failPrepaidPayment(ctx context.Context, id uuid.UUID, code, r
 		return err
 	}
 	if disable {
-		if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_auto_recharge SET enabled=false,disabled_reason=$2,disabled_at=clock_timestamp(),notified_at=NULL WHERE team_id=$1 AND enabled`, team, "auto-recharge charge failed: "+reason); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_auto_recharge SET enabled=false,disabled_reason=$2,disabled_at=clock_timestamp(),notified_at=NULL WHERE team_id=$1 AND enabled`, team, reason); err != nil {
 			return err
 		}
 	}
