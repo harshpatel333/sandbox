@@ -142,6 +142,13 @@ func TestIntegration_PublicBillingPlansListTodaysPurchasablePlans(t *testing.T) 
 	}
 	// An unavailable plan stays unlisted even where a price is configured, so
 	// only the Pro offers checkout already sells are listed, at today's terms.
+	var catalog []string
+	if err := testPool.QueryRow(t.Context(), `SELECT array_agg(offer_key ORDER BY offer_key) FROM billing_plan WHERE offer_key <> $1`, testCatalogOffer).Scan(&catalog); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(catalog) != "[pro_annual pro_monthly]" {
+		t.Fatalf("migrated catalog = %v, want only the Pro offers", catalog)
+	}
 	got := fmt.Sprint(body.Plans)
 	want := "[{pro_monthly 1 120000 100000} {pro_annual 12 1200000 100000}]"
 	if got != want {
