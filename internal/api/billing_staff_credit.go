@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -83,6 +84,36 @@ func (h *Handlers) CreateStaffCreditGrant(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, credit)
+}
+
+// usageLedgerPeriodClosing reports a recently ended period still being closed
+// through the usage-only credit ledger, which cannot place credit that became
+// effective after the period ended into that period's held invoice.
+func (h *Handlers) usageLedgerPeriodClosing(ctx context.Context, team uuid.UUID) (bool, error) {
+	rows, err := h.Pool.Query(ctx, `SELECT p.period_start,p.period_end FROM team_billing_period p JOIN billing_invoice_account i USING(team_id)
+        WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp() AND p.period_end>clock_timestamp()-interval '7 days'
+        AND NOT EXISTS(SELECT 1 FROM billing_invoice_close c WHERE c.team_id=p.team_id AND c.period_start=p.period_start AND c.period_end=p.period_end AND c.state='released')`, team)
+	if err != nil {
+		return false, err
+	}
+	periods, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (billing.ExportPeriod, error) {
+		p := billing.ExportPeriod{TeamID: team}
+		return p, row.Scan(&p.Start, &p.End)
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, p := range periods {
+		a, _, err := h.invoiceAccountForPeriod(ctx, p)
+		if err != nil {
+			return true, nil
+		}
+		path, err := h.invoiceCreditPath(ctx, p, a)
+		if err != nil || path == invoiceCreditsLedger {
+			return true, err
+		}
+	}
+	return false, nil
 }
 
 func decodeStaffCreditRequest(body io.Reader) (staffCreditRequest, error) {
@@ -158,21 +189,14 @@ func (h *Handlers) grantStaffCredit(ctx context.Context, team, actor uuid.UUID, 
 		if credit.customer != *customer {
 			return errors.Join(errStaffCreditConflict, errors.New("team's billing customer changed since the credit was requested"))
 		}
-		// Usage-only invoices reconcile credit through a ledger that cannot
-		// place credit becoming effective after a period ended into that
-		// period's held invoice; wait while a recent close is outstanding.
-		var closing bool
-		if e := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_account i USING(team_id)
-            WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp() AND p.period_end>clock_timestamp()-interval '7 days'
-            AND NOT EXISTS(SELECT 1 FROM billing_invoice_close c WHERE c.team_id=p.team_id AND c.period_start=p.period_start AND c.period_end=p.period_end AND c.state='released'))
-            AND NOT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1)
-            AND NOT EXISTS(SELECT 1 FROM billing_sponsored_operation WHERE team_id=$1)`, team).Scan(&closing); e != nil {
+		closing, e := h.usageLedgerPeriodClosing(ctx, team)
+		if e != nil {
 			return e
 		}
 		if closing {
 			return errors.Join(errStaffCreditConflict, errors.New("the team's previous invoice is still being closed; retry once it is finalized"))
 		}
-		_, e := h.Pool.Exec(ctx, `UPDATE billing_staff_credit_grant SET attempts=attempts+1 WHERE id=$1 AND state='pending'`, credit.ID)
+		_, e = h.Pool.Exec(ctx, `UPDATE billing_staff_credit_grant SET attempts=attempts+1 WHERE id=$1 AND state='pending'`, credit.ID)
 		return e
 	})
 	if err != nil {

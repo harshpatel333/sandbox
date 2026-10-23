@@ -705,20 +705,45 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 	if plan.AdjustmentCents > int64(len(items)) || plan.AdjustmentCents < -int64(len(items)) {
 		return plan, fmt.Errorf("invoice difference exceeds supported rounding correction")
 	}
-	var sponsored bool
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND charge_kind='sponsored_entitlement' AND starts_at<=$4 AND ends_at>=$5)`, p.TeamID, a.Customer, a.Subscription, p.Start, p.End).Scan(&sponsored); err != nil {
+	path, err := h.invoiceCreditPath(ctx, p, a)
+	if err != nil {
 		return plan, err
 	}
-	if a.Base.Price != "" || sponsored {
+	switch path {
+	case invoiceCreditsEntitlement:
 		err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
-	} else {
-		var released bool
-		released, err = h.prepareReleasedFundingCredits(ctx, p, a, inv.ID, &plan, client)
-		if err == nil && !released {
-			plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
-		}
+	case invoiceCreditsReleasedFunding:
+		_, err = h.prepareReleasedFundingCredits(ctx, p, a, inv.ID, &plan, client)
+	default:
+		plan.CreditBeforeCents, err = client.invoiceCreditLedger(ctx, a.Customer, invoicePeriod.End.Unix())
 	}
 	return plan, err
+}
+
+type invoiceCreditSource int
+
+const (
+	invoiceCreditsLedger invoiceCreditSource = iota
+	invoiceCreditsEntitlement
+	invoiceCreditsReleasedFunding
+)
+
+// invoiceCreditPath picks how a period's invoice accounts for credit: the
+// entitlement inventory for contract-backed periods, the released funding
+// inventory, or the usage-only credit ledger.
+func (h *Handlers) invoiceCreditPath(ctx context.Context, p billing.ExportPeriod, a invoiceAccount) (invoiceCreditSource, error) {
+	var sponsored bool
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND charge_kind='sponsored_entitlement' AND starts_at<=$4 AND ends_at>=$5)`, p.TeamID, a.Customer, a.Subscription, p.Start, p.End).Scan(&sponsored); err != nil {
+		return invoiceCreditsLedger, err
+	}
+	if a.Base.Price != "" || sponsored {
+		return invoiceCreditsEntitlement, nil
+	}
+	_, released, err := h.releasedFundingCreditContract(ctx, p.TeamID, a, h.Pool)
+	if err != nil || !released {
+		return invoiceCreditsLedger, err
+	}
+	return invoiceCreditsReleasedFunding, nil
 }
 
 // Quantity drift is provisional only for accounts under a durable invoice hold.
