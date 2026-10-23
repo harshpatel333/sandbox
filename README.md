@@ -180,3 +180,7 @@ grants or contract transitions are performed by backfill.
 Apply scans bounded pages past deferred customers. If a complete pass makes no
 progress it exits with the unresolved count; inspect the report and rerun after
 the provider or busy team recovers. Committed assignments survive interruption.
+
+Regional team migration refuses existing Free allowance or pause state in either
+cell. These rows are not transferred by `migrate-team`; coordinate their financial
+and operational authority transfer before copy or cutover.
