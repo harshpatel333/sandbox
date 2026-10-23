@@ -252,6 +252,17 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
+	if !v2 && !resuming {
+		_, assigned, assignmentErr := currentTeamPlan(ctx, tx, team)
+		if assignmentErr != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if assigned {
+			proConflict(c)
+			return
+		}
+	}
 	if state == "committed" || (v2 && !resuming && account.CommercialBillingAnchor.Valid) || (selected != nil && *selected != offer.Key) || account.StripeSubscriptionID != nil || (account.TrialEndedAt.Valid && !v2) || account.StripeActivationCreditReservedAt.Valid || account.StripeActivationCreditGrantID != nil {
 		proConflict(c)
 		return

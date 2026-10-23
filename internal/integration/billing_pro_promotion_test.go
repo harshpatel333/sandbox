@@ -187,3 +187,19 @@ func TestIntegration_ProPricingV2PurchaseSurvivesSwitchOff(t *testing.T) {
 		t.Fatalf("new checkout after switch-off: promotion codes=%v fee=%d", next.promotionCodes, next.amount)
 	}
 }
+
+func TestIntegration_ProRejectsNewLegacyCheckoutForAssignedTeam(t *testing.T) {
+	withPricingV2(t)
+	f, r, key := newProFixture(t, "pro_monthly")
+	var assigned bool
+	if err := testPool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL AND kind='free')`, f.team).Scan(&assigned); err != nil || !assigned {
+		t.Fatalf("new v2 team has no Free assignment: %v %v", assigned, err)
+	}
+	setPricingVersion(t, "legacy")
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 409, "plan_conflict")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.creates != 0 {
+		t.Fatalf("created %d legacy checkouts for an assigned team", f.creates)
+	}
+}
