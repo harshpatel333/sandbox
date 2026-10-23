@@ -105,7 +105,9 @@ BEGIN
         SELECT * INTO STRICT c FROM billing_commercial_contract WHERE id = NEW.contract_id;
         IF NEW.period_start < r.effective_from OR (r.revoked_at IS NOT NULL AND NEW.period_start >= r.revoked_at)
             OR NEW.period_start < c.starts_at OR (c.ends_at IS NOT NULL AND NEW.period_start >= c.ends_at)
-            OR NEW.customer_id IS DISTINCT FROM c.customer_id THEN
+            OR NEW.customer_id IS DISTINCT FROM c.customer_id
+            OR EXISTS (SELECT 1 FROM billing_commercial_contract n WHERE n.subscription_id = c.subscription_id AND n.id <> c.id
+                AND n.starts_at > c.starts_at AND n.starts_at <= NEW.period_start) THEN
             RAISE EXCEPTION 'invoice period is outside the matching rule';
         END IF;
         IF NOT EXISTS (SELECT 1 FROM billing_invoice_close j JOIN billing_invoice_collection k USING (invoice_id)

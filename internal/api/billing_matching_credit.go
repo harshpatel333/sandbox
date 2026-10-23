@@ -169,6 +169,7 @@ func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *strip
  JOIN billing_invoice_close j ON j.team_id=r.team_id AND j.state='released' AND j.period_start>=r.effective_from
   AND j.period_start>=c.starts_at AND (c.ends_at IS NULL OR j.period_start<c.ends_at) AND (r.revoked_at IS NULL OR j.period_start<r.revoked_at)
   AND j.plan->>'customer'=c.customer_id AND j.plan->>'subscription'=c.subscription_id
+  AND NOT EXISTS(SELECT 1 FROM billing_commercial_contract n WHERE n.subscription_id=c.subscription_id AND n.id<>c.id AND n.starts_at>c.starts_at AND n.starts_at<=j.period_start)
  JOIN billing_invoice_collection k ON k.invoice_id=j.invoice_id AND k.state='paid'
  WHERE NOT EXISTS(SELECT 1 FROM billing_matching_credit m WHERE m.invoice_id=j.invoice_id)
  ORDER BY j.period_start,j.invoice_id LIMIT 20`)
