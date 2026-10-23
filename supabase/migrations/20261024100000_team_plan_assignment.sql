@@ -97,6 +97,7 @@ CREATE TRIGGER team_plan_assignment_limits AFTER INSERT ON team_plan_assignment
 CREATE FUNCTION assign_new_team_free_plan() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE v billing_plan_version;
 BEGIN
+ IF current_setting('superserve.migrating_team_id',true)=NEW.id::text THEN RETURN NULL; END IF;
  IF billing_pricing_version()<>'v2' THEN RETURN NULL; END IF;
  SELECT * INTO v FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published';
  IF NOT FOUND THEN RETURN NULL; END IF;
