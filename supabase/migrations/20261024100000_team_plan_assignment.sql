@@ -4,7 +4,7 @@
 -- contract that bills them.
 CREATE TABLE team_plan_assignment (
  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
- team_id uuid NOT NULL REFERENCES team(id),
+ team_id uuid NOT NULL,
  plan_key text NOT NULL CHECK(btrim(plan_key)<>''),
  kind text NOT NULL CHECK(kind IN ('free','prepaid','subscription','legacy_payg','custom')),
  plan_version_id uuid REFERENCES billing_plan_version(id),
@@ -28,6 +28,8 @@ CREATE FUNCTION guard_team_plan_assignment() RETURNS trigger LANGUAGE plpgsql AS
 BEGIN
  IF TG_OP<>'UPDATE' AND TG_OP<>'INSERT' THEN RAISE EXCEPTION 'plan assignment history is immutable'; END IF;
  IF TG_OP='INSERT' THEN
+  PERFORM 1 FROM team WHERE id=NEW.team_id FOR KEY SHARE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'assignment team does not exist' USING ERRCODE='23503'; END IF;
   IF NEW.effective_to IS NOT NULL OR NEW.effective_from>clock_timestamp() THEN
    RAISE EXCEPTION 'a plan assignment starts open and not in the future';
   END IF;

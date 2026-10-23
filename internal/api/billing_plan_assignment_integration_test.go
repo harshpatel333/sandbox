@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -454,4 +455,27 @@ func TestStaffPlanAssignmentUnderV2(t *testing.T) {
 		t.Fatalf("off requests changed assignment history: %+v %v", history, err)
 	}
 
+}
+
+func TestPlanAssignmentHistorySurvivesTeamDeletion(t *testing.T) {
+	h, _ := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
+	team, err := h.DB.CreateTeam(t.Context(), "plan-delete-"+uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, ok, err := currentTeamPlan(t.Context(), h.Pool, team.ID)
+	if err != nil || !ok {
+		t.Fatalf("new v2 assignment: %v %v", ok, err)
+	}
+	if err := h.DB.DeleteTeam(t.Context(), team.ID); err != nil {
+		t.Fatal(err)
+	}
+	retained, ok, err := currentTeamPlan(t.Context(), h.Pool, team.ID)
+	if err != nil || !ok || retained.ID != plan.ID {
+		t.Fatalf("deleted team's history lost: %+v %v", retained, err)
+	}
+	if _, err := assignInTx(t, h, planAssignment{Team: team.ID, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceSignup, Reason: "deleted"}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("assignment to deleted team: %v", err)
+	}
 }

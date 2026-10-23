@@ -538,7 +538,7 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 	if version != "v2" {
 		return teamPlan{}, errPricingV2Off
 	}
-	catalogVersion, err := scanPlanVersion(tx.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1 AND state<>'draft'`, body.VersionID))
+	catalogVersion, err := scanPlanVersion(tx.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1 AND state<>'draft' FOR SHARE`, body.VersionID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return teamPlan{}, errUnknownPlan
 	}
