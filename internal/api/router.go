@@ -252,6 +252,11 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.POST("/teams/:team_id/billing/periods/:period_id/approve", h.ApproveTeamBillingPeriod)
 		internal.POST("/teams/:team_id/billing/periods/:period_id/export", h.ExportTeamBillingPeriod)
 		internal.GET("/teams/:team_id/billing/periods/:period_id/export-accounting", h.GetBillingExportAccounting)
+		internal.GET("/teams/:team_id/billing/matching", h.GetTeamMatchingCredit)
+		internal.POST("/teams/:team_id/billing/matching", h.AttachTeamMatchingRule)
+		internal.POST("/teams/:team_id/billing/matching/revoke", h.RevokeTeamMatchingRule)
+		internal.POST("/teams/:team_id/billing/matching/credits/:credit_id/acknowledge", h.AcknowledgeMatchingCreditFlag)
+		internal.GET("/billing/matching/flags", h.ListMatchingCreditFlags)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)

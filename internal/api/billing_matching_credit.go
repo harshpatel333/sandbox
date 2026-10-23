@@ -1,0 +1,482 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/rs/zerolog/log"
+	"github.com/superserve-ai/sandbox/internal/billing"
+	"github.com/superserve-ai/sandbox/internal/db"
+)
+
+var errMatchingDeferred = errors.New("matching credit issuance deferred")
+
+type matchingTerms struct {
+	BasisPoints int32
+	CapCents    int64
+}
+
+type matchingRule struct {
+	ContractID        uuid.UUID
+	TeamID            uuid.UUID
+	Terms             matchingTerms
+	PriorMatchedCents int64
+	EffectiveFrom     time.Time
+	Source            string
+	Actor             *uuid.UUID
+}
+
+// insertContractMatchingRule freezes matching terms onto a contract. Plan
+// assignment calls it with the plan's terms; staff call it for bespoke deals.
+func insertContractMatchingRule(ctx context.Context, q db.DBTX, r matchingRule) error {
+	_, err := q.Exec(ctx, `INSERT INTO billing_contract_matching_rule(contract_id,team_id,basis_points,cap_cents,prior_matched_cents,effective_from,source,created_by)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, r.ContractID, r.TeamID, r.Terms.BasisPoints, r.Terms.CapCents, r.PriorMatchedCents, r.EffectiveFrom, r.Source, r.Actor)
+	return err
+}
+
+type matchingUsage struct {
+	UsageCents, CreditCents, DiscountCents int64
+	SkipReason                             string
+}
+
+// Only usage-priced lines are matchable: the plan fee and anything else on the
+// invoice fall outside the frozen close plan's credit prices. Every applied
+// credit grant is subtracted, including earlier matching credit.
+func matchingInvoiceUsage(inv StripeInvoiceAmounts, prices []string) (matchingUsage, error) {
+	var u matchingUsage
+	if len(prices) == 0 {
+		u.SkipReason = "close plan does not identify usage prices"
+		return u, nil
+	}
+	if inv.Lines.HasMore || len(inv.Taxes) != 0 || inv.AmountShipping != 0 || inv.PrePaymentCreditNotes != 0 || inv.PostPaymentCreditNotes != 0 {
+		u.SkipReason = "invoice carries tax, shipping, credit notes or incomplete lines"
+		return u, nil
+	}
+	usage := map[string]bool{}
+	for _, p := range prices {
+		usage[p] = true
+	}
+	var err error
+	for _, line := range inv.Lines.Data {
+		if line.Pricing.PriceDetails == nil || !usage[line.Pricing.PriceDetails.Price] {
+			continue
+		}
+		if line.Currency != "usd" || line.Amount < 0 {
+			u.SkipReason = "usage line has unsupported currency or amount"
+			return u, nil
+		}
+		if u.UsageCents, err = checkedCreditSum(u.UsageCents, line.Amount); err != nil {
+			return u, err
+		}
+		for _, credit := range line.PretaxCredits {
+			switch credit.Type {
+			case "credit_balance_transaction":
+				u.CreditCents, err = checkedCreditSum(u.CreditCents, credit.Amount)
+			case "discount":
+				u.DiscountCents, err = checkedCreditSum(u.DiscountCents, credit.Amount)
+			default:
+				u.SkipReason = "usage line has an unsupported pretax credit"
+				return u, nil
+			}
+			if err != nil {
+				return u, err
+			}
+		}
+	}
+	return u, nil
+}
+
+func (h *Handlers) startMatchingCredits(ctx context.Context, client *stripeHTTPClient) {
+	go func() {
+		for ctx.Err() == nil {
+			if h.Config != nil && h.Config.BillingUsageEntitlementsEnabled {
+				started := time.Now()
+				err := h.matchingCreditTick(ctx, client)
+				currentBillingRecorder().RecordBillingWork(ctx, "matching_credit", err != nil, time.Since(started), 1)
+				if err != nil {
+					log.Warn().Err(err).Msg("matching credit reconciliation failed")
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(15 * time.Second):
+			}
+		}
+	}()
+}
+
+func (h *Handlers) matchingCreditTick(ctx context.Context, client *stripeHTTPClient) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	return errors.Join(h.recordPaidMatchingInvoices(ctx, client), h.issueDueMatchingCredits(ctx, client), h.reviewMatchedInvoices(ctx, client))
+}
+
+type matchingCandidate struct {
+	Team, Contract    uuid.UUID
+	Invoice, Customer string
+	Hash              string
+	Start, End        time.Time
+	Plan              billing.InvoiceClosePlan
+}
+
+// Collection is the durable record of payment: invoice.paid webhooks wake it
+// and its poller recovers missed events, so a paid collection is the trigger.
+func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *stripeHTTPClient) error {
+	rows, err := h.Pool.Query(ctx, `SELECT r.team_id,r.contract_id,j.invoice_id,c.customer_id,k.settlement_hash,j.period_start,j.period_end,j.plan
+ FROM billing_contract_matching_rule r
+ JOIN billing_commercial_contract c ON c.id=r.contract_id
+ JOIN billing_invoice_close j ON j.team_id=r.team_id AND j.state='released' AND j.period_start>=r.effective_from
+  AND j.period_start>=c.starts_at AND (c.ends_at IS NULL OR j.period_start<c.ends_at) AND (r.revoked_at IS NULL OR j.period_start<r.revoked_at)
+  AND j.plan->>'customer'=c.customer_id
+ JOIN billing_invoice_collection k ON k.invoice_id=j.invoice_id AND k.state='paid'
+ WHERE NOT EXISTS(SELECT 1 FROM billing_matching_credit m WHERE m.invoice_id=j.invoice_id)
+ ORDER BY j.period_start,j.invoice_id LIMIT 20`)
+	if err != nil {
+		return err
+	}
+	var candidates []matchingCandidate
+	for rows.Next() {
+		var m matchingCandidate
+		var raw []byte
+		if err = rows.Scan(&m.Team, &m.Contract, &m.Invoice, &m.Customer, &m.Hash, &m.Start, &m.End, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		if err = json.Unmarshal(raw, &m.Plan); err != nil {
+			rows.Close()
+			return err
+		}
+		candidates = append(candidates, m)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	var errs []error
+	for _, m := range candidates {
+		errs = append(errs, h.recordMatchingInvoice(ctx, client, m))
+	}
+	return errors.Join(errs...)
+}
+
+func (h *Handlers) recordMatchingInvoice(ctx context.Context, client *stripeHTTPClient, m matchingCandidate) error {
+	inv, err := client.RetrieveBillingInvoice(ctx, m.Invoice)
+	if err != nil {
+		return err
+	}
+	if inv.ID != m.Invoice || inv.Customer != m.Customer {
+		return fmt.Errorf("matching invoice %s ownership changed", m.Invoice)
+	}
+	if inv.Status != "paid" || inv.AmountRemaining == nil || *inv.AmountRemaining != 0 {
+		return fmt.Errorf("matching invoice %s is not fully paid", m.Invoice)
+	}
+	u, err := matchingInvoiceUsage(inv, m.Plan.CreditPrices)
+	if err != nil {
+		return err
+	}
+	if u.SkipReason == "" && invoiceSettlementHash(inv) != m.Hash {
+		u.SkipReason = "invoice changed after its verified settlement"
+	}
+	evidence, err := json.Marshal(inv)
+	if err != nil {
+		return err
+	}
+	var reason *string
+	if u.SkipReason != "" {
+		reason = &u.SkipReason
+	}
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var id uuid.UUID
+	err = tx.QueryRow(ctx, `INSERT INTO billing_matching_credit(team_id,contract_id,invoice_id,customer_id,period_start,period_end,usage_cents,credit_applied_cents,discount_cents,matchable_cents,amount_cents,skip_reason,invoice_evidence,state,idempotency_key)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,0,0,$10,$11,'skipped','') ON CONFLICT(invoice_id) DO NOTHING RETURNING id`,
+		m.Team, m.Contract, m.Invoice, m.Customer, m.Start, m.End, u.UsageCents, u.CreditCents, u.DiscountCents, reason, evidence).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if reason != nil {
+		if _, err = tx.Exec(ctx, `UPDATE billing_matching_credit SET flagged_at=clock_timestamp(),flag_reason=$2 WHERE id=$1`, id, *reason); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func (h *Handlers) issueDueMatchingCredits(ctx context.Context, client *stripeHTTPClient) error {
+	rows, err := h.Pool.Query(ctx, `SELECT id FROM billing_matching_credit WHERE state IN ('pending','uncertain') AND next_attempt_at<=clock_timestamp() ORDER BY next_attempt_at,id LIMIT 20`)
+	if err != nil {
+		return err
+	}
+	var due []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		due = append(due, id)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	var errs []error
+	for _, id := range due {
+		issueErr := h.issueMatchingCredit(ctx, client, id)
+		ack, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		var err error
+		switch {
+		case issueErr == nil:
+			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET failures=0,last_error=NULL WHERE id=$1`, id)
+		case errors.Is(issueErr, errMatchingDeferred) || errors.Is(issueErr, errCreditInventoryPending):
+			issueErr = nil
+			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET next_attempt_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, id)
+		default:
+			log.Error().Err(issueErr).Str("matching_credit_id", id.String()).Msg("matching credit issuance failed; inspect before replaying")
+			_, err = h.Pool.Exec(ack, `UPDATE billing_matching_credit SET failures=least(failures+1,10000),last_error=$2,
+ next_attempt_at=clock_timestamp()+make_interval(secs=>least(300,10*power(2,least(failures,5)))::double precision) WHERE id=$1`, id, issueErr.Error())
+		}
+		cancel()
+		errs = append(errs, issueErr, err)
+	}
+	return errors.Join(errs...)
+}
+
+// Issuance shares the invoice closer's per-team lock and waits out any close
+// in progress: a close freezes the eligible credit set, so a grant appearing
+// mid-close would wedge it. A grant issued between closes simply funds the next.
+func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPClient, id uuid.UUID) error {
+	var team, contract uuid.UUID
+	var customer, key string
+	if err := h.Pool.QueryRow(ctx, `SELECT team_id,contract_id,customer_id,idempotency_key FROM billing_matching_credit WHERE id=$1`, id).Scan(&team, &contract, &customer, &key); err != nil {
+		return err
+	}
+	lock, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = lock.Rollback(cleanup)
+	}()
+	var locked, closing bool
+	if err = lock.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+team.String()).Scan(&locked); err != nil {
+		return err
+	}
+	if !locked {
+		return errMatchingDeferred
+	}
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_invoice_close WHERE team_id=$1 AND state IN ('prepared','adjusted','finalizing'))`, team).Scan(&closing); err != nil {
+		return err
+	}
+	if closing {
+		return errMatchingDeferred
+	}
+	var state string
+	var payload []byte
+	var first *time.Time
+	err = h.Pool.QueryRow(ctx, `UPDATE billing_matching_credit SET state='uncertain',first_attempt_at=COALESCE(first_attempt_at,clock_timestamp())
+ WHERE id=$1 AND state IN ('pending','uncertain') RETURNING state,request_payload,first_attempt_at`, id).Scan(&state, &payload, &first)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if first == nil || time.Since(*first) >= 23*time.Hour {
+		return h.discoverMatchingCredit(ctx, client, id, contract, customer)
+	}
+	form, err := matchingGrantForm(payload)
+	if err != nil {
+		return err
+	}
+	grant, err := client.createCreditGrant(ctx, form, key)
+	if err != nil {
+		return err
+	}
+	return h.confirmMatchingCredit(ctx, id, grant)
+}
+
+func (h *Handlers) confirmMatchingCredit(ctx context.Context, id uuid.UUID, grant entitlementGrant) error {
+	raw, err := json.Marshal(grant)
+	if err != nil {
+		return err
+	}
+	_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET state='issued',stripe_credit_grant_id=$2,issuance_evidence=$3,issued_at=clock_timestamp() WHERE id=$1 AND state='uncertain'`, id, grant.ID, raw)
+	return err
+}
+
+// Past Stripe's idempotency window a replay could create a second grant, so
+// only the provider inventory can settle the outcome.
+func (h *Handlers) discoverMatchingCredit(ctx context.Context, client *stripeHTTPClient, id, contract uuid.UUID, customer string) error {
+	if err := h.syncCreditInventory(ctx, contract, customer, client); err != nil {
+		return err
+	}
+	rows, err := h.Pool.Query(ctx, `SELECT grant_id FROM billing_provider_credit WHERE customer_id=$1 AND evidence->'metadata'->>'matching_credit_id'=$2 LIMIT 2`, customer, id.String())
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var grant string
+		if err = rows.Scan(&grant); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, grant)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	if len(ids) != 1 {
+		return fmt.Errorf("matching credit outcome unknown after the replay window (%d provider grants); operator recovery required", len(ids))
+	}
+	grant, err := client.retrieveEntitlementGrant(ctx, ids[0])
+	if err != nil {
+		return err
+	}
+	if grant.VoidedAt != 0 {
+		return errors.New("recovered matching grant was voided; operator recovery required")
+	}
+	return h.confirmMatchingCredit(ctx, id, grant)
+}
+
+// The form is derived exclusively from the frozen request so every replay
+// sends identical parameters under the same idempotency key.
+func matchingGrantForm(raw []byte) (url.Values, error) {
+	var g entitlementGrant
+	if err := json.Unmarshal(raw, &g); err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	var name string
+	if err := json.Unmarshal(fields["name"], &name); err != nil {
+		return nil, err
+	}
+	if g.Customer == "" || g.Category != "promotional" || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value <= 0 || g.Priority != 50 || g.ExpiresAt != 0 || g.EffectiveAt != 0 || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Metadata["matching_credit_id"] == "" || g.Metadata["invoice_id"] == "" || len(g.Metadata) != 2 || name == "" {
+		return nil, errors.New("incomplete saved matching credit request")
+	}
+	return url.Values{
+		"customer": {g.Customer}, "category": {g.Category}, "name": {name},
+		"amount[type]": {"monetary"}, "amount[monetary][currency]": {"usd"}, "amount[monetary][value]": {strconv.FormatInt(g.Amount.Monetary.Value, 10)},
+		"priority": {"50"}, "applicability_config[scope][price_type]": {"metered"},
+		"metadata[matching_credit_id]": {g.Metadata["matching_credit_id"]}, "metadata[invoice_id]": {g.Metadata["invoice_id"]},
+	}, nil
+}
+
+// Refunds and credit notes after a match are surfaced for staff; matched
+// credit is never clawed back automatically.
+func (h *Handlers) reviewMatchedInvoices(ctx context.Context, client *stripeHTTPClient) error {
+	rows, err := h.Pool.Query(ctx, `SELECT id,invoice_id,customer_id FROM billing_matching_credit
+ WHERE amount_cents>0 AND flagged_at IS NULL AND created_at>clock_timestamp()-interval '120 days'
+  AND (review_checked_at IS NULL OR review_checked_at<clock_timestamp()-interval '1 day')
+ ORDER BY review_checked_at NULLS FIRST,id LIMIT 10`)
+	if err != nil {
+		return err
+	}
+	type matched struct {
+		ID                uuid.UUID
+		Invoice, Customer string
+	}
+	var due []matched
+	for rows.Next() {
+		var m matched
+		if err = rows.Scan(&m.ID, &m.Invoice, &m.Customer); err != nil {
+			rows.Close()
+			return err
+		}
+		due = append(due, m)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	var errs []error
+	for _, m := range due {
+		reason, evidence, err := client.matchedInvoiceReversal(ctx, m.Invoice, m.Customer)
+		if err != nil {
+			errs = append(errs, err)
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET review_checked_at=clock_timestamp()-interval '23 hours' WHERE id=$1`, m.ID)
+		} else if reason != "" {
+			log.Warn().Str("matching_credit_id", m.ID.String()).Str("invoice_id", m.Invoice).Str("reason", reason).Msg("matched invoice was reversed; staff review required")
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET review_checked_at=clock_timestamp(),flagged_at=clock_timestamp(),flag_reason=$2,flag_evidence=$3 WHERE id=$1 AND flagged_at IS NULL`, m.ID, reason, evidence)
+		} else {
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET review_checked_at=clock_timestamp() WHERE id=$1`, m.ID)
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func (c *stripeHTTPClient) matchedInvoiceReversal(ctx context.Context, id, customer string) (string, []byte, error) {
+	inv, err := c.RetrieveBillingInvoice(ctx, id)
+	if err != nil {
+		return "", nil, err
+	}
+	if inv.Customer != customer {
+		return "", nil, errors.New("matched invoice ownership changed")
+	}
+	if inv.Status != "paid" || inv.PrePaymentCreditNotes != 0 || inv.PostPaymentCreditNotes != 0 {
+		raw, _ := json.Marshal(inv)
+		return "credit note issued or payment reversed on matched invoice", raw, nil
+	}
+	var payments struct {
+		Data []struct {
+			Invoice    string `json:"invoice"`
+			AmountPaid int64  `json:"amount_paid"`
+			Payment    struct {
+				Type   string `json:"type"`
+				Intent string `json:"payment_intent"`
+			} `json:"payment"`
+		} `json:"data"`
+		HasMore bool `json:"has_more"`
+	}
+	q := url.Values{"invoice": {id}, "status": {"paid"}, "limit": {"100"}}
+	if err = c.doForm(ctx, http.MethodGet, "/v1/invoice_payments?"+q.Encode(), nil, &payments, ""); err != nil {
+		return "", nil, err
+	}
+	if payments.HasMore {
+		return "", nil, errors.New("matched invoice payments exceed the supported bound")
+	}
+	for _, p := range payments.Data {
+		if p.Invoice != id || p.Payment.Type != "payment_intent" || p.Payment.Intent == "" {
+			continue
+		}
+		var intent struct {
+			ID           string `json:"id"`
+			LatestCharge string `json:"latest_charge"`
+		}
+		if err = c.doForm(ctx, http.MethodGet, "/v1/payment_intents/"+url.PathEscape(p.Payment.Intent), nil, &intent, ""); err != nil {
+			return "", nil, err
+		}
+		raw, err := c.verifyProCharge(ctx, intent.LatestCharge, p.Payment.Intent, customer, p.AmountPaid)
+		var review *proPaymentReviewError
+		if errors.As(err, &review) {
+			return "payment on matched invoice was refunded or disputed", raw, nil
+		}
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	return "", nil, nil
+}

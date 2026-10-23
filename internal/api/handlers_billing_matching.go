@@ -1,0 +1,183 @@
+package api
+
+import (
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/superserve-ai/sandbox/internal/billing"
+)
+
+type matchingRuleRequest struct {
+	BasisPoints       int32      `json:"basis_points"`
+	CapCents          int64      `json:"cap_cents"`
+	PriorMatchedCents int64      `json:"prior_matched_cents"`
+	EffectiveFrom     *time.Time `json:"effective_from"`
+}
+
+const matchingRuleJSON = `jsonb_build_object('contract_id',r.contract_id,'offer_key',c.offer_key,'basis_points',r.basis_points,'cap_cents',r.cap_cents,
+ 'prior_matched_cents',r.prior_matched_cents,'matched_cents',m.matched,'remaining_cents',greatest(r.cap_cents-r.prior_matched_cents-m.matched,0),
+ 'eligible_source',r.eligible_source,'effective_from',r.effective_from,'source',r.source,'created_by',r.created_by,'created_at',r.created_at,
+ 'revoked_at',r.revoked_at,'revoked_by',r.revoked_by)`
+
+const matchingCreditJSON = `jsonb_build_object('id',x.id,'team_id',x.team_id,'contract_id',x.contract_id,'invoice_id',x.invoice_id,'period_start',x.period_start,'period_end',x.period_end,
+ 'usage_cents',x.usage_cents,'credit_applied_cents',x.credit_applied_cents,'discount_cents',x.discount_cents,'matchable_cents',x.matchable_cents,
+ 'amount_cents',x.amount_cents,'state',x.state,'skip_reason',x.skip_reason,'stripe_credit_grant_id',x.stripe_credit_grant_id,'issued_at',x.issued_at,
+ 'last_error',x.last_error,'flagged_at',x.flagged_at,'flag_reason',x.flag_reason,'acknowledged_at',x.acknowledged_at,'acknowledged_by',x.acknowledged_by,'created_at',x.created_at)`
+
+func (h *Handlers) GetTeamMatchingCredit(c *gin.Context) {
+	if _, ok := h.requirePlatformBilling(c, platformBillingReadPermission); !ok {
+		return
+	}
+	team, err := internalTeamID(c)
+	if err != nil {
+		return
+	}
+	var raw []byte
+	err = h.Pool.QueryRow(c.Request.Context(), `SELECT jsonb_build_object(
+ 'rules',(SELECT COALESCE(jsonb_agg(`+matchingRuleJSON+` ORDER BY r.created_at DESC),'[]') FROM billing_contract_matching_rule r
+   JOIN billing_commercial_contract c ON c.id=r.contract_id
+   CROSS JOIN LATERAL (SELECT COALESCE(sum(amount_cents),0) matched FROM billing_matching_credit WHERE contract_id=r.contract_id) m WHERE r.team_id=$1),
+ 'credits',(SELECT COALESCE(jsonb_agg(`+matchingCreditJSON+` ORDER BY x.created_at DESC),'[]') FROM
+   (SELECT * FROM billing_matching_credit WHERE team_id=$1 ORDER BY created_at DESC LIMIT 200) x))`, team).Scan(&raw)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
+}
+
+func (h *Handlers) ListMatchingCreditFlags(c *gin.Context) {
+	if _, ok := h.requirePlatformBilling(c, platformBillingReadPermission); !ok {
+		return
+	}
+	var raw []byte
+	err := h.Pool.QueryRow(c.Request.Context(), `SELECT COALESCE(jsonb_agg(`+matchingCreditJSON+` ORDER BY x.flagged_at),'[]') FROM
+ (SELECT * FROM billing_matching_credit WHERE flagged_at IS NOT NULL AND acknowledged_at IS NULL ORDER BY flagged_at LIMIT 200) x`).Scan(&raw)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	c.Data(http.StatusOK, "application/json; charset=utf-8", []byte(`{"flags":`+string(raw)+`}`))
+}
+
+// Attaches a matching rule to the team's current arrangement so hand-managed
+// deals move into the system. Cap already matched by hand is carried over.
+func (h *Handlers) AttachTeamMatchingRule(c *gin.Context) {
+	actor, ok := h.requirePlatformBilling(c, platformBillingWritePermission)
+	if !ok {
+		return
+	}
+	team, err := internalTeamID(c)
+	if err != nil {
+		return
+	}
+	var req matchingRuleRequest
+	if err = c.ShouldBindJSON(&req); err != nil || req.BasisPoints < 1 || req.BasisPoints > 10000 || req.CapCents <= 0 || req.PriorMatchedCents < 0 || req.PriorMatchedCents > req.CapCents {
+		respondErrorMsg(c, "bad_request", "basis_points must be 1-10000, cap_cents positive, and prior_matched_cents between 0 and cap_cents", http.StatusBadRequest)
+		return
+	}
+	ctx := c.Request.Context()
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	defer tx.Rollback(ctx)
+	var contract uuid.UUID
+	var anchor time.Time
+	var tracked bool
+	err = tx.QueryRow(ctx, `SELECT c.id,c.entitlement_anchor,EXISTS(SELECT 1 FROM billing_entitlement_work w WHERE w.contract_id=c.id)
+ FROM billing_commercial_contract c WHERE c.team_id=$1 AND c.status='active' AND (c.ends_at IS NULL OR c.ends_at>clock_timestamp()) FOR UPDATE`, team).Scan(&contract, &anchor, &tracked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		respondErrorMsg(c, "conflict", "team has no active commercial contract to attach matching to", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if !tracked {
+		respondErrorMsg(c, "conflict", "contract is not managed by the entitlement worker", http.StatusConflict)
+		return
+	}
+	effective, _, ok := billing.AnniversaryPeriod(anchor, h.nowUTC())
+	if req.EffectiveFrom != nil {
+		effective, ok = req.EffectiveFrom.UTC().Truncate(time.Second), true
+	}
+	if !ok {
+		respondErrorMsg(c, "bad_request", "effective_from is required before the contract anniversary", http.StatusBadRequest)
+		return
+	}
+	err = insertContractMatchingRule(ctx, tx, matchingRule{ContractID: contract, TeamID: team, Terms: matchingTerms{BasisPoints: req.BasisPoints, CapCents: req.CapCents}, PriorMatchedCents: req.PriorMatchedCents, EffectiveFrom: effective, Source: "staff", Actor: &actor})
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		respondErrorMsg(c, "conflict", "contract already has a matching rule", http.StatusConflict)
+		return
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"contract_id": contract, "basis_points": req.BasisPoints, "cap_cents": req.CapCents, "prior_matched_cents": req.PriorMatchedCents, "effective_from": effective, "source": "staff", "created_by": actor})
+}
+
+// Revocation stops matching for usage periods that start afterwards; credit
+// already earned is still issued.
+func (h *Handlers) RevokeTeamMatchingRule(c *gin.Context) {
+	actor, ok := h.requirePlatformBilling(c, platformBillingWritePermission)
+	if !ok {
+		return
+	}
+	team, err := internalTeamID(c)
+	if err != nil {
+		return
+	}
+	var contract uuid.UUID
+	var revoked time.Time
+	err = h.Pool.QueryRow(c.Request.Context(), `UPDATE billing_contract_matching_rule r SET revoked_at=clock_timestamp(),revoked_by=$2
+ FROM billing_commercial_contract c WHERE c.id=r.contract_id AND r.team_id=$1 AND c.status<>'ended' AND r.revoked_at IS NULL RETURNING r.contract_id,r.revoked_at`, team, actor).Scan(&contract, &revoked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		respondErrorMsg(c, "not_found", "team has no active matching rule", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"contract_id": contract, "revoked_at": revoked, "revoked_by": actor})
+}
+
+func (h *Handlers) AcknowledgeMatchingCreditFlag(c *gin.Context) {
+	actor, ok := h.requirePlatformBilling(c, platformBillingWritePermission)
+	if !ok {
+		return
+	}
+	team, err := internalTeamID(c)
+	if err != nil {
+		return
+	}
+	credit, err := parseUUIDParam(c, "credit_id")
+	if err != nil {
+		return
+	}
+	var acknowledged time.Time
+	err = h.Pool.QueryRow(c.Request.Context(), `UPDATE billing_matching_credit SET acknowledged_at=clock_timestamp(),acknowledged_by=$3
+ WHERE id=$1 AND team_id=$2 AND flagged_at IS NOT NULL AND acknowledged_at IS NULL RETURNING acknowledged_at`, credit, team, actor).Scan(&acknowledged)
+	if errors.Is(err, pgx.ErrNoRows) {
+		respondErrorMsg(c, "not_found", "no unacknowledged flag for this matching credit", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"id": credit, "acknowledged_at": acknowledged, "acknowledged_by": actor})
+}
