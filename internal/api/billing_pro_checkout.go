@@ -33,25 +33,43 @@ var legacyProOffers = map[string]proOffer{
 // paidPlanOffers matches every offer_key in the self-serve plan catalog.
 const paidPlanOffers = "(SELECT offer_key FROM billing_plan)"
 
-// proOffer returns a catalog plan's current terms and configured Stripe price.
-func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, bool, error) {
+var errOfferUnavailable = errors.New("plan is not available")
+
+// proOffer returns a purchasable catalog plan's current terms and configured Stripe price.
+func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, error) {
 	if h.Config == nil || h.Pool == nil {
-		return proOffer{}, false, errors.New("billing is not configured")
+		return proOffer{}, errors.New("billing is not configured")
 	}
 	o := proOffer{Key: key}
 	var available bool
 	err := h.Pool.QueryRow(ctx, `SELECT charge_amount_cents,charge_interval_months,monthly_credit_cents,available FROM billing_plan WHERE offer_key=$1`, key).Scan(&o.Amount, &o.Months, &o.Credit, &available)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return o, false, errors.New("unsupported offer")
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !available) {
+		return o, errOfferUnavailable
 	}
 	if err != nil {
-		return o, false, err
+		return o, err
 	}
 	o.Price = h.Config.PlanPriceID(key)
 	if o.Price == "" {
-		return o, false, fmt.Errorf("%s offer is not configured", key)
+		return o, errOfferUnavailable
 	}
-	return o, available, nil
+	return o, nil
+}
+
+// checkoutOffer returns the frozen terms of the team's pending purchase of key,
+// or the catalog's current terms when no such purchase is pending.
+func (h *Handlers) checkoutOffer(ctx context.Context, team uuid.UUID, key string) (proOffer, bool, error) {
+	var choice proChoice
+	err := h.Pool.QueryRow(ctx, `SELECT COALESCE(offer_key,''),state,COALESCE(base_price_id,''),request_payload FROM billing_signup_choice WHERE team_id=$1`, team).Scan(&choice.Offer, &choice.State, &choice.Price, &choice.Payload)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return proOffer{}, false, err
+	}
+	if err == nil && choice.State == "pending" && choice.Offer == key {
+		o, err := choice.frozenOffer()
+		return o, true, err
+	}
+	o, err := h.proOffer(ctx, key)
+	return o, false, err
 }
 
 // frozenProOffer returns the terms a purchase was started with.
@@ -111,12 +129,13 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
-	offer, available, err := h.proOffer(c.Request.Context(), req.Offer)
-	if err == nil && !available {
-		err = errors.New("plan is not available")
+	offer, resuming, err := h.checkoutOffer(c.Request.Context(), team, req.Offer)
+	if errors.Is(err, errOfferUnavailable) {
+		respondErrorMsg(c, "invalid_offer", "plan is not available", http.StatusBadRequest)
+		return
 	}
 	if err != nil {
-		respondErrorMsg(c, "invalid_offer", err.Error(), http.StatusBadRequest)
+		respondError(c, ErrInternal)
 		return
 	}
 	if _, ok := h.Stripe.(*stripeHTTPClient); !ok {
@@ -206,7 +225,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 	attempt := uuid.New()
 	var choice proChoice
 	if state == "selecting" {
-		if account.CheckoutInitializingAt.Valid || account.CheckoutCompletedAt.Valid {
+		if resuming || account.CheckoutInitializingAt.Valid || account.CheckoutCompletedAt.Valid {
 			proConflict(c)
 			return
 		}

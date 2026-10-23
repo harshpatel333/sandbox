@@ -2,8 +2,16 @@
 -- purchase, so editing a row changes only checkouts started afterwards; rows
 -- are never deleted because contracts keep referencing their offer_key.
 -- Stripe price IDs differ per environment and stay in API configuration.
+-- Every plan activates with its own limits.
+INSERT INTO plan_limits
+    SELECT 'starter_monthly', max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib
+    FROM plan_limits WHERE offer_key = 'free';
+INSERT INTO plan_limits
+    SELECT 'starter_annual', max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib
+    FROM plan_limits WHERE offer_key = 'free';
+
 CREATE TABLE billing_plan (
-    offer_key text PRIMARY KEY CHECK (offer_key ~ '^[a-z][a-z0-9]*_(monthly|annual)$'),
+    offer_key text PRIMARY KEY REFERENCES plan_limits(offer_key) CHECK (offer_key ~ '^[a-z][a-z0-9]*_(monthly|annual)$'),
     family text NOT NULL CHECK (family ~ '^[a-z][a-z0-9]*$'),
     display_name text NOT NULL CHECK (btrim(display_name) <> ''),
     charge_interval_months integer NOT NULL CHECK (charge_interval_months IN (1, 12)),
@@ -28,19 +36,21 @@ DO $$ DECLARE r text; BEGIN
     END LOOP;
 END $$;
 
+-- Contracts and purchases keep referencing a plan's offer_key, and the
+-- billing guards below treat only catalog plans as paid plans.
+CREATE FUNCTION guard_billing_plan_identity() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'billing plans cannot be deleted or renamed';
+END $$;
+CREATE TRIGGER billing_plan_identity_guard BEFORE DELETE OR UPDATE OF offer_key ON billing_plan
+    FOR EACH ROW EXECUTE FUNCTION guard_billing_plan_identity();
+
 -- Starter stays unavailable until its annual price and credits are decided.
 INSERT INTO billing_plan VALUES
     ('starter_monthly', 'starter', 'Starter', 1, 10000, 10000, false, 10),
     ('starter_annual', 'starter', 'Starter', 12, 100000, 10000, false, 11),
     ('pro_monthly', 'pro', 'Pro', 1, 120000, 100000, true, 20),
     ('pro_annual', 'pro', 'Pro', 12, 1200000, 100000, true, 21);
-
-INSERT INTO plan_limits
-    SELECT 'starter_monthly', max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib
-    FROM plan_limits WHERE offer_key = 'free';
-INSERT INTO plan_limits
-    SELECT 'starter_annual', max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib
-    FROM plan_limits WHERE offer_key = 'free';
 
 CREATE FUNCTION billing_plan_offer(p_offer text) RETURNS boolean LANGUAGE sql STABLE AS $$
     SELECT EXISTS (SELECT 1 FROM billing_plan WHERE offer_key = p_offer);
@@ -75,9 +85,11 @@ BEGIN
     END IF;
     RETURN NEW;
 END $$;
-CREATE TRIGGER billing_plan_contract_guard BEFORE INSERT ON billing_commercial_contract
+CREATE TRIGGER billing_plan_contract_guard
+    BEFORE INSERT OR UPDATE OF offer_key, charge_kind, entitlement_kind, entitlement_cadence, charge_interval_months
+    ON billing_commercial_contract
     FOR EACH ROW EXECUTE FUNCTION guard_billing_plan_contract();
-REVOKE ALL ON FUNCTION billing_plan_offer(text), guard_billing_signup_offer(), guard_billing_plan_contract() FROM PUBLIC;
+REVOKE ALL ON FUNCTION billing_plan_offer(text), guard_billing_plan_identity(), guard_billing_signup_offer(), guard_billing_plan_contract() FROM PUBLIC;
 
 DROP INDEX billing_signup_recovery;
 CREATE INDEX billing_signup_recovery ON billing_signup_choice(next_check_at,team_id) WHERE offer_key <> 'free';
