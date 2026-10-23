@@ -35,11 +35,15 @@ const paidPlanOffers = "(SELECT offer_key FROM billing_plan)"
 
 // proOffer returns a catalog plan's current terms and configured Stripe price.
 func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, bool, error) {
-	if h.Config == nil {
+	if h.Config == nil || h.Pool == nil {
 		return proOffer{}, false, errors.New("billing is not configured")
 	}
-	t, err := h.planTerms(ctx, key)
-	o := proOffer{Key: key, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents}
+	o := proOffer{Key: key}
+	var available bool
+	err := h.Pool.QueryRow(ctx, `SELECT charge_amount_cents,charge_interval_months,monthly_credit_cents,available FROM billing_plan WHERE offer_key=$1`, key).Scan(&o.Amount, &o.Months, &o.Credit, &available)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return o, false, errors.New("unsupported offer")
+	}
 	if err != nil {
 		return o, false, err
 	}
@@ -47,7 +51,7 @@ func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, bool, er
 	if o.Price == "" {
 		return o, false, fmt.Errorf("%s offer is not configured", key)
 	}
-	return o, t.Available, nil
+	return o, available, nil
 }
 
 // frozenProOffer returns the terms a purchase was started with.
