@@ -89,3 +89,31 @@ func TestValidateTemplateShapeComputeCeilings(t *testing.T) {
 		})
 	}
 }
+
+func TestTemplateShapeDefaultsStayWithinTeamLimits(t *testing.T) {
+	team, systemID := uuid.New(), uuid.New()
+	small := teamLimits{MaxVCPU: 1, MaxMemoryMiB: 512, MaxDiskMiB: 2048}
+	two := int32(2)
+	cases := []struct {
+		name    string
+		team    uuid.UUID
+		limits  teamLimits
+		vcpu    *int32
+		want    [3]int32
+		invalid bool
+	}{
+		{"legacy defaults", team, legacyLimits(db.Team{ID: team}), nil, [3]int32{1, 1024, 4096}, false},
+		{"capped at a smaller plan", team, small, nil, [3]int32{1, 512, 2048}, false},
+		{"explicit sizes are not capped", team, small, &two, [3]int32{2, 512, 2048}, true},
+		{"system team keeps the defaults", systemID, small, nil, [3]int32{1, 1024, 4096}, false},
+	}
+	for _, tc := range cases {
+		vcpu, mem, disk := templateShape(tc.team, systemID, tc.limits, tc.vcpu, nil, nil)
+		if got := [3]int32{vcpu, mem, disk}; got != tc.want {
+			t.Errorf("%s: shape = %v, want %v", tc.name, got, tc.want)
+		}
+		if msg := validateTemplateShape(tc.team, systemID, tc.limits, vcpu, mem, disk); (msg != "") != tc.invalid {
+			t.Errorf("%s: validation = %q", tc.name, msg)
+		}
+	}
+}

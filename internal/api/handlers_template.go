@@ -113,6 +113,21 @@ const (
 // `.`, `_`, `/`, `-` in the middle. URL-safe, shell-safe, no Unicode.
 var templateNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9._/-]*[a-z0-9])?$`)
 
+// templateShape fills the fields a request leaves out with the defaults,
+// capped at the team's limits; validateTemplateShape still checks the result.
+func templateShape(teamID, systemTeamID uuid.UUID, limits teamLimits, vcpu, memMib, diskMib *int32) (int32, int32, int32) {
+	pick := func(requested *int32, fallback, limit int32) int32 {
+		if requested != nil {
+			return *requested
+		}
+		if teamID != systemTeamID && limit < fallback {
+			return limit
+		}
+		return fallback
+	}
+	return pick(vcpu, defaultVcpu, limits.MaxVCPU), pick(memMib, defaultMemoryMi, limits.MaxMemoryMiB), pick(diskMib, defaultDiskMib, limits.MaxDiskMiB)
+}
+
 // validateTemplateShape returns a user-facing error message on failure, "" on pass.
 // limits are the team's effective limits; the system team has no team caps.
 func validateTemplateShape(teamID, systemTeamID uuid.UUID, limits teamLimits, vcpu, memMib, diskMib int32) string {
@@ -435,24 +450,13 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 			http.StatusBadRequest)
 		return
 	}
-	vcpu := int32(defaultVcpu)
-	if req.Vcpu != nil {
-		vcpu = *req.Vcpu
-	}
-	memMib := int32(defaultMemoryMi)
-	if req.MemoryMib != nil {
-		memMib = *req.MemoryMib
-	}
-	diskMib := int32(defaultDiskMib)
-	if req.DiskMib != nil {
-		diskMib = *req.DiskMib
-	}
 	limits, err := h.teamEffectiveLimits(c.Request.Context(), teamID)
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read team limits failed")
 		respondError(c, ErrInternal)
 		return
 	}
+	vcpu, memMib, diskMib := templateShape(teamID, h.systemTeamID(), limits, req.Vcpu, req.MemoryMib, req.DiskMib)
 	if msg := validateTemplateShape(teamID, h.systemTeamID(), limits, vcpu, memMib, diskMib); msg != "" {
 		respondErrorMsg(c, "bad_request", msg, http.StatusBadRequest)
 		return
