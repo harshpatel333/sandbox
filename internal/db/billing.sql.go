@@ -2560,7 +2560,7 @@ func (q *Queries) ListPricingRatesForPlanAt(ctx context.Context, arg ListPricing
 }
 
 const listPricingV2ActivationBuckets = `-- name: ListPricingV2ActivationBuckets :many
-SELECT t.id AS team_id, b.bucket::text AS bucket, COALESCE(b.reason, '')::text AS reason
+SELECT t.id AS team_id, b.bucket::text AS bucket, COALESCE(b.reason, '')::text AS reason, COALESCE(b.stripe_customer_id, '')::text AS stripe_customer_id
 FROM team t
 CROSS JOIN LATERAL pricing_v2_activation_bucket(t.id) b
 WHERE t.home_region = $1
@@ -2574,9 +2574,10 @@ type ListPricingV2ActivationBucketsParams struct {
 }
 
 type ListPricingV2ActivationBucketsRow struct {
-	TeamID uuid.UUID `json:"team_id"`
-	Bucket string    `json:"bucket"`
-	Reason string    `json:"reason"`
+	TeamID           uuid.UUID `json:"team_id"`
+	Bucket           string    `json:"bucket"`
+	Reason           string    `json:"reason"`
+	StripeCustomerID string    `json:"stripe_customer_id"`
 }
 
 func (q *Queries) ListPricingV2ActivationBuckets(ctx context.Context, arg ListPricingV2ActivationBucketsParams) ([]ListPricingV2ActivationBucketsRow, error) {
@@ -2588,7 +2589,12 @@ func (q *Queries) ListPricingV2ActivationBuckets(ctx context.Context, arg ListPr
 	items := []ListPricingV2ActivationBucketsRow{}
 	for rows.Next() {
 		var i ListPricingV2ActivationBucketsRow
-		if err := rows.Scan(&i.TeamID, &i.Bucket, &i.Reason); err != nil {
+		if err := rows.Scan(
+			&i.TeamID,
+			&i.Bucket,
+			&i.Reason,
+			&i.StripeCustomerID,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

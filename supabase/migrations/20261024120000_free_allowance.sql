@@ -199,27 +199,30 @@ DO $$ DECLARE r text; f regprocedure; BEGIN
 END $$;
 
 CREATE OR REPLACE FUNCTION pricing_v2_activation_bucket(p_team uuid)
-RETURNS TABLE(bucket text, reason text)
-LANGUAGE plpgsql STABLE AS $$
-BEGIN
- RETURN QUERY
- SELECT CASE WHEN x.reason IS NULL THEN x.target WHEN x.reason = 'already_assigned' THEN 'assigned' ELSE 'skipped' END, x.reason
+RETURNS TABLE(bucket text, reason text, stripe_customer_id text)
+LANGUAGE sql STABLE AS $$
+ SELECT CASE
+    WHEN x.reason = 'already_assigned' THEN 'assigned'
+    WHEN x.reason IS NOT NULL THEN 'skipped'
+    WHEN lower(COALESCE(x.status, '')) IN ('active','trialing','past_due','unpaid','paused') THEN 'legacy_payg'
+    WHEN x.customer IS NOT NULL OR x.subscription IS NOT NULL THEN 'lapsed'
+    ELSE 'free' END,
+  x.reason, x.customer
  FROM (
-  SELECT CASE
+  SELECT a.stripe_customer_id AS customer, a.stripe_subscription_id AS subscription, a.stripe_subscription_status AS status,
+   CASE
     WHEN EXISTS(SELECT 1 FROM team_plan_assignment pa WHERE pa.team_id = p_team AND pa.effective_to IS NULL) THEN 'already_assigned'
     WHEN qm_team_managed_billing(p_team) THEN 'qm_managed_billing'
     WHEN EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id = p_team AND c.status <> 'ended') THEN 'commercial_contract'
     WHEN EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.team_id = p_team AND o.state <> 'ended') THEN 'yc_operation'
     WHEN EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.team_id = p_team AND o.state NOT IN ('revoked','expired')) THEN 'sponsored_operation'
-    WHEN lower(COALESCE(a.stripe_subscription_status, '')) IN ('active','trialing','past_due','unpaid','paused') THEN NULL
-    WHEN a.stripe_customer_id IS NOT NULL OR a.stripe_subscription_id IS NOT NULL THEN 'card_state_unknown'
-    WHEN EXISTS(SELECT 1 FROM team_credit_grant g WHERE g.team_id = p_team AND g.reason IS DISTINCT FROM 'signup trial credit'
+    WHEN a.stripe_customer_id IS NULL AND a.stripe_subscription_id IS NULL
+     AND EXISTS(SELECT 1 FROM team_credit_grant g WHERE g.team_id = p_team AND g.reason IS DISTINCT FROM 'signup trial credit'
                 AND g.remaining_usd > 0 AND (g.expires_at IS NULL OR g.expires_at > now())) THEN 'no_card_granted_credit'
-    END AS reason,
-   CASE WHEN lower(COALESCE(a.stripe_subscription_status, '')) IN ('active','trialing','past_due','unpaid','paused') THEN 'legacy_payg' ELSE 'free' END AS target
+   END AS reason
   FROM (SELECT p_team AS team_id) t LEFT JOIN team_billing_account a USING (team_id)
  ) x;
-END $$;
+$$;
 REVOKE ALL ON FUNCTION pricing_v2_activation_bucket(uuid) FROM PUBLIC;
 DO $$ BEGIN
  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN GRANT EXECUTE ON FUNCTION pricing_v2_activation_bucket(uuid) TO service_role; END IF;

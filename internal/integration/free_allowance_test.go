@@ -302,7 +302,7 @@ func TestIntegration_PricingV2Activation_Buckets(t *testing.T) {
 	}{
 		{"no card", noCard, "free", ""},
 		{"card on file", payg, "legacy_payg", ""},
-		{"customer without a live subscription", lapsed, "skipped", "card_state_unknown"},
+		{"customer without a live subscription", lapsed, "lapsed", ""},
 		{"no card with granted credit", granted, "skipped", "no_card_granted_credit"},
 		{"already assigned", assigned, "assigned", "already_assigned"},
 	} {

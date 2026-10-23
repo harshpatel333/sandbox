@@ -1715,7 +1715,7 @@ WHERE r.team_id = sqlc.arg(team_id)
   );
 
 -- name: ListPricingV2ActivationBuckets :many
-SELECT t.id AS team_id, b.bucket::text AS bucket, COALESCE(b.reason, '')::text AS reason
+SELECT t.id AS team_id, b.bucket::text AS bucket, COALESCE(b.reason, '')::text AS reason, COALESCE(b.stripe_customer_id, '')::text AS stripe_customer_id
 FROM team t
 CROSS JOIN LATERAL pricing_v2_activation_bucket(t.id) b
 WHERE t.home_region = sqlc.arg(region)
