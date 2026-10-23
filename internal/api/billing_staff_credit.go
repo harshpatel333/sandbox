@@ -26,6 +26,13 @@ var (
 	errStaffCreditReview     = errors.New("the Stripe credit grant for this request does not match it; operator review required")
 )
 
+type staffCreditConflictError struct{ reason string }
+
+func (e staffCreditConflictError) Error() string { return e.reason }
+func (e staffCreditConflictError) Unwrap() error { return errStaffCreditConflict }
+
+func staffCreditConflict(reason string) error { return staffCreditConflictError{reason} }
+
 type staffCreditRequest struct {
 	Key         string `json:"idempotency_key"`
 	AmountCents int64  `json:"amount_cents"`
@@ -180,23 +187,14 @@ func (h *Handlers) grantStaffCredit(ctx context.Context, team, actor uuid.UUID, 
 		return staffCredit{}, err
 	}
 	if credit.AmountCents != req.AmountCents || credit.Reason != req.Reason {
-		return staffCredit{}, errors.Join(errStaffCreditConflict, errors.New("idempotency key was used for a different credit"))
+		return staffCredit{}, staffCreditConflict("idempotency key was used for a different credit")
 	}
 	if credit.State == "issued" {
 		return credit, nil
 	}
-	grant, err := client.issueStaffCredit(ctx, credit, func() error {
-		// Only a new grant needs these checks; one already created for this
-		// request is adopted above even if the team's customer has changed.
-		closing, e := h.usageLedgerPeriodClosing(ctx, team)
-		if e != nil {
-			return e
-		}
-		if closing {
-			return errors.Join(errStaffCreditConflict, errors.New("the team's invoice period is ending or still being closed; retry once it is finalized"))
-		}
-		return h.beginStaffCreditAttempt(ctx, credit)
-	})
+	// Only a new grant needs these checks; one already created for this request
+	// is adopted even if the team's customer has changed.
+	grant, err := client.issueStaffCredit(ctx, credit, func() error { return h.beginStaffCreditAttempt(ctx, team, credit) })
 	if err != nil {
 		_, _ = h.Pool.Exec(context.WithoutCancel(ctx), `UPDATE billing_staff_credit_grant SET last_error=$2 WHERE id=$1 AND state='pending'`, credit.ID, err.Error())
 		return credit, err
@@ -211,21 +209,33 @@ func (h *Handlers) grantStaffCredit(ctx context.Context, team, actor uuid.UUID, 
 	return scanStaffCredit(h.Pool.QueryRow(ctx, `SELECT `+staffCreditColumns+` FROM billing_staff_credit_grant WHERE id=$1`, credit.ID))
 }
 
-// beginStaffCreditAttempt confirms the team still bills the credit's customer
-// and stamps the attempt; the customer binding trigger then refuses to replace
-// that customer until the provider call has had time to finish.
-func (h *Handlers) beginStaffCreditAttempt(ctx context.Context, credit staffCredit) error {
+// beginStaffCreditAttempt confirms under the account lock that the team still
+// bills the credit's customer and no period is ending or closing, then stamps
+// the attempt; the customer binding trigger then refuses to replace that
+// customer until the provider call has had time to finish.
+func (h *Handlers) beginStaffCreditAttempt(ctx context.Context, team uuid.UUID, credit staffCredit) error {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 	var customer *string
-	if err = tx.QueryRow(ctx, `SELECT stripe_customer_id FROM team_billing_account WHERE team_id=(SELECT team_id FROM billing_staff_credit_grant WHERE id=$1) FOR UPDATE`, credit.ID).Scan(&customer); err != nil {
+	err = tx.QueryRow(ctx, `SELECT stripe_customer_id FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, team).Scan(&customer)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errStaffCreditNoCustomer
+	}
+	if err != nil {
 		return err
 	}
 	if customer == nil || *customer != credit.customer {
-		return errors.Join(errStaffCreditConflict, errors.New("team's billing customer changed since the credit was requested"))
+		return staffCreditConflict("team's billing customer changed since the credit was requested")
+	}
+	closing, err := h.usageLedgerPeriodClosing(ctx, team)
+	if err != nil {
+		return err
+	}
+	if closing {
+		return staffCreditConflict("the team's invoice period is ending or still being closed; retry once it is finalized")
 	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_staff_credit_grant SET attempts=attempts+1,attempted_at=clock_timestamp() WHERE id=$1 AND state='pending'`, credit.ID); err != nil {
 		return err
