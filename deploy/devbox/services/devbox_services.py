@@ -248,6 +248,8 @@ def api_env(env, runtime):
         "DEFAULT_HOST_ID": need(runtime, "host_id"),
         "VMD_GRPC_ADDRESS": runtime.get("vmd_grpc_address") or "127.0.0.1:50051",
         "OTEL_SERVICE_VERSION": need(env, "SANDBOX_SHA"),
+        # Devbox preview only: show the PAYG Checkout fallback note.
+        "STRIPE_CHECKOUT_SUBMIT_MESSAGE": "true",
     }
     for key in API_PASSTHROUGH:
         if env.get(key):
