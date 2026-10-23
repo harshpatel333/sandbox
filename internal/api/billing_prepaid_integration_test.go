@@ -654,3 +654,33 @@ func TestPrepaidObservationScalesPastEightGrants(t *testing.T) {
 		t.Fatal("a price-scoped grant did not fall back to the bounded per-grant observation")
 	}
 }
+
+func TestPrepaidSummaryFlagsLowBalanceOnlyWithoutAutoRecharge(t *testing.T) {
+	f := newPrepaidFixture(t)
+	low := func() bool {
+		raw, err := f.h.prepaidSummary(t.Context(), f.team, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var s struct {
+			Low bool `json:"low_balance"`
+		}
+		if err = json.Unmarshal(raw, &s); err != nil {
+			t.Fatal(err)
+		}
+		return s.Low
+	}
+	f.observe(400, true)
+	if !low() {
+		t.Fatal("a $4 balance without auto-recharge is not low")
+	}
+	f.enableAutoRecharge(1000, 2500)
+	if low() {
+		t.Fatal("a balance auto-recharge will refill was flagged low")
+	}
+	f.exec(`UPDATE billing_prepaid_auto_recharge SET enabled=false WHERE team_id=$1`, f.team)
+	f.observe(2500, true)
+	if low() {
+		t.Fatal("a $25 balance was flagged low")
+	}
+}

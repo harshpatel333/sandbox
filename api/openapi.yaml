@@ -3170,11 +3170,14 @@ components:
 
     PrepaidCreditSummary:
       type: object
-      required: [balance_cents, auto_recharge, has_saved_card, purchases]
+      required: [balance_cents, low_balance, auto_recharge, has_saved_card, purchases]
       properties:
         balance_cents:
           type: integer
           format: int64
+        low_balance:
+          type: boolean
+          description: Balance is below $5 and auto-recharge is off.
         has_saved_card:
           type: boolean
         auto_recharge:
