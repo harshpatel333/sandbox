@@ -13,13 +13,13 @@ import (
 )
 
 type matchingRuleRequest struct {
-	BasisPoints       int32      `json:"basis_points"`
+	MatchingBps       int32      `json:"matching_bps"`
 	CapCents          int64      `json:"cap_cents"`
 	PriorMatchedCents int64      `json:"prior_matched_cents"`
 	EffectiveFrom     *time.Time `json:"effective_from"`
 }
 
-const matchingRuleJSON = `jsonb_build_object('contract_id',r.contract_id,'offer_key',c.offer_key,'basis_points',r.basis_points,'cap_cents',r.cap_cents,
+const matchingRuleJSON = `jsonb_build_object('contract_id',r.contract_id,'offer_key',c.offer_key,'matching_bps',r.matching_bps,'cap_cents',r.cap_cents,
  'prior_matched_cents',r.prior_matched_cents,'matched_cents',m.matched,'remaining_cents',greatest(r.cap_cents-r.prior_matched_cents-m.matched,0),
  'eligible_source',r.eligible_source,'effective_from',r.effective_from,'source',r.source,'created_by',r.created_by,'created_at',r.created_at,
  'revoked_at',r.revoked_at,'revoked_by',r.revoked_by)`
@@ -77,8 +77,8 @@ func (h *Handlers) AttachTeamMatchingRule(c *gin.Context) {
 		return
 	}
 	var req matchingRuleRequest
-	if err = c.ShouldBindJSON(&req); err != nil || req.BasisPoints < 1 || req.BasisPoints > 10000 || req.CapCents <= 0 || req.PriorMatchedCents < 0 || req.PriorMatchedCents > req.CapCents {
-		respondErrorMsg(c, "bad_request", "basis_points must be 1-10000, cap_cents positive, and prior_matched_cents between 0 and cap_cents", http.StatusBadRequest)
+	if err = c.ShouldBindJSON(&req); err != nil || req.MatchingBps < 1 || req.MatchingBps > 10000 || req.CapCents <= 0 || req.PriorMatchedCents < 0 || req.PriorMatchedCents > req.CapCents {
+		respondErrorMsg(c, "bad_request", "matching_bps must be 1-10000, cap_cents positive, and prior_matched_cents between 0 and cap_cents", http.StatusBadRequest)
 		return
 	}
 	ctx := c.Request.Context()
@@ -113,7 +113,7 @@ func (h *Handlers) AttachTeamMatchingRule(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "effective_from is required before the contract anniversary", http.StatusBadRequest)
 		return
 	}
-	err = insertContractMatchingRule(ctx, tx, matchingRule{ContractID: contract, TeamID: team, Terms: matchingTerms{BasisPoints: req.BasisPoints, CapCents: req.CapCents}, PriorMatchedCents: req.PriorMatchedCents, EffectiveFrom: effective, Source: "staff", Actor: &actor})
+	err = insertContractMatchingRule(ctx, tx, matchingRule{ContractID: contract, TeamID: team, Terms: matchingTerms{MatchingBps: req.MatchingBps, CapCents: req.CapCents}, PriorMatchedCents: req.PriorMatchedCents, EffectiveFrom: effective, Source: "staff", Actor: &actor})
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		respondErrorMsg(c, "conflict", "contract already has a matching rule", http.StatusConflict)
@@ -126,7 +126,7 @@ func (h *Handlers) AttachTeamMatchingRule(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"contract_id": contract, "basis_points": req.BasisPoints, "cap_cents": req.CapCents, "prior_matched_cents": req.PriorMatchedCents, "effective_from": effective, "source": "staff", "created_by": actor})
+	c.JSON(http.StatusCreated, gin.H{"contract_id": contract, "matching_bps": req.MatchingBps, "cap_cents": req.CapCents, "prior_matched_cents": req.PriorMatchedCents, "effective_from": effective, "source": "staff", "created_by": actor})
 }
 
 // Revocation stops matching for usage periods that start afterwards; credit

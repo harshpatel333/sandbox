@@ -4,7 +4,7 @@
 CREATE TABLE billing_contract_matching_rule (
     contract_id uuid PRIMARY KEY,
     team_id uuid NOT NULL,
-    basis_points integer NOT NULL CHECK (basis_points BETWEEN 1 AND 10000),
+    matching_bps integer NOT NULL CHECK (matching_bps BETWEEN 1 AND 10000),
     cap_cents bigint NOT NULL CHECK (cap_cents > 0),
     -- Cap already consumed by matches issued by hand before the rule existed.
     prior_matched_cents bigint NOT NULL DEFAULT 0 CHECK (prior_matched_cents BETWEEN 0 AND cap_cents),
@@ -106,7 +106,7 @@ BEGIN
         END IF;
         SELECT COALESCE(sum(amount_cents), 0) INTO used FROM billing_matching_credit WHERE contract_id = NEW.contract_id;
         NEW.matchable_cents := greatest(NEW.usage_cents - NEW.credit_applied_cents - NEW.discount_cents, 0);
-        earned := floor(NEW.matchable_cents::numeric * r.basis_points / 10000)::bigint;
+        earned := floor(NEW.matchable_cents::numeric * r.matching_bps / 10000)::bigint;
         NEW.amount_cents := CASE WHEN NEW.skip_reason IS NOT NULL THEN 0
             ELSE greatest(least(earned, r.cap_cents - r.prior_matched_cents - used), 0) END;
         NEW.idempotency_key := 'matching-credit:v1:' || NEW.invoice_id;

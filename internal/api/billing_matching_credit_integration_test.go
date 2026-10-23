@@ -33,7 +33,7 @@ type matchingFixture struct {
 	periodEnd time.Time
 }
 
-func newMatchingFixture(t *testing.T, basisPoints int32, capCents, prior int64) *matchingFixture {
+func newMatchingFixture(t *testing.T, matchingBps int32, capCents, prior int64) *matchingFixture {
 	t.Helper()
 	m := &matchingFixture{t: t, f: newEntitlementFixture(t), invoices: map[string]StripeInvoiceAmounts{}, grants: map[string]entitlementGrant{}, byKey: map[string]string{}, unpaid: map[string]bool{}}
 	m.periodEnd = m.f.start
@@ -41,7 +41,7 @@ func newMatchingFixture(t *testing.T, basisPoints int32, capCents, prior int64) 
 	t.Cleanup(srv.Close)
 	m.client = &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
 	m.f.h.Stripe = m.client
-	if err := insertContractMatchingRule(t.Context(), m.f.h.Pool, matchingRule{ContractID: m.f.c.ID, TeamID: m.f.c.TeamID, Terms: matchingTerms{BasisPoints: basisPoints, CapCents: capCents}, PriorMatchedCents: prior, EffectiveFrom: m.f.c.StartsAt, Source: "plan"}); err != nil {
+	if err := insertContractMatchingRule(t.Context(), m.f.h.Pool, matchingRule{ContractID: m.f.c.ID, TeamID: m.f.c.TeamID, Terms: matchingTerms{MatchingBps: matchingBps, CapCents: capCents}, PriorMatchedCents: prior, EffectiveFrom: m.f.c.StartsAt, Source: "plan"}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(m.retire)

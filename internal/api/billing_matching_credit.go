@@ -20,7 +20,7 @@ import (
 var errMatchingDeferred = errors.New("matching credit issuance deferred")
 
 type matchingTerms struct {
-	BasisPoints int32
+	MatchingBps int32
 	CapCents    int64
 }
 
@@ -37,8 +37,8 @@ type matchingRule struct {
 // insertContractMatchingRule freezes matching terms onto a contract. Plan
 // assignment calls it with the plan's terms; staff call it for bespoke deals.
 func insertContractMatchingRule(ctx context.Context, q db.DBTX, r matchingRule) error {
-	_, err := q.Exec(ctx, `INSERT INTO billing_contract_matching_rule(contract_id,team_id,basis_points,cap_cents,prior_matched_cents,effective_from,source,created_by)
- VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, r.ContractID, r.TeamID, r.Terms.BasisPoints, r.Terms.CapCents, r.PriorMatchedCents, r.EffectiveFrom, r.Source, r.Actor)
+	_, err := q.Exec(ctx, `INSERT INTO billing_contract_matching_rule(contract_id,team_id,matching_bps,cap_cents,prior_matched_cents,effective_from,source,created_by)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, r.ContractID, r.TeamID, r.Terms.MatchingBps, r.Terms.CapCents, r.PriorMatchedCents, r.EffectiveFrom, r.Source, r.Actor)
 	return err
 }
 

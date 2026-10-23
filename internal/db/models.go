@@ -381,7 +381,7 @@ type BillingContractEntitlementSchedule struct {
 type BillingContractMatchingRule struct {
 	ContractID        uuid.UUID          `json:"contract_id"`
 	TeamID            uuid.UUID          `json:"team_id"`
-	BasisPoints       int32              `json:"basis_points"`
+	MatchingBps       int32              `json:"matching_bps"`
 	CapCents          int64              `json:"cap_cents"`
 	PriorMatchedCents int64              `json:"prior_matched_cents"`
 	EligibleSource    string             `json:"eligible_source"`
