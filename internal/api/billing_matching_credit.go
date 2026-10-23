@@ -163,7 +163,7 @@ type matchingCandidate struct {
 // and its poller recovers missed events, so a paid collection is the trigger.
 func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *stripeHTTPClient) error {
 	rows, err := h.Pool.Query(ctx, `SELECT r.team_id,r.contract_id,j.invoice_id,c.customer_id,k.settlement_hash,j.period_start,j.period_end,
- CASE WHEN jsonb_typeof(j.plan->'credit_prices')='array' AND NOT jsonb_path_exists(j.plan,'$.credit_prices[*] ? (@.type() != "string")') THEN ARRAY(SELECT jsonb_array_elements_text(j.plan->'credit_prices')) ELSE '{}'::text[] END
+ CASE WHEN jsonb_typeof(j.plan->'credit_prices')='array' AND NOT jsonb_path_exists(j.plan,'strict $.credit_prices[*] ? (@.type() != "string")') THEN ARRAY(SELECT jsonb_array_elements_text(j.plan->'credit_prices')) ELSE '{}'::text[] END
  FROM billing_contract_matching_rule r
  JOIN billing_commercial_contract c ON c.id=r.contract_id
  JOIN billing_invoice_close j ON j.team_id=r.team_id AND j.state='released' AND j.period_start>=r.effective_from
