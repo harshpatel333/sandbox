@@ -99,11 +99,11 @@ paths:
     get:
       operationId: getPublicBillingPlans
       tags: [Billing]
-      summary: List plan cards and signup credits
+      summary: List plan cards for the live pricing model
       description: |
-        Returns the published plan cards (including display-only families such
-        as Enterprise), the subscription offers new customers can currently
-        buy, and the signup credit amounts. This endpoint is unauthenticated so
+        Returns the live pricing model, its published plan cards (including
+        display-only families such as Enterprise) and the subscription offers
+        new customers can currently buy. This endpoint is unauthenticated so
         signup pages render from the same plan catalog used by checkout.
       responses:
         "200":
@@ -5009,8 +5009,12 @@ components:
 
     BillingPlansResponse:
       type: object
-      required: [cards, plans, signup]
+      required: [pricing_version, cards, plans]
       properties:
+        pricing_version:
+          type: string
+          enum: [legacy, v2]
+          description: Pricing model that is live for new customers.
         cards:
           type: array
           items:
@@ -5020,28 +5024,22 @@ components:
           description: Offers new customers can check out.
           items:
             $ref: "#/components/schemas/BillingPlan"
-        signup:
-          type: object
-          required: [trial_credit_cents, card_bonus_cents]
-          properties:
-            trial_credit_cents:
-              type: integer
-              format: int64
-              description: Credit granted to a new team without a payment method.
-            card_bonus_cents:
-              type: integer
-              format: int64
-              description: Promotional credit granted when a payment method is added; it replaces the trial credit.
     BillingPlanCard:
       type: object
-      required: [family, version, name, tagline, features, display_only, monthly, annual, credit_summary, monthly_credit_cents, credit_schedule, matching, limits]
+      required: [family, version, kind, name, price_label, tagline, features, display_only, monthly, annual, credit_summary, monthly_credit_cents, allowance, matching, limits]
       properties:
         family:
           type: string
         version:
           type: integer
+        kind:
+          type: string
+          enum: [free, prepaid, subscription, legacy_payg, custom]
         name:
           type: string
+        price_label:
+          type: string
+          description: Price as shown on the card, e.g. `$250/month`. Empty when the card shows its fees.
         tagline:
           type: string
         features:
@@ -5063,10 +5061,38 @@ components:
           format: int64
           nullable: true
           description: Credit included every month, when the schedule is a uniform monthly grant.
-        credit_schedule:
-          type: array
-          items:
-            $ref: "#/components/schemas/BillingPlanGrant"
+        allowance:
+          type: object
+          nullable: true
+          required: [amount_cents, period, on_exhausted, summary]
+          description: Usage included in the plan.
+          properties:
+            amount_cents:
+              type: integer
+              format: int64
+              description: Included usage in USD cents per period, priced at the current rate card for compute allowances.
+            period:
+              type: string
+              enum: [day_window, month]
+              description: "`day_window` is 24 hours from the first sandbox start; `month` is the billing month."
+            on_exhausted:
+              type: string
+              enum: [pause, payg]
+              description: Whether sandboxes pause or usage continues pay as you go once the allowance is used.
+            compute:
+              type: object
+              required: [seconds, vcpu, memory_gib]
+              description: Present when the allowance is defined as compute time.
+              properties:
+                seconds:
+                  type: integer
+                vcpu:
+                  type: integer
+                memory_gib:
+                  type: integer
+            summary:
+              type: string
+              description: The allowance in words, e.g. `$250 of usage included every month`.
         matching:
           type: object
           nullable: true
@@ -5080,21 +5106,28 @@ components:
               type: integer
               format: int64
         limits:
-          type: object
-          required: [max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib]
-          properties:
-            max_sandboxes:
-              type: integer
-              nullable: true
-            max_template_vcpu:
-              type: integer
-              nullable: true
-            max_template_memory_mib:
-              type: integer
-              nullable: true
-            max_template_disk_mib:
-              type: integer
-              nullable: true
+          $ref: "#/components/schemas/BillingPlanLimits"
+    BillingPlanLimits:
+      type: object
+      required: [max_concurrent, max_vcpu, max_memory_mib, max_disk_mib, max_templates]
+      properties:
+        max_concurrent:
+          type: integer
+          nullable: true
+          description: Running sandboxes at once.
+        max_vcpu:
+          type: integer
+          nullable: true
+          description: vCPUs per sandbox.
+        max_memory_mib:
+          type: integer
+          nullable: true
+        max_disk_mib:
+          type: integer
+          nullable: true
+        max_templates:
+          type: integer
+          nullable: true
     BillingPlanPrice:
       type: object
       nullable: true
@@ -5112,24 +5145,6 @@ components:
         available:
           type: boolean
           description: Whether new customers can check out this offer.
-    BillingPlanGrant:
-      type: object
-      required: [start_months, repeat, every_months, amount_cents, expires_after_months]
-      properties:
-        start_months:
-          type: integer
-          description: Months after the contract anchor of the first grant.
-        repeat:
-          type: integer
-          nullable: true
-          description: Number of grants; null repeats indefinitely.
-        every_months:
-          type: integer
-        amount_cents:
-          type: integer
-          format: int64
-        expires_after_months:
-          type: integer
     BillingPlan:
       type: object
       required: [key, family, name, interval_months, price_cents, monthly_credit_cents, limits]
