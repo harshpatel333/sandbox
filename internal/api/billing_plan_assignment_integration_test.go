@@ -398,9 +398,19 @@ func TestPlanAssignmentConcurrentSameKeyReturnsOneAssignment(t *testing.T) {
 
 func TestStaffPlanAssignmentUnderV2(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
+	config := h.Pool.Config()
+	config.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	h.Pool, h.DB = pool, db.New(pool)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
 	var version uuid.UUID
-	if err := h.Pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version(pricing_version,family,version,kind,display_name,max_sandboxes)
-        VALUES('v2','custom_'||substr(md5(random()::text),1,8),1,'custom','Example deal',250) RETURNING id`).Scan(&version); err != nil {
+	if err := h.Pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version(pricing_version,family,version,kind,display_name,max_sandboxes,allowance_period,allowance_on_exhausted,allowance_compute_seconds,allowance_compute_vcpu,allowance_compute_memory_gib)
+        VALUES('v2','custom_'||substr(md5(random()::text),1,8),1,'custom','Example deal',250,'day_window','pause',7200,1,1) RETURNING id`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.Pool.Exec(t.Context(), `SELECT publish_billing_plan_version($1,$2)`, version, uuid.New()); err != nil {
@@ -409,11 +419,11 @@ func TestStaffPlanAssignmentUnderV2(t *testing.T) {
 	setPricingVersion(t, h, "v2")
 	actor := uuid.New()
 	body := staffPlanAssignmentBody{Key: "enterprise-approval:1", VersionID: version, Reason: "enterprise approval"}
-	plan, err := h.assignStaffPlan(t.Context(), team, actor, body)
+	plan, err := h.assignStaffPlan(ctx, team, actor, body)
 	if err != nil || plan.Kind != planKindCustom || plan.Source != planSourceStaff || *plan.AssignedBy != actor || *plan.VersionID != version {
 		t.Fatalf("staff assignment: %+v %v", plan, err)
 	}
-	if again, err := h.assignStaffPlan(t.Context(), team, actor, body); err != nil || again.ID != plan.ID {
+	if again, err := h.assignStaffPlan(ctx, team, actor, body); err != nil || again.ID != plan.ID {
 		t.Fatalf("replayed staff assignment: %+v %v", again, err)
 	}
 	if max, _ := limitsOf(t, h, team); max != 250 {
@@ -423,7 +433,25 @@ func TestStaffPlanAssignmentUnderV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = h.assignStaffPlan(t.Context(), team, actor, staffPlanAssignmentBody{Key: "k2", VersionID: free.VersionID, Reason: "r"}); !errors.Is(err, errUnknownPlan) {
+	if _, err = h.assignStaffPlan(ctx, team, actor, staffPlanAssignmentBody{Key: "k2", VersionID: free.VersionID, Reason: "r"}); !errors.Is(err, errUnknownPlan) {
 		t.Fatalf("staff assigned a non-custom plan: %v", err)
 	}
+	setPricingVersion(t, h, "legacy")
+	if _, err := h.assignStaffPlan(ctx, team, actor, staffPlanAssignmentBody{Key: "new-after-off", VersionID: version, Reason: "new custom deal"}); !errors.Is(err, errPricingV2Off) {
+		t.Fatalf("new staff assignment for assigned team while off: %v", err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `SELECT retire_billing_plan_version($1,$2)`, version, actor); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := h.assignStaffPlan(ctx, team, actor, body); err != nil || again.ID != plan.ID {
+		t.Fatalf("recorded staff commitment did not replay after off and retirement: %+v %v", again, err)
+	}
+	if _, err := h.assignStaffPlan(ctx, team, actor, staffPlanAssignmentBody{Key: body.Key, VersionID: uuid.New(), Reason: body.Reason}); !errors.Is(err, errPlanAssignmentReused) {
+		t.Fatalf("replayed key accepted different version while off: %v", err)
+	}
+	history, err := teamPlanHistory(t.Context(), h.Pool, team, 10)
+	if err != nil || len(history) != 1 || history[0].ID != plan.ID {
+		t.Fatalf("off requests changed assignment history: %+v %v", history, err)
+	}
+
 }
