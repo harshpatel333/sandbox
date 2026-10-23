@@ -427,7 +427,7 @@ paths:
       operationId: createStripeCheckoutSession
       tags: [Billing]
       summary: Create a Stripe Checkout session
-      description: Pro offers are available only during uncommitted new-team onboarding. Checkout completion is followed by authoritative payment verification.
+      description: Plan offers are available only during uncommitted new-team onboarding. Checkout completion is followed by authoritative payment verification.
       security:
         - apiKey: []
       requestBody:
@@ -440,9 +440,10 @@ paths:
               properties:
                 offer:
                   type: string
-                  enum: [free, pro_monthly, pro_annual]
+                  pattern: "^(free|[a-z][a-z0-9]*_(monthly|annual))$"
                   default: free
-                  description: Backend-owned offer key; price IDs are never accepted from the caller.
+                  example: pro_monthly
+                  description: Backend-owned offer key, `free` or an available plan from `GET /billing/plans/public`; price IDs are never accepted from the caller.
                 success_url:
                   type: string
                   format: uri
@@ -3395,7 +3396,7 @@ components:
       properties:
         key:
           type: string
-          description: free, pro_monthly, or pro_annual.
+          description: free or a plan catalog offer key, such as pro_annual.
           example: pro_annual
         name:
           type: string
