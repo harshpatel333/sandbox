@@ -98,7 +98,7 @@ func TestIntegration_PublicBillingPlansListTodaysPurchasablePlans(t *testing.T) 
 		Port:                    "0",
 		VMDAddress:              "localhost:0",
 		SystemTeamID:            testSystemTeamID.String(),
-		StripePlanPriceIDs:      map[string]string{"starter_monthly": "price_starter_monthly"},
+		StripePlanPriceIDs:      map[string]string{"starter_monthly": "price_starter_monthly", "starter_annual": "price_starter_annual"},
 		StripeProMonthlyPriceID: "price_pro_monthly",
 		StripeProAnnualPriceID:  "price_pro_annual",
 	}
