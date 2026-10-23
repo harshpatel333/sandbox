@@ -187,7 +187,8 @@ func TestIntegration_BillingPlanChangeCustomerConsent(t *testing.T) {
 	r := newRouter(t)
 	w := do(r, http.MethodGet, "/billing/plan-change-preview?target_plan=free", key, "")
 	var preview struct {
-		Token string `json:"preview_token"`
+		Token       string    `json:"preview_token"`
+		EffectiveAt time.Time `json:"effective_at"`
 	}
 	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &preview) != nil || len(preview.Token) != 64 {
 		t.Fatalf("exit preview missing consent token with entry off: %d %s", w.Code, w.Body)
@@ -201,6 +202,14 @@ func TestIntegration_BillingPlanChangeCustomerConsent(t *testing.T) {
 		}
 	}
 	body := `{"target_plan":"free","idempotency_key":"consent","preview_token":"` + preview.Token + `","confirm_pauses_running":true}`
+	if w := do(r, http.MethodPost, "/billing/plan-changes", key, body); w.Code != http.StatusConflict {
+		t.Fatalf("scheduled date precondition was optional: %d %s", w.Code, w.Body)
+	}
+	stale := `{"target_plan":"free","idempotency_key":"consent","preview_token":"` + preview.Token + `","expected_effective_at":"` + preview.EffectiveAt.Add(time.Second).Format(time.RFC3339Nano) + `","confirm_pauses_running":true}`
+	if w := do(r, http.MethodPost, "/billing/plan-changes", key, stale); w.Code != http.StatusConflict {
+		t.Fatalf("changed confirmed date accepted: %d %s", w.Code, w.Body)
+	}
+	body = `{"target_plan":"free","idempotency_key":"consent","preview_token":"` + preview.Token + `","expected_effective_at":"` + preview.EffectiveAt.Format(time.RFC3339Nano) + `","confirm_pauses_running":true}`
 	w = do(r, http.MethodPost, "/billing/plan-changes", key, body)
 	var change struct {
 		ID string `json:"id"`

@@ -133,7 +133,11 @@ func (f planChangeV2Fixture) intent(t *testing.T, target, key string, terms plan
 	if err != nil {
 		t.Fatal(err)
 	}
-	return teamPlanChangeRequest{Team: f.team, Target: target, Key: key, Actor: f.actor, Via: "customer", Reason: "requested by the team", PreviewToken: token, ConfirmPausesRunning: true}
+	var expected *time.Time
+	if timing == planChangeEndOfPeriod {
+		expected = &at
+	}
+	return teamPlanChangeRequest{Team: f.team, Target: target, Key: key, Actor: f.actor, Via: "customer", Reason: "requested by the team", PreviewToken: token, ExpectedEffectiveAt: expected, ConfirmPausesRunning: true}
 }
 
 func (f planChangeV2Fixture) request(t *testing.T, target, key string) (teamPlanChange, error) {
@@ -628,7 +632,7 @@ func TestTeamPlanChangeCustomWithoutBillingAccountUsesOneConnection(t *testing.T
 }
 
 func TestTeamPlanChangeConsentRejectsChangedPreviewWithoutScheduling(t *testing.T) {
-	for _, scenario := range []string{"period", "limits", "assignment", "pause_confirmation"} {
+	for _, scenario := range []string{"period", "limits", "assignment", "pause_confirmation", "expected_date", "missing_date"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newPlanChangeV2Fixture(t, planKindSubscription)
 			terms := testPlanTerms("free", planKindFree, 1, nil)
@@ -645,6 +649,11 @@ func TestTeamPlanChangeConsentRejectsChangedPreviewWithoutScheduling(t *testing.
 				}
 			case "pause_confirmation":
 				req.ConfirmPausesRunning = false
+			case "expected_date":
+				changed := req.ExpectedEffectiveAt.Add(time.Second)
+				req.ExpectedEffectiveAt = &changed
+			case "missing_date":
+				req.ExpectedEffectiveAt = nil
 			}
 			if _, err := f.h.scheduleTeamPlanChangeTo(t.Context(), req, terms); !errors.Is(err, errTeamPlanChangeConflict) {
 				t.Fatalf("changed consent was accepted: %v", err)
@@ -664,6 +673,12 @@ func TestTeamPlanChangeImmediateConsentAndReplay(t *testing.T) {
 	later, err := planChangeConsentToken(f.plan(t), terms, planChangeNow, time.Now().Add(time.Hour))
 	if err != nil || later != req.PreviewToken {
 		t.Fatalf("immediate preview expired with its display timestamp: %s %v", later, err)
+	}
+	withDate := req
+	at := time.Now()
+	withDate.ExpectedEffectiveAt = &at
+	if _, err := f.h.scheduleTeamPlanChangeTo(t.Context(), withDate, terms); !errors.Is(err, errTeamPlanChangeConflict) {
+		t.Fatalf("immediate change accepted a billing-period date precondition: %v", err)
 	}
 	c, err := f.h.scheduleTeamPlanChangeTo(t.Context(), req, terms)
 	if err != nil {

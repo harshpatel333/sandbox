@@ -304,7 +304,9 @@ paths:
         idempotency key returns the original change. Send the preview_token from
         the confirmed preview; changed terms, limits or effective boundary return
         409 and require another preview and confirmation. Moves to Free require
-        confirm_pauses_running=true. Requires `billing:write`.
+        confirm_pauses_running=true. End-of-period requests also require
+        expected_effective_at matching the confirmed preview. Omit that field for
+        immediate changes. Requires `billing:write`.
       security:
         - apiKey: []
       requestBody:
@@ -327,6 +329,10 @@ paths:
                   minLength: 64
                   maxLength: 64
                   description: Token from the confirmed exit preview, binding its assignment, terms, limits and effective boundary. Immediate moves bind to immediate timing.
+                expected_effective_at:
+                  type: string
+                  format: date-time
+                  description: Required when preview timing is end_of_billing_period and must exactly match the confirmed effective_at. Omit for immediate changes. Stale or missing date preconditions return 409 without scheduling.
                 confirm_pauses_running:
                   type: boolean
                   description: Must be true when target_plan is free, confirming that all running compute will be paused.

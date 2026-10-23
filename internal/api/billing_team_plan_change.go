@@ -131,6 +131,7 @@ type teamPlanChangeRequest struct {
 	Via                  string
 	Reason               string
 	PreviewToken         string
+	ExpectedEffectiveAt  *time.Time
 	ConfirmPausesRunning bool
 }
 
@@ -246,7 +247,7 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 		}
 		effective = periodEnd
 	}
-	if req.Via == "customer" || req.PreviewToken != "" {
+	if req.Via == "customer" || req.PreviewToken != "" || req.ExpectedEffectiveAt != nil {
 		if terms.Kind == planKindFree && !req.ConfirmPausesRunning {
 			return teamPlanChange{}, teamPlanChangeConflict("confirm that all running compute will be paused before continuing")
 		}
@@ -254,7 +255,8 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 		if err != nil {
 			return teamPlanChange{}, err
 		}
-		if req.PreviewToken == "" || token != req.PreviewToken || timing == planChangeEndOfPeriod && effective.Sub(now) < planChangeMinNotice {
+		dateMatches := timing == planChangeNow && req.ExpectedEffectiveAt == nil || timing == planChangeEndOfPeriod && req.ExpectedEffectiveAt != nil && req.ExpectedEffectiveAt.Equal(effective)
+		if !dateMatches || req.PreviewToken == "" || token != req.PreviewToken || timing == planChangeEndOfPeriod && effective.Sub(now) < planChangeMinNotice {
 			return teamPlanChange{}, teamPlanChangeConflict("the plan change preview changed; reload it and confirm again")
 		}
 	}
@@ -689,11 +691,12 @@ func (h *Handlers) waitForPlanChangePauses(ctx context.Context, team uuid.UUID) 
 }
 
 type teamPlanChangeBody struct {
-	TargetPlan           string `json:"target_plan"`
-	Key                  string `json:"idempotency_key"`
-	Reason               string `json:"reason"`
-	PreviewToken         string `json:"preview_token"`
-	ConfirmPausesRunning bool   `json:"confirm_pauses_running"`
+	TargetPlan           string     `json:"target_plan"`
+	Key                  string     `json:"idempotency_key"`
+	Reason               string     `json:"reason"`
+	PreviewToken         string     `json:"preview_token"`
+	ExpectedEffectiveAt  *time.Time `json:"expected_effective_at"`
+	ConfirmPausesRunning bool       `json:"confirm_pauses_running"`
 }
 
 func decodeTeamPlanChange(c *gin.Context) (teamPlanChangeBody, bool) {
@@ -760,7 +763,7 @@ func (h *Handlers) RequestBillingPlanChange(c *gin.Context) {
 	if reason == "" {
 		reason = "requested by the team"
 	}
-	change, err := h.scheduleTeamPlanChange(c.Request.Context(), teamPlanChangeRequest{Team: team, Target: body.TargetPlan, Key: body.Key, Actor: actor, Via: "customer", Reason: reason, PreviewToken: body.PreviewToken, ConfirmPausesRunning: body.ConfirmPausesRunning})
+	change, err := h.scheduleTeamPlanChange(c.Request.Context(), teamPlanChangeRequest{Team: team, Target: body.TargetPlan, Key: body.Key, Actor: actor, Via: "customer", Reason: reason, PreviewToken: body.PreviewToken, ExpectedEffectiveAt: body.ExpectedEffectiveAt, ConfirmPausesRunning: body.ConfirmPausesRunning})
 	h.respondTeamPlanChange(c, team, change, err)
 }
 
@@ -802,7 +805,7 @@ func (h *Handlers) RequestTeamPlanChange(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "reason is required", http.StatusBadRequest)
 		return
 	}
-	change, err := h.scheduleTeamPlanChange(c.Request.Context(), teamPlanChangeRequest{Team: team, Target: body.TargetPlan, Key: body.Key, Actor: actor, Via: "staff", Reason: body.Reason, PreviewToken: body.PreviewToken, ConfirmPausesRunning: body.ConfirmPausesRunning})
+	change, err := h.scheduleTeamPlanChange(c.Request.Context(), teamPlanChangeRequest{Team: team, Target: body.TargetPlan, Key: body.Key, Actor: actor, Via: "staff", Reason: body.Reason, PreviewToken: body.PreviewToken, ExpectedEffectiveAt: body.ExpectedEffectiveAt, ConfirmPausesRunning: body.ConfirmPausesRunning})
 	h.respondTeamPlanChange(c, team, change, err)
 }
 
