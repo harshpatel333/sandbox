@@ -99,9 +99,11 @@ const (
 
 	// Platform ceiling — applies to every team including system. 32 vCPU is
 	// Firecracker's maximum.
-	absoluteMaxVcpu      = 32
-	absoluteMaxMemoryMib = 131072
-	absoluteMaxDiskMib   = 131072
+	minimumTemplateMemoryMiB = 256
+	minimumTemplateDiskMiB   = 1024
+	absoluteMaxVcpu          = 32
+	absoluteMaxMemoryMib     = 131072
+	absoluteMaxDiskMib       = 131072
 
 	// Template shape when a request leaves it out.
 	defaultVcpu     = 1
@@ -125,7 +127,7 @@ func templateShape(teamID, systemTeamID uuid.UUID, limits teamLimits, vcpu, memM
 		}
 		return fallback
 	}
-	return pick(vcpu, defaultVcpu, limits.MaxVCPU, 1), pick(memMib, defaultMemoryMi, limits.MaxMemoryMiB, 256), pick(diskMib, defaultDiskMib, limits.MaxDiskMiB, 1024)
+	return pick(vcpu, defaultVcpu, limits.MaxVCPU, 1), pick(memMib, defaultMemoryMi, limits.MaxMemoryMiB, minimumTemplateMemoryMiB), pick(diskMib, defaultDiskMib, limits.MaxDiskMiB, minimumTemplateDiskMiB)
 }
 
 // validateTemplateShape returns a user-facing error message on failure, "" on pass.
@@ -134,10 +136,10 @@ func validateTemplateShape(teamID, systemTeamID uuid.UUID, limits teamLimits, vc
 	if vcpu < 1 || vcpu > absoluteMaxVcpu {
 		return fmt.Sprintf("vcpu must be 1-%d", absoluteMaxVcpu)
 	}
-	if memMib < 256 || memMib > absoluteMaxMemoryMib {
+	if memMib < minimumTemplateMemoryMiB || memMib > absoluteMaxMemoryMib {
 		return fmt.Sprintf("memory_mib must be 256-%d", absoluteMaxMemoryMib)
 	}
-	if diskMib < 1024 || diskMib > absoluteMaxDiskMib {
+	if diskMib < minimumTemplateDiskMiB || diskMib > absoluteMaxDiskMib {
 		return fmt.Sprintf("disk_mib must be 1024-%d", absoluteMaxDiskMib)
 	}
 	if teamID == systemTeamID {

@@ -193,6 +193,12 @@ func (v planVersion) validate() error {
 			return errors.New("limits must be positive")
 		}
 	}
+	if v.Limits.MaxMemoryMiB != nil && *v.Limits.MaxMemoryMiB < minimumTemplateMemoryMiB {
+		return errors.New("max_memory_mib must allow at least 256 MiB")
+	}
+	if v.Limits.MaxDiskMiB != nil && *v.Limits.MaxDiskMiB < minimumTemplateDiskMiB {
+		return errors.New("max_disk_mib must allow at least 1024 MiB")
+	}
 	if v.Kind == "legacy_payg" && (v.Limits.MaxVCPU == nil || v.Limits.MaxMemoryMiB == nil || v.Limits.MaxDiskMiB == nil || v.Limits.MaxTemplates == nil) {
 		return errors.New("pay as you go needs every template limit: teams without their own limits use it")
 	}

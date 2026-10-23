@@ -82,25 +82,28 @@ func TestUniformMonthlyCredit(t *testing.T) {
 
 func TestPlanVersionValidate(t *testing.T) {
 	valid := planVersion{PricingVersion: "v2", Family: "pro", Kind: "subscription", DisplayName: "Pro", MonthlyFeeCents: int64p(25000),
-		Limits:         planLimits{MaxConcurrent: int32p(1000), MaxVCPU: int32p(8), MaxTemplates: int32p(10)},
+		Limits:         planLimits{MaxConcurrent: int32p(1000), MaxVCPU: int32p(8), MaxMemoryMiB: int32p(256), MaxDiskMiB: int32p(1024), MaxTemplates: int32p(10)},
 		CreditSchedule: []planGrant{{EveryMonths: 1, AmountCents: 25000, ExpiresAfterMonths: 1}},
 		Allowance:      &planAllowance{AmountCents: 25000, Period: "month", OnExhausted: "payg"}}
 	if err := valid.validate(); err != nil {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*planVersion){
-		"family":              func(v *planVersion) { v.Family = "Pro_1" },
-		"pricing version":     func(v *planVersion) { v.PricingVersion = "v3" },
-		"kind":                func(v *planVersion) { v.Kind = "trial" },
-		"name":                func(v *planVersion) { v.DisplayName = " " },
-		"subscription no fee": func(v *planVersion) { v.MonthlyFeeCents = nil },
-		"fee on prepaid":      func(v *planVersion) { v.Kind = "prepaid" },
-		"fee with underscore": func(v *planVersion) { v.Family = "custom_example" },
-		"zero fee":            func(v *planVersion) { v.MonthlyFeeCents = int64p(0) },
-		"limits":              func(v *planVersion) { v.Limits.MaxConcurrent = nil },
-		"zero templates":      func(v *planVersion) { v.Limits.MaxTemplates = int32p(0) },
+		"family":               func(v *planVersion) { v.Family = "Pro_1" },
+		"pricing version":      func(v *planVersion) { v.PricingVersion = "v3" },
+		"kind":                 func(v *planVersion) { v.Kind = "trial" },
+		"name":                 func(v *planVersion) { v.DisplayName = " " },
+		"subscription no fee":  func(v *planVersion) { v.MonthlyFeeCents = nil },
+		"fee on prepaid":       func(v *planVersion) { v.Kind = "prepaid" },
+		"fee with underscore":  func(v *planVersion) { v.Family = "custom_example" },
+		"zero fee":             func(v *planVersion) { v.MonthlyFeeCents = int64p(0) },
+		"limits":               func(v *planVersion) { v.Limits.MaxConcurrent = nil },
+		"zero templates":       func(v *planVersion) { v.Limits.MaxTemplates = int32p(0) },
+		"memory below minimum": func(v *planVersion) { v.Limits.MaxMemoryMiB = int32p(255) },
+		"disk below minimum":   func(v *planVersion) { v.Limits.MaxDiskMiB = int32p(1023) },
 		"payg without caps": func(v *planVersion) {
 			v.Kind, v.Family, v.PricingVersion, v.MonthlyFeeCents, v.CreditSchedule, v.Allowance = "legacy_payg", "payg", "legacy", nil, nil, nil
+			v.Limits.MaxMemoryMiB = nil
 		},
 		"grant every":        func(v *planVersion) { v.CreditSchedule[0].EveryMonths = 0 },
 		"grant repeat":       func(v *planVersion) { v.CreditSchedule[0].Repeat = int32p(0) },
