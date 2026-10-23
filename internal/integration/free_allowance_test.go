@@ -8,6 +8,7 @@ import (
 	"math"
 	"slices"
 	"sort"
+"strings"
 	"testing"
 	"time"
 
@@ -517,7 +518,7 @@ func TestIntegration_PricingV2Activation_RechecksSwitchAndCustomerAfterStripe(t 
 					_, _ = testPool.Exec(ctx, `UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team, customer+"_replacement")
 				}
 			}}
-			batch, err := api.NewPricingV2Activation(testPool, stripe, region, "").ApplyBatch(ctx, "operator@example.com", "launch", 10)
+			batch, err := api.NewPricingV2Activation(testPool, stripe, region, testSystemTeamID.String()).ApplyBatch(ctx, "operator@example.com", "launch", 10)
 			if change == "switch_off" {
 				if !errors.Is(err, api.ErrPricingV2Off) {
 					t.Fatalf("apply after switch-off = %+v, %v", batch, err)
@@ -558,7 +559,7 @@ func TestIntegration_PricingV2Activation_ApplyAssignsEveryBucketOnce(t *testing.
 	exec(`INSERT INTO team_billing_account (team_id, stripe_customer_id) VALUES ($1, $2)`, lapsedSpent, "cus_"+lapsedSpent.String())
 	exec(`INSERT INTO abuse_restrictions (subject_type, subject_value, subject_team_id, action, source, reason) VALUES ('team', $1::text, $1::uuid, 'resume', 'test', 'test')`, blocked)
 	stripe := activationStripe{credit: map[string]float64{"cus_" + lapsedCredit.String(): 3.5}}
-	activation := api.NewPricingV2Activation(testPool, stripe, region, "")
+	activation := api.NewPricingV2Activation(testPool, stripe, region, testSystemTeamID.String())
 
 	report, err := activation.Report(ctx)
 	if err != nil {
@@ -657,7 +658,7 @@ func TestIntegration_PricingV2Activation_BackfillsContractsWithoutChangingAuthor
 		}
 	}
 	setPricingSwitch(t, "v2")
-	activation := api.NewPricingV2Activation(testPool, nil, "usw", "")
+	activation := api.NewPricingV2Activation(testPool, nil, "usw", testSystemTeamID.String())
 	report, err := activation.Report(ctx)
 	if err != nil || report.ToContract != 2 || report.SkippedReasons["pending_contract"] != 1 {
 		t.Fatalf("contract report = %+v, %v", report, err)
@@ -712,7 +713,7 @@ func TestIntegration_PricingV2Activation_ContinuesPastUnreadableCustomers(t *tes
 	}
 	setPricingSwitch(t, "v2")
 	healthy := ids[len(ids)-1]
-	activation := api.NewPricingV2Activation(testPool, activationStripe{credit: map[string]float64{"cus_" + healthy.String(): 5}, unknownErrors: true}, "usw", "")
+	activation := api.NewPricingV2Activation(testPool, activationStripe{credit: map[string]float64{"cus_" + healthy.String(): 5}, unknownErrors: true}, "usw", testSystemTeamID.String())
 	first, err := activation.ApplyBatch(ctx, "operator@example.com", "launch", 500)
 	if err != nil || len(first.Assigned) != 0 || first.Next == nil {
 		t.Fatalf("first page = %+v, %v", first, err)
@@ -764,3 +765,13 @@ func TestIntegration_TeamPauseAll_DeletionPreservesAssignmentAudit(t *testing.T)
 		t.Fatalf("deleted team assignment audit=%d pause requests=%d, %v", assignments, requests, err)
 	}
 }
+
+func TestIntegration_PricingV2Activation_RequiresSystemTeamBeforeApply(t *testing.T) {
+	for _, value := range []string{"", "invalid", uuid.Nil.String()} {
+		_, err := api.NewPricingV2Activation(testPool, nil, "usw", value).ApplyBatch(t.Context(), "operator@example.com", "launch", 10)
+		if err == nil || !strings.Contains(err.Error(), "SYSTEM_TEAM_ID") {
+			t.Fatalf("apply system team %q = %v", value, err)
+		}
+	}
+}
+
