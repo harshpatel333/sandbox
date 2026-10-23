@@ -170,14 +170,46 @@ func TestStaffCreditGrantFollowsCurrentCustomer(t *testing.T) {
 	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req); err == nil {
 		t.Fatal("lost response treated as issued")
 	}
-	s.mu.Lock()
-	s.grants = nil
-	s.mu.Unlock()
-	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_customer_id='cus_replacement' WHERE team_id=$1`, team); err != nil {
+	replacement := "cus_replacement_" + uuid.NewString()
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team, replacement); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req); !errors.Is(err, errStaffCreditConflict) || s.creates != 1 {
+	credit, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req)
+	if err != nil || credit.State != "issued" || s.creates != 1 {
+		t.Fatalf("grant already created for the previous customer was not recorded: creates=%d %+v %v", s.creates, credit, err)
+	}
+	s.mu.Lock()
+	s.lose = true
+	s.mu.Unlock()
+	next := staffCreditRequest{Key: "k2", AmountCents: 100, Reason: "r"}
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team, s.customer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.grantStaffCredit(t.Context(), team, uuid.New(), next); err == nil {
+		t.Fatal("lost response treated as issued")
+	}
+	s.mu.Lock()
+	s.grants = s.grants[:1]
+	s.mu.Unlock()
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.grantStaffCredit(t.Context(), team, uuid.New(), next); !errors.Is(err, errStaffCreditConflict) || s.creates != 2 {
 		t.Fatalf("pending credit issued to the previous customer: creates=%d %v", s.creates, err)
+	}
+}
+
+func TestStaffCreditGrantWaitsForPeriodClose(t *testing.T) {
+	h, team, s := newStaffCreditFixture(t, true)
+	end := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$4,'price_round','round','mtr_round',$3::timestamptz-interval '2 months')`, team, s.customer, end, "sub_"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2::timestamptz-interval '1 month',$2,'open')`, team, end); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
+		t.Fatalf("credit granted while the previous invoice was closing: %v", err)
 	}
 }
 
@@ -188,7 +220,7 @@ func TestStaffCreditIsRecognizedByAllowanceChecks(t *testing.T) {
 		t.Fatal(err)
 	}
 	staff, err := h.issuedStaffCredits(t.Context(), h.Pool, s.customer)
-	if err != nil || !staff[*credit.GrantID] {
+	if _, listed := staff[*credit.GrantID]; err != nil || !listed {
 		t.Fatalf("issued staff credit not listed: %v %v", staff, err)
 	}
 	if err = h.Stripe.(*stripeHTTPClient).ycGrantPreflight(t.Context(), s.customer, "", "", staff); err != nil {
@@ -224,5 +256,31 @@ func TestStaffCreditGrantRequiresCustomerAndStaff(t *testing.T) {
 				t.Fatalf("staff credit endpoint with actor %q: got %d want %d", actor.header, w.Code, actor.want)
 			}
 		}
+	}
+}
+
+func TestStaffCreditGrantRejectsExpiry(t *testing.T) {
+	h, team, s := newStaffCreditFixture(t, true)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"idempotency_key":"k","amount_cents":100,"reason":"r","expires_at":"2030-01-01T00:00:00Z"}`))
+	c.Params = gin.Params{{Key: "team_id", Value: team.String()}}
+	c.Set("actor_id", uuid.New())
+	h.CreateStaffCreditGrant(c)
+	if w.Code < 400 || s.creates != 0 {
+		t.Fatalf("expiring credit request accepted: %d", w.Code)
+	}
+	tampered, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "ok", AmountCents: 100, Reason: "r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staff, err := h.issuedStaffCredits(t.Context(), h.Pool, s.customer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := s.grants[0]
+	g.Metadata = map[string]string{"staff_credit_grant": uuid.NewString()}
+	if isStaffCredit(g, staff) || !isStaffCredit(s.grants[0], staff) || tampered.GrantID == nil {
+		t.Fatal("staff credit recognition ignored the issued terms")
 	}
 }

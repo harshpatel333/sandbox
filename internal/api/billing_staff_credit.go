@@ -63,8 +63,10 @@ func (h *Handlers) CreateStaffCreditGrant(c *gin.Context) {
 		return
 	}
 	var req staffCreditRequest
-	if c.ShouldBindJSON(&req) != nil {
-		respondErrorMsg(c, "bad_request", "invalid credit grant", http.StatusBadRequest)
+	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 8192))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&req) != nil {
+		respondErrorMsg(c, "bad_request", "invalid credit grant; staff credit takes idempotency_key, amount_cents and reason and never expires", http.StatusBadRequest)
 		return
 	}
 	req.Reason = strings.TrimSpace(req.Reason)
@@ -142,10 +144,23 @@ func (h *Handlers) grantStaffCredit(ctx context.Context, team, actor uuid.UUID, 
 	if credit.State == "issued" {
 		return credit, nil
 	}
-	if credit.customer != *customer {
-		return credit, errors.Join(errStaffCreditConflict, errors.New("team's billing customer changed since the credit was requested"))
-	}
 	grant, err := client.issueStaffCredit(ctx, credit, func() error {
+		// Only a new grant needs these checks; one already created for this
+		// request is adopted above even if the team's customer has changed.
+		if credit.customer != *customer {
+			return errors.Join(errStaffCreditConflict, errors.New("team's billing customer changed since the credit was requested"))
+		}
+		var closing bool
+		if e := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p JOIN billing_invoice_account i USING(team_id)
+            WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp()
+            AND NOT EXISTS(SELECT 1 FROM billing_invoice_close c WHERE c.team_id=p.team_id AND c.period_start=p.period_start AND c.period_end=p.period_end AND c.state='released'))`, team).Scan(&closing); e != nil {
+			return e
+		}
+		if closing {
+			// Credit that becomes effective after a period ended cannot be
+			// reconciled into that period's held invoice.
+			return errors.Join(errStaffCreditConflict, errors.New("the team's previous invoice is still being closed; retry once it is finalized"))
+		}
 		_, e := h.Pool.Exec(ctx, `UPDATE billing_staff_credit_grant SET attempts=attempts+1 WHERE id=$1 AND state='pending'`, credit.ID)
 		return e
 	})
@@ -229,19 +244,26 @@ func validStaffCreditGrant(g entitlementGrant, credit staffCredit) error {
 
 // issuedStaffCredits lists the Stripe grants issued as staff credit for a
 // customer; code that treats unknown live grants as conflicts recognizes them.
-func (h *Handlers) issuedStaffCredits(ctx context.Context, reader db.DBTX, customer string) (map[string]bool, error) {
-	rows, err := reader.Query(ctx, `SELECT stripe_credit_grant_id FROM billing_staff_credit_grant WHERE customer_id=$1 AND state='issued'`, customer)
+func (h *Handlers) issuedStaffCredits(ctx context.Context, reader db.DBTX, customer string) (map[string]staffCredit, error) {
+	rows, err := reader.Query(ctx, `SELECT `+staffCreditColumns+` FROM billing_staff_credit_grant WHERE customer_id=$1 AND state='issued'`, customer)
 	if err != nil {
 		return nil, err
 	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	staff := make(map[string]bool, len(ids))
-	for _, id := range ids {
-		staff[id] = true
+	credits, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (staffCredit, error) { return scanStaffCredit(row) })
+	staff := make(map[string]staffCredit, len(credits))
+	for _, credit := range credits {
+		staff[*credit.GrantID] = credit
 	}
 	return staff, err
 }
 
-func isStaffCredit(g entitlementGrant, staff map[string]bool) bool {
-	return staff[g.ID] && g.Metadata["staff_credit_grant"] != "" && g.Applicability.Scope.PriceType == "metered" && len(g.Applicability.Scope.Prices) == 0
+// isStaffCredit recognizes a grant only while it still carries the terms it
+// was issued with.
+func isStaffCredit(g entitlementGrant, staff map[string]staffCredit) bool {
+	credit, ok := staff[g.ID]
+	if !ok {
+		return false
+	}
+	g.VoidedAt = 0
+	return validStaffCreditGrant(g, credit) == nil
 }

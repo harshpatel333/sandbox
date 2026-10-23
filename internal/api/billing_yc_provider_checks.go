@@ -14,7 +14,7 @@ import (
 // Historical expired/voided grants are retained and do not block adoption.
 // Issued staff credits are known one-off usage credit, not a competing
 // allowance, so they are skipped.
-func (c *stripeHTTPClient) ycGrantPreflight(ctx context.Context, customer, contract, approved string, staff map[string]bool) error {
+func (c *stripeHTTPClient) ycGrantPreflight(ctx context.Context, customer, contract, approved string, staff map[string]staffCredit) error {
 	var list struct {
 		Data    []entitlementGrant `json:"data"`
 		HasMore bool               `json:"has_more"`

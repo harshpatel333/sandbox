@@ -180,7 +180,7 @@ func (h *Handlers) enrollInvoiceAccount(ctx context.Context, team uuid.UUID, req
 		var ycContract, ycGrant string
 		ycErr := tx.QueryRow(ctx, `SELECT contract_id::text,COALESCE(request->>'existing_grant_id','') FROM billing_yc_operation WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3`, team, a.Customer, a.Subscription).Scan(&ycContract, &ycGrant)
 		if ycErr == nil {
-			var staff map[string]bool
+			var staff map[string]staffCredit
 			if staff, err = h.issuedStaffCredits(ctx, tx, a.Customer); err == nil {
 				err = client.ycGrantPreflight(ctx, a.Customer, ycContract, ycGrant, staff)
 			}
