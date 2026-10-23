@@ -116,16 +116,16 @@ var templateNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9._/-]*[a-z0-9])?$`)
 // templateShape fills the fields a request leaves out with the defaults,
 // capped at the team's limits; validateTemplateShape still checks the result.
 func templateShape(teamID, systemTeamID uuid.UUID, limits teamLimits, vcpu, memMib, diskMib *int32) (int32, int32, int32) {
-	pick := func(requested *int32, fallback, limit int32) int32 {
+	pick := func(requested *int32, fallback, limit, floor int32) int32 {
 		if requested != nil {
 			return *requested
 		}
 		if teamID != systemTeamID && limit < fallback {
-			return limit
+			return max(limit, floor)
 		}
 		return fallback
 	}
-	return pick(vcpu, defaultVcpu, limits.MaxVCPU), pick(memMib, defaultMemoryMi, limits.MaxMemoryMiB), pick(diskMib, defaultDiskMib, limits.MaxDiskMiB)
+	return pick(vcpu, defaultVcpu, limits.MaxVCPU, 1), pick(memMib, defaultMemoryMi, limits.MaxMemoryMiB, 256), pick(diskMib, defaultDiskMib, limits.MaxDiskMiB, 1024)
 }
 
 // validateTemplateShape returns a user-facing error message on failure, "" on pass.

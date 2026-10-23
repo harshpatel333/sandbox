@@ -19,6 +19,7 @@ import (
 
 type proOffer struct {
 	Key, Price string
+	Name       string
 	Amount     int64
 	Months     int32
 	Credit     int64
@@ -60,7 +61,7 @@ func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, error) {
 	if err != nil {
 		return proOffer{Key: key}, err
 	}
-	return proOffer{Key: key, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Pricing: t.PricingVersion, Matching: t.Matching, Limits: &t.Limits, Price: h.Config.PlanPriceID(key), Family: t.Family, DisplayName: t.DisplayName}, nil
+	return proOffer{Key: key, Name: t.DisplayName, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Pricing: t.PricingVersion, Matching: t.Matching, Limits: &t.Limits, Price: h.Config.PlanPriceID(key), Family: t.Family, DisplayName: t.DisplayName}, nil
 }
 
 // checkoutOffer returns the frozen terms of the team's pending purchase of key,
@@ -191,7 +192,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		err = client.validateProPrice(c.Request.Context(), offer)
 	} else {
 		var price storagePrice
-		price, err = h.ensurePlanPrice(c.Request.Context(), client, planTerms{OfferKey: offer.Key, FeeCents: offer.Amount, IntervalMonths: offer.Months, VersionID: offer.VersionID, Version: offer.Version, PricingVersion: offer.Pricing})
+		price, err = h.ensurePlanPrice(c.Request.Context(), client, planTerms{OfferKey: offer.Key, DisplayName: offer.Name, FeeCents: offer.Amount, IntervalMonths: offer.Months, VersionID: offer.VersionID, Version: offer.Version, PricingVersion: offer.Pricing})
 		offer.Price = price.ID
 	}
 	if err != nil {

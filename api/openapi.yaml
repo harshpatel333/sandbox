@@ -5083,7 +5083,7 @@ components:
         allowance:
           type: object
           nullable: true
-          required: [amount_cents, period, on_exhausted, summary]
+          required: [amount_cents, amount_usd, period, on_exhausted, summary]
           description: Usage included in the plan.
           properties:
             amount_cents:
@@ -5173,10 +5173,10 @@ components:
       properties:
         key:
           type: string
-          description: Offer key used to start checkout, e.g. `starter_monthly`.
+          description: Offer key used to start checkout, e.g. `pro_monthly`.
         family:
           type: string
-          description: Plan family shared by its monthly and annual offers, e.g. `starter`.
+          description: Plan family shared by its monthly and annual offers, e.g. `pro`.
         name:
           type: string
         interval_months:

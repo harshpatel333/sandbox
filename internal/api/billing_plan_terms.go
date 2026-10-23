@@ -102,13 +102,14 @@ func forgetPricingVersion() {
 // planTerms is the one lookup for a plan's current terms. It reads the
 // family's published version in the live pricing model; a family the live
 // model does not offer answers with its most recently retired or other-model
-// version, flagged Retired.
+// version, flagged Retired, except legacy pay as you go, which v2 keeps for
+// the teams on it. Subscriptions are keyed "<family>_monthly" or
+// "<family>_annual"; every other kind is keyed by its bare family and has
+// FeeCents and IntervalMonths of zero.
 //
 // Keys are catalog families, not billing_signup_choice.offer_key values: the
 // signup choice "free" means legacy pay as you go, while the v2 "free" family
-// is the Free plan. v2 code reads a team's plan from its plan assignment only. Subscriptions are keyed
-// "<family>_monthly" or "<family>_annual"; every other kind is keyed by its
-// bare family and has FeeCents and IntervalMonths of zero.
+// is the Free plan. v2 code reads a team's plan from its plan assignment only.
 func (h *Handlers) planTerms(ctx context.Context, offerKey string) (planTerms, error) {
 	family, months, ok := planOfferInterval(offerKey)
 	if !ok && planFamilyPattern(offerKey) {
@@ -131,7 +132,9 @@ func (h *Handlers) planTerms(ctx context.Context, offerKey string) (planTerms, e
 	}
 	t, err := h.termsOfVersion(ctx, v, months)
 	if v.PricingVersion != model {
-		t.Available, t.Retired = false, true
+		// Legacy pay as you go stays in force for the teams on it under v2:
+		// not sold, but still assignable.
+		t.Available, t.Retired = false, t.Retired || v.Kind != "legacy_payg"
 	}
 	return t, err
 }

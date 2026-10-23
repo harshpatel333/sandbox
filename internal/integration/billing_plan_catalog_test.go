@@ -876,6 +876,10 @@ func TestIntegration_PublicBillingPlansListTodaysPurchasablePlans(t *testing.T) 
 	}
 	// Starter stays unavailable, even where a price is configured, so only
 	// the Pro offers checkout already sells are listed, at their current terms.
+	var starter int
+	if err := testPool.QueryRow(t.Context(), `SELECT (SELECT COUNT(*) FROM billing_plan WHERE family='starter') + (SELECT COUNT(*) FROM plan_limits WHERE offer_key LIKE 'starter%')`).Scan(&starter); err != nil || starter != 0 {
+		t.Fatalf("migrated catalog has %d Starter offer rows, err=%v", starter, err)
+	}
 	got := fmt.Sprint(body.Plans)
 	want := "[{pro_monthly 1 120000 100000} {pro_annual 12 1200000 100000}]"
 	if got != want {
@@ -944,5 +948,36 @@ func TestIntegration_PricingV2HasNoSignupPromotions(t *testing.T) {
 	}
 	if len(stripe.creditGrantCalls) != 0 {
 		t.Fatalf("card bonus granted under v2: %+v", stripe.creditGrantCalls)
+	}
+}
+
+func TestIntegration_PricingSwitchRollbackRestoresTheLegacyOfferRows(t *testing.T) {
+	ctx := t.Context()
+	snapshot := func() string {
+		var rows string
+		if err := testPool.QueryRow(ctx, `SELECT jsonb_build_object(
+			'plans', (SELECT jsonb_agg(to_jsonb(p) ORDER BY offer_key) FROM billing_plan p),
+			'limits', (SELECT jsonb_agg(to_jsonb(l) ORDER BY offer_key) FROM plan_limits l))::text`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+	before := snapshot()
+	setPricingSwitch(t, "v2")
+	if during := snapshot(); during == before {
+		t.Fatal("the v2 flip left the offer rows unchanged")
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
+		t.Fatal(err)
+	}
+	if after := snapshot(); after != before {
+		t.Fatalf("offer rows after rollback differ:\nbefore %s\nafter  %s", before, after)
+	}
+	var monthly, annual int64
+	var monthlyAvailable, annualAvailable bool
+	if err := testPool.QueryRow(ctx, `SELECT m.charge_amount_cents, m.available, a.charge_amount_cents, a.available
+		FROM billing_plan m, billing_plan a WHERE m.offer_key='pro_monthly' AND a.offer_key='pro_annual'`).
+		Scan(&monthly, &monthlyAvailable, &annual, &annualAvailable); err != nil || monthly != 120000 || annual != 1200000 || !monthlyAvailable || !annualAvailable {
+		t.Fatalf("legacy Pro after rollback monthly=%d/%v annual=%d/%v err=%v", monthly, monthlyAvailable, annual, annualAvailable, err)
 	}
 }

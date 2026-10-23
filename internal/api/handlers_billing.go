@@ -641,19 +641,21 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 
 var commercialPlanNames = map[string]string{"yc_2026": "YC Pro Annual"}
 
-// catalogPlanName names "<family>_<interval>" catalog keys, e.g. "Starter Monthly".
-func catalogPlanName(key string) string {
-	family, interval, ok := strings.Cut(key, "_")
-	if !ok || family == "" || (interval != "monthly" && interval != "annual") {
-		return key
+// catalogPlanName combines a catalog plan's display name with its interval,
+// e.g. "Pro Monthly".
+func catalogPlanName(displayName string, intervalMonths int32) string {
+	if intervalMonths == 12 {
+		return displayName + " Annual"
 	}
-	return strings.ToUpper(family[:1]) + family[1:] + " " + strings.ToUpper(interval[:1]) + interval[1:]
+	return displayName + " Monthly"
 }
 
 func billingPlanFromContract(row db.GetCurrentCommercialPlanRow) billingSummaryPlan {
 	name, ok := commercialPlanNames[row.OfferKey]
-	if !ok {
-		name = catalogPlanName(row.OfferKey)
+	if !ok && row.PlanDisplayName != "" {
+		name = catalogPlanName(row.PlanDisplayName, row.ChargeIntervalMonths)
+	} else if !ok {
+		name = row.OfferKey
 	}
 	price := float64(row.ChargeAmountCents) / 100
 	if row.OfferKey == "yc_2026" {
