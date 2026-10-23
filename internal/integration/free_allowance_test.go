@@ -314,6 +314,12 @@ func TestIntegration_PricingV2Activation_Buckets(t *testing.T) {
 	assigned, _ := seedTeamAndKey(t)
 	assignFreePlan(t, assigned, time.Now())
 
+	blocked, _ := seedTeamAndKey(t)
+	exec(`INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'active')`, blocked, "cus_"+blocked.String(), "sub_"+blocked.String())
+	exec(`INSERT INTO abuse_restrictions (subject_type, subject_value, subject_team_id, action, source, reason)
+		VALUES ('team', $1::text, $1::uuid, 'create', 'test', 'test')`, blocked)
+
 	for _, tc := range []struct {
 		name   string
 		team   uuid.UUID
@@ -323,12 +329,18 @@ func TestIntegration_PricingV2Activation_Buckets(t *testing.T) {
 		{"no card", noCard, "free", ""},
 		{"card on file", payg, "legacy_payg", ""},
 		{"customer without a live subscription", lapsed, "lapsed", ""},
-		{"no card with granted credit", granted, "skipped", "no_card_granted_credit"},
+		{"no card with granted credit", granted, "free", ""},
+		{"abuse blocked with a card", blocked, "blocked", "abuse_blocked"},
 		{"already assigned", assigned, "assigned", "already_assigned"},
 	} {
 		if bucket, reason := activationBucket(t, tc.team); bucket != tc.bucket || reason != tc.reason {
 			t.Errorf("%s: bucket %q reason %q, want %q %q", tc.name, bucket, reason, tc.bucket, tc.reason)
 		}
+	}
+
+	assignFreePlan(t, blocked, time.Now())
+	if eligible(t, blocked) {
+		t.Fatal("assigning Free lifted an abuse block")
 	}
 }
 

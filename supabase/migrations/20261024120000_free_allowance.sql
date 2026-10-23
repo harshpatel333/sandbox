@@ -240,6 +240,7 @@ RETURNS TABLE(bucket text, reason text, stripe_customer_id text)
 LANGUAGE sql STABLE AS $$
  SELECT CASE
     WHEN x.reason = 'already_assigned' THEN 'assigned'
+    WHEN x.reason = 'abuse_blocked' THEN 'blocked'
     WHEN x.reason IS NOT NULL THEN 'skipped'
     WHEN x.subscription IS NOT NULL AND lower(COALESCE(x.status, '')) IN ('active','trialing','past_due','unpaid','paused') THEN 'legacy_payg'
     WHEN x.customer IS NOT NULL OR x.subscription IS NOT NULL THEN 'lapsed'
@@ -253,9 +254,8 @@ LANGUAGE sql STABLE AS $$
     WHEN EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id = p_team AND c.status <> 'ended') THEN 'commercial_contract'
     WHEN EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.team_id = p_team AND o.state <> 'ended') THEN 'yc_operation'
     WHEN EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.team_id = p_team AND o.state NOT IN ('revoked','expired')) THEN 'sponsored_operation'
-    WHEN a.stripe_customer_id IS NULL AND a.stripe_subscription_id IS NULL
-     AND EXISTS(SELECT 1 FROM team_credit_grant g WHERE g.team_id = p_team AND g.reason IS DISTINCT FROM 'signup trial credit'
-                AND g.remaining_usd > 0 AND (g.expires_at IS NULL OR g.expires_at > now())) THEN 'no_card_granted_credit'
+    WHEN EXISTS(SELECT 1 FROM abuse_restrictions r WHERE r.subject_team_id = p_team AND r.released_at IS NULL
+                AND (r.expires_at IS NULL OR r.expires_at > now()) AND r.action IN ('create','resume')) THEN 'abuse_blocked'
    END AS reason
   FROM (SELECT p_team AS team_id) t LEFT JOIN team_billing_account a USING (team_id)
  ) x;

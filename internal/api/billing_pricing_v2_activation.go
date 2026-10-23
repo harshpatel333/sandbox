@@ -48,6 +48,7 @@ type activationReport struct {
 	AsOf             time.Time               `json:"as_of"`
 	ToFree           int                     `json:"to_free"`
 	ToLegacyPAYG     int                     `json:"to_legacy_payg"`
+	BlockedToFree    int                     `json:"blocked_to_free"`
 	AlreadyAssigned  int                     `json:"already_assigned"`
 	Skipped          int                     `json:"skipped"`
 	SkippedReasons   map[string]int          `json:"skipped_reasons"`
@@ -79,6 +80,8 @@ func (h *Handlers) resolveActivationTeams(ctx context.Context, rows []db.ListPri
 		switch row.Bucket {
 		case activationTargetFree, activationTargetLegacyPAYG:
 			teams[i].Target = row.Bucket
+		case "blocked":
+			teams[i].Target = activationTargetFree
 		case "lapsed":
 			if row.StripeCustomerID == "" {
 				teams[i].Target, teams[i].Reason = activationTargetFree, "lapsed_no_credit"
@@ -133,6 +136,9 @@ func summarizeActivation(region string, asOf time.Time, teams []activationTeam) 
 			r.LapsedUnchecked = append(r.LapsedUnchecked, t.TeamID)
 		case t.Target == activationTargetFree:
 			r.ToFree++
+			if t.Bucket == "blocked" {
+				r.BlockedToFree++
+			}
 		case t.Target == activationTargetLegacyPAYG:
 			r.ToLegacyPAYG++
 		case t.Bucket == "assigned":
