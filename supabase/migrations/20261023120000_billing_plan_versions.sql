@@ -385,8 +385,10 @@ $$;
 INSERT INTO billing_plan_version(id, pricing_version, family, version, kind, public, display_name, price_label, tagline, features, sort_order, self_serve,
     monthly_fee_cents, annual_fee_cents, credit_schedule, max_sandboxes, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates)
 SELECT md5('billing-plan-version:legacy:pro:1')::uuid, 'legacy', 'pro', 1, 'subscription', true, m.display_name, '$1,200/month',
-    'For teams running agents in production at scale.', ARRAY['Priority support'], 2, m.available AND a.available,
-    m.charge_amount_cents, a.charge_amount_cents,
+    'For teams running agents in production at scale.', ARRAY['Priority support'], 2, m.available OR a.available,
+    -- An interval that is not sold today keeps no fee, so it stays unsold.
+    CASE WHEN m.available OR NOT a.available THEN m.charge_amount_cents END,
+    CASE WHEN a.available OR NOT m.available THEN a.charge_amount_cents END,
     jsonb_build_array(jsonb_build_object('start_months', 0, 'repeat', NULL, 'every_months', 1, 'amount_cents', m.monthly_credit_cents, 'expires_after_months', 1)),
     l.max_sandboxes, l.max_template_vcpu, l.max_template_memory_mib, l.max_template_disk_mib, 10
 FROM billing_plan m JOIN billing_plan a ON a.offer_key = 'pro_annual' JOIN plan_limits l ON l.offer_key = m.offer_key

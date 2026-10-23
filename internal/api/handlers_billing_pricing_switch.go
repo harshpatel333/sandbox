@@ -67,7 +67,11 @@ func (h *Handlers) SetPlatformPricingVersion(c *gin.Context) {
 		return
 	}
 	if current == req.PricingVersion {
-		err = tx.Rollback(ctx)
+		if err = tx.Rollback(ctx); err != nil {
+			log.Error().Err(err).Msg("release pricing switch failed")
+			respondError(c, ErrInternal)
+			return
+		}
 	} else {
 		if _, err = tx.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version=$1,changed_by=$2,reason=$3,changed_at=clock_timestamp()`, req.PricingVersion, actor, reason); err == nil {
 			_, err = tx.Exec(ctx, `INSERT INTO billing_pricing_switch_audit(actor_id,from_version,to_version,reason) VALUES($1,$2,$3,$4)`, actor, current, req.PricingVersion, reason)
