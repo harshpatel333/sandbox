@@ -574,6 +574,7 @@ func seedFixture(t *testing.T) *fixture {
 		"stripe_checkout_expiration_evidence":      2,
 		"team_trial_eligibility_cache":             0,
 		"team_pricing_plan":                        1,
+		"team_plan_assignment":                     0,
 		"team_credit_grant":                        1,
 		"team_credit_ledger":                       1,
 		"quota_alert_state":                        1,
@@ -3140,5 +3141,258 @@ func TestYCClaimHistoryBlocksMigration(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "YC claim history") {
 			t.Fatalf("locked recheck: %v", err)
 		}
+	}
+}
+
+func TestPlanAssignmentMigration(t *testing.T) {
+	ctx := context.Background()
+	t.Run("source lock fences direct first assignment", func(t *testing.T) {
+		team := uuid.New()
+		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "locked-assignment-"+team.String())
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if err := lockSourcePromotionMigration(ctx, tx, team); err != nil {
+			t.Fatal(err)
+		}
+		if err := lockSourceAssignments(ctx, tx, team); err != nil {
+			t.Fatal(err)
+		}
+		writer, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Rollback(ctx)
+		if _, err := writer.Exec(ctx, `SET LOCAL lock_timeout='100ms'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'starter','prepaid','{}','{"max_concurrent":10}',clock_timestamp(),'credit_purchase','accepted purchase')`, team); err == nil || !strings.Contains(err.Error(), "lock timeout") {
+			t.Fatalf("assignment writer escaped snapshot lock: %v", err)
+		}
+	})
+
+	for _, pricing := range []string{"legacy", "v2"} {
+		t.Run(pricing, func(t *testing.T) {
+			mustExec(t, srcPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+			mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version=$1`, pricing)
+			t.Cleanup(func() { mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`) })
+			team := uuid.New()
+			mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "assignment-"+team.String())
+			first, second := uuid.New(), uuid.New()
+			mustExec(t, srcPool, `INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
+    VALUES($1,$2,'starter','prepaid',(SELECT id FROM billing_plan_version WHERE pricing_version='v2' AND family='starter' AND state='published'),'{"display_name":"Frozen Starter"}','{"max_concurrent":20,"max_memory_mib":4096}',clock_timestamp(),'credit_purchase','accepted purchase')`, first, team)
+			mustExec(t, srcPool, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE id=$1`, first)
+			mustExec(t, srcPool, `INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,terms,limits,effective_from,source,reason,idempotency_key)
+    VALUES($1,$2,'custom_example','custom','{"display_name":"Frozen Custom"}','{"max_concurrent":30,"max_memory_mib":8192}',clock_timestamp(),'staff','agreement','request-one')`, second, team)
+			mustExec(t, srcPool, `UPDATE team SET max_sandboxes=17,max_template_memory_mib=2048,limits_customized=true WHERE id=$1`, team)
+			spec, _ := tableByName("team")
+			for i := 0; i < 2; i++ {
+				if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := requireAssignmentParity(ctx, srcPool, dstPool, team); err != nil {
+				t.Fatal(err)
+			}
+			var current uuid.UUID
+			var concurrent, memory int
+			var customized bool
+			if err := dstPool.QueryRow(ctx, `SELECT a.id,t.max_sandboxes,t.max_template_memory_mib,t.limits_customized FROM team t JOIN team_plan_assignment a ON a.team_id=t.id AND a.effective_to IS NULL WHERE t.id=$1`, team).Scan(&current, &concurrent, &memory, &customized); err != nil {
+				t.Fatal(err)
+			}
+			if current != second || concurrent != 17 || memory != 2048 || !customized {
+				t.Fatalf("authority or manual limits changed: %s %d %d %v", current, concurrent, memory, customized)
+			}
+			mustExec(t, srcPool, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE id=$1`, second)
+			third := uuid.New()
+			mustExec(t, srcPool, `INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+    VALUES($1,$2,'free','free','{"display_name":"Frozen Free"}','{"max_concurrent":1}',clock_timestamp(),'plan_change','accepted exit')`, third, team)
+			if err := requireAssignmentParity(ctx, srcPool, dstPool, team); err == nil {
+				t.Fatal("cutover allowed uncopied assignment")
+			}
+			if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := requireAssignmentParity(ctx, srcPool, dstPool, team); err != nil {
+				t.Fatal(err)
+			}
+			mustExec(t, dstPool, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE id=$1`, third)
+			mustExec(t, dstPool, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+    VALUES($1,'starter','prepaid','{"display_name":"Destination Starter"}','{"max_concurrent":100}',clock_timestamp(),'credit_purchase','destination purchase')`, team)
+			if err := validateRetainedAssignments(ctx, srcPool, dstPool, team); err != nil {
+				t.Fatalf("destination progression rejected: %v", err)
+			}
+			if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil {
+				t.Fatal("retry overwrote destination progression")
+			}
+			mustExec(t, srcPool, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE id=$1`, third)
+			if err := validateRetainedAssignments(ctx, srcPool, dstPool, team); err == nil {
+				t.Fatal("post-detach source change was lost")
+			}
+			mustExec(t, srcPool, `DELETE FROM team WHERE id=$1`, team)
+			var retained int
+			if err := srcPool.QueryRow(ctx, `SELECT count(*) FROM team_plan_assignment WHERE team_id=$1`, team).Scan(&retained); err != nil || retained != 3 {
+				t.Fatalf("history lost: %d %v", retained, err)
+			}
+		})
+	}
+	t.Run("unassigned legacy team stays unassigned in v2", func(t *testing.T) {
+		team := uuid.New()
+		mustExec(t, srcPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+		mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='v2'`)
+		t.Cleanup(func() { mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`) })
+		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "unassigned-"+team.String())
+		spec, _ := tableByName("team")
+		if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := requireAssignmentParity(ctx, srcPool, dstPool, team); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("contract authority refuses before team insert", func(t *testing.T) {
+		team, contract := uuid.New(), uuid.New()
+		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "contract-"+team.String())
+		anchor := time.Now().UTC().Truncate(time.Second)
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,commercial_billing_anchor) VALUES($1,$2,$3,$4)`, team, "cus_"+team.String(), "sub_"+team.String(), anchor)
+		mustExec(t, srcPool, `INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor)
+   VALUES($1,$2,'pro_monthly',$5,$3,$4,'price_example',120000,1,100000,$5)`, contract, team, "cus_"+team.String(), "sub_"+team.String(), anchor)
+		mustExec(t, srcPool, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,contract_id,terms,limits,effective_from,source,reason) VALUES($1,'pro_monthly','subscription',$2,'{}','{"max_concurrent":100}',clock_timestamp(),'checkout','accepted purchase')`, team, contract)
+		spec, _ := tableByName("team")
+		if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil || !strings.Contains(err.Error(), "financial authority transfer") {
+			t.Fatalf("contract migration not refused: %v", err)
+		}
+		var exists bool
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1)`, team).Scan(&exists); err != nil || exists {
+			t.Fatalf("destination team published: %v %v", exists, err)
+		}
+	})
+	t.Run("missing catalog reference fails before team insert", func(t *testing.T) {
+		team, version := uuid.New(), uuid.New()
+		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "missing-version-"+team.String())
+		mustExec(t, srcPool, `INSERT INTO billing_plan_version(id,family,version,kind,display_name,display_only) VALUES($1,$2,1,'custom','Example',true)`, version, "example_"+strings.ReplaceAll(version.String(), "-", ""))
+		mustExec(t, srcPool, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason) VALUES($1,'custom_example','custom',$2,'{}','{"max_concurrent":10}',clock_timestamp(),'staff','agreement')`, team, version)
+		spec, _ := tableByName("team")
+		if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil {
+			t.Fatal("missing catalog reference accepted")
+		}
+		var exists bool
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1)`, team).Scan(&exists); err != nil || exists {
+			t.Fatalf("destination team published: %v %v", exists, err)
+		}
+	})
+}
+
+func TestPlanChangeMigrationRefusesAuthorityWithoutMutatingCells(t *testing.T) {
+	ctx := t.Context()
+	for _, side := range []string{"source", "destination"} {
+		t.Run(side, func(t *testing.T) {
+			team, assignment, change := uuid.New(), uuid.New(), uuid.New()
+			pool := srcPool
+			if side == "destination" {
+				pool = dstPool
+			}
+			mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "plan-change-migration-"+team.String())
+			if side == "destination" {
+				mustExec(t, dstPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "plan-change-migration-"+team.String())
+			}
+			mustExec(t, pool, `INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+    VALUES($1,$2,'custom_example','custom','{}','{"max_concurrent":10}',clock_timestamp(),'staff','agreement')`, assignment, team)
+			cfg := config{teamID: team, sourceURL: srcURL, destURL: dstURL, destHostID: destHostID, destRegion: destRegion, confirmTeamName: "plan-change-migration-" + team.String()}
+			for _, state := range []string{"assigned", "scheduled", "undone"} {
+				if state == "scheduled" {
+					mustExec(t, pool, `INSERT INTO team_plan_change(id,team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,requested_by,requested_via,reason,idempotency_key)
+     VALUES($1,$2,$3,'free','free','{}','{"max_concurrent":1}',clock_timestamp()+interval '2 days',true,$4,'staff','exit','migration-intent')`, change, team, assignment, uuid.New())
+				}
+				if state == "undone" {
+					mustExec(t, pool, `UPDATE team_plan_change SET state='undone',undone_at=clock_timestamp(),undo_reason='keep agreement' WHERE id=$1`, change)
+				}
+				for _, phase := range []string{phasePlan, phaseCopy, phaseValidate, phaseDetach, phasePurge, phaseReleaseRollups} {
+					cfg.phase = phase
+					if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "plan change history cannot migrate") {
+						t.Fatalf("%s %s migration did not refuse: %v", side, state, err)
+					}
+				}
+				var retained uuid.UUID
+				if err := pool.QueryRow(ctx, `SELECT id FROM team_plan_assignment WHERE id=$1`, assignment).Scan(&retained); err != nil || retained != assignment {
+					t.Fatalf("refusal lost assignment: %s %v", retained, err)
+				}
+				if state != "assigned" {
+					var got string
+					if err := pool.QueryRow(ctx, `SELECT state FROM team_plan_change WHERE id=$1`, change).Scan(&got); err != nil || got != state {
+						t.Fatalf("refusal changed history: %s %v", got, err)
+					}
+				}
+				var fenced bool
+				if err := srcPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stripe_promotion_migration_fence WHERE team_id=$1)`, team).Scan(&fenced); err != nil || fenced {
+					t.Fatalf("refusal mutated source fence: %v %v", fenced, err)
+				}
+			}
+			if side == "source" {
+				var copied bool
+				if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1)`, team).Scan(&copied); err != nil || copied {
+					t.Fatalf("refusal published destination team: %v %v", copied, err)
+				}
+				tx, err := srcPool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				if err = lockSourceAssignments(ctx, tx, team); err == nil || !strings.Contains(err.Error(), "plan change history cannot migrate") {
+					t.Fatalf("locked recheck allowed authority: %v", err)
+				}
+			} else {
+				var count int
+				if err := srcPool.QueryRow(ctx, `SELECT count(*) FROM team_plan_assignment WHERE team_id=$1`, team).Scan(&count); err != nil || count != 0 {
+					t.Fatalf("refusal copied destination authority into source: %d %v", count, err)
+				}
+			}
+		})
+	}
+}
+
+func TestPlanChangeMigrationRechecksAssignmentCommittedBeforeSourceLock(t *testing.T) {
+	ctx := t.Context()
+	team, assignment := uuid.New(), uuid.New()
+	mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "migration-race-"+team.String())
+	if err := refusePlanChangeMigration(ctx, srcPool, team); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := srcPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Rollback(ctx)
+	if _, err = writer.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR UPDATE`, team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = writer.Exec(ctx, `INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+  VALUES($1,$2,'custom_example','custom','{}','{"max_concurrent":10}',clock_timestamp(),'staff','agreement')`, assignment, team); err != nil {
+		t.Fatal(err)
+	}
+	migrator, err := srcPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrator.Rollback(ctx)
+	if _, err = migrator.Exec(ctx, `SET LOCAL lock_timeout='100ms'`); err != nil {
+		t.Fatal(err)
+	}
+	if err = lockSourceAssignments(ctx, migrator, team); err == nil || !strings.Contains(err.Error(), "lock timeout") {
+		t.Fatalf("migration did not wait for assignment writer: %v", err)
+	}
+	if err = writer.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	migrator.Rollback(ctx)
+	migrator, err = srcPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrator.Rollback(ctx)
+	if err = lockSourceAssignments(ctx, migrator, team); err == nil || !strings.Contains(err.Error(), "plan change history cannot migrate") {
+		t.Fatalf("locked recheck missed committed assignment: %v", err)
 	}
 }
