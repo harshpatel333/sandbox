@@ -347,3 +347,62 @@ func TestStaffCreditGrantRejectsExpiry(t *testing.T) {
 		t.Fatal("staff credit recognition ignored the issued terms")
 	}
 }
+
+func setPricingSwitch(t *testing.T, h *Handlers, version string) {
+	t.Helper()
+	ctx := context.WithoutCancel(t.Context())
+	conn, err := h.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err = conn.Exec(ctx, `SET session_replication_role=replica`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(ctx, `RESET session_replication_role`)
+	if _, err = conn.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version=$1`, version); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaffCreditIgnoresPricingSwitch(t *testing.T) {
+	h, team, s := newStaffCreditFixture(t, true)
+	var hasSwitch bool
+	if err := h.Pool.QueryRow(t.Context(), `SELECT to_regclass('billing_pricing_switch') IS NOT NULL`).Scan(&hasSwitch); err != nil {
+		t.Fatal(err)
+	}
+	if hasSwitch {
+		var before string
+		if err := h.Pool.QueryRow(t.Context(), `SELECT pricing_version FROM billing_pricing_switch`).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { setPricingSwitch(t, h, before) })
+		setPricingSwitch(t, h, "v2")
+	}
+	req := staffCreditRequest{Key: "issued-under-v2", AmountCents: 1500, Reason: "Top-up while pricing v2 was on"}
+	credit, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req)
+	if err != nil || credit.State != "issued" {
+		t.Fatalf("credit not issued: %+v %v", credit, err)
+	}
+	if hasSwitch {
+		setPricingSwitch(t, h, "legacy")
+	}
+	again, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req)
+	if err != nil || again.ID != credit.ID || s.creates != 1 {
+		t.Fatalf("replay after switch-off: %+v %d creates %v", again, s.creates, err)
+	}
+	staff, err := h.issuedStaffCredits(t.Context(), h.Pool, s.customer)
+	if _, listed := staff[*credit.GrantID]; err != nil || !listed {
+		t.Fatalf("credit issued before switch-off is no longer recognized: %v", err)
+	}
+	if err = creditScope(s.grants[0], s.customer, time.Now().Unix(), nil); err != nil {
+		t.Fatalf("credit issued before switch-off is no longer spendable: %v", err)
+	}
+	if err = h.Stripe.(*stripeHTTPClient).ycGrantPreflight(t.Context(), s.customer, "", "", staff); err != nil {
+		t.Fatalf("credit issued before switch-off blocks YC preflight: %v", err)
+	}
+	next, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "issued-after-switch-off", AmountCents: 500, Reason: "Top-up after switch-off"})
+	if err != nil || next.State != "issued" || s.creates != 2 {
+		t.Fatalf("staff credit refused with the switch off: %+v %v", next, err)
+	}
+}
