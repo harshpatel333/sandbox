@@ -44,6 +44,8 @@ BEGIN
 END $$;
 CREATE TRIGGER billing_plan_identity_guard BEFORE DELETE OR UPDATE OF offer_key ON billing_plan
     FOR EACH ROW EXECUTE FUNCTION guard_billing_plan_identity();
+CREATE TRIGGER billing_plan_truncate_guard BEFORE TRUNCATE ON billing_plan
+    FOR EACH STATEMENT EXECUTE FUNCTION guard_billing_plan_identity();
 
 -- Starter stays unavailable until its annual price and credits are decided.
 INSERT INTO billing_plan VALUES
