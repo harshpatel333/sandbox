@@ -744,3 +744,23 @@ func TestIntegration_TeamPauseAll_WorkerConsumesTargetsWhileSwitchOff(t *testing
 		t.Fatalf("later resume status = %s, want active", state.status)
 	}
 }
+
+func TestIntegration_TeamPauseAll_DeletionPreservesAssignmentAudit(t *testing.T) {
+	ctx := t.Context()
+	setPricingSwitch(t, "v2")
+	team, err := testQueries.CreateTeam(ctx, "pause-delete-"+uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testQueries.RequestTeamPauseAll(ctx, db.RequestTeamPauseAllParams{TeamID: team.ID, Reason: "plan_switch_free"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := testQueries.DeleteTeam(ctx, team.ID); err != nil {
+		t.Fatal(err)
+	}
+	var assignments, requests int
+	if err := testPool.QueryRow(ctx, `SELECT (SELECT count(*) FROM team_plan_assignment WHERE team_id=$1),
+        (SELECT count(*) FROM billing_team_pause_request WHERE team_id=$1)`, team.ID).Scan(&assignments, &requests); err != nil || assignments != 1 || requests != 0 {
+		t.Fatalf("deleted team assignment audit=%d pause requests=%d, %v", assignments, requests, err)
+	}
+}

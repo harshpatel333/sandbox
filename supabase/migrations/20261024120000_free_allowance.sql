@@ -149,7 +149,7 @@ $$;
 
 CREATE TABLE billing_team_pause_request (
  assignment_id uuid PRIMARY KEY REFERENCES team_plan_assignment(id),
- team_id uuid NOT NULL REFERENCES team(id),
+ team_id uuid NOT NULL REFERENCES team(id) ON DELETE CASCADE,
  requested_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 ALTER TABLE billing_team_pause_request ENABLE ROW LEVEL SECURITY;
@@ -158,7 +158,7 @@ REVOKE ALL ON billing_team_pause_request FROM PUBLIC;
 CREATE TABLE billing_team_pause_target (
  sandbox_id uuid NOT NULL REFERENCES sandbox(id) ON DELETE CASCADE,
  team_id uuid NOT NULL REFERENCES team(id) ON DELETE CASCADE,
- assignment_id uuid NOT NULL REFERENCES billing_team_pause_request(assignment_id),
+ assignment_id uuid NOT NULL REFERENCES billing_team_pause_request(assignment_id) ON DELETE CASCADE,
  reason text NOT NULL CHECK (reason IN ('plan_switch_free')),
  requested_at timestamptz NOT NULL,
  done_at timestamptz,
