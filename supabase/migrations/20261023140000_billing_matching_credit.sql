@@ -42,7 +42,8 @@ CREATE TABLE billing_matching_credit (
     amount_cents bigint NOT NULL CHECK (amount_cents >= 0),
     skip_reason text CHECK (btrim(skip_reason) <> ''),
     invoice_evidence jsonb NOT NULL CHECK (jsonb_typeof(invoice_evidence) = 'object'),
-    -- withheld: staff declined a match held for a reversed payment; it no longer reserves cap.
+    -- withheld: staff declined a match held for a reversed payment. It keeps its
+    -- cap reservation so the running total never shrinks behind recorded skips.
     state text NOT NULL CHECK (state IN ('pending', 'uncertain', 'issued', 'skipped', 'withheld')),
     idempotency_key text NOT NULL UNIQUE,
     request_payload jsonb,
@@ -113,7 +114,7 @@ BEGIN
                 AND k.customer_id = NEW.customer_id AND k.state = 'paid') THEN
             RAISE EXCEPTION 'matching requires a released and fully paid usage invoice';
         END IF;
-        SELECT COALESCE(sum(amount_cents), 0) INTO used FROM billing_matching_credit WHERE contract_id = NEW.contract_id AND state <> 'withheld';
+        SELECT COALESCE(sum(amount_cents), 0) INTO used FROM billing_matching_credit WHERE contract_id = NEW.contract_id;
         NEW.matchable_cents := greatest(NEW.usage_cents - NEW.credit_applied_cents - NEW.discount_cents - NEW.unpaid_cents, 0);
         earned := floor(NEW.matchable_cents::numeric * r.matching_bps / 10000)::bigint;
         NEW.amount_cents := CASE WHEN NEW.skip_reason IS NOT NULL THEN 0

@@ -610,7 +610,7 @@ func TestMatchingCreditWithholdsReversedPayments(t *testing.T) {
 	}
 }
 
-func TestMatchingCreditWithheldMatchReleasesCap(t *testing.T) {
+func TestMatchingCreditWithheldMatchKeepsCapReserved(t *testing.T) {
 	m := newMatchingFixture(t, 10000, 70000, 0)
 	prior, ended := m.f.start.AddDate(0, -2, 0), m.f.start.AddDate(0, -1, 0)
 	m.exec(`UPDATE billing_invoice_account SET enrolled_at=$2 WHERE team_id=$1`, m.f.c.TeamID, prior)
@@ -640,8 +640,8 @@ func TestMatchingCreditWithheldMatchReleasesCap(t *testing.T) {
 	if err := m.tick(); err != nil {
 		t.Fatal(err)
 	}
-	if r := m.row(next); r.Paid != 70000 || r.State != "issued" || len(m.posts) != 1 {
-		t.Fatalf("withheld match kept reserving cap: %+v", r)
+	if r := m.row(next); r.Paid != 0 || r.State != "skipped" || len(m.posts) != 0 {
+		t.Fatalf("withholding released cap that earlier skips could not reclaim: %+v", r)
 	}
 	if r := m.row(held); r.State != "withheld" {
 		t.Fatalf("withheld match changed: %+v", r)

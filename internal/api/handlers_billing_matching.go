@@ -27,8 +27,8 @@ type matchingReasonRequest struct {
 	Reason string `json:"reason"`
 }
 
-// A match held for a reversed payment must be resolved: withhold releases
-// its cap, issue sends the grant anyway (e.g. a dispute the merchant won).
+// A match held for a reversed payment must be resolved: withhold ends it
+// without a grant (its cap stays consumed), issue sends the grant anyway.
 type matchingAcknowledgeRequest struct {
 	Reason     string `json:"reason"`
 	Resolution string `json:"resolution"`
@@ -65,7 +65,7 @@ func (h *Handlers) GetTeamMatchingCredit(c *gin.Context) {
 	err = h.Pool.QueryRow(c.Request.Context(), `SELECT jsonb_build_object(
  'rules',(SELECT COALESCE(jsonb_agg(`+matchingRuleJSON+` ORDER BY r.created_at DESC),'[]') FROM billing_contract_matching_rule r
    JOIN billing_commercial_contract c ON c.id=r.contract_id
-   CROSS JOIN LATERAL (SELECT COALESCE(sum(amount_cents),0) matched FROM billing_matching_credit WHERE contract_id=r.contract_id AND state<>'withheld') m WHERE r.team_id=$1),
+   CROSS JOIN LATERAL (SELECT COALESCE(sum(amount_cents),0) matched FROM billing_matching_credit WHERE contract_id=r.contract_id) m WHERE r.team_id=$1),
  'credits',(SELECT COALESCE(jsonb_agg(`+matchingCreditJSON+` ORDER BY x.created_at DESC),'[]') FROM
    (SELECT * FROM billing_matching_credit WHERE team_id=$1 ORDER BY created_at DESC LIMIT 200) x))`, team).Scan(&raw)
 	if err != nil {
