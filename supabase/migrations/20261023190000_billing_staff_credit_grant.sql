@@ -29,6 +29,10 @@ DO $$ DECLARE r text; BEGIN
  FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
    EXECUTE format('REVOKE ALL ON billing_staff_credit_grant FROM %I',r);
+   IF r='service_role' THEN
+    GRANT SELECT,INSERT,UPDATE ON billing_staff_credit_grant TO service_role;
+    CREATE POLICY staff_credit_backend ON billing_staff_credit_grant TO service_role USING(true) WITH CHECK(true);
+   END IF;
   END IF;
  END LOOP;
 END $$;
@@ -83,3 +87,10 @@ END $$;
 CREATE TRIGGER staff_credit_customer_binding BEFORE UPDATE OF stripe_customer_id ON team_billing_account
  FOR EACH ROW EXECUTE FUNCTION guard_staff_credit_customer_binding();
 REVOKE ALL ON FUNCTION guard_staff_credit_customer_binding() FROM PUBLIC;
+
+-- Security-invoker triggers and the backend run these as the backend role.
+DO $$ DECLARE f regprocedure; BEGIN
+ FOREACH f IN ARRAY ARRAY['guard_billing_staff_credit_grant()'::regprocedure,'guard_staff_credit_customer_binding()'::regprocedure] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role',f); END IF;
+ END LOOP;
+END $$;
