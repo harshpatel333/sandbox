@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -429,7 +430,7 @@ func TestPrepaidPaymentCheckoutCreditsOnlyAfterVerifiedPayment(t *testing.T) {
 }
 
 func TestPrepaidFirstPurchaseUsesSubscriptionInvoice(t *testing.T) {
-	f := newPrepaidFixture(t)
+	f, predecessor := prepaidPlanFixture(t)
 	lease := time.Now().UTC()
 	id := prepaidCheckoutPurchaseID(f.team, lease, 1000)
 	if id != prepaidCheckoutPurchaseID(f.team, lease, 1000) {
@@ -462,8 +463,61 @@ func TestPrepaidFirstPurchaseUsesSubscriptionInvoice(t *testing.T) {
 	f.products["prod_credit"] = map[string]string{"prepaid_purchase_id": id.String()}
 	f.sessions[session] = map[string]any{"id": session, "mode": "subscription", "status": "complete", "customer": f.customer, "invoice": invoice, "subscription": f.sub}
 	f.mu.Unlock()
-	if err := f.tick(); err != nil {
+	var frozen []byte
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT plan_snapshot FROM billing_prepaid_purchase WHERE id=$1`, id).Scan(&frozen); err != nil {
 		t.Fatal(err)
+	}
+	var snapshot prepaidPurchasePlan
+	if err := json.Unmarshal(frozen, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Predecessor == nil || *snapshot.Predecessor != predecessor.ID {
+		t.Fatal("purchase did not freeze its Free predecessor", snapshot)
+	}
+	limitsMatch := func(want planLimits) bool {
+		t.Helper()
+		var match bool
+		if err := f.h.Pool.QueryRow(t.Context(), `SELECT max_sandboxes IS NOT DISTINCT FROM $2::integer
+   AND max_template_vcpu IS NOT DISTINCT FROM $3::integer AND max_template_memory_mib IS NOT DISTINCT FROM $4::integer
+   AND max_template_disk_mib IS NOT DISTINCT FROM $5::integer FROM team WHERE id=$1`, f.team, want.MaxConcurrent, want.MaxVCPU, want.MaxMemoryMiB, want.MaxDiskMiB).Scan(&match); err != nil {
+			t.Fatal(err)
+		}
+		return match
+	}
+	fault := "zz_prepaid_assignment_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	f.exec(`CREATE FUNCTION ` + fault + `() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected assignment commit failure'; END $$`)
+	f.exec(`CREATE CONSTRAINT TRIGGER ` + fault + ` AFTER INSERT ON team_plan_assignment DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW WHEN(NEW.team_id='` + f.team.String() + `'::uuid AND NEW.source='credit_purchase') EXECUTE FUNCTION ` + fault + `()`)
+	t.Cleanup(func() {
+		if _, err := f.h.Pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS `+fault+` ON team_plan_assignment; DROP FUNCTION IF EXISTS `+fault+`() `); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := f.tick(); err == nil {
+		t.Fatal("assignment commit failure was not reported")
+	}
+	if row := f.rows()[0]; row.Payment != "succeeded" || row.Credit != "none" || len(f.grantPosts) != 0 {
+		t.Fatal("failed assignment lost payment or issued credit", row)
+	}
+	current, ok, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil || !ok || current.ID != predecessor.ID || !limitsMatch(predecessor.Limits) {
+		t.Fatal("failed assignment partially replaced Free authority", current, err)
+	}
+	f.exec(`DROP TRIGGER ` + fault + ` ON team_plan_assignment; DROP FUNCTION ` + fault + `() `)
+	setPricingVersion(t, f.h, "legacy")
+	if err := f.tick(); err != nil {
+		t.Fatal("accepted checkout recovery while OFF", err)
+	}
+	current, ok, err = currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil || !ok || current.Kind != planKindPrepaid || current.Source != planSourceCreditPurchase || !reflect.DeepEqual(current.Terms, freezePlanTerms(snapshot.Terms)) || !limitsMatch(snapshot.Terms.Limits) {
+		t.Fatal("paid checkout retained Free assignment or limits", current, err)
+	}
+	if err := f.h.settlePrepaidPurchase(t.Context(), f.client, id); err != nil {
+		t.Fatal("settlement replay", err)
+	}
+	replay, _, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil || replay.ID != current.ID || len(f.grantPosts) != 1 {
+		t.Fatal("settlement replay replaced assignment or duplicated credit", replay, err)
 	}
 	if r := f.rows(); len(r) != 1 || r[0].Payment != "succeeded" || r[0].Credit != "issued" || r[0].Amount != 1000 {
 		t.Fatalf("first purchase not credited from its paid invoice: %+v", r)
