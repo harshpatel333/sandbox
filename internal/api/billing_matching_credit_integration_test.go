@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1007,5 +1008,49 @@ func TestMatchingCreditUnsupportedPaidEvidenceCannotAuthorizeOrRetire(t *testing
 				}
 			})
 		}
+	}
+}
+
+func TestMatchingCreditBacklogBudgetPreservesIssuanceAndReversalReview(t *testing.T) {
+	m := newMatchingFixture(t, 10000, 8_000_000, 0)
+	issued := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	pending := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	if err := m.f.h.recordPaidMatchingInvoices(t.Context(), m.client); err != nil {
+		t.Fatal(err)
+	}
+	backlog := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+	m.exec(`UPDATE billing_matching_credit SET review_checked_at=clock_timestamp()-interval '25 hours' WHERE invoice_id=$1`, issued)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/invoices/"+backlog:
+			<-r.Context().Done()
+		case r.URL.Path == "/v1/invoice_payments" && r.URL.Query().Get("invoice") == issued:
+			fmt.Fprintf(w, `{"data":[{"invoice":%q,"amount_paid":100,"payment":{"type":"payment_intent","payment_intent":"pi_review"}}]}`, issued)
+		case r.URL.Path == "/v1/payment_intents/pi_review":
+			fmt.Fprint(w, `{"id":"pi_review","latest_charge":"ch_review"}`)
+		case r.URL.Path == "/v1/charges/ch_review":
+			fmt.Fprintf(w, `{"id":"ch_review","customer":%q,"payment_intent":"pi_review","currency":"usd","paid":true,"captured":true,"amount_captured":100,"amount_refunded":100}`, m.f.c.CustomerID)
+		default:
+			m.serve(w, r)
+		}
+	}))
+	defer srv.Close()
+	m.client.baseURL = srv.URL
+	err := runBillingPhases(t.Context(), time.Second,
+		func(ctx context.Context) error { return m.f.h.recordPaidMatchingInvoices(ctx, m.client) },
+		func(ctx context.Context) error { return m.f.h.issueDueMatchingCredits(ctx, m.client) },
+		func(ctx context.Context) error { return m.f.h.reviewMatchedInvoices(ctx, m.client) },
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("backlog timeout was not reported", err)
+	}
+	if row := m.row(pending); row.State != "issued" {
+		t.Fatal("candidate timeout starved a pending grant", row)
+	}
+	if row := m.row(issued); row.Flag == "" {
+		t.Fatal("candidate timeout starved reversal review", row)
 	}
 }
