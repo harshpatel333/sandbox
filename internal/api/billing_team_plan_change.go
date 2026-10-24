@@ -381,6 +381,23 @@ func (h *Handlers) undoTeamPlanChange(ctx context.Context, team, id, actor uuid.
 	if c.State == "undone" {
 		return c, nil
 	}
+	if c.Subscription != nil && c.State == "scheduled" {
+		client, ok := h.Stripe.(*stripeHTTPClient)
+		if !ok {
+			return c, errors.New("plan changes require the Stripe provider")
+		}
+		sub, err := client.invoiceSubscription(ctx, *c.Subscription)
+		if err != nil {
+			return c, err
+		}
+		if subscriptionEnded(sub) {
+			_, err = h.Pool.Exec(ctx, `UPDATE team_plan_change SET next_check_at=clock_timestamp() WHERE id=$1 AND state='scheduled'`, c.ID)
+			if err != nil {
+				return c, err
+			}
+			return c, teamPlanChangeConflict("the subscription has ended; the committed plan change must finish")
+		}
+	}
 	tag, err := h.Pool.Exec(ctx, `UPDATE team_plan_change SET state='undone',undone_at=clock_timestamp(),undone_by=$2,undo_reason=$4,
         next_check_at=CASE WHEN provider_cancel_requested_at IS NOT NULL THEN clock_timestamp() ELSE 'infinity'::timestamptz END
         WHERE id=$1 AND state='scheduled' AND effective_at>clock_timestamp()+$3::interval AND (lease_until IS NULL OR lease_until<clock_timestamp())
@@ -667,7 +684,19 @@ func (h *Handlers) restorePlanChangeRenewal(ctx context.Context, c teamPlanChang
 		if err != nil {
 			return err
 		}
-		if !subscriptionEnded(sub) && sub.CancelAtPeriodEnd && sub.Metadata["plan_change_cancellation"] == c.ID.String() &&
+		if subscriptionEnded(sub) {
+			ended := time.Now()
+			if sub.EndedAt > 0 && !time.Unix(sub.EndedAt, 0).After(ended) {
+				ended = time.Unix(sub.EndedAt, 0)
+			}
+			if _, err = tx.Exec(ctx, `INSERT INTO team_plan_change(team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,
+                subscription_id,requested_by,requested_via,reason,idempotency_key,terminal_undo_of)
+                SELECT team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,$2,pauses_running,subscription_id,requested_by,requested_via,
+                'the subscription ended before renewal could be restored','terminal-undo:'||gen_random_uuid()::text,id FROM team_plan_change WHERE id=$1
+                ON CONFLICT(terminal_undo_of) DO NOTHING`, c.ID, ended); err != nil {
+				return err
+			}
+		} else if sub.CancelAtPeriodEnd && sub.Metadata["plan_change_cancellation"] == c.ID.String() &&
 			(sub.CancelAt == 0 || sub.CancelAt == subscriptionPeriodEnd(sub).Unix()) {
 			if err = h.setSubscriptionRenewal(ctx, *c.Subscription, c.ID, true); err != nil {
 				return err
@@ -713,7 +742,14 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 			return end, fencedPlanChangeUpdate(ctx, h.Pool, c, `effective_at=$3`, end)
 		}
 		if !subscriptionEnded(sub) {
-			return now, errors.New("waiting for the source subscription to end before releasing its authority")
+			return now.Add(time.Minute), nil
+		}
+		closed, err := h.proInvoicesClosed(ctx, client, c.Team, sub.Customer, sub.ID, nil)
+		if err != nil {
+			return now, err
+		}
+		if !closed {
+			return now.Add(time.Minute), nil
 		}
 		terminal = sub
 	}

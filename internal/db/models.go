@@ -2091,6 +2091,7 @@ type TeamPlanChange struct {
 	Reason                    string             `json:"reason"`
 	IdempotencyKey            string             `json:"idempotency_key"`
 	RequestedAt               time.Time          `json:"requested_at"`
+	TerminalUndoOf            pgtype.UUID        `json:"terminal_undo_of"`
 	State                     string             `json:"state"`
 	ProviderCancelRequestedAt pgtype.Timestamptz `json:"provider_cancel_requested_at"`
 	ProviderCancelPreexisting bool               `json:"provider_cancel_preexisting"`

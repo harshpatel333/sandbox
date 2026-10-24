@@ -18,6 +18,7 @@ CREATE TABLE team_plan_change (
  reason text NOT NULL CHECK(length(btrim(reason)) BETWEEN 1 AND 2000),
  idempotency_key text NOT NULL CHECK(length(idempotency_key) BETWEEN 1 AND 200),
  requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+ terminal_undo_of uuid UNIQUE REFERENCES team_plan_change(id),
  state text NOT NULL DEFAULT 'scheduled' CHECK(state IN ('scheduled','applied','completed','undone')),
  -- The worker records that it is about to tell Stripe not to renew before it
  -- does, and whether the subscription was already set to end; undoing a change
@@ -62,6 +63,13 @@ BEGIN
   IF NEW.state<>'scheduled' OR NEW.provider_cancel_preexisting OR num_nonnulls(NEW.provider_cancel_requested_at,NEW.provider_cancel_at,NEW.provider_renewed_at,
    NEW.undone_at,NEW.undone_by,NEW.undo_reason,NEW.applied_at,NEW.applied_assignment_id,NEW.completed_at)<>0 THEN
    RAISE EXCEPTION 'a plan change starts scheduled';
+  END IF;
+  IF NEW.terminal_undo_of IS NOT NULL AND NOT EXISTS(SELECT 1 FROM team_plan_change p WHERE p.id=NEW.terminal_undo_of AND p.state='undone'
+   AND p.provider_cancel_requested_at IS NOT NULL AND p.team_id=NEW.team_id AND p.from_assignment_id=NEW.from_assignment_id
+   AND p.subscription_id=NEW.subscription_id AND p.target_plan_key=NEW.target_plan_key AND p.target_kind=NEW.target_kind
+   AND p.target_terms=NEW.target_terms AND p.target_limits=NEW.target_limits AND p.pauses_running=NEW.pauses_running
+   AND p.requested_by=NEW.requested_by AND p.requested_via=NEW.requested_via) THEN
+   RAISE EXCEPTION 'terminal undo settlement must preserve its original commitment';
   END IF;
   RETURN NEW;
  END IF;

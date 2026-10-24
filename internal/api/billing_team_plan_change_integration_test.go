@@ -29,6 +29,7 @@ type renewalStripe struct {
 	endedAt        int64
 	checkout       *StripeRetrievedCheckoutSession
 	metadata       map[string]string
+	invoices       []proPaidInvoice
 	periodEnd      time.Time
 	status         string
 	cancel         bool
@@ -46,6 +47,10 @@ type renewalStripe struct {
 func (s *renewalStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/invoices" && r.URL.Query().Get("customer") == s.customer && r.URL.Query().Get("subscription") == s.sub {
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": s.invoices, "has_more": false})
+		return
+	}
 	if s.checkout != nil && r.Method == http.MethodGet && r.URL.Path == "/v1/checkout/sessions/"+s.checkout.ID {
 		_ = json.NewEncoder(w).Encode(s.checkout)
 		return

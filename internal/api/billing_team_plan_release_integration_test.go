@@ -4,6 +4,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 func (f planChangeV2Fixture) committedCheckout(t *testing.T) {
 	t.Helper()
+	invoice := "in_" + uuid.NewString()
 	generation := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
 	session := "cs_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	metadata := map[string]string{"checkout_generation": generation.Format(time.RFC3339Nano), "commercial_offer": "pro_monthly", "activation_user_id": f.actor.String()}
@@ -22,7 +24,10 @@ func (f planChangeV2Fixture) committedCheckout(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err = f.h.Pool.Exec(t.Context(), `INSERT INTO billing_contract_payment(team_id,contract_id,invoice_id,payment_reference,customer_id,subscription_id,base_price_id,service_period_start,service_period_end,base_amount_paid_cents,invoice_amount_paid_cents,invoice_amount_remaining_cents,currency,paid_at,verified_at,evidence)
-        SELECT team_id,id,$2,'example-payment',customer_id,subscription_id,base_price_id,starts_at,billing_anniversary_boundary(entitlement_anchor,1),charge_amount_cents,charge_amount_cents,0,currency,clock_timestamp(),clock_timestamp(),'{"paid":true}' FROM billing_commercial_contract WHERE id=$1`, f.plan(t).ContractID, "in_"+uuid.NewString()); err != nil {
+        SELECT team_id,id,$2,'example-payment',customer_id,subscription_id,base_price_id,starts_at,billing_anniversary_boundary(entitlement_anchor,1),charge_amount_cents,charge_amount_cents,0,currency,clock_timestamp(),clock_timestamp(),'{"paid":true}' FROM billing_commercial_contract WHERE id=$1`, f.plan(t).ContractID, invoice); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_invoice_seen(team_id,invoice_id) VALUES($1,$2)`, f.team, invoice); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE billing_signup_choice SET offer_key='pro_monthly',state='committed',generation=$2,actor_id=$3,base_price_id='price_pro',request_payload=$4,session_id=$5,subscription_id=$6 WHERE team_id=$1`, f.team, generation, f.actor, payload, session, f.stripe.sub); err != nil {
@@ -33,12 +38,13 @@ func (f planChangeV2Fixture) committedCheckout(t *testing.T) {
 	}
 	f.stripe.set(func(s *renewalStripe) {
 		s.metadata = metadata
+		s.invoices = []proPaidInvoice{{StripeInvoiceAmounts: StripeInvoiceAmounts{ID: invoice, Status: "paid"}, AmountPaid: 25000}}
 		s.checkout = &StripeRetrievedCheckoutSession{ID: session, CustomerID: s.customer, SubscriptionID: s.sub, ClientReferenceID: f.team.String(), Status: "complete", Mode: "subscription", Metadata: metadata}
 	})
 }
 
 func TestTeamPlanChangeReleasesOnlyTheEndedSourcePurchase(t *testing.T) {
-	for _, conflict := range []string{"", "replacement subscription", "checkout provenance"} {
+	for _, conflict := range []string{"", "replacement subscription", "checkout provenance", "unreconciled invoice"} {
 		t.Run(conflict, func(t *testing.T) {
 			f := newPlanChangeV2Fixture(t, planKindSubscription)
 			f.committedCheckout(t)
@@ -56,6 +62,9 @@ func TestTeamPlanChangeReleasesOnlyTheEndedSourcePurchase(t *testing.T) {
 			f.stripe.set(func(s *renewalStripe) {
 				s.status = "canceled"
 				s.endedAt = time.Now().Add(-time.Minute).Unix()
+				if conflict == "unreconciled invoice" {
+					s.invoices = append(s.invoices, proPaidInvoice{StripeInvoiceAmounts: StripeInvoiceAmounts{ID: "in_" + uuid.NewString(), Status: "paid"}, AmountPaid: 25000})
+				}
 				if conflict == "checkout provenance" {
 					copy := *s.checkout
 					copy.ClientReferenceID = uuid.NewString()
@@ -69,7 +78,7 @@ func TestTeamPlanChangeReleasesOnlyTheEndedSourcePurchase(t *testing.T) {
 				t.Fatal(err)
 			}
 			if conflict != "" {
-				if c.State != "scheduled" || c.LastError == nil || f.plan(t).ID != source.ID || releases != 0 || payments != 1 {
+				if c.State != "scheduled" || conflict != "unreconciled invoice" && c.LastError == nil || f.plan(t).ID != source.ID || releases != 0 || payments != 1 {
 					t.Fatalf("conflicting authority was released: %+v releases=%d payments=%d", c, releases, payments)
 				}
 				return
@@ -165,5 +174,78 @@ func TestTeamPlanChangeFreeReleaseAndAssignmentCommitTogether(t *testing.T) {
 		}
 	} else if c.State != "scheduled" || c.LastError == nil || f.plan(t).PlanKey != "pro_monthly" || releases != 0 || subscription == nil || *subscription != f.stripe.sub || state != "committed" {
 		t.Fatalf("failed Free assignment detached its authority: %+v releases=%d choice=%s", c, releases, state)
+	}
+}
+
+func TestTeamPlanChangeUndoRefusesAnAlreadyEndedSubscription(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindSubscription)
+	c, err := f.request(t, "starter", "ended-before-undo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.stripe.set(func(s *renewalStripe) { s.status, s.endedAt = "canceled", time.Now().Add(-time.Minute).Unix() })
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan", "customer"); !errors.Is(err, errTeamPlanChangeConflict) {
+		t.Fatalf("undo retained already-ended subscription authority: %v", err)
+	}
+	if got := f.reload(t, c.ID); got.State != "scheduled" || got.UndoneAt != nil {
+		t.Fatalf("rejected undo changed commitment: %+v", got)
+	}
+	f.tick(t)
+	if got := f.reload(t, c.ID); got.State != "completed" || f.plan(t).PlanKey != "starter" {
+		t.Fatalf("ended subscription was stranded after rejected undo: %+v", got)
+	}
+}
+
+func TestTeamPlanChangeUndoLosingTerminalRaceSettlesOnce(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindSubscription)
+	c, err := f.request(t, "starter", "terminal-undo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.tick(t)
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan", "customer"); err != nil {
+		t.Fatal(err)
+	}
+	f.stripe.set(func(s *renewalStripe) {
+		s.status, s.endedAt = "incomplete_expired", time.Now().Add(-time.Minute).Unix()
+	})
+	f.tick(t)
+	f.tick(t)
+	f.tick(t)
+	var followup uuid.UUID
+	var count int
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*),min(id::text)::uuid FROM team_plan_change WHERE terminal_undo_of=$1 AND state='completed'`, c.ID).Scan(&count, &followup); err != nil || count != 1 {
+		t.Fatalf("terminal undo did not settle exactly once: %d %v", count, err)
+	}
+	if got := f.reload(t, c.ID); got.State != "undone" || got.UndoReason == nil || *got.UndoReason != "keep plan" || got.ProviderRenewedAt == nil || f.plan(t).PlanKey != "starter" {
+		t.Fatalf("terminal undo lost history or stranded paid assignment: %+v", got)
+	}
+	if len(f.stripe.writes) != 1 {
+		t.Fatalf("terminal undo tried to renew ended subscription: %v", f.stripe.writes)
+	}
+	if got := f.reload(t, followup); got.FromAssignment != c.FromAssignment || got.Subscription == nil || *got.Subscription != *c.Subscription || got.TargetPlanKey != c.TargetPlanKey {
+		t.Fatalf("terminal settlement changed its original authority: %+v", got)
+	}
+}
+
+func TestTeamPlanChangeWaitingForTerminalDoesNotBackOff(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindSubscription)
+	c, err := f.request(t, "starter", "terminal-wait")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.tick(t)
+	f.reachEffective(t, c.ID)
+	c = f.reload(t, c.ID)
+	f.stripe.set(func(s *renewalStripe) { s.periodEnd = c.EffectiveAt.Truncate(time.Second) })
+	for range 4 {
+		f.tick(t)
+		var next time.Time
+		if err := f.h.Pool.QueryRow(t.Context(), `SELECT next_check_at FROM team_plan_change WHERE id=$1`, c.ID).Scan(&next); err != nil || next.After(time.Now().Add(2*time.Minute)) {
+			t.Fatalf("terminal observation backs off beyond bound: %v %v", next, err)
+		}
+		if got := f.reload(t, c.ID); got.State != "scheduled" || got.Failures != 0 || got.LastError != nil {
+			t.Fatalf("normal terminal wait is treated as provider failure: %+v", got)
+		}
 	}
 }
