@@ -334,6 +334,79 @@ func TestPlanAssignmentNewTeamStartsOnFreeOnlyUnderV2(t *testing.T) {
 	}
 }
 
+func TestPlanAssignmentSignupRequiresPublishedFree(t *testing.T) {
+	h, _ := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
+	tx, err := h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.WithoutCancel(t.Context()))
+	if _, err := tx.Exec(t.Context(), `SELECT retire_billing_plan_version(id,NULL) FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'`); err != nil {
+		t.Fatal(err)
+	}
+	name := "unpublished-free-" + uuid.NewString()
+	if _, err := db.New(tx).CreateTeam(t.Context(), name); err == nil || !strings.Contains(err.Error(), "published v2 Free plan is required") {
+		t.Fatalf("team creation did not fail closed without Free: %v", err)
+	}
+	if err := tx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var exists bool
+	if err := h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team WHERE name=$1)`, name).Scan(&exists); err != nil || exists {
+		t.Fatalf("planless team persisted: %v %v", exists, err)
+	}
+}
+
+func TestPlanAssignmentSignupLocksAcceptanceRows(t *testing.T) {
+	h, _ := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
+	for name, mutation := range map[string]string{
+		"switch rollback": `UPDATE billing_pricing_switch SET pricing_version='legacy'`,
+		"Free retirement": `SELECT retire_billing_plan_version(id,NULL) FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			signup, err := h.Pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer signup.Rollback(context.WithoutCancel(t.Context()))
+			team, err := db.New(signup).CreateTeam(t.Context(), "serialized-signup-"+uuid.NewString())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan, assigned, err := currentTeamPlan(t.Context(), signup, team.ID); err != nil || !assigned || plan.Kind != planKindFree {
+				t.Fatalf("signup missing Free: %+v %v %v", plan, assigned, err)
+			}
+			contender, err := h.Pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer contender.Rollback(context.WithoutCancel(t.Context()))
+			if _, err := contender.Exec(t.Context(), `SET LOCAL lock_timeout='100ms'`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := contender.Exec(t.Context(), mutation); err == nil || !strings.Contains(err.Error(), "lock timeout") {
+				t.Fatalf("%s overtook uncommitted signup: %v", name, err)
+			}
+			if err := contender.Rollback(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := signup.Rollback(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			released, err := h.Pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer released.Rollback(context.WithoutCancel(t.Context()))
+			if _, err := released.Exec(t.Context(), mutation); err != nil {
+				t.Fatalf("%s failed after signup released locks: %v", name, err)
+			}
+		})
+	}
+}
+
 func TestPlanAssignmentOwnsLimitsAfterSwitchOff(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
 	terms := testPlanTerms("starter", planKindPrepaid, 5, nil)
