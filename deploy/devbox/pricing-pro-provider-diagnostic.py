@@ -107,10 +107,10 @@ class Client:
         self.bound = True
 
 
-def failed_request(source):
+def failed_request(source, expected_account):
     require(source.get('status') == 'blocked' and source.get('verified_test_mode') is True,
             'Source must be the preserved failed verified-test run')
-    require(source.get('account_id') == 'acct_1UST2ILIAkKd3qgh'
+    require(source.get('account_id') == expected_account
             and source.get('api_version') == '2026-05-27.dahlia', 'Source account/version differs')
     run = source.get('run_id')
     require(isinstance(run, str) and re.fullmatch(r'[0-9a-f]{32}', run), 'Missing original run ID')
@@ -174,7 +174,7 @@ def main():
         require(os.geteuid() == 0, 'Run root on the isolated box')
         raw = args.source_receipt.read_bytes()
         source = json.loads(raw)
-        row, fields, idempotency = failed_request(source)
+        row, fields, idempotency = failed_request(source, result['account_id'])
         result.update(source_sha256=hashlib.sha256(raw).hexdigest(),
                       original_request={key: source['requests'][-1].get(key) for key in ('method', 'path', 'status', 'request_id')},
                       fixtures={key: row[key] for key in ('clock', 'customer', 'product', 'price')},

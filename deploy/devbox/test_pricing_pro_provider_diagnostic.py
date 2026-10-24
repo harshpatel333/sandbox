@@ -13,7 +13,7 @@ spec.loader.exec_module(diag)
 
 
 def source():
-    return {'status': 'blocked', 'verified_test_mode': True, 'account_id': 'acct_1UST2ILIAkKd3qgh',
+    return {'status': 'blocked', 'verified_test_mode': True, 'account_id': 'acct_fixture',
             'api_version': '2026-05-27.dahlia', 'run_id': 'a' * 32,
             'calendars': [{'year': 2027, 'status': 'pending', 'clock': 'clock_fixture', 'customer': 'cus_fixture',
                            'product': 'prod_fixture', 'price': 'price_fixture'}],
@@ -22,7 +22,7 @@ def source():
 
 class DiagnosticTests(unittest.TestCase):
     def test_exact_original_form_and_idempotency_are_reconstructed(self):
-        row, fields, key = diag.failed_request(source())
+        row, fields, key = diag.failed_request(source(), 'acct_fixture')
         self.assertEqual(key, 'dev-pro-qa:' + 'a' * 32 + ':2027:subscription')
         self.assertEqual(fields, {'customer': 'cus_fixture', 'items[0][price]': 'price_fixture',
                          'collection_method': 'send_invoice', 'days_until_due': 30, 'proration_behavior': 'none',
@@ -33,7 +33,7 @@ class DiagnosticTests(unittest.TestCase):
             s = source()
             s[key] = value
             with self.subTest(key=key), self.assertRaises(diag.DiagnosticError):
-                diag.failed_request(s)
+                diag.failed_request(s, 'acct_fixture')
 
     def test_error_whitelist_redacts_credential_and_ignores_full_body(self):
         body = json.dumps({'error': {'type': 'invalid_request_error', 'code': 'rk_test_fixture',
@@ -75,7 +75,7 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(result['requests'][0]['error']['param'], 'billing_mode[type]')
 
     def test_existing_or_paginated_customer_inventory_blocks_replay(self):
-        row, fields, _ = diag.failed_request(source())
+        row, fields, _ = diag.failed_request(source(), 'acct_fixture')
         for subscriptions in [{'has_more': True, 'data': []}, {'has_more': False, 'data': [{'id': 'sub_existing'}]}]:
             with self.subTest(subscriptions=subscriptions):
                 client = Mock()
