@@ -127,7 +127,7 @@ fi
 
 [[ $PROMOTION_EVIDENCE_PROXY_PASSWORD =~ ^[0-9a-f]+$ ]] || die "PROMOTION_EVIDENCE_PROXY_PASSWORD in $local_secrets must be hex"
 [[ $SYSTEM_TEAM_ID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "SYSTEM_TEAM_ID in $local_secrets must be a UUID"
-rm -f "$deploy_record"
+clear_api_deploy_record
 mkdir -p "$DEVBOX_INSTALL_DIR/tools"
 ensure_go
 ensure_supabase_cli

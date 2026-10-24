@@ -17,7 +17,7 @@ from pathlib import Path
 backup=Path(sys.argv[1])
 pid=int(subprocess.check_output(['systemctl','show','superserve-devbox-api.service','--property=MainPID','--value'],text=True))
 exe=Path('/proc')/str(pid)/'exe'
-record={'pid':pid,'executable':str(exe.resolve()),'binary_sha256':hashlib.sha256(exe.read_bytes()).hexdigest(),'original_api_deploy_receipt_present':Path('/var/lib/superserve-devbox/api-deploy.json').exists(),'receipt_note':'The workflow removes api-deploy.json before invoking selected scripts; retained prior workflow logs are separate from this live process observation.'}
+record={'pid':pid,'executable':str(exe.resolve()),'binary_sha256':hashlib.sha256(exe.read_bytes()).hexdigest(),'original_api_deploy_receipt_present':Path('/var/lib/superserve-devbox/api-deploy.json').exists(),'receipt_note':'Current receipt may be cleared before reset; archived receipts under api-deploy-history are separate provenance and must not be represented as this current receipt.'}
 (backup/'previous-api-runtime.json').write_text(json.dumps(record)+'\n')
 PYCODE
 cp "$DEVBOX_STATE_DIR/runtime.json" "$backup/previous-runtime.json"

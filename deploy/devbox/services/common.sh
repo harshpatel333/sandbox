@@ -52,3 +52,13 @@ load_local_secrets() {
   . "$local_secrets"
   set +a
 }
+
+clear_api_deploy_record() {
+  local record="$DEVBOX_STATE_DIR/api-deploy.json" archive="$DEVBOX_STATE_DIR/api-deploy-history" saved
+  if [[ -e $record ]]; then
+    install -d -m 0700 "$archive"
+    saved=$(mktemp -d "$archive/receipt.XXXXXXXX")
+    cp -p -- "$record" "$saved/api-deploy.json"
+  fi
+  rm -f -- "$record"
+}

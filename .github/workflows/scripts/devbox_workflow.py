@@ -367,7 +367,12 @@ class Box:
 
     def remove(self, path):
         self.guard()
-        self.ssh("sudo rm -f " + shlex.quote(path))
+        if path == API_DEPLOY_FILE:
+            archive = str(Path(path).parent / "api-deploy-history")
+            script = 'set -eu; if [ -e "$1" ]; then install -d -m 0700 "$2"; saved=$(mktemp -d "$2/receipt.XXXXXXXX"); cp -p -- "$1" "$saved/api-deploy.json"; fi; rm -f -- "$1"'
+            self.ssh("sudo sh -c " + shlex.quote(script) + " -- " + shlex.quote(path) + " " + shlex.quote(archive))
+        else:
+            self.ssh("sudo rm -f " + shlex.quote(path))
 
     def head(self, key):
         source = f"{contract.BOX_SOURCE_DIR}/{SOURCE_DIRS[key]}"

@@ -222,7 +222,7 @@ class FakeCloud:
                 self.box_files[workflow.API_DEPLOY_FILE] = json.dumps(
                     {"sha": self.deployed_sha, "migrations": self.migrations, "applied": []})
             return fail() if script.group(1) == self.fail_script else ok()
-        if command.startswith("sudo rm -f"):
+        if command.startswith("sudo rm -f") or (command.startswith("sudo sh -c") and "receipt.XXXXXXXX" in command):
             self.box_files.pop(workflow.API_DEPLOY_FILE, None)
             return ok()
         if command.startswith("sudo cat"):
