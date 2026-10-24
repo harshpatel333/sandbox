@@ -431,6 +431,8 @@ func TestPrepaidPaymentCheckoutCreditsOnlyAfterVerifiedPayment(t *testing.T) {
 
 func TestPrepaidFirstPurchaseUsesSubscriptionInvoice(t *testing.T) {
 	f, predecessor := prepaidPlanFixture(t)
+	assertPlan := prepaidPlanReader(t, f, f.team)
+	assertPlan(predecessor)
 	lease := time.Now().UTC()
 	id := prepaidCheckoutPurchaseID(f.team, lease, 1000)
 	if id != prepaidCheckoutPurchaseID(f.team, lease, 1000) {
@@ -503,6 +505,7 @@ func TestPrepaidFirstPurchaseUsesSubscriptionInvoice(t *testing.T) {
 	if err != nil || !ok || current.ID != predecessor.ID || !limitsMatch(predecessor.Limits) {
 		t.Fatal("failed assignment partially replaced Free authority", current, err)
 	}
+	assertPlan(current)
 	f.exec(`DROP TRIGGER ` + fault + ` ON team_plan_assignment; DROP FUNCTION ` + fault + `() `)
 	setPricingVersion(t, f.h, "legacy")
 	if err := f.tick(); err != nil {
@@ -512,6 +515,7 @@ func TestPrepaidFirstPurchaseUsesSubscriptionInvoice(t *testing.T) {
 	if err != nil || !ok || current.Kind != planKindPrepaid || current.Source != planSourceCreditPurchase || !reflect.DeepEqual(current.Terms, freezePlanTerms(snapshot.Terms)) || !limitsMatch(snapshot.Terms.Limits) {
 		t.Fatal("paid checkout retained Free assignment or limits", current, err)
 	}
+	assertPlan(current)
 	if err := f.h.settlePrepaidPurchase(t.Context(), f.client, id); err != nil {
 		t.Fatal("settlement replay", err)
 	}
@@ -519,6 +523,7 @@ func TestPrepaidFirstPurchaseUsesSubscriptionInvoice(t *testing.T) {
 	if err != nil || replay.ID != current.ID || len(f.grantPosts) != 1 {
 		t.Fatal("settlement replay replaced assignment or duplicated credit", replay, err)
 	}
+	assertPlan(replay)
 	if r := f.rows(); len(r) != 1 || r[0].Payment != "succeeded" || r[0].Credit != "issued" || r[0].Amount != 1000 {
 		t.Fatalf("first purchase not credited from its paid invoice: %+v", r)
 	}

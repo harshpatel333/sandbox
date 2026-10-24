@@ -33,6 +33,48 @@ func prepaidPlanFixture(t *testing.T) (*prepaidFixture, teamPlan) {
 	return f, p
 }
 
+func prepaidPlanReader(t *testing.T, f *prepaidFixture, team uuid.UUID) func(teamPlan) {
+	t.Helper()
+	actor := uuid.New()
+	f.exec(`INSERT INTO profile(id,email,provider,provider_id) VALUES($1,$2,'google',$3)`, actor, actor.String()+"@example.com", actor.String())
+	f.exec(`INSERT INTO team_memberships(team_id,user_id,status) VALUES($1,$2,'active')`, team, actor)
+	f.exec(`INSERT INTO user_role_assignments(user_id,role_id,scope_type,team_id) SELECT $1,id,'team',$2 FROM roles WHERE name='team_owner'`, actor, team)
+	f.exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'tenant_usage_dashboard',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, team)
+	r := gin.New()
+	r.GET("/billing/plan", func(c *gin.Context) {
+		c.Set("team_id", team.String())
+		c.Set("actor_id", actor)
+		f.h.GetBillingPlan(c)
+	})
+	return func(want teamPlan) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		r.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/billing/plan", nil).WithContext(t.Context()))
+		if response.Code != http.StatusOK {
+			t.Fatal("customer plan read", response.Code, response.Body.String())
+		}
+		var body struct {
+			Plan *customerPlan `json:"plan"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Plan == nil || body.Plan.Kind != want.Kind || body.Plan.PlanKey != want.PlanKey {
+			t.Fatal("customer plan differs from committed authority", body.Plan, want)
+		}
+		for _, limits := range []struct{ got, want *int32 }{
+			{body.Plan.Limits.MaxConcurrent, want.Limits.MaxConcurrent},
+			{body.Plan.Limits.MaxVCPU, want.Limits.MaxVCPU},
+			{body.Plan.Limits.MaxMemoryMiB, want.Limits.MaxMemoryMiB},
+			{body.Plan.Limits.MaxDiskMiB, want.Limits.MaxDiskMiB},
+		} {
+			if limits.want != nil && !reflect.DeepEqual(limits.got, limits.want) {
+				t.Fatal("customer limits differ from frozen assignment", body.Plan.Limits, want.Limits)
+			}
+		}
+	}
+}
+
 func freezePaidPrepaidPurchase(t *testing.T, f *prepaidFixture) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
@@ -99,6 +141,7 @@ func TestPrepaidSettlementDoesNotOverwriteLaterFreeAssignment(t *testing.T) {
 	if err != nil || p.ID != newer.ID {
 		t.Fatal("late payment overwrote newer Free", p, err)
 	}
+	prepaidPlanReader(t, f, f.team)(p)
 	if r := f.rows(); r[0].Credit != "issued" {
 		t.Fatalf("later assignment stranded paid credit: %+v", r)
 	}
@@ -175,6 +218,7 @@ func TestPrepaidUnassignedEntryClosedButAcceptedAbsenceSettles(t *testing.T) {
 			if err != nil || !ok || (newer && p.ID != expected) || (!newer && p.Kind != planKindPrepaid) {
 				t.Fatal("accepted absence mishandled", p, err)
 			}
+			prepaidPlanReader(t, f, team.ID)(p)
 			f.exec(`UPDATE billing_prepaid_purchase SET next_attempt_at='9999-01-01' WHERE id=$1`, id)
 		})
 	}
