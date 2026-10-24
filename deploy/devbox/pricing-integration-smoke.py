@@ -74,6 +74,7 @@ team = str(uuid.uuid4())
 key = "devprobe_" + secrets.token_hex(32)
 keyhash = hashlib.sha256(key.encode()).hexdigest()
 sql(f"INSERT INTO profile(id,email,provider,provider_id) VALUES('{actor}','dev-probe@example.com','google','{actor}'); INSERT INTO user_role_assignments(user_id,role_id,scope_type) SELECT '{actor}',id,'platform' FROM roles WHERE name='platform_admin';")
+sql(f"SELECT row_to_json(t) FROM billing_transition_pricing_version('legacy','{actor}','dev smoke initial rollback preserving authority') t;")
 old_team = str(uuid.uuid4())
 old_key = "devprobe_" + secrets.token_hex(32)
 old_hash = hashlib.sha256(old_key.encode()).hexdigest()
@@ -83,9 +84,13 @@ sql(f"SELECT row_to_json(t) FROM billing_transition_pricing_version('v2','{actor
 public = request("/billing/plans/public")
 if public.get("pricing_version") != "legacy":
     raise RuntimeError("PREPARING exposed public v2")
+old_entry_query = f"SELECT jsonb_build_object('assignments',(SELECT count(*) FROM team_plan_assignment WHERE team_id='{old_team}'),'choice',(SELECT to_jsonb(c) FROM billing_signup_choice c WHERE team_id='{old_team}'))"
+old_entry_before = json.loads(sql(old_entry_query))
+if old_entry_before["assignments"] != 0 or (old_entry_before["choice"] and old_entry_before["choice"]["state"] != "selecting"):
+    raise RuntimeError("Old unassigned entry fixture already has accepted authority")
 request("/stripe/plan-choice", {"offer": "free"}, key=old_key, expected=(409,))
-if sql(f"SELECT (SELECT count(*) FROM team_plan_assignment WHERE team_id='{old_team}')+(SELECT count(*) FROM billing_signup_choice WHERE team_id='{old_team}')") != "0":
-    raise RuntimeError("Old unassigned Free entry created choice or assignment while PREPARING")
+if json.loads(sql(old_entry_query)) != old_entry_before:
+    raise RuntimeError("Old unassigned Free entry mutated choice or assignment while PREPARING")
 sql(f"INSERT INTO team(id,name) VALUES('{team}','dev-worker-{team}'); INSERT INTO team_memberships(team_id,user_id,status) VALUES('{team}','{actor}','active'); INSERT INTO user_role_assignments(user_id,role_id,scope_type,team_id) SELECT '{actor}',id,'team','{team}' FROM roles WHERE name='team_owner'; INSERT INTO api_key(team_id,key_hash,name,created_by,scopes) VALUES('{team}','{keyhash}','dev-worker-probe','{actor}',ARRAY['sandbox:read','sandbox:write']); INSERT INTO team_feature_flag(team_id,key,enabled) VALUES('{team}','tenant_usage_dashboard',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true;")
 plan = request("/billing/plan", key=key)
 if plan.get("plan", {}).get("kind") != "free":
