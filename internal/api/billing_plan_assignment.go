@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -317,21 +318,32 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	current, assigned, err := currentTeamPlan(ctx, h.Pool, team)
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("begin billing plan read failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	defer tx.Rollback(ctx)
+	reader := &Handlers{DB: db.New(tx)}
+	current, assigned, err := currentTeamPlan(ctx, tx, team)
 	var limits teamLimits
 	if err == nil && assigned {
-		limits, err = h.teamEffectiveLimits(ctx, team)
+		limits, err = reader.teamEffectiveLimits(ctx, team)
 	}
 	var anchor pgtype.Timestamptz
 	if err == nil {
-		err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
+		err = tx.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
 		if errors.Is(err, pgx.ErrNoRows) {
 			err = nil
 		}
 	}
 	var start, end time.Time
 	if err == nil {
-		start, end, err = h.currentBillingPeriod(ctx, team, anchor, h.nowUTC())
+		start, end, err = reader.currentBillingPeriod(ctx, team, anchor, h.nowUTC())
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
 	}
 	if err != nil {
 		log.Error().Err(err).Str("team_id", team.String()).Msg("load billing plan failed")
@@ -477,14 +489,14 @@ func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 		return
 	}
 	var body staffPlanAssignmentBody
-	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 8192))
+	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&body) != nil || decoder.Decode(&struct{}{}) != io.EOF || body.VersionID == uuid.Nil {
 		respondErrorMsg(c, "bad_request", "idempotency_key, version_id and reason are required", http.StatusBadRequest)
 		return
 	}
 	body.Reason = strings.TrimSpace(body.Reason)
-	if strings.TrimSpace(body.Key) == "" || len(body.Key) > 200 || body.Reason == "" || len(body.Reason) > 2000 {
+	if strings.TrimSpace(body.Key) == "" || utf8.RuneCountInString(body.Key) > 200 || body.Reason == "" || utf8.RuneCountInString(body.Reason) > 2000 {
 		respondErrorMsg(c, "bad_request", "idempotency_key, version_id and reason are required", http.StatusBadRequest)
 		return
 	}
