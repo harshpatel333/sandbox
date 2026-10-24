@@ -874,6 +874,37 @@ type BillingPlanVersion struct {
 	RetiredAt                 pgtype.Timestamptz `json:"retired_at"`
 }
 
+type BillingPricingAdoption struct {
+	Singleton    bool               `json:"singleton"`
+	Region       *string            `json:"region"`
+	SystemTeamID pgtype.UUID        `json:"system_team_id"`
+	Epoch        uuid.UUID          `json:"epoch"`
+	State        string             `json:"state"`
+	Evidence     []byte             `json:"evidence"`
+	ReleasedAt   pgtype.Timestamptz `json:"released_at"`
+}
+
+type BillingPricingAdoptionEvent struct {
+	ID        uuid.UUID `json:"id"`
+	Epoch     uuid.UUID `json:"epoch"`
+	Region    *string   `json:"region"`
+	Action    string    `json:"action"`
+	Actor     string    `json:"actor"`
+	Reason    string    `json:"reason"`
+	Details   []byte    `json:"details"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type BillingPricingAdoptionInventory struct {
+	Epoch        uuid.UUID   `json:"epoch"`
+	TeamID       uuid.UUID   `json:"team_id"`
+	AssignmentID pgtype.UUID `json:"assignment_id"`
+	Bucket       string      `json:"bucket"`
+	Reason       string      `json:"reason"`
+	Present      bool        `json:"present"`
+	ObservedAt   time.Time   `json:"observed_at"`
+}
+
 type BillingPricingSwitch struct {
 	Singleton      bool        `json:"singleton"`
 	PricingVersion string      `json:"pricing_version"`

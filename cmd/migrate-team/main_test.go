@@ -3146,6 +3146,23 @@ func TestYCClaimHistoryBlocksMigration(t *testing.T) {
 
 func TestPlanAssignmentMigration(t *testing.T) {
 	ctx := context.Background()
+	t.Run("released adoption refuses destination import", func(t *testing.T) {
+		mustExec(t, srcPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+		team := uuid.New()
+		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "released-import-"+team.String())
+		mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='v2'`)
+		mustExec(t, dstPool, `UPDATE billing_pricing_adoption SET region='usw',system_team_id=$1,state='released',evidence='{}',released_at=clock_timestamp()`, uuid.New())
+		t.Cleanup(func() { mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`) })
+		spec, _ := tableByName("team")
+		if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil || !strings.Contains(err.Error(), "released entry") {
+			t.Fatalf("released cell accepted imported planless authority: %v", err)
+		}
+		var exists bool
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1)`, team).Scan(&exists); err != nil || exists {
+			t.Fatalf("destination published: %v %v", exists, err)
+		}
+	})
+
 	t.Run("source lock fences direct first assignment", func(t *testing.T) {
 		team := uuid.New()
 		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "locked-assignment-"+team.String())

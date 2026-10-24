@@ -195,3 +195,78 @@ the provider or busy team recovers. Committed assignments survive interruption.
 Regional team migration refuses existing Free allowance or pause state in either
 cell. These rows are not transferred by `migrate-team`; coordinate their financial
 and operational authority transfer before copy or cutover.
+
+### Regional adoption barrier
+
+Raw pricing v2 starts a durable PREPARING epoch. It does not release public v2
+entry when apply finishes. A raw pricing rollback rotates the epoch, clears the
+release and retains existing assignments and commitments. Each regional database
+binds its adoption state to an explicit region and nonzero system-team UUID.
+
+`billing_pricing_public_state()` returns `pricing_version`, `entry_open`, and
+`epoch`. Raw legacy returns legacy/closed for v2 entry; preparing v2 returns legacy/closed;
+consistent released v2 returns v2/open. Missing state returns exactly one
+legacy/closed/NULL-epoch row. Ordinary legacy route behavior is handled separately. Public catalog and entry owners must consume this
+helper before public v2 exposure. This migration does not change their call sites.
+During preparation subscription offers must be unavailable, and an old unassigned
+Free choice must fail without writing a choice or assignment.
+
+New-entry writers call
+`billing_assert_pricing_entry_open(expected_epoch uuid DEFAULT NULL, expected_pricing_version text DEFAULT NULL)`
+after durable idempotency replay. It holds switch/adoption SHARE locks through the
+transaction and raises `55000` when closed or stale. Supply both expected values
+for terms already loaded; otherwise call with neither and load terms under those
+locks. An epoch alone does not detect preparation becoming released. Entry owners
+map closed entry to 409. Existing assignment reads, exits, undo and committed
+workers retain their authority independently of this gate.
+
+Human operations, with private region/database/provider configuration already set:
+
+```bash
+go run ./cmd/pricing-v2-migrate prepare --confirm --actor "$W5_ADOPTION_ACTOR" --reason "$W5_ADOPTION_REASON"
+go run ./cmd/pricing-v2-migrate report --format json
+```
+
+After the approved owner integrations, schema and consuming worker are deployed,
+set raw v2 through the existing staff switch interface. This starts a new
+PREPARING epoch. Public exposure must still use the effective-state helper.
+Then run the human adoption and persist the exhaustive residual inventory:
+
+```bash
+go run ./cmd/pricing-v2-migrate apply --confirm --actor "$W5_ADOPTION_ACTOR" --reason "$W5_ADOPTION_REASON" --batch 200
+go run ./cmd/pricing-v2-migrate capture --confirm --actor "$W5_ADOPTION_ACTOR" --reason "$W5_ADOPTION_REASON"
+go run ./cmd/pricing-v2-migrate report --format json
+```
+
+`report` is read-only and includes the adoption epoch, effective public state and
+all non-system unassigned teams in the cell, including skipped teams and teams
+whose home-region label differs. `capture` durably upserts the epoch inventory and
+records an audit event. Apply also captures after each batch. Eligible `remaining`
+can be zero while exhaustive residuals are nonzero. Resolve financial operations
+through their owners and rerun; no implicit legacy/quarantine exceptions exist.
+
+Release is a separate explicit operation against the current capture epoch:
+
+```bash
+go run ./cmd/pricing-v2-migrate release --confirm --actor "$W5_ADOPTION_ACTOR" --reason "$W5_ADOPTION_REASON" --epoch "$W5_ADOPTION_EPOCH" --evidence-file "$W5_ADOPTION_EVIDENCE"
+```
+
+The evidence JSON must include `region`, `system_team_id`, `epoch`, matching full 40-character
+`assembled_sha`, `schema_sha` and `worker_sha`, nonempty `deployment_reference`
+and `worker_reference`, and `verified_worker: true`. These are recorded operator
+attestations referencing actual assembled deployment and worker-consumption
+receipts, not an automatic observation of a running worker. Local test evidence
+must never be used for a real release. External review, CI, owner entry and route
+prerequisites and deployment evidence remain separate required release gates.
+
+`billing_release_pricing_adoption(region text, system_team_id uuid, epoch uuid, actor text, reason text, evidence jsonb)`
+requires READ COMMITTED isolation and unfiltered row visibility, and locks
+switch/adoption state, published Free terms and every live non-system team
+before recapturing inventory. Every such team must have an open durable assignment;
+any residual or unsettled pause target returns `released: false`, persists the
+blocked inventory/event and makes the CLI exit nonzero. Enabled signup/shape
+triggers and allowance/pause schema are required. Successful release records its
+evidence and opens the effective public v2 gate. Signup holds the switch lock and
+assigns Free even during preparation, so release cannot miss a planless newborn.
+Regional imports also fence on the switch and refuse released v2 destinations.
+Service roles can read/assert the gate but cannot prepare, capture or release it.

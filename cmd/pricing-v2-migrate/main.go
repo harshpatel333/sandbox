@@ -23,6 +23,8 @@ import (
 const usage = `usage:
   pricing-v2-migrate [report] [--format text|json|csv]
   pricing-v2-migrate apply --confirm --actor <who> --reason <why> [--batch 500]
+  pricing-v2-migrate prepare|capture --confirm --actor <who> --reason <why>
+  pricing-v2-migrate release --confirm --actor <who> --reason <why> --epoch <uuid> --evidence-file <json>
 
 Environment: DATABASE_URL (the region's database), TEAM_CREATION_REGION (the
 region, or --region), SYSTEM_TEAM_ID, and STRIPE_SECRET_KEY with
@@ -37,13 +39,14 @@ func main() {
 
 type options struct {
 	command, format, region, actor, reason string
+	epoch, evidenceFile                    string
 	confirm                                bool
 	batch                                  int
 }
 
 func parse(args []string, getenv func(string) string) (options, error) {
 	o := options{command: "report"}
-	if len(args) > 0 && (args[0] == "report" || args[0] == "apply") {
+	if len(args) > 0 && (args[0] == "report" || args[0] == "apply" || args[0] == "prepare" || args[0] == "capture" || args[0] == "release") {
 		o.command, args = args[0], args[1:]
 	}
 	fs := flag.NewFlagSet("pricing-v2-migrate", flag.ContinueOnError)
@@ -52,6 +55,8 @@ func parse(args []string, getenv func(string) string) (options, error) {
 	fs.StringVar(&o.region, "region", getenv("TEAM_CREATION_REGION"), "")
 	fs.StringVar(&o.actor, "actor", "", "")
 	fs.StringVar(&o.reason, "reason", "", "")
+	fs.StringVar(&o.epoch, "epoch", "", "")
+	fs.StringVar(&o.evidenceFile, "evidence-file", "", "")
 	fs.BoolVar(&o.confirm, "confirm", false, "")
 	fs.IntVar(&o.batch, "batch", 500, "")
 	if err := fs.Parse(args); err != nil || fs.NArg() > 0 {
@@ -63,10 +68,12 @@ func parse(args []string, getenv func(string) string) (options, error) {
 		return o, errors.New("set TEAM_CREATION_REGION or --region to the region whose database DATABASE_URL names")
 	case o.command == "report" && o.format != "text" && o.format != "json" && o.format != "csv":
 		return o, errors.New("--format must be text, json or csv")
-	case o.command == "apply" && (!o.confirm || o.actor == "" || o.reason == ""):
-		return o, errors.New("apply changes customers' plans; it needs --confirm, --actor and --reason")
-	case o.command == "apply" && !validSystemTeam(getenv("SYSTEM_TEAM_ID")):
-		return o, errors.New("apply requires a valid nonzero SYSTEM_TEAM_ID")
+	case o.command != "report" && (!o.confirm || o.actor == "" || o.reason == ""):
+		return o, errors.New("writes require --confirm, --actor and --reason")
+	case !validSystemTeam(getenv("SYSTEM_TEAM_ID")):
+		return o, errors.New("a valid nonzero SYSTEM_TEAM_ID is required")
+	case o.command == "release" && (!validSystemTeam(o.epoch) || o.evidenceFile == ""):
+		return o, errors.New("release requires current --epoch and --evidence-file")
 	case o.batch < 1 || o.batch > 5000:
 		return o, errors.New("--batch must be between 1 and 5000")
 	}
@@ -86,6 +93,40 @@ func run(ctx context.Context, args []string, out io.Writer, getenv func(string) 
 		return err
 	}
 	defer pool.Close()
+	if o.command == "prepare" || o.command == "capture" || o.command == "release" {
+		activation := api.NewPricingV2Activation(pool, nil, o.region, getenv("SYSTEM_TEAM_ID"))
+		encoder := json.NewEncoder(out)
+		encoder.SetIndent("", "  ")
+		if o.command == "prepare" {
+			epoch, err := activation.PrepareAdoption(ctx, o.actor, o.reason)
+			if err != nil {
+				return err
+			}
+			return encoder.Encode(map[string]any{"epoch": epoch, "state": "preparing", "region": o.region})
+		}
+		if o.command == "capture" {
+			snapshot, err := activation.CaptureAdoption(ctx, o.actor, o.reason)
+			if err != nil {
+				return err
+			}
+			return encoder.Encode(snapshot)
+		}
+		evidence, err := os.ReadFile(o.evidenceFile)
+		if err != nil {
+			return err
+		}
+		if !json.Valid(evidence) {
+			return errors.New("evidence file must be valid JSON")
+		}
+		snapshot, releaseErr := activation.ReleaseAdoption(ctx, uuid.MustParse(o.epoch), o.actor, o.reason, evidence)
+		if releaseErr != nil && snapshot.Epoch == uuid.Nil {
+			return releaseErr
+		}
+		if err := encoder.Encode(snapshot); err != nil {
+			return err
+		}
+		return releaseErr
+	}
 	stripe := api.NewStripeBillingClient(&config.Config{
 		StripeSecretKey: getenv("STRIPE_SECRET_KEY"), StripeAPIVersion: getenv("STRIPE_API_VERSION"),
 		StripeAPIBaseURL: envOr(getenv, "STRIPE_API_BASE_URL", "https://api.stripe.com"),
@@ -123,6 +164,11 @@ func apply(ctx context.Context, activation *api.PricingV2Activation, o options, 
 		fmt.Fprintf(out, "%s batch: %d to Free, %d to legacy PAYG, %d contract-backed, %d deferred, %d remaining\n",
 			time.Now().UTC().Format(time.RFC3339), batch.AssignedFree, batch.AssignedLegacyPAYG, batch.AssignedContract, batch.Deferred, batch.Remaining)
 		if batch.Remaining == 0 {
+			snapshot, err := activation.CaptureAdoption(ctx, o.actor, o.reason)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "adoption epoch %s: %d total, %d assigned, %d residual unassigned; state %s (not auto-released)\n", snapshot.Epoch, snapshot.Total, snapshot.Assigned, snapshot.Unassigned, snapshot.State)
 			fmt.Fprintf(out, "done: %d to Free, %d to legacy PAYG, %d contract-backed\n", total.AssignedFree, total.AssignedLegacyPAYG, total.AssignedContract)
 			return nil
 		}
@@ -160,6 +206,9 @@ func writeReport(out io.Writer, format string, r api.ActivationReport) error {
 				_ = w.Write([]string{g.name, t.TeamID.String(), t.Reason, credit})
 			}
 		}
+		for _, item := range r.ResidualUnassigned {
+			_ = w.Write([]string{"residual_unassigned", item.TeamID.String(), item.Reason, ""})
+		}
 		w.Flush()
 		return w.Error()
 	}
@@ -170,6 +219,10 @@ func writeReport(out io.Writer, format string, r api.ActivationReport) error {
 	fmt.Fprintf(out, "  already assigned:     %d\n", r.AlreadyAssigned)
 	fmt.Fprintf(out, "  credit not yet read:  %d\n", len(r.LapsedUnchecked))
 	fmt.Fprintf(out, "  skipped:              %d %v\n", len(r.Skipped), r.SkippedReasons)
+	fmt.Fprintf(out, "  residual unassigned (all cell teams): %d\n", r.ResidualCount)
+	if r.Adoption != nil {
+		fmt.Fprintf(out, "  adoption: %s epoch %s public %s entry_open=%t\n", r.Adoption.State, r.Adoption.Epoch, r.Adoption.PublicPricingVersion, r.Adoption.EntryOpen)
+	}
 	fmt.Fprintf(out, "  pending:              %d\n", r.Pending)
 	fmt.Fprintf(out, "  Stripe reads:         %d in %dms\n", r.CreditReads, r.ElapsedMS)
 	fmt.Fprintln(out, "Use --format csv for the team lists.")

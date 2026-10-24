@@ -54,6 +54,9 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, spec tableSp
 		return 0, 0, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockPricingAdoptionImport(ctx, tx); err != nil {
+		return 0, 0, err
+	}
 	payload, count, err := assignmentSnapshot(ctx, src, team)
 	if err != nil {
 		return 0, 0, err
@@ -231,6 +234,31 @@ func validateRetainedAssignments(ctx context.Context, src, dst querier, team uui
 		if err != nil || !matches {
 			return fmt.Errorf("source assignment %s is not preserved in destination; refusing cutover/purge", a.id)
 		}
+	}
+	return nil
+}
+
+func lockPricingAdoptionImport(ctx context.Context, tx pgx.Tx) error {
+	var raw string
+	if err := tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch WHERE singleton FOR SHARE`).Scan(&raw); err != nil {
+		return err
+	}
+	if raw != "v2" {
+		return nil
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass('public.billing_pricing_adoption') IS NOT NULL`).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("v2 migration requires adoption isolation schema")
+	}
+	var state string
+	if err := tx.QueryRow(ctx, `SELECT state FROM billing_pricing_adoption WHERE singleton FOR SHARE`).Scan(&state); err != nil {
+		return err
+	}
+	if state != "preparing" {
+		return fmt.Errorf("regional import requires pricing adoption preparing; released entry cannot accept imported authority")
 	}
 	return nil
 }

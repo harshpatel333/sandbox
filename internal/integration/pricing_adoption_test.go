@@ -1,0 +1,321 @@
+//go:build integration
+
+package integration
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+func TestIntegration_PricingAdoptionBarrier(t *testing.T) {
+	ctx := t.Context()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := tx.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+	var initial, epoch uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT billing_prepare_pricing_adoption('usw',$1,'operator@example.com','local adoption test')`, testSystemTeamID).Scan(&initial); err != nil {
+		t.Fatal(err)
+	}
+	pending, foreign := uuid.New(), uuid.New()
+	exec(`INSERT INTO team(id,name,home_region) VALUES($1,'pending-adoption','usw'),($2,'foreign-residual','use')`, pending, foreign)
+	exec(`INSERT INTO team_billing_account(team_id,checkout_may_exist) VALUES($1,true)`, pending)
+	exec(`UPDATE billing_pricing_switch SET pricing_version='v2'`)
+	var model string
+	var open bool
+	if err := tx.QueryRow(ctx, `SELECT * FROM billing_pricing_public_state()`).Scan(&model, &open, &epoch); err != nil {
+		t.Fatal(err)
+	}
+	if model != "legacy" || open || epoch == initial {
+		t.Fatalf("preparing public state=%s/%t/%s previous=%s", model, open, epoch, initial)
+	}
+	reject := func(sql, code string, args ...any) {
+		t.Helper()
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sp.Exec(ctx, sql, args...); pgCode(err) != code {
+			t.Fatalf("expected %s, got %v", code, err)
+		}
+		if err := sp.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reject(`SELECT billing_assert_pricing_entry_open($1,'legacy')`, "55000", epoch)
+	reject(`SELECT billing_capture_pricing_adoption('use',$1,'operator@example.com','wrong binding')`, "P0001", testSystemTeamID)
+	reject(`SELECT billing_release_pricing_adoption('usw',$1,$2,'operator@example.com','no evidence','{}')`, "P0001", testSystemTeamID, epoch)
+	denied, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer denied.Rollback(context.Background())
+	if _, err := denied.Exec(ctx, `SET LOCAL lock_timeout='100ms'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := denied.Exec(ctx, `INSERT INTO team(name) VALUES('concurrent-adoption-signup')`); pgCode(err) != "55P03" {
+		t.Fatalf("signup escaped switch/release fencing: %v", err)
+	}
+	denied.Rollback(ctx)
+	exec(`INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+ SELECT t.id,'free','free','{}','{"max_concurrent":1}',clock_timestamp(),'migration','local adoption test'
+ FROM team t WHERE t.id NOT IN ($1,$2,$3) AND NOT EXISTS(SELECT 1 FROM team_plan_assignment a WHERE a.team_id=t.id AND a.effective_to IS NULL)`, testSystemTeamID, pending, foreign)
+	evidence, err := json.Marshal(map[string]any{"epoch": epoch.String(), "region": "usw", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release := func() map[string]any {
+		t.Helper()
+		var raw []byte
+		if err := tx.QueryRow(ctx, `SELECT billing_release_pricing_adoption('usw',$1,$2,'operator@example.com','local adoption test',$3::jsonb)`, testSystemTeamID, epoch, evidence).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var result map[string]any
+		if err := json.Unmarshal(raw, &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	blocked := release()
+	if blocked["released"] != false || blocked["unassigned"] != float64(2) {
+		t.Fatalf("release ignored pending/foreign unassigned teams: %v", blocked)
+	}
+	var residuals int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM billing_pricing_adoption_inventory WHERE epoch=$1 AND present AND assignment_id IS NULL`, epoch).Scan(&residuals); err != nil || residuals != 2 {
+		t.Fatalf("durable residuals=%d %v", residuals, err)
+	}
+	var deferredReason string
+	if err := tx.QueryRow(ctx, `SELECT reason FROM billing_pricing_adoption_inventory WHERE epoch=$1 AND team_id=$2`, epoch, pending).Scan(&deferredReason); err != nil || deferredReason != "checkout_pending" {
+		t.Fatalf("durable reason=%s %v", deferredReason, err)
+	}
+	exec(`INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+ SELECT id,'free','free','{}','{"max_concurrent":1}',clock_timestamp(),'migration','local adoption test' FROM team WHERE id IN ($1,$2)`, pending, foreign)
+	var pauseSandbox uuid.UUID
+	if err := tx.QueryRow(ctx, `INSERT INTO sandbox(team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib) VALUES($1,'adoption-worker-proof','active','default',1,1024,4096) RETURNING id`, pending).Scan(&pauseSandbox); err != nil {
+		t.Fatal(err)
+	}
+	exec(`SELECT request_team_pause_all($1,'plan_switch_free')`, pending)
+	if result := release(); result["released"] != false || result["unassigned"] != float64(0) {
+		t.Fatalf("unsettled pause target did not block release: %v", result)
+	}
+	exec(`UPDATE billing_team_pause_target SET done_at=clock_timestamp() WHERE done_at IS NULL`)
+	released := release()
+	if released["released"] != true || released["unassigned"] != float64(0) {
+		t.Fatalf("zero residual release=%v", released)
+	}
+	if err := tx.QueryRow(ctx, `SELECT * FROM billing_pricing_public_state()`).Scan(&model, &open, &epoch); err != nil || model != "v2" || !open {
+		t.Fatalf("released state=%s/%t %v", model, open, err)
+	}
+	savepoint, err := tx.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := savepoint.Exec(ctx, `SELECT billing_assert_pricing_entry_open($1,'legacy')`, epoch); pgCode(err) != "55000" {
+		t.Fatalf("stale preparing model passed released assertion: %v", err)
+	}
+	savepoint.Rollback(ctx)
+	var asserted uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT billing_assert_pricing_entry_open($1,'v2')`, epoch).Scan(&asserted); err != nil || asserted != epoch {
+		t.Fatalf("released assertion=%s %v", asserted, err)
+	}
+	oldEpoch := epoch
+	exec(`UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+	if err := tx.QueryRow(ctx, `SELECT * FROM billing_pricing_public_state()`).Scan(&model, &open, &epoch); err != nil || model != "legacy" || open || epoch == oldEpoch {
+		t.Fatalf("rollback state=%s/%t/%s %v", model, open, epoch, err)
+	}
+	exec(`UPDATE billing_pricing_switch SET pricing_version='v2'`)
+	if err := tx.QueryRow(ctx, `SELECT * FROM billing_pricing_public_state()`).Scan(&model, &open, &epoch); err != nil || model != "legacy" || open {
+		t.Fatalf("second rollout auto released: %s/%t %v", model, open, err)
+	}
+	var newborn uuid.UUID
+	if err := tx.QueryRow(ctx, `INSERT INTO team(name) VALUES('preparing-newborn') RETURNING id`).Scan(&newborn); err != nil {
+		t.Fatal(err)
+	}
+	var assigned bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND kind='free' AND effective_to IS NULL)`, newborn).Scan(&assigned); err != nil || !assigned {
+		t.Fatalf("preparing newborn planless: %v %v", assigned, err)
+	}
+	savepoint, err = tx.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := savepoint.Exec(ctx, `SELECT billing_release_pricing_adoption('usw',$1,$2,'operator@example.com','stale epoch',$3::jsonb)`, testSystemTeamID, oldEpoch, evidence); pgCode(err) != "55000" {
+		t.Fatalf("old epoch released new rollout: %v", err)
+	}
+	savepoint.Rollback(ctx)
+}
+
+func TestIntegration_PricingAdoptionPublicStateFailsClosed(t *testing.T) {
+	ctx := t.Context()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
+		t.Fatal(err)
+	}
+	check := func(q pgx.Tx, missing bool) {
+		t.Helper()
+		rows, err := q.Query(ctx, `SELECT * FROM billing_pricing_public_state()`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for rows.Next() {
+			n++
+			var model string
+			var open bool
+			var epoch *uuid.UUID
+			if err := rows.Scan(&model, &open, &epoch); err != nil {
+				t.Fatal(err)
+			}
+			if model != "legacy" || open || (missing && epoch != nil) {
+				t.Fatalf("unsafe public state=%s/%t/%v", model, open, epoch)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		rows.Close()
+		if n != 1 {
+			t.Fatalf("public state returned %d rows", n)
+		}
+	}
+	check(tx, false)
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sp.Exec(ctx, `SELECT billing_assert_pricing_entry_open()`); pgCode(err) != "55000" {
+		t.Fatalf("OFF passed v2 entry assertion: %v", err)
+	}
+	if err := sp.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"billing_pricing_switch", "billing_pricing_adoption"} {
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sp.Exec(ctx, `ALTER TABLE `+pgx.Identifier{table}.Sanitize()+` DISABLE TRIGGER ALL`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sp.Exec(ctx, `DELETE FROM `+pgx.Identifier{table}.Sanitize()); err != nil {
+			t.Fatal(err)
+		}
+		check(sp, true)
+		if err := sp.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version='v2'`); err != nil {
+		t.Fatal(err)
+	}
+	var epoch uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT epoch FROM billing_pricing_adoption WHERE singleton`).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	for _, broken := range []string{"region", "system_team_id", "epoch", "worker_sha", "verified_worker", "deployment_reference"} {
+		evidence := map[string]any{"epoch": epoch.String(), "region": "usw", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture"}
+		delete(evidence, broken)
+		raw, err := json.Marshal(evidence)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE billing_pricing_adoption SET region='usw',system_team_id=$1,state='released',released_at=clock_timestamp(),evidence=$2::jsonb`, testSystemTeamID, raw); err != nil {
+			t.Fatal(err)
+		}
+		check(tx, true)
+	}
+}
+
+func TestIntegration_PricingAdoptionCLIBlocksResidualRelease(t *testing.T) {
+	ctx := t.Context()
+	if _, err := testPool.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
+		t.Fatal(err)
+	}
+	team, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account(team_id,checkout_may_exist) VALUES($1,true)`, team); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+	})
+	cli := func(expectFailure bool, args ...string) []byte {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, "go", append([]string{"run", "../../cmd/pricing-v2-migrate"}, args...)...)
+		cmd.Env = append(os.Environ(), "DATABASE_URL="+testPool.Config().ConnString(), "TEAM_CREATION_REGION=usw", "SYSTEM_TEAM_ID="+testSystemTeamID.String(), "STRIPE_SECRET_KEY=")
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		if (err != nil) != expectFailure {
+			t.Fatalf("CLI failure=%t err=%v stdout=%s stderr=%s", expectFailure, err, stdout.String(), stderr.String())
+		}
+		return stdout.Bytes()
+	}
+	authority := []string{"--confirm", "--actor", "operator@example.com", "--reason", "local CLI adoption test"}
+	cli(false, append([]string{"prepare"}, authority...)...)
+	if _, err := testPool.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version='v2'`); err != nil {
+		t.Fatal(err)
+	}
+	captured := cli(false, append([]string{"capture"}, authority...)...)
+	var snapshot struct {
+		Epoch      uuid.UUID `json:"epoch"`
+		Unassigned int       `json:"unassigned"`
+		Released   bool      `json:"released"`
+	}
+	if err := json.Unmarshal(captured, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Unassigned < 1 {
+		t.Fatal("pending team missing from exhaustive capture")
+	}
+	var reason string
+	if err := testPool.QueryRow(ctx, `SELECT reason FROM billing_pricing_adoption_inventory WHERE epoch=$1 AND team_id=$2 AND present`, snapshot.Epoch, team).Scan(&reason); err != nil || reason != "checkout_pending" {
+		t.Fatalf("CLI capture not durably visible: %s %v", reason, err)
+	}
+	evidence, err := json.Marshal(map[string]any{"epoch": snapshot.Epoch.String(), "region": "usw", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "evidence.json")
+	if err := os.WriteFile(path, evidence, 0600); err != nil {
+		t.Fatal(err)
+	}
+	args := append([]string{"release"}, authority...)
+	args = append(args, "--epoch", snapshot.Epoch.String(), "--evidence-file", path)
+	blocked := cli(true, args...)
+	if err := json.Unmarshal(blocked, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Released || snapshot.Unassigned < 1 {
+		t.Fatalf("CLI release ignored residuals: %s", blocked)
+	}
+	var open bool
+	if err := testPool.QueryRow(ctx, `SELECT entry_open FROM billing_pricing_public_state()`).Scan(&open); err != nil || open {
+		t.Fatalf("blocked CLI opened public entry: %v %v", open, err)
+	}
+	var events int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM billing_pricing_adoption_event WHERE epoch=$1 AND action='release_blocked'`, snapshot.Epoch).Scan(&events); err != nil || events < 1 {
+		t.Fatalf("blocked attempt not durable: %d %v", events, err)
+	}
+}

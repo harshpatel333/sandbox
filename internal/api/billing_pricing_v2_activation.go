@@ -54,22 +54,25 @@ type ActivationTeam struct {
 }
 
 type ActivationReport struct {
-	Region           string           `json:"region"`
-	PricingVersion   string           `json:"pricing_version"`
-	AsOf             time.Time        `json:"as_of"`
-	ToFree           int              `json:"to_free"`
-	ToContract       int              `json:"to_contract"`
-	ToLegacyPAYG     int              `json:"to_legacy_payg"`
-	BlockedToFree    []ActivationTeam `json:"blocked_to_free"`
-	LapsedWithCredit []ActivationTeam `json:"lapsed_with_credit"`
-	LapsedNoCredit   []ActivationTeam `json:"lapsed_no_credit"`
-	LapsedUnchecked  []ActivationTeam `json:"lapsed_unchecked"`
-	AlreadyAssigned  int              `json:"already_assigned"`
-	Skipped          []ActivationTeam `json:"skipped"`
-	SkippedReasons   map[string]int   `json:"skipped_reasons"`
-	Pending          int              `json:"pending"`
-	CreditReads      int              `json:"credit_reads"`
-	ElapsedMS        int64            `json:"elapsed_ms"`
+	Adoption           *PricingAdoptionState     `json:"adoption"`
+	ResidualCount      int                       `json:"residual_unassigned_count"`
+	ResidualUnassigned []PricingAdoptionResidual `json:"residual_unassigned"`
+	Region             string                    `json:"region"`
+	PricingVersion     string                    `json:"pricing_version"`
+	AsOf               time.Time                 `json:"as_of"`
+	ToFree             int                       `json:"to_free"`
+	ToContract         int                       `json:"to_contract"`
+	ToLegacyPAYG       int                       `json:"to_legacy_payg"`
+	BlockedToFree      []ActivationTeam          `json:"blocked_to_free"`
+	LapsedWithCredit   []ActivationTeam          `json:"lapsed_with_credit"`
+	LapsedNoCredit     []ActivationTeam          `json:"lapsed_no_credit"`
+	LapsedUnchecked    []ActivationTeam          `json:"lapsed_unchecked"`
+	AlreadyAssigned    int                       `json:"already_assigned"`
+	Skipped            []ActivationTeam          `json:"skipped"`
+	SkippedReasons     map[string]int            `json:"skipped_reasons"`
+	Pending            int                       `json:"pending"`
+	CreditReads        int                       `json:"credit_reads"`
+	ElapsedMS          int64                     `json:"elapsed_ms"`
 }
 
 type ActivationCursor struct {
@@ -196,6 +199,9 @@ func (a *PricingV2Activation) Report(ctx context.Context) (ActivationReport, err
 	teams, reads := h.resolveActivationTeams(ctx, rows)
 	r := summarizeActivation(h.Config.TeamCreationRegion, time.Now().UTC(), teams)
 	r.PricingVersion, r.CreditReads, r.ElapsedMS = version, reads, time.Since(started).Milliseconds()
+	if err := a.adoptionReport(ctx, &r); err != nil {
+		return ActivationReport{}, err
+	}
 	return r, nil
 }
 
@@ -217,6 +223,9 @@ func (a *PricingV2Activation) ApplyBatchAfter(ctx context.Context, actor, reason
 	}
 	if version != "v2" {
 		return ActivationBatch{}, ErrPricingV2Off
+	}
+	if _, err := a.PrepareAdoption(ctx, actor, reason); err != nil {
+		return ActivationBatch{}, err
 	}
 	free, payg, err := a.activationTerms(ctx)
 	if err != nil {
@@ -354,6 +363,9 @@ func (a *PricingV2Activation) ApplyBatchAfter(ctx context.Context, actor, reason
 		return batch, err
 	}
 	batch.Remaining = int(remaining)
+	if _, err := a.CaptureAdoption(ctx, actor, reason); err != nil {
+		return ActivationBatch{}, err
+	}
 	return batch, nil
 }
 
