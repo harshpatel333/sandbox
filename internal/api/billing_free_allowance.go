@@ -43,6 +43,7 @@ func (h *Handlers) refreshFreeAllowances(ctx context.Context) {
 		next, advance := processSweepPage(ctx, teams, freeAllowancePageSize, func(teamID uuid.UUID) bool {
 			if _, err := h.DB.RefreshFreeAllowance(ctx, teamID); err != nil {
 				log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh free allowance failed")
+				return false
 			}
 			return true
 		})
