@@ -13,6 +13,7 @@ main() {
   devbox_require_root
   devbox_load_env
   [[ $DEVBOX_NAME == awille-ai-dev-billing && $DEVBOX_ID == 29baf003ad05 ]] || devbox_die "integration branch is restricted to its named devbox"
+  "$DEVBOX_REPO/deploy/devbox/pricing-provider-diagnostic-entry.sh"
   if ! curl -fs -o /dev/null --max-time 5 "$DEVBOX_API_URL/health"; then
     "$DEVBOX_REPO/deploy/devbox/services-up.sh"
     "$DEVBOX_REPO/deploy/devbox/install-api.sh"
