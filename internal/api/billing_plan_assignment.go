@@ -324,21 +324,36 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	current, assigned, err := currentTeamPlan(ctx, h.Pool, team)
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("begin billing plan read failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	defer tx.Rollback(ctx)
+	reader := &Handlers{DB: db.New(tx)}
+	current, assigned, err := currentTeamPlan(ctx, tx, team)
 	var limits teamLimits
 	if err == nil && assigned {
-		limits, err = h.teamEffectiveLimits(ctx, team)
+		limits, err = reader.teamEffectiveLimits(ctx, team)
 	}
 	var anchor pgtype.Timestamptz
 	if err == nil {
-		err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
+		err = tx.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
 		if errors.Is(err, pgx.ErrNoRows) {
 			err = nil
 		}
 	}
 	var start, end time.Time
 	if err == nil {
-		start, end, err = h.currentBillingPeriod(ctx, team, anchor, h.nowUTC())
+		start, end, err = reader.currentBillingPeriod(ctx, team, anchor, h.nowUTC())
+	}
+	var pending *customerPendingPlanChange
+	if err == nil {
+		pending, err = pendingCustomerPlanChange(ctx, tx, team, "customer")
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
 	}
 	if err != nil {
 		log.Error().Err(err).Str("team_id", team.String()).Msg("load billing plan failed")
@@ -349,12 +364,6 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	if assigned {
 		plan = &customerPlan{PlanKey: current.PlanKey, Kind: current.Kind, DisplayName: current.Terms.DisplayName, EffectiveFrom: current.EffectiveFrom,
 			Limits: planLimits{MaxConcurrent: &limits.MaxConcurrent, MaxVCPU: &limits.MaxVCPU, MaxMemoryMiB: &limits.MaxMemoryMiB, MaxDiskMiB: &limits.MaxDiskMiB, MaxTemplates: &limits.MaxTemplates}}
-	}
-	pending, err := pendingCustomerPlanChange(ctx, h.Pool, team, "customer")
-	if err != nil {
-		log.Error().Err(err).Str("team_id", team.String()).Msg("load pending plan change failed")
-		respondError(c, ErrInternal)
-		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"plan":           plan,
