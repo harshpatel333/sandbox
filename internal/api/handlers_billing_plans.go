@@ -154,7 +154,7 @@ func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
 			return
 		}
 		card := h.planCard(v, allowance)
-		if !state.EntryOpen {
+		if !state.EntryOpen && !state.LegacyOpen {
 			if card.Monthly != nil {
 				card.Monthly.Available = false
 			}

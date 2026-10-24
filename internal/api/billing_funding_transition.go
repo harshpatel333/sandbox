@@ -101,7 +101,7 @@ func (h *Handlers) commitFreeFundingPlan(ctx context.Context, team, actor uuid.U
 		if offer != nil && *offer == "free" && choiceState == "committed" {
 			return tx.Commit(ctx)
 		}
-		if !entryOpen {
+		if rawPricing == "v2" && !entryOpen {
 			return errFundingPlanTransition
 		}
 		if rawPricing == "v2" {

@@ -307,12 +307,13 @@ func getPublicPlans(t *testing.T, r http.Handler) publicPlansBody {
 }
 
 func TestIntegration_PublicBillingPlansWithTheSwitchOff(t *testing.T) {
-	body := getPublicPlans(t, newRouter(t))
+	_, r, _ := newProFixture(t, "pro_monthly")
+	body := getPublicPlans(t, r)
 	if body.PricingVersion != "legacy" || len(body.Cards) != 2 || body.Cards[0].Family != "pro" || body.Cards[1].Family != "enterprise" {
 		t.Fatalf("legacy cards=%+v", body)
 	}
 	pro := body.Cards[0]
-	if pro.Monthly == nil || pro.Monthly.PriceCents != 120000 || pro.Annual == nil || pro.Annual.PriceCents != 1200000 || pro.Annual.MonthlyEquivalentCents != 100000 ||
+	if pro.Monthly == nil || !pro.Monthly.Available || pro.Monthly.PriceCents != 120000 || pro.Annual == nil || pro.Annual.PriceCents != 1200000 || pro.Annual.MonthlyEquivalentCents != 100000 ||
 		pro.MonthlyCreditCents == nil || *pro.MonthlyCreditCents != 100000 || pro.Limits.MaxConcurrent == nil || *pro.Limits.MaxConcurrent != 1000 {
 		t.Fatalf("pro card=%+v", pro)
 	}
