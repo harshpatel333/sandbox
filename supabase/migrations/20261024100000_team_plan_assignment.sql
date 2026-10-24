@@ -95,12 +95,13 @@ CREATE TRIGGER team_plan_assignment_limits AFTER INSERT ON team_plan_assignment
 -- The terms and limits are frozen in the same shape as an assignment made by
 -- the backend.
 CREATE FUNCTION assign_new_team_free_plan() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE v billing_plan_version;
+DECLARE v billing_plan_version; pricing text;
 BEGIN
  IF current_setting('superserve.migrating_team_id',true)=NEW.id::text THEN RETURN NULL; END IF;
- IF billing_pricing_version()<>'v2' THEN RETURN NULL; END IF;
- SELECT * INTO v FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published';
- IF NOT FOUND THEN RETURN NULL; END IF;
+ SELECT pricing_version INTO pricing FROM billing_pricing_switch FOR SHARE;
+ IF pricing IS DISTINCT FROM 'v2' THEN RETURN NULL; END IF;
+ SELECT * INTO v FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published' FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION 'published v2 Free plan is required for team creation' USING ERRCODE='55000'; END IF;
  INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
  VALUES(NEW.id,v.family,v.kind,v.id,
   jsonb_build_object('offer_key',v.family,'display_name',v.display_name,'fee_cents',0,'interval_months',0,
