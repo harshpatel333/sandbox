@@ -25,6 +25,18 @@ if sha != config["DEVBOX_SANDBOX_SHA"]:
     raise SystemExit("Deployed checkout does not match selected SHA")
 artifacts = state / ("pricing-e2e-" + sha)
 artifacts.mkdir(mode=0o700, exist_ok=True)
+pid = int(subprocess.check_output(["systemctl", "show", "superserve-devbox-api.service", "--property=MainPID", "--value"], text=True))
+expected_binary = Path("/opt/superserve-devbox/api/releases") / sha / "controlplane"
+running_binary = Path("/proc") / str(pid) / "exe"
+if pid <= 1 or running_binary.resolve() != expected_binary.resolve():
+    raise SystemExit("Running controlplane is not the selected immutable release")
+binary_hash = hashlib.sha256(expected_binary.read_bytes()).hexdigest()
+if hashlib.sha256(running_binary.read_bytes()).hexdigest() != binary_hash:
+    raise SystemExit("Running worker binary differs from the selected release")
+installed = json.loads((state / "api-deploy.json").read_text())
+if installed.get("sha") != sha or installed.get("migrations") not in ("applied", "none"):
+    raise SystemExit("Schema installation receipt does not match the selected release")
+(artifacts / "runtime.json").write_text(json.dumps({"pid": pid, "binary_sha256": binary_hash, "release": str(expected_binary), "schema_receipt": installed}, indent=2) + "\n")
 compose = ["docker", "compose", "--project-name", "superserve-devbox", "--file", str(root / "services/compose.yml"), "--env-file", str(state / "services.env")]
 
 def sql(statement):
@@ -80,10 +92,10 @@ while sql(f"SELECT status FROM sandbox WHERE id='{sandbox}'") != "active":
     if time.monotonic() > deadline:
         raise RuntimeError("Probe sandbox did not reach active")
     time.sleep(3)
+sql(f"SELECT row_to_json(t) FROM billing_transition_pricing_version('legacy','{actor}','dev OFF committed-worker proof') t;")
 queued = int(sql(f"SELECT request_team_pause_all('{team}','plan_switch_free');"))
 if queued < 1:
     raise RuntimeError("Worker probe queued no target")
-sql(f"SELECT row_to_json(t) FROM billing_transition_pricing_version('legacy','{actor}','dev OFF committed-worker proof') t;")
 deadline = time.monotonic() + 300
 proof = None
 while time.monotonic() < deadline:
@@ -104,7 +116,7 @@ if capture["unassigned"] or capture["deferred"] or capture["assigned"] != captur
     raise RuntimeError("Adoption residuals block release")
 start = int(subprocess.check_output(["systemctl", "show", "superserve-devbox-api.service", "--property=ActiveEnterTimestampMonotonic", "--value"], text=True)) / 1000000
 while time.monotonic() - start < 360:
-    time.sleep(min(5, 360 - (time.monotonic() - start)))
+    time.sleep(max(0, min(5, 360 - (time.monotonic() - start))))
 evidence = {"region": env["TEAM_CREATION_REGION"], "system_team_id": env["SYSTEM_TEAM_ID"], "epoch": capture["epoch"], "assembled_sha": sha, "schema_sha": sha, "worker_sha": sha, "deployment_reference": str(state / "api-deploy.json"), "worker_reference": str(artifacts / "worker.json"), "verified_worker": True}
 evidence_file = artifacts / "evidence.json"
 evidence_file.write_text(json.dumps(evidence))
