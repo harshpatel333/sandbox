@@ -6,11 +6,11 @@ load_box_config
 [[ $DEVBOX_NAME == awille-ai-dev-billing && $DEVBOX_ID == 29baf003ad05 ]] || die "incorrect diagnostic target"
 sha=$(git -C "$here/../.." rev-parse HEAD)
 invocation=$(python3 -I -c 'import uuid; print(uuid.uuid4().hex)')
-output="$DEVBOX_STATE_DIR/pro-qa/inventory-$sha-$invocation.json"
+output="$DEVBOX_STATE_DIR/pro-qa/replay-$sha-$invocation.json"
 [[ ! -e $output ]] || die "refusing an existing diagnostic output"
 if python3 "$here/pricing-pro-provider-diagnostic.py" --state-dir "$DEVBOX_STATE_DIR" \
   --source-receipt "$DEVBOX_STATE_DIR/pro-qa/calendar-4cbd9ec570e822a8de0241dc4fa2a07cd5aaa46b.json" \
-  --output "$output"; then
+  --output "$output" --replay-failed-subscription; then
   status=0
 else
   status=$?
