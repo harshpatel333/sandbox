@@ -5,14 +5,17 @@ package api
 import (
 	"context"
 	"errors"
-	"github.com/gin-gonic/gin"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+const closedPrepaidAssertionSQL = `CREATE OR REPLACE FUNCTION billing_assert_pricing_entry_open(p_epoch uuid DEFAULT NULL,p_pricing_version text DEFAULT NULL)
+ RETURNS uuid LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'pricing adoption entry is closed or epoch changed' USING ERRCODE='55000'; END $$`
 
 func installPrepaidPublicStateFixture(t *testing.T, h *Handlers) {
 	t.Helper()
@@ -20,12 +23,27 @@ func installPrepaidPublicStateFixture(t *testing.T, h *Handlers) {
  INSERT INTO billing_pricing_adoption VALUES(true,true);
  CREATE FUNCTION billing_pricing_public_state() RETURNS TABLE(pricing_version text,entry_open boolean,epoch uuid)
  LANGUAGE sql AS $$ SELECT CASE WHEN s.pricing_version='v2' AND a.fixture_released THEN 'v2' ELSE 'legacy' END,
- COALESCE(s.pricing_version='v2' AND a.fixture_released,false),NULL::uuid FROM (SELECT 1) seed LEFT JOIN billing_pricing_switch s ON s.singleton LEFT JOIN billing_pricing_adoption a ON a.singleton $$`)
+ COALESCE(s.pricing_version='v2' AND a.fixture_released,false),CASE WHEN a.singleton THEN '97cb97ef-7fde-4676-8d81-2d438939d47c'::uuid END FROM (SELECT 1) seed LEFT JOIN billing_pricing_switch s ON s.singleton LEFT JOIN billing_pricing_adoption a ON a.singleton $$`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = h.Pool.Exec(t.Context(), `CREATE FUNCTION billing_assert_pricing_entry_open(p_epoch uuid DEFAULT NULL,p_pricing_version text DEFAULT NULL)
+ RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path=public,pg_temp AS $$
+ DECLARE actual_epoch uuid; model text; opened boolean;
+ BEGIN
+  SELECT pricing_version,entry_open,epoch INTO model,opened,actual_epoch FROM billing_lock_pricing_public_state();
+  IF NOT opened OR actual_epoch IS NULL OR (p_epoch IS NULL)<>(p_pricing_version IS NULL)
+   OR (p_epoch IS NOT NULL AND p_epoch<>actual_epoch) OR (p_pricing_version IS NOT NULL AND p_pricing_version<>model) THEN
+   RAISE EXCEPTION 'pricing adoption entry is closed or epoch changed' USING ERRCODE='55000';
+  END IF;
+  RETURN actual_epoch;
+ END $$`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := h.Pool.Exec(context.Background(), `DROP FUNCTION billing_pricing_public_state(); DROP TABLE billing_pricing_adoption`); err != nil {
+		if _, err := h.Pool.Exec(context.Background(), `DROP FUNCTION billing_assert_pricing_entry_open(uuid,text); DROP FUNCTION billing_pricing_public_state(); DROP TABLE billing_pricing_adoption`); err != nil {
 			t.Error(err)
 		}
 	})
@@ -87,6 +105,13 @@ func TestPrepaidAutoRechargeAdoptionGatePreservesBoundNoopAndDisable(t *testing.
 	if status := put(accepted); status != http.StatusOK {
 		t.Fatal("released enable", status)
 	}
+	f.exec(closedPrepaidAssertionSQL)
+	if status := put(`{"enabled":true,"threshold_cents":2000,"amount_cents":5500}`); status != http.StatusConflict {
+		t.Fatal("assertion SQLSTATE55000 was not mapped to409", status)
+	}
+	if status := put(accepted); status != http.StatusOK {
+		t.Fatal("no-op replay reached closed assertion", status)
+	}
 	f.exec(`UPDATE billing_pricing_adoption SET fixture_released=false`)
 	for _, state := range []string{"preparing", "off"} {
 		t.Run(state, func(t *testing.T) {
@@ -106,5 +131,21 @@ func TestPrepaidAutoRechargeAdoptionGatePreservesBoundNoopAndDisable(t *testing.
 	}
 	if status := put(accepted); status != http.StatusConflict {
 		t.Fatal("fresh reenable accepted", status)
+	}
+}
+
+func TestPrepaidEntryAssertionFailureCannotCommitOrDispatch(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.exec(closedPrepaidAssertionSQL)
+	if _, err := f.h.startPrepaidPaymentCheckout(t.Context(), f.client, f.team, uuid.New(), f.customer, 500, "https://console.example.com/ok", "https://console.example.com/cancel"); !errors.Is(err, errPricingV2Off) {
+		t.Fatal("assertion conflict not mapped", err)
+	}
+	if rows := f.rows(); len(rows) != 0 {
+		t.Fatal("assertion failure committed a purchase", rows)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.sessions) != 0 || len(f.intentPosts) != 0 || len(f.grantPosts) != 0 {
+		t.Fatal("assertion failure reached payment provider")
 	}
 }

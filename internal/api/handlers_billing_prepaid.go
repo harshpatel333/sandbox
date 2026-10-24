@@ -210,6 +210,14 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 			return
 		}
 		if !replay {
+			if err = assertPrepaidEntry(ctx, tx); err != nil {
+				if errors.Is(err, errPricingV2Off) {
+					respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
+				} else {
+					respondError(c, ErrInternal)
+				}
+				return
+			}
 			plan, ok, planErr := currentTeamPlan(ctx, tx, team)
 			if planErr != nil {
 				respondError(c, ErrInternal)

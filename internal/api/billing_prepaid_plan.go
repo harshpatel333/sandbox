@@ -7,7 +7,18 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func assertPrepaidEntry(ctx context.Context, tx pgx.Tx) error {
+	var epoch uuid.UUID
+	err := tx.QueryRow(ctx, `SELECT billing_assert_pricing_entry_open()`).Scan(&epoch)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "55000" {
+		return errPricingV2Off
+	}
+	return err
+}
 
 type prepaidPurchasePlan struct {
 	Terms       planTerms  `json:"terms"`
@@ -32,6 +43,9 @@ func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, te
 	}
 	if raw != "v2" || !entryOpen {
 		return errPricingV2Off
+	}
+	if err := assertPrepaidEntry(ctx, tx); err != nil {
+		return err
 	}
 	current, ok, err := currentTeamPlan(ctx, tx, team)
 	if err != nil {
