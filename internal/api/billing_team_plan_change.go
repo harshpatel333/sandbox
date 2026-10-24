@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -753,7 +754,7 @@ type teamPlanChangeBody struct {
 
 func decodeTeamPlanChange(c *gin.Context) (teamPlanChangeBody, bool) {
 	var body teamPlanChangeBody
-	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 8192))
+	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&body) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		respondErrorMsg(c, "bad_request", "target_plan and idempotency_key are required", http.StatusBadRequest)
@@ -764,7 +765,7 @@ func decodeTeamPlanChange(c *gin.Context) (teamPlanChangeBody, bool) {
 		respondErrorMsg(c, "invalid_plan", "target_plan must be free, starter or pro_monthly", http.StatusBadRequest)
 		return body, false
 	}
-	if strings.TrimSpace(body.Key) == "" || len(body.Key) > 200 || len(body.Reason) > 2000 || len(body.PreviewToken) > 64 {
+	if strings.TrimSpace(body.Key) == "" || utf8.RuneCountInString(body.Key) > 200 || utf8.RuneCountInString(body.Reason) > 2000 || len(body.PreviewToken) > 64 {
 		respondErrorMsg(c, "bad_request", "idempotency_key (up to 200 characters) is required and reason is at most 2000 characters", http.StatusBadRequest)
 		return body, false
 	}
@@ -879,9 +880,9 @@ func (h *Handlers) UndoTeamPlanChange(c *gin.Context) {
 	var body struct {
 		Reason string `json:"reason"`
 	}
-	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 8192))
+	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&body) != nil || decoder.Decode(&struct{}{}) != io.EOF || strings.TrimSpace(body.Reason) == "" || len(body.Reason) > 2000 {
+	if decoder.Decode(&body) != nil || decoder.Decode(&struct{}{}) != io.EOF || strings.TrimSpace(body.Reason) == "" || utf8.RuneCountInString(body.Reason) > 2000 {
 		respondErrorMsg(c, "bad_request", "reason (up to 2000 characters) is required", http.StatusBadRequest)
 		return
 	}
