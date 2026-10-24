@@ -241,4 +241,3 @@ until curl -fs -o /dev/null --max-time 5 "http://127.0.0.1:$API_PORT/health"; do
   sleep 2
 done
 log "API ready at $sha"
-
