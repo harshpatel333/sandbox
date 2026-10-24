@@ -29,22 +29,18 @@ func (h *Handlers) publicPricingState(ctx context.Context) (pricingPublicState, 
 }
 
 func lockPricingEntry(ctx context.Context, tx pgx.Tx) (string, bool, error) {
-	var raw string
-	if err := tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch WHERE singleton FOR SHARE`).Scan(&raw); err != nil {
-		return "", false, err
-	}
 	var available bool
-	if err := tx.QueryRow(ctx, `SELECT to_regprocedure('billing_pricing_public_state()') IS NOT NULL`).Scan(&available); err != nil {
-		return "", false, err
-	}
-	if !available {
-		return raw, false, nil
-	}
-	if _, err := tx.Exec(ctx, `SELECT singleton FROM billing_pricing_adoption WHERE singleton FOR SHARE`); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT to_regprocedure('billing_lock_pricing_public_state()') IS NOT NULL`).Scan(&available); err != nil {
 		return "", false, err
 	}
 	var open bool
-	if err := tx.QueryRow(ctx, `SELECT entry_open FROM billing_pricing_public_state()`).Scan(&open); err != nil {
+	if available {
+		if err := tx.QueryRow(ctx, `SELECT entry_open FROM billing_lock_pricing_public_state()`).Scan(&open); err != nil {
+			return "", false, err
+		}
+	}
+	var raw string
+	if err := tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch WHERE singleton`).Scan(&raw); err != nil {
 		return "", false, err
 	}
 	return raw, open, nil
