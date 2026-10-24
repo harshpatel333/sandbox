@@ -1,6 +1,6 @@
 //go:build integration
 
-package integrationdb
+package integration
 
 import (
 	"context"
@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/superserve-ai/sandbox/internal/integrationdb"
 )
 
 func TestPricingOperatorTransition(t *testing.T) {
@@ -53,7 +54,7 @@ func TestPricingOperatorTransition(t *testing.T) {
 	exec(`DO $$ DECLARE r text; BEGIN FOREACH r IN ARRAY ARRAY['service_role','anon','authenticated'] LOOP IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('CREATE ROLE %I NOLOGIN',r); END IF; END LOOP; END $$;
  ALTER DEFAULT PRIVILEGES GRANT ALL ON TABLES TO service_role;
  ALTER DEFAULT PRIVILEGES GRANT ALL ON FUNCTIONS TO service_role,anon,authenticated;`)
-	if _, err = Reset(ctx, pool); err != nil {
+	if _, err = integrationdb.Reset(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
 	exec(`GRANT USAGE ON SCHEMA public TO service_role,anon,authenticated`)
