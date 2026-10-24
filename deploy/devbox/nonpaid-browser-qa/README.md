@@ -33,7 +33,7 @@ RC supplies these files privately, mode600:
 ["docker","exec","-i","<RC-measured-db-container>","psql","-XAtq","-v","ON_ERROR_STOP=1","-U","<authorized-role>","-d","postgres","-p","54322"]
 ```
 
-The harness sends a BEGIN READ ONLY transaction and a10second statement timeout. It reads only aggregate counts from auth.users, team_member, team_plan_assignment, then rolls back. No fixture credentials, raw user metadata, cookie, token, mail body or SQL stderr is retained. A permission/schema mismatch fails the receipt rather than skipping DB proof.
+The harness sends a BEGIN READ ONLY transaction and a10second statement timeout. It reads only aggregate counts from auth.users, profile, team_memberships, roles, user_role_assignments and team_plan_assignment, then rolls back. No fixture credentials, raw user metadata, cookie, token, mail body or SQL stderr is retained. A permission/schema mismatch fails the receipt rather than skipping DB proof.
 
 Run with actual measured pins passed explicitly; do not use the literal placeholders:
 
@@ -62,3 +62,5 @@ Artifacts: receipt.json contains measured timings/checks, sanitized network outc
 Return receipt.json plus reviewed redacted PNGs and execution command with nonsecret pins. Preserve the test rows and sink messages for RC ownership; this harness performs no cleanup/deletion. Existing PM core smoke and W2 serializer proof remain distinct evidence.
 
 Mailpit API contract: https://mailpit.axllent.org/docs/api-v1/
+
+Exact source alignment checked against backend4cbd9ec570e822a8de0241dc4fa2a07cd5aaa46b and Console587039f5e5bd9994e4e2f52a7c6a2e5daf452984: DB proof uses profile plus team_memberships(user_id,status), roles(name,scope_type) and nonrevoked user_role_assignments. It does not query legacy team_member. Free requires one confirmed Auth user/profile/membership/active team_owner role, one time-valid published-version-linked signupFree assignment and exactly one open assignment; held Enterprise requires pending Auth metadata and zero memberships/active roles. UI placeholders are exact Full Name, Email, Password, Confirm Password; buttons Sign Up and Sign In; confirmation heading Check Your Email. These labels are verified against587, not inferred from lower-case flow names.

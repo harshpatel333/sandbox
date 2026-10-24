@@ -80,6 +80,8 @@ for stale in state.glob("nonpaid-browser-*/pgpass"):
 before = observe()
 (artifacts / "runtime-before.json").write_text(json.dumps(before))
 limits = json.loads(sql("SELECT json_build_object('max_concurrent',max_sandboxes,'max_vcpu',max_template_vcpu,'max_memory_mib',max_template_memory_mib,'max_disk_mib',max_template_disk_mib,'max_templates',max_templates) FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'"))
+if limits != {"max_concurrent": 1, "max_vcpu": 1, "max_memory_mib": 1024, "max_disk_mib": 4096, "max_templates": 10}:
+    raise RuntimeError("published Free catalog differs from independently expected dev limits")
 (artifacts / "free-limits.json").write_text(json.dumps(limits))
 credential_context = tempfile.TemporaryDirectory(prefix="nonpaid-credential-", dir=state)
 credential_dir = Path(credential_context.name)
@@ -92,7 +94,7 @@ try:
     pgpass.chmod(0o600)
     argv = ["psql", "-X", "-q", "-At", "-h", "127.0.0.1", "-p", "54322", "-U", "supabase_admin", "-d", "postgres", "-v", "ON_ERROR_STOP=1"]
     (artifacts / "psql-argv.json").write_text(json.dumps(argv))
-    command = ["docker", "run", "--name", container_name, "--label", "pricing-nonpaid-qa=true", "--rm", "--network", "host", "--shm-size", "256m", "--mount", f"type=bind,src={root / 'nonpaid-browser-qa'},dst=/qa,readonly", "--mount", f"type=bind,src={artifacts},dst=/results", "--mount", f"type=bind,src={credential_dir},dst=/credentials,readonly", "-e", "PGPASSFILE=/credentials/pgpass", "mcr.microsoft.com/playwright:v1.56.1-noble", "bash", "-euc", "apt-get update -qq && apt-get install -y -qq postgresql-client >/dev/null && mkdir -p /tmp/qa && cp /qa/package.json /qa/package-lock.json /qa/nonpaid-signup.mjs /tmp/qa/ && cd /tmp/qa && npm ci --ignore-scripts --no-audit --no-fund >/dev/null && node nonpaid-signup.mjs --console http://localhost:3000 --auth http://localhost:54321 --mailpit http://localhost:8025 --backend-sha " + backend + " --console-sha " + console + " --runtime-proof /results/runtime-before.json --free-limits /results/free-limits.json --psql-argv /results/psql-argv.json --output /results/browser"]
+    command = ["docker", "run", "--name", container_name, "--label", "pricing-nonpaid-qa=true", "--rm", "--network", "host", "--shm-size", "256m", "--mount", f"type=bind,src={root / 'nonpaid-browser-qa'},dst=/qa,readonly", "--mount", f"type=bind,src={artifacts},dst=/results", "--mount", f"type=bind,src={credential_dir},dst=/credentials,readonly", "-e", "PGPASSFILE=/credentials/pgpass", "mcr.microsoft.com/playwright:v1.56.1-noble", "bash", "-euc", "apt-get update -qq && apt-get install -y -qq postgresql-client >/dev/null && mkdir -p /tmp/qa && cp /qa/package.json /qa/package-lock.json /qa/nonpaid-signup.mjs /qa/safety-launcher.mjs /tmp/qa/ && cd /tmp/qa && npm ci --ignore-scripts --no-audit --no-fund >/dev/null && node safety-launcher.mjs --console http://localhost:3000 --auth http://localhost:54321 --mailpit http://localhost:8025 --backend-sha " + backend + " --console-sha " + console + " --runtime-proof /results/runtime-before.json --free-limits /results/free-limits.json --psql-argv /results/psql-argv.json --output /results/browser"]
     with (artifacts / "runner-private.log").open("w") as log:
         status = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=1200).returncode
 finally:

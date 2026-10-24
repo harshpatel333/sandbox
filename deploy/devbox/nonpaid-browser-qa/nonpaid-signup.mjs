@@ -82,7 +82,7 @@ try {
       const u = new URL(req.url())
       if (!['http:', 'https:'].includes(u.protocol)) return route.continue()
       if (![consoleOrigin, authOrigin, sinkOrigin].includes(u.origin)) return route.abort('blockedbyclient')
-      if (req.method() !== 'GET' && /(?:checkout|stripe|plan-changes|plan-assignments|buy-credit|prepaid|auto-recharge)/.test(u.pathname)) return route.abort('blockedbyclient')
+      if (req.method() !== 'GET' && /(?:checkout|stripe|plan-changes|plan-assignments|buy-credit)/.test(u.pathname)) return route.abort('blockedbyclient')
       return route.continue()
     })
     const page = await context.newPage()
@@ -211,19 +211,27 @@ try {
   })
   await step('readonly_durable_assignment_and_hold_proof', async () => {
     const literal = value => "'" + value.replaceAll("'", "''") + "'"
-    const sql = `BEGIN READ ONLY; SET LOCAL statement_timeout='10s'; SELECT json_build_object(
-      'free_users',(SELECT count(*) FROM auth.users WHERE email=${literal(identities.free.email)} AND email_confirmed_at IS NOT NULL),
-      'free_teams',(SELECT count(DISTINCT tm.team_id) FROM team_member tm JOIN auth.users u ON u.id=tm.profile_id WHERE u.email=${literal(identities.free.email)} AND tm.role='owner'),
-      'free_assignments',(SELECT count(*) FROM team_plan_assignment a JOIN team_member tm ON tm.team_id=a.team_id JOIN auth.users u ON u.id=tm.profile_id WHERE u.email=${literal(identities.free.email)} AND tm.role='owner' AND a.effective_to IS NULL AND a.effective_from<=CURRENT_TIMESTAMP AND a.kind='free' AND a.source='signup'),
-      'free_all_active_assignments',(SELECT count(*) FROM team_plan_assignment a JOIN team_member tm ON tm.team_id=a.team_id JOIN auth.users u ON u.id=tm.profile_id WHERE u.email=${literal(identities.free.email)} AND tm.role='owner' AND a.effective_to IS NULL),
-      'held_users',(SELECT count(*) FROM auth.users WHERE email=${literal(identities.enterprise.email)} AND app_metadata_placeholder),
-      'held_teams',(SELECT count(*) FROM team_member tm JOIN auth.users u ON u.id=tm.profile_id WHERE u.email=${literal(identities.enterprise.email)})
-    ); ROLLBACK;`.replace('app_metadata_placeholder', "raw_app_meta_data->>'signup_review'='pending'")
+    const sql = `BEGIN READ ONLY; SET LOCAL statement_timeout='10s'; WITH
+      free_user AS (SELECT id FROM auth.users WHERE email=${literal(identities.free.email)} AND email_confirmed_at IS NOT NULL),
+      free_members AS (SELECT m.* FROM public.team_memberships m JOIN public.profile p ON p.id=m.user_id JOIN free_user u ON u.id=p.id),
+      held_user AS (SELECT id FROM auth.users WHERE email=${literal(identities.enterprise.email)} AND raw_app_meta_data->>'signup_review'='pending')
+    SELECT json_build_object(
+      'free_users',(SELECT count(*) FROM free_user),
+      'free_profiles',(SELECT count(*) FROM public.profile p JOIN free_user u ON u.id=p.id),
+      'free_memberships',(SELECT count(*) FROM free_members),
+      'free_teams',(SELECT count(DISTINCT team_id) FROM free_members WHERE status='active'),
+      'free_owner_roles',(SELECT count(DISTINCT a.id) FROM public.user_role_assignments a JOIN public.roles r ON r.id=a.role_id JOIN free_user u ON u.id=a.user_id WHERE a.scope_type='team' AND a.revoked_at IS NULL AND r.name='team_owner' AND r.scope_type='team' AND EXISTS(SELECT 1 FROM free_members m WHERE m.team_id=a.team_id AND m.status='active')),
+      'free_assignments',(SELECT count(*) FROM public.team_plan_assignment a WHERE EXISTS(SELECT 1 FROM free_members m WHERE m.team_id=a.team_id AND m.status='active') AND a.effective_to IS NULL AND a.effective_from<=CURRENT_TIMESTAMP AND a.kind='free' AND a.plan_key='free' AND a.source='signup' AND a.plan_version_id IS NOT NULL AND a.terms->>'pricing_version'='v2'),
+      'free_all_active_assignments',(SELECT count(*) FROM public.team_plan_assignment a WHERE EXISTS(SELECT 1 FROM free_members m WHERE m.team_id=a.team_id AND m.status='active') AND a.effective_to IS NULL),
+      'held_users',(SELECT count(*) FROM held_user),
+      'held_teams',(SELECT count(*) FROM public.team_memberships m JOIN held_user u ON u.id=m.user_id),
+      'held_active_roles',(SELECT count(*) FROM public.user_role_assignments a JOIN held_user u ON u.id=a.user_id WHERE a.revoked_at IS NULL)
+    ); ROLLBACK;`
     const result = spawnSync(psqlArgv[0], psqlArgv.slice(1), { input: sql, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 })
     check('readonly_db_command_success', result.status === 0)
     let counts
     try { counts = JSON.parse(result.stdout.trim()) } catch { fail('readonly_db_invalid_sanitized_counts') }
-    check('durable_free_once_and_enterprise_held', counts.free_users === 1 && counts.free_teams === 1 && counts.free_assignments === 1 && counts.free_all_active_assignments === 1 && counts.held_users === 1 && counts.held_teams === 0)
+    check('durable_free_once_and_enterprise_held', counts.free_users === 1 && counts.free_profiles === 1 && counts.free_memberships === 1 && counts.free_owner_roles === 1 && counts.free_teams === 1 && counts.free_assignments === 1 && counts.free_all_active_assignments === 1 && counts.held_users === 1 && counts.held_teams === 0 && counts.held_active_roles === 0)
     receipt.database_counts = counts
   })
   const material = receipt.network.filter(n => n.origin !== 'external' && (n.status >= 500 || (n.failed && !n.navigation_cancelled)))
