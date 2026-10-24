@@ -113,13 +113,13 @@ func pendingTeamPlanChange(ctx context.Context, q db.DBTX, team uuid.UUID) (team
 	return c, err == nil, err
 }
 
-func pendingCustomerPlanChange(ctx context.Context, q db.DBTX, team uuid.UUID) (*customerPendingPlanChange, error) {
+func pendingCustomerPlanChange(ctx context.Context, q db.DBTX, team uuid.UUID, via string) (*customerPendingPlanChange, error) {
 	change, ok, err := pendingTeamPlanChange(ctx, q, team)
 	if err != nil || !ok {
 		return nil, err
 	}
 	return &customerPendingPlanChange{ID: change.ID, TargetPlanKey: change.TargetPlanKey, TargetDisplayName: change.TargetTerms.DisplayName,
-		EffectiveAt: change.EffectiveAt, Undoable: change.Undoable(time.Now()), PausesRunning: change.PausesRunning}, nil
+		EffectiveAt: change.EffectiveAt, Undoable: change.Undoable(time.Now()) && (via == "staff" || via == "customer" && change.RequestedVia == "customer"), PausesRunning: change.PausesRunning}, nil
 }
 
 // teamPlanChangeRequest asks to move a team to a self-serve plan.
@@ -372,8 +372,8 @@ func (h *Handlers) planChangePeriodEnd(ctx context.Context, team uuid.UUID, anch
 // undoTeamPlanChange withdraws a scheduled change. It only records the undo;
 // the worker then turns the subscription's renewal back on if this change had
 // turned it off, so Stripe never ends up contradicting the plan.
-func (h *Handlers) undoTeamPlanChange(ctx context.Context, team, id, actor uuid.UUID, reason string) (teamPlanChange, error) {
-	c, err := scanTeamPlanChange(h.Pool.QueryRow(ctx, `SELECT `+teamPlanChangeColumns+` FROM team_plan_change WHERE id=$1 AND team_id=$2`, id, team))
+func (h *Handlers) undoTeamPlanChange(ctx context.Context, team, id, actor uuid.UUID, reason, via string) (teamPlanChange, error) {
+	c, err := scanTeamPlanChange(h.Pool.QueryRow(ctx, `SELECT `+teamPlanChangeColumns+` FROM team_plan_change WHERE id=$1 AND team_id=$2 AND ($3='staff' OR ($3='customer' AND requested_via='customer'))`, id, team, via))
 	if err != nil {
 		return c, err
 	}
@@ -382,8 +382,9 @@ func (h *Handlers) undoTeamPlanChange(ctx context.Context, team, id, actor uuid.
 	}
 	tag, err := h.Pool.Exec(ctx, `UPDATE team_plan_change SET state='undone',undone_at=clock_timestamp(),undone_by=$2,undo_reason=$4,
         next_check_at=CASE WHEN provider_cancel_requested_at IS NOT NULL THEN clock_timestamp() ELSE 'infinity'::timestamptz END
-        WHERE id=$1 AND state='scheduled' AND effective_at>clock_timestamp()+$3::interval AND (lease_until IS NULL OR lease_until<clock_timestamp())`,
-		c.ID, actor, planChangeUndoCutoff.String(), reason)
+        WHERE id=$1 AND state='scheduled' AND effective_at>clock_timestamp()+$3::interval AND (lease_until IS NULL OR lease_until<clock_timestamp())
+        AND ($5='staff' OR ($5='customer' AND requested_via='customer'))`,
+		c.ID, actor, planChangeUndoCutoff.String(), reason, via)
 	if err != nil {
 		return c, err
 	}
@@ -833,7 +834,7 @@ func (h *Handlers) UndoBillingPlanChange(c *gin.Context) {
 		respondErrorMsg(c, "not_found", "plan change not found", http.StatusNotFound)
 		return
 	}
-	change, err := h.undoTeamPlanChange(c.Request.Context(), team, id, actor, "requested by the team")
+	change, err := h.undoTeamPlanChange(c.Request.Context(), team, id, actor, "requested by the team", "customer")
 	h.respondTeamPlanChange(c, team, change, err)
 }
 
@@ -884,7 +885,7 @@ func (h *Handlers) UndoTeamPlanChange(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "reason (up to 2000 characters) is required", http.StatusBadRequest)
 		return
 	}
-	change, err := h.undoTeamPlanChange(c.Request.Context(), team, id, actor, strings.TrimSpace(body.Reason))
+	change, err := h.undoTeamPlanChange(c.Request.Context(), team, id, actor, strings.TrimSpace(body.Reason), "staff")
 	h.respondTeamPlanChange(c, team, change, err)
 }
 

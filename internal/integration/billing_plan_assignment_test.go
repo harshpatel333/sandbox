@@ -159,7 +159,7 @@ func TestIntegration_BillingPlanChangeStaffPendingAndUndoReason(t *testing.T) {
 			t.Fatalf("preview and scheduling disagree: %s != %s", preview.EffectiveAt, change.EffectiveAt)
 		}
 	}
-	for _, response := range []*httptest.ResponseRecorder{
+	for index, response := range []*httptest.ResponseRecorder{
 		doInternal(router, http.MethodGet, "/internal/teams/"+team.String()+"/billing/plan-assignments", staff, ""),
 		do(newRouter(t), http.MethodGet, "/billing/plan", key, ""),
 	} {
@@ -170,9 +170,16 @@ func TestIntegration_BillingPlanChangeStaffPendingAndUndoReason(t *testing.T) {
 				PausesRunning bool   `json:"pauses_running"`
 			} `json:"pending_change"`
 		}
-		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil || body.Pending == nil || body.Pending.ID != change.ID || !body.Pending.Undoable || !body.Pending.PausesRunning {
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil || body.Pending == nil || body.Pending.ID != change.ID || body.Pending.Undoable != (index == 0) || !body.Pending.PausesRunning {
 			t.Fatalf("pending exit missing from billing read: %d %s", response.Code, response.Body)
 		}
+	}
+	if w := do(newRouter(t), http.MethodPost, "/billing/plan-changes/"+change.ID+"/undo", key, ""); w.Code != http.StatusNotFound {
+		t.Fatalf("customer undid staff-originated change: %d %s", w.Code, w.Body)
+	}
+	var state string
+	if err := testPool.QueryRow(t.Context(), `SELECT state FROM team_plan_change WHERE id=$1`, change.ID).Scan(&state); err != nil || state != "scheduled" {
+		t.Fatalf("denied customer undo mutated staff change: %s %v", state, err)
 	}
 	undo := path + "/" + change.ID + "/undo"
 	if w := operatorRequest(router, http.MethodPost, undo, staff, `{}`); w.Code != http.StatusBadRequest {

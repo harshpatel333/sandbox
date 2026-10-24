@@ -284,7 +284,7 @@ func (h *Handlers) GetTeamPlanAssignments(c *gin.Context) {
 	if len(history) > 0 && history[0].EffectiveTo == nil {
 		current = &history[0]
 	}
-	pending, err := pendingCustomerPlanChange(c.Request.Context(), h.Pool, team)
+	pending, err := pendingCustomerPlanChange(c.Request.Context(), h.Pool, team, "staff")
 	if err != nil {
 		log.Error().Err(err).Str("team_id", team.String()).Msg("load pending plan change failed")
 		respondError(c, ErrInternal)
@@ -349,7 +349,7 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 		plan = &customerPlan{PlanKey: current.PlanKey, Kind: current.Kind, DisplayName: current.Terms.DisplayName, EffectiveFrom: current.EffectiveFrom,
 			Limits: planLimits{MaxConcurrent: &limits.MaxConcurrent, MaxVCPU: &limits.MaxVCPU, MaxMemoryMiB: &limits.MaxMemoryMiB, MaxDiskMiB: &limits.MaxDiskMiB, MaxTemplates: &limits.MaxTemplates}}
 	}
-	pending, err := pendingCustomerPlanChange(ctx, h.Pool, team)
+	pending, err := pendingCustomerPlanChange(ctx, h.Pool, team, "customer")
 	if err != nil {
 		log.Error().Err(err).Str("team_id", team.String()).Msg("load pending plan change failed")
 		respondError(c, ErrInternal)

@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -286,7 +287,7 @@ func TestTeamPlanChangeProDowngradeStopsRenewalAndUndoRestoresIt(t *testing.T) {
 	if c = f.reload(t, c.ID); c.CancelRequestedAt == nil || c.CancelPreexisting || c.ProviderCancelAt == nil || !f.stripe.cancel || c.State != "scheduled" {
 		t.Fatalf("renewal not stopped: %+v %v", c, f.stripe.writes)
 	}
-	if c, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind"); err != nil || c.State != "undone" {
+	if c, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind", "customer"); err != nil || c.State != "undone" {
 		t.Fatalf("undo: %+v %v", c, err)
 	}
 	if _, err = f.request(t, "free", "replacement"); !errors.Is(err, errTeamPlanChangeConflict) {
@@ -296,7 +297,7 @@ func TestTeamPlanChangeProDowngradeStopsRenewalAndUndoRestoresIt(t *testing.T) {
 	if c = f.reload(t, c.ID); c.needsRenewal() || c.ProviderRenewedAt == nil || f.stripe.cancel {
 		t.Fatalf("renewal not restored after undo: %+v %v", c, f.stripe.writes)
 	}
-	if again, err := f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind"); err != nil || again.State != "undone" {
+	if again, err := f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind", "customer"); err != nil || again.State != "undone" {
 		t.Fatalf("repeated undo: %v", err)
 	}
 	if plan := f.plan(t); plan.PlanKey != "pro_monthly" {
@@ -309,7 +310,7 @@ func TestTeamPlanChangeProDowngradeStopsRenewalAndUndoRestoresIt(t *testing.T) {
 	f.tick(t)
 	f.reachEffective(t, c.ID)
 	f.stripe.set(func(s *renewalStripe) { s.status = "canceled" })
-	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind"); !errors.Is(err, errTeamPlanChangeConflict) {
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind", "customer"); !errors.Is(err, errTeamPlanChangeConflict) {
 		t.Fatalf("undo after the cutoff: %v", err)
 	}
 	f.tick(t)
@@ -328,7 +329,7 @@ func TestTeamPlanChangeUndoWaitsForAnInFlightStripeWrite(t *testing.T) {
 	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE team_plan_change SET lease_token=gen_random_uuid(),lease_until=clock_timestamp()+interval '1 minute' WHERE id=$1`, c.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind"); !errors.Is(err, errTeamPlanChangeConflict) || !strings.Contains(err.Error(), "try again") {
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind", "customer"); !errors.Is(err, errTeamPlanChangeConflict) || !strings.Contains(err.Error(), "try again") {
 		t.Fatalf("undo raced the worker: %v", err)
 	}
 	if c = f.reload(t, c.ID); c.State != "scheduled" {
@@ -346,7 +347,7 @@ func TestTeamPlanChangeUndoAfterUnconfirmedRequestRestoresRenewal(t *testing.T) 
 		t.Fatal(err)
 	}
 	f.stripe.set(func(s *renewalStripe) { s.cancel = true; s.owner = c.ID.String() })
-	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind"); err != nil {
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind", "customer"); err != nil {
 		t.Fatal(err)
 	}
 	f.tick(t)
@@ -366,7 +367,7 @@ func TestTeamPlanChangeLeavesTheCustomersOwnCancellation(t *testing.T) {
 	if c = f.reload(t, c.ID); !c.CancelPreexisting || c.ProviderCancelAt == nil || len(f.stripe.writes) != 0 {
 		t.Fatalf("existing cancellation not recognised: %+v %v", c, f.stripe.writes)
 	}
-	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind"); err != nil {
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind", "customer"); err != nil {
 		t.Fatal(err)
 	}
 	f.tick(t)
@@ -512,7 +513,7 @@ func TestTeamPlanChangeExitAndUndoContinueWhilePricingV2IsOff(t *testing.T) {
 	if c = f.reload(t, c.ID); c.ProviderCancelAt == nil || !f.stripe.cancel {
 		t.Fatalf("exit did not stop renewal: %+v", c)
 	}
-	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep existing plan"); err != nil {
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep existing plan", "customer"); err != nil {
 		t.Fatal(err)
 	}
 	if worked, err := f.h.teamPlanChangeTick(t.Context()); err != nil || !worked {
@@ -574,7 +575,7 @@ func TestTeamPlanChangeSingleConnectionAndUndoAfterReassignment(t *testing.T) {
 	if !f.stripe.cancel {
 		t.Fatal("single-connection worker did not cancel renewal")
 	}
-	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan"); err != nil {
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan", "customer"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = assignInTx(t, f.h, planAssignment{Team: f.team, Terms: testPlanTerms("custom_other", planKindCustom, 900, nil), Source: planSourceStaff, Reason: "replacement agreement"}); err != nil {
@@ -624,7 +625,7 @@ func TestTeamPlanChangeStaffViewReportsPendingAndUndo(t *testing.T) {
 	if pending := view(); pending == nil || pending.ID != change.ID || pending.TargetPlanKey != "free" || !pending.Undoable || !pending.PausesRunning || !pending.EffectiveAt.Equal(change.EffectiveAt) {
 		t.Fatalf("staff cannot see scheduled downgrade and undo: %+v", pending)
 	}
-	if _, err := f.h.undoTeamPlanChange(t.Context(), f.team, change.ID, f.actor, "changed my mind"); err != nil {
+	if _, err := f.h.undoTeamPlanChange(t.Context(), f.team, change.ID, f.actor, "changed my mind", "customer"); err != nil {
 		t.Fatal(err)
 	}
 	if pending := view(); pending != nil {
@@ -725,7 +726,7 @@ func TestTeamPlanChangeHistorySurvivesTeamDeletionWithoutRestoringRenewal(t *tes
 				f.tick(t)
 			}
 			if stage == "undone" {
-				if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind"); err != nil {
+				if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind", "customer"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -773,7 +774,7 @@ func TestTeamPlanChangeCancellationOwnershipSurvivesRetries(t *testing.T) {
 			}
 			f.tick(t)
 			f.tick(t)
-			if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan"); err != nil {
+			if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan", "customer"); err != nil {
 				t.Fatal(err)
 			}
 			f.tick(t)
@@ -840,7 +841,7 @@ func TestTeamPlanChangeFreeEntryRequiresDeployedPauseSupport(t *testing.T) {
 	if replay, err := f.h.scheduleTeamPlanChange(t.Context(), req); err != nil || replay.ID != c.ID {
 		t.Fatalf("readiness blocked committed replay: %+v %v", replay, err)
 	}
-	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan"); err != nil {
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan", "customer"); err != nil {
 		t.Fatalf("readiness blocked undo: %v", err)
 	}
 }
@@ -890,5 +891,43 @@ func TestTeamPlanChangeDoesNotRollAnEndingSubscriptionIntoLaterCycle(t *testing.
 				t.Fatalf("changed an independent cancellation: %v", f.stripe.writes)
 			}
 		})
+	}
+}
+
+func TestTeamPlanChangeCustomerCannotUndoStaffCancellation(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindSubscription)
+	terms := testPlanTerms("starter", planKindPrepaid, 1, nil)
+	req := f.intent(t, "starter", "staff-cancellation", terms)
+	req.Via = "staff"
+	c, err := f.h.scheduleTeamPlanChangeTo(t.Context(), req, terms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.tick(t)
+	if c = f.reload(t, c.ID); c.ProviderCancelAt == nil || !f.stripe.cancel || len(f.stripe.writes) != 1 {
+		t.Fatalf("staff cancellation not committed: %+v %v", c, f.stripe.writes)
+	}
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, uuid.New(), "customer request", "customer"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("customer undid staff change: %v", err)
+	}
+	f.tick(t)
+	if c = f.reload(t, c.ID); c.State != "scheduled" || c.ProviderRenewedAt != nil || c.UndoReason != nil || !f.stripe.cancel || len(f.stripe.writes) != 1 {
+		t.Fatalf("denied customer undo changed staff commitment/provider: %+v %v", c, f.stripe.writes)
+	}
+	for _, via := range []string{"customer", "staff"} {
+		p, err := pendingCustomerPlanChange(t.Context(), f.h.Pool, f.team, via)
+		if err != nil || p == nil || p.ID != c.ID || p.Undoable != (via == "staff") {
+			t.Fatalf("%s pending undo authority: %+v %v", via, p, err)
+		}
+	}
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "operator correction", "staff"); err != nil {
+		t.Fatalf("staff undo denied: %v", err)
+	}
+	f.tick(t)
+	if c = f.reload(t, c.ID); c.State != "undone" || c.ProviderRenewedAt == nil || f.stripe.cancel {
+		t.Fatalf("operator could not undo owned cancellation: %+v %v", c, f.stripe.writes)
+	}
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, uuid.New(), "replay", "customer"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("customer replay accessed undone staff change: %v", err)
 	}
 }
