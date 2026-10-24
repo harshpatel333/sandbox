@@ -914,3 +914,98 @@ func TestMatchingCreditInspectionFailuresDoNotStarveQueue(t *testing.T) {
 		})
 	}
 }
+
+func TestMatchingCreditUnsupportedPaidEvidenceCannotAuthorizeOrRetire(t *testing.T) {
+	for _, field := range []string{"invoice", "type", "intent", "retrieved intent", "missing payments"} {
+		for _, stage := range []string{"inspection", "issuance", "final review"} {
+			t.Run(field+"/"+stage, func(t *testing.T) {
+				m := newMatchingFixture(t, 10000, 8_000_000, 0)
+				invoice := m.paidInvoice("paid", usageLine("price_cpu", 70000))
+				switch stage {
+				case "issuance":
+					if err := m.f.h.recordPaidMatchingInvoices(t.Context(), m.client); err != nil {
+						t.Fatal(err)
+					}
+				case "final review":
+					if err := m.tick(); err != nil {
+						t.Fatal(err)
+					}
+					conn, err := m.f.h.Pool.Acquire(t.Context())
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, sql := range []string{`SET session_replication_role=replica`, `UPDATE billing_matching_credit SET issued_at=now()-interval '120 days 1 hour',review_checked_at=now()-interval '25 hours' WHERE invoice_id=$1`, `SET session_replication_role=origin`} {
+						var args []any
+						if strings.Contains(sql, "$1") {
+							args = append(args, invoice)
+						}
+						if _, err = conn.Exec(t.Context(), sql, args...); err != nil {
+							t.Fatal(err)
+						}
+					}
+					conn.Release()
+				}
+				var recovered atomic.Bool
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if !recovered.Load() {
+						if field == "retrieved intent" && r.URL.Path == "/v1/payment_intents/pi_match" {
+							fmt.Fprint(w, `{"id":"pi_other","latest_charge":"ch_match"}`)
+							return
+						}
+						if field != "retrieved intent" && r.URL.Path == "/v1/invoice_payments" {
+							if field == "missing payments" {
+								fmt.Fprint(w, `{}`)
+								return
+							}
+							inv, kind, intent := invoice, "payment_intent", "pi_match"
+							switch field {
+							case "invoice":
+								inv = "in_other"
+							case "type":
+								kind = "payment_record"
+							case "intent":
+								intent = ""
+							}
+							json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"invoice": inv, "amount_paid": 100, "payment": map[string]any{"type": kind, "payment_intent": intent}}}})
+							return
+						}
+					}
+					m.serve(w, r)
+				}))
+				defer srv.Close()
+				m.client.baseURL = srv.URL
+				if err := m.tick(); err == nil {
+					t.Fatal("unsupported payment evidence was accepted as clean")
+				}
+				switch stage {
+				case "inspection":
+					var deferred bool
+					if err := m.f.h.Pool.QueryRow(t.Context(), `SELECT next_attempt_at>clock_timestamp() AND last_error IS NOT NULL FROM billing_matching_invoice_inspection WHERE invoice_id=$1`, invoice).Scan(&deferred); err != nil || !deferred {
+						t.Fatal("inspection lacks durable evidence retry", deferred, err)
+					}
+				case "issuance":
+					if row := m.row(invoice); row.State != "pending" || row.Grant != "" {
+						t.Fatal("unsupported evidence dispatched a grant", row)
+					}
+				case "final review":
+					var retired bool
+					if err := m.f.h.Pool.QueryRow(t.Context(), `SELECT review_checked_at='infinity'::timestamptz FROM billing_matching_credit WHERE invoice_id=$1`, invoice).Scan(&retired); err != nil || retired {
+						t.Fatal("unsupported evidence retired final review", retired, err)
+					}
+				}
+				if stage != "final review" && len(m.posts) != 0 {
+					t.Fatal("unsupported evidence issued credit", len(m.posts))
+				}
+				recovered.Store(true)
+				m.exec(`UPDATE billing_matching_invoice_inspection SET next_attempt_at=clock_timestamp() WHERE invoice_id=$1`, invoice)
+				m.exec(`UPDATE billing_matching_credit SET review_checked_at=clock_timestamp()-interval '25 hours' WHERE invoice_id=$1`, invoice)
+				if err := m.tick(); err != nil {
+					t.Fatal("valid evidence recovery failed", err)
+				}
+				if row := m.row(invoice); row.State != "issued" || len(m.posts) != 1 {
+					t.Fatal("recovery lost or duplicated credit", row, len(m.posts))
+				}
+			})
+		}
+	}
+}
