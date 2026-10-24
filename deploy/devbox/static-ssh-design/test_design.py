@@ -48,13 +48,19 @@ class DesignTests(unittest.TestCase):
             plan = Path(directory) / 'plan.json'
             plan.write_text(json.dumps({'gcloud': str(binary), 'gcloud_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'instance': 'example-instance', 'project': 'example-project', 'zone': 'example-zone'}))
             plan.chmod(0o600)
-            argv = proxy.command(plan)
+            digest = hashlib.sha256(plan.read_bytes()).hexdigest()
+            argv = proxy.command(plan, digest)
             self.assertEqual(argv[1:5], ['compute', 'start-iap-tunnel', 'example-instance', '22'])
             self.assertIn('--listen-on-stdin', argv)
             self.assertNotIn('ssh', argv)
+            changed = json.loads(plan.read_bytes())
+            changed["instance"] = "example-other"
+            plan.write_text(json.dumps(changed))
+            with self.assertRaises(ValueError):
+                proxy.command(plan, digest)
             plan.chmod(0o644)
             with self.assertRaises(ValueError):
-                proxy.command(plan)
+                proxy.command(plan, digest)
 
 
 if __name__ == '__main__':

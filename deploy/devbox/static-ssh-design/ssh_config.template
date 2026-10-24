@@ -11,7 +11,7 @@ Host rc-billing-readonly
     StrictHostKeyChecking yes
     UpdateHostKeys no
     VerifyHostKeyDNS no
-    ProxyCommand @PROXY_EXECUTABLE@ @PROXY_PLAN@
+    ProxyCommand @PROXY_EXECUTABLE@ @PROXY_PLAN@ @PROXY_PLAN_SHA256@
     ProxyJump none
     ForwardAgent no
     ForwardX11 no

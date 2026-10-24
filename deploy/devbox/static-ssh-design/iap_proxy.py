@@ -8,11 +8,14 @@ import stat
 import sys
 
 
-def command(path):
+def command(path, expected_sha256):
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
         raise ValueError()
-    plan = json.loads(path.read_bytes())
+    data = path.read_bytes()
+    if not re.fullmatch("[a-f0-9]{64}", expected_sha256) or hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise ValueError()
+    plan = json.loads(data)
     if set(plan) != {'gcloud', 'gcloud_sha256', 'instance', 'project', 'zone'}:
         raise ValueError()
     for key in ('instance', 'project', 'zone'):
@@ -28,9 +31,9 @@ def command(path):
 
 def main():
     try:
-        if len(sys.argv) != 2:
+        if len(sys.argv) != 3:
             raise ValueError()
-        argv = command(Path(sys.argv[1]))
+        argv = command(Path(sys.argv[1]), sys.argv[2])
         with open(os.devnull, 'wb') as sink:
             os.dup2(sink.fileno(), 2)
         os.execv(argv[0], argv)
