@@ -24,6 +24,7 @@ import (
 )
 
 type proProviderFixture struct {
+	upgrade                                           *proUpgradeProviderFixture
 	rounded, held                                     bool
 	resourcesAttached, failAttach, loseAttachResponse bool
 	attachCalls                                       int
@@ -88,6 +89,9 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
+	if f.upgrade != nil && f.serveUpgrade(w, r) {
+		return
+	}
 	write := func(v any) { _ = json.NewEncoder(w).Encode(v) }
 	basePrice := map[string]any{"product": "prod_pro_fixture", "id": f.price, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": fmt.Sprint(f.amount), "recurring": map[string]any{"usage_type": "licensed", "interval": f.interval, "interval_count": 1}}
 	switch {
@@ -284,12 +288,16 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 				discounts = []any{map[string]any{"id": "di_promo", "promotion_code": "promo_example", "source": map[string]any{"coupon": map[string]any{"id": "coupon_example", "duration": map[bool]string{true: "forever", false: "once"}[f.renewalDiscount > 0], "amount_off": f.discount, "currency": "usd"}}}}
 			}
 		}
+		paidAt := time.Now().Unix()
+		if f.upgrade != nil {
+			paidAt = f.handlers.Now().Unix()
+		}
 		write(map[string]any{"id": strings.TrimPrefix(r.URL.Path, "/v1/invoices/"), "customer": f.customer, "billing_reason": reason, "discounts": discounts, "total_discount_amounts": totals, "status": func() string {
 			if f.paid {
 				return "paid"
 			}
 			return "open"
-		}(), "currency": "usd", "subtotal": f.amount, "total": due, "amount_due": due, "ending_balance": 0, "amount_paid": due, "amount_remaining": 0, "post_payment_credit_notes_amount": f.creditNote, "status_transitions": map[string]any{"paid_at": time.Now().Unix()}, "parent": map[string]any{"subscription_details": map[string]any{"subscription": f.sub}}, "lines": map[string]any{"data": []any{map[string]any{"quantity": 1, "amount": f.amount, "currency": "usd", "pretax_credit_amounts": credits, "period": map[string]any{"start": invoiceStart, "end": invoiceEnd}, "pricing": map[string]any{"price_details": map[string]any{"price": f.price}}, "parent": map[string]any{"subscription_item_details": map[string]any{"subscription": f.sub}}}}}})
+		}(), "currency": "usd", "subtotal": f.amount, "total": due, "amount_due": due, "ending_balance": 0, "amount_paid": due, "amount_remaining": 0, "post_payment_credit_notes_amount": f.creditNote, "status_transitions": map[string]any{"paid_at": paidAt}, "parent": map[string]any{"subscription_details": map[string]any{"subscription": f.sub}}, "lines": map[string]any{"data": []any{map[string]any{"quantity": 1, "amount": f.amount, "currency": "usd", "pretax_credit_amounts": credits, "period": map[string]any{"start": invoiceStart, "end": invoiceEnd}, "pricing": map[string]any{"price_details": map[string]any{"price": f.price}}, "parent": map[string]any{"subscription_item_details": map[string]any{"subscription": f.sub}}}}}})
 	case r.URL.Path == "/v1/invoice_payments":
 		paid := f.amount - f.renewalDiscount
 		if strings.HasSuffix(r.URL.Query().Get("invoice"), fmt.Sprint(f.anchor)) {
@@ -643,7 +651,15 @@ func TestIntegration_ProTerminalPaymentBeforeActivationRemainsFenced(t *testing.
 		assertTerminalPaidPending(t, f)
 	}
 	assertProResponse(t, r, key, "/stripe/plan-choice", `{"offer":"free"}`, 409, "plan_conflict")
-	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 409, "plan_conflict")
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 202, "payment_confirmation_pending")
+	var fresh map[string]any
+	if err := json.Unmarshal([]byte(proCheckoutBody("pro_monthly")), &fresh); err != nil {
+		t.Fatal(err)
+	}
+	fresh["operation_id"] = uuid.NewString()
+	payload, _ := json.Marshal(fresh)
+	assertProResponse(t, r, key, "/stripe/checkout-session", string(payload), 409, "plan_conflict")
+
 }
 
 func TestIntegration_ProCheckoutTermsSurviveConfigurationChange(t *testing.T) {

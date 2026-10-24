@@ -503,7 +503,6 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 	if params.SetupOnly {
 		form.Set("mode", "setup")
 		form.Set("payment_method_types[0]", "card")
-		form.Set("setup_intent_data[usage]", "off_session")
 	}
 	if params.OneOffAmount > 0 {
 		form.Set("mode", "payment")

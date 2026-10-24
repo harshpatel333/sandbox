@@ -483,7 +483,7 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 			if h.nowUTC().Sub(u.Quoted) >= 23*time.Hour {
 				return invoiceSubscription{}, errors.New("upgrade subscription creation replay expired")
 			}
-			form := url.Values{"customer": {u.Customer}, "billing_mode[type]": {"flexible"}, "proration_behavior": {"none"}, "backdate_start_date": {strconv.FormatInt(u.Anchor.Unix(), 10)}, "pause_collection[behavior]": {"keep_as_draft"}, "metadata[pro_upgrade_id]": {u.ID.String()}}
+			form := url.Values{"customer": {u.Customer}, "billing_mode[type]": {"flexible"}, "proration_behavior": {"none"}, "backdate_start_date": {strconv.FormatInt(u.Anchor.Unix(), 10)}, "metadata[pro_upgrade_id]": {u.ID.String()}}
 			if u.End.Day() == u.Anchor.Day() {
 				form.Set("billing_cycle_anchor", strconv.FormatInt(u.End.Unix(), 10))
 			}
@@ -508,29 +508,59 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 	if err != nil {
 		return sub, err
 	}
-	if sub.Customer != u.Customer || sub.Status != "active" || sub.CancelAtPeriodEnd || sub.CancelAt != 0 || sub.PendingUpdate != nil || sub.Schedule != "" || len(sub.Discounts) != 0 || sub.AutomaticTax.Enabled || sub.BillingMode.Type != "flexible" {
-		return sub, errors.New("subscription is unavailable for immediate Pro upgrade")
+	var rounding string
+	if err = conn.QueryRow(ctx, `SELECT COALESCE((SELECT adjustment_price_id FROM billing_invoice_account WHERE team_id=$1),'')`, u.Team).Scan(&rounding); err != nil {
+		return sub, err
+	}
+	expectedStart, expectedEnd, err := validateProUpgradeSubscription(*u, p, sub, rounding, h.nowUTC())
+	if err != nil {
+		return sub, err
+	}
+	if sub.PauseCollection == nil {
+		if err = c.doForm(ctx, http.MethodPost, "/v1/subscriptions/"+url.PathEscape(id), url.Values{"pause_collection[behavior]": {"keep_as_draft"}}, nil, "pro-upgrade-prepare-hold:"+u.ID.String()); err != nil {
+			return sub, err
+		}
+		sub, err = c.invoiceSubscription(ctx, id)
+		if err != nil {
+			return sub, err
+		}
+		expectedStart, expectedEnd, err = validateProUpgradeSubscription(*u, p, sub, rounding, h.nowUTC())
+		if err != nil {
+			return sub, err
+		}
+	}
+	if sub.PauseCollection == nil || sub.PauseCollection.Behavior != "keep_as_draft" || sub.PauseCollection.ResumesAt != 0 {
+		return sub, errors.New("upgrade collection hold requires verification before payment")
+	}
+
+	tag, err := conn.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status=$3,commercial_billing_anchor=COALESCE(commercial_billing_anchor,$4),current_period_start=$6,current_period_end=$7 WHERE team_id=$1 AND stripe_customer_id=$5 AND (stripe_subscription_id IS NULL OR stripe_subscription_id=$2) AND (commercial_billing_anchor IS NULL OR commercial_billing_anchor=$4)`, u.Team, id, sub.Status, u.Anchor, u.Customer, expectedStart, expectedEnd)
+	if err == nil && tag.RowsAffected() != 1 {
+		err = errors.New("upgrade billing association changed before payment")
+	}
+	return sub, err
+}
+
+func validateProUpgradeSubscription(u proUpgrade, p StripeCreateCheckoutSessionParams, sub invoiceSubscription, rounding string, now time.Time) (time.Time, time.Time, error) {
+	if sub.ID != derefString(u.Subscription) || sub.Customer != u.Customer || sub.Status != "active" || sub.CancelAtPeriodEnd || sub.CancelAt != 0 || sub.PendingUpdate != nil || sub.Schedule != "" || len(sub.Discounts) != 0 || sub.AutomaticTax.Enabled || sub.BillingMode.Type != "flexible" {
+		return time.Time{}, time.Time{}, errors.New("subscription is unavailable for immediate Pro upgrade")
 	}
 	resources := sub
 	for _, item := range sub.Items.Data {
 		if item.Price.ID != p.BasePriceID {
 			continue
 		}
+		var err error
 		resources, err = (invoiceBase{Price: p.BasePriceID, Amount: p.PlanTerms.Amount, Months: 1}).stripSubscription(sub)
 		if err != nil {
-			return sub, err
+			return time.Time{}, time.Time{}, err
 		}
 	}
-	var rounding string
-	if err = conn.QueryRow(ctx, `SELECT COALESCE((SELECT adjustment_price_id FROM billing_invoice_account WHERE team_id=$1),'')`, u.Team).Scan(&rounding); err != nil {
-		return sub, err
+	if err := validateFrozenProResources(resources, p.ResourceTerms, rounding); err != nil {
+		return time.Time{}, time.Time{}, err
 	}
-	if err = validateFrozenProResources(resources, p.ResourceTerms, rounding); err != nil {
-		return sub, err
-	}
-	expectedStart, expectedEnd, ok := billing.AnniversaryPeriod(u.Anchor, h.nowUTC())
+	expectedStart, expectedEnd, ok := billing.AnniversaryPeriod(u.Anchor, now)
 	if !ok {
-		return sub, errors.New("upgrade billing calendar is unavailable")
+		return time.Time{}, time.Time{}, errors.New("upgrade billing calendar is unavailable")
 	}
 	if u.Contract == nil {
 		for _, item := range resources.Items.Data {
@@ -538,16 +568,12 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 				continue
 			}
 			if item.Start != expectedStart.Unix() || item.End != expectedEnd.Unix() {
-				return sub, errors.New("upgrade provider calendar must preserve the existing billing period before payment")
+				return time.Time{}, time.Time{}, errors.New("upgrade provider calendar must preserve the existing billing period before payment")
 			}
 		}
 	}
-	if err = invoiceCalendarCompatible(u.Anchor, resources, rounding); err != nil {
-		return sub, err
+	if err := invoiceCalendarCompatible(u.Anchor, resources, rounding); err != nil {
+		return time.Time{}, time.Time{}, err
 	}
-	tag, err := conn.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status=$3,commercial_billing_anchor=COALESCE(commercial_billing_anchor,$4),current_period_start=$6,current_period_end=$7 WHERE team_id=$1 AND stripe_customer_id=$5 AND (stripe_subscription_id IS NULL OR stripe_subscription_id=$2) AND (commercial_billing_anchor IS NULL OR commercial_billing_anchor=$4)`, u.Team, id, sub.Status, u.Anchor, u.Customer, expectedStart, expectedEnd)
-	if err == nil && tag.RowsAffected() != 1 {
-		err = errors.New("upgrade billing association changed before payment")
-	}
-	return sub, err
+	return expectedStart, expectedEnd, nil
 }
