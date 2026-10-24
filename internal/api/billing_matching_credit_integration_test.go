@@ -21,22 +21,23 @@ import (
 )
 
 type matchingFixture struct {
-	t         *testing.T
-	f         *entitlementFixture
-	client    *stripeHTTPClient
-	mu        sync.Mutex
-	invoices  map[string]StripeInvoiceAmounts
-	grants    map[string]entitlementGrant
-	byKey     map[string]string
-	posts     []url.Values
-	keys      []string
-	lose      int
-	refunded  bool
-	unpaid    map[string]bool
-	paid      map[string]int64
-	prices    any
-	planSub   string
-	periodEnd time.Time
+	t             *testing.T
+	f             *entitlementFixture
+	client        *stripeHTTPClient
+	mu            sync.Mutex
+	invoices      map[string]StripeInvoiceAmounts
+	grants        map[string]entitlementGrant
+	byKey         map[string]string
+	posts         []url.Values
+	keys          []string
+	lose          int
+	refunded      bool
+	unpaid        map[string]bool
+	paid          map[string]int64
+	prices        any
+	planSub       string
+	periodEnd     time.Time
+	endingBalance *int64
 }
 
 func newMatchingFixture(t *testing.T, matchingBps int32, capCents, prior int64) *matchingFixture {
@@ -99,17 +100,7 @@ func (m *matchingFixture) serve(w http.ResponseWriter, r *http.Request) {
 		raw, _ := json.Marshal(inv)
 		var doc map[string]any
 		_ = json.Unmarshal(raw, &doc)
-		paid := int64(0)
-		for _, line := range inv.Lines.Data {
-			paid += line.Amount
-			for _, credit := range line.PretaxCredits {
-				paid -= credit.Amount
-			}
-		}
-		if v, ok := m.paid[inv.ID]; ok {
-			paid = v
-		}
-		doc["amount_paid"] = paid
+		doc["amount_paid"] = m.cashPaid(inv.ID)
 		json.NewEncoder(w).Encode(doc)
 	case r.URL.Path == "/v1/billing/credit_grants" && r.Method == http.MethodPost:
 		if err := r.ParseForm(); err != nil {
@@ -147,7 +138,11 @@ func (m *matchingFixture) serve(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(m.grants[strings.TrimPrefix(r.URL.Path, "/v1/billing/credit_grants/")])
 	case r.URL.Path == "/v1/invoice_payments":
 		inv := r.URL.Query().Get("invoice")
-		fmt.Fprintf(w, `{"data":[{"invoice":%q,"amount_paid":100,"payment":{"type":"payment_intent","payment_intent":"pi_match"}}]}`, inv)
+		data := []any{}
+		if paid := m.cashPaid(inv); paid > 0 {
+			data = append(data, map[string]any{"invoice": inv, "amount_paid": paid, "payment": map[string]string{"type": "payment_intent", "payment_intent": "pi_match"}})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": data})
 	case r.URL.Path == "/v1/payment_intents/pi_match":
 		fmt.Fprint(w, `{"id":"pi_match","latest_charge":"ch_match"}`)
 	case r.URL.Path == "/v1/charges/ch_match":
@@ -155,11 +150,29 @@ func (m *matchingFixture) serve(w http.ResponseWriter, r *http.Request) {
 		if m.refunded {
 			refunded = 100
 		}
-		fmt.Fprintf(w, `{"id":"ch_match","customer":%q,"payment_intent":"pi_match","currency":"usd","paid":true,"captured":true,"amount_captured":100,"amount_refunded":%d}`, m.f.c.CustomerID, refunded)
+		var captured int64
+		for id := range m.invoices {
+			captured = max(captured, m.cashPaid(id))
+		}
+		fmt.Fprintf(w, `{"id":"ch_match","customer":%q,"payment_intent":"pi_match","currency":"usd","paid":true,"captured":true,"amount_captured":%d,"amount_refunded":%d}`, m.f.c.CustomerID, captured, refunded)
 	default:
 		m.t.Errorf("unexpected provider request %s %s", r.Method, r.URL)
 		http.Error(w, "unexpected", 500)
 	}
+}
+
+func (m *matchingFixture) cashPaid(id string) int64 {
+	if paid, ok := m.paid[id]; ok {
+		return paid
+	}
+	var paid int64
+	for _, line := range m.invoices[id].Lines.Data {
+		paid += line.Amount
+		for _, credit := range line.PretaxCredits {
+			paid -= credit.Amount
+		}
+	}
+	return paid
 }
 
 func usageLine(price string, amount int64, credits ...StripeInvoicePretaxCredit) StripeInvoiceAmountLine {
@@ -192,6 +205,7 @@ func (m *matchingFixture) invoiceFor(start, end time.Time, closeState, collectio
 	id := "in_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	zero := int64(0)
 	inv := StripeInvoiceAmounts{ID: id, Customer: m.f.c.CustomerID, Currency: "usd", Status: "paid", AmountRemaining: &zero, BillingReason: "subscription_cycle", PeriodStart: start.Unix(), PeriodEnd: end.Unix(), CollectionMethod: "charge_automatically"}
+	inv.EndingBalance = m.endingBalance
 	inv.Parent.SubscriptionDetails = &struct {
 		Subscription string `json:"subscription"`
 	}{Subscription: m.f.c.SubscriptionID}
@@ -917,7 +931,7 @@ func TestMatchingCreditInspectionFailuresDoNotStarveQueue(t *testing.T) {
 }
 
 func TestMatchingCreditUnsupportedPaidEvidenceCannotAuthorizeOrRetire(t *testing.T) {
-	for _, field := range []string{"invoice", "type", "intent", "retrieved intent", "missing payments"} {
+	for _, field := range []string{"invoice", "type", "intent", "retrieved intent", "missing payments", "empty payments", "partial payments", "duplicate payments"} {
 		for _, stage := range []string{"inspection", "issuance", "final review"} {
 			t.Run(field+"/"+stage, func(t *testing.T) {
 				m := newMatchingFixture(t, 10000, 8_000_000, 0)
@@ -956,6 +970,15 @@ func TestMatchingCreditUnsupportedPaidEvidenceCannotAuthorizeOrRetire(t *testing
 						if field != "retrieved intent" && r.URL.Path == "/v1/invoice_payments" {
 							if field == "missing payments" {
 								fmt.Fprint(w, `{}`)
+								return
+							}
+							if field == "empty payments" {
+								fmt.Fprint(w, `{"data":[]}`)
+								return
+							}
+							if field == "duplicate payments" {
+								payment := map[string]any{"invoice": invoice, "amount_paid": 35000, "payment": map[string]string{"type": "payment_intent", "payment_intent": "pi_match"}}
+								json.NewEncoder(w).Encode(map[string]any{"data": []any{payment, payment}})
 								return
 							}
 							inv, kind, intent := invoice, "payment_intent", "pi_match"

@@ -330,8 +330,9 @@ func (h *Handlers) issueDueMatchingCredits(ctx context.Context, client *stripeHT
 func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPClient, id uuid.UUID) error {
 	var team, contract uuid.UUID
 	var customer, key, invoice, current string
-	var acknowledged bool
-	if err := h.Pool.QueryRow(ctx, `SELECT team_id,contract_id,customer_id,idempotency_key,invoice_id,state,acknowledged_at IS NOT NULL FROM billing_matching_credit WHERE id=$1`, id).Scan(&team, &contract, &customer, &key, &invoice, &current, &acknowledged); err != nil {
+	var acknowledged, flagged bool
+	var attempted *time.Time
+	if err := h.Pool.QueryRow(ctx, `SELECT team_id,contract_id,customer_id,idempotency_key,invoice_id,state,acknowledged_at IS NOT NULL,flagged_at IS NOT NULL,first_attempt_at FROM billing_matching_credit WHERE id=$1`, id).Scan(&team, &contract, &customer, &key, &invoice, &current, &acknowledged, &flagged, &attempted); err != nil {
 		return err
 	}
 	release, err := h.holdCreditIssuanceFence(ctx, team)
@@ -339,16 +340,29 @@ func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPCl
 		return err
 	}
 	defer release()
-	// A refund or dispute can land while the match waits; a grant that was never
-	// sent must not be sent for reversed payment. An attempted one may exist.
-	if current == "pending" && !acknowledged {
+	if current == "uncertain" {
+		found, err := h.recoverMatchingCredit(ctx, client, id, contract, customer)
+		if err != nil || found {
+			return err
+		}
+		if attempted == nil || time.Since(*attempted) >= 23*time.Hour {
+			return errors.New("matching credit outcome unknown after the replay window; operator recovery required")
+		}
+		if flagged && !acknowledged {
+			return fmt.Errorf("%w: uncertain matching credit is held for provider recovery", errCreditIssuanceDeferred)
+		}
+	}
+	if (current == "pending" || current == "uncertain") && !acknowledged {
 		reason, evidence, err := client.matchedInvoiceReversal(ctx, invoice, customer)
 		if err != nil {
 			return err
 		}
 		if reason != "" {
 			log.Warn().Str("matching_credit_id", id.String()).Str("invoice_id", invoice).Str("reason", reason).Msg("matched invoice was reversed before issuance; staff review required")
-			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET flagged_at=clock_timestamp(),flag_reason=$2,flag_evidence=$3 WHERE id=$1 AND state='pending' AND flagged_at IS NULL`, id, reason, evidence)
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET flagged_at=clock_timestamp(),flag_reason=$2,flag_evidence=$3 WHERE id=$1 AND state IN ('pending','uncertain') AND flagged_at IS NULL`, id, reason, evidence)
+			if err == nil && current == "uncertain" {
+				return fmt.Errorf("%w: reversed uncertain matching credit requires provider recovery", errCreditIssuanceDeferred)
+			}
 			return err
 		}
 	}
@@ -356,8 +370,11 @@ func (h *Handlers) issueMatchingCredit(ctx context.Context, client *stripeHTTPCl
 	var payload []byte
 	var first *time.Time
 	err = h.Pool.QueryRow(ctx, `UPDATE billing_matching_credit SET state='uncertain',first_attempt_at=COALESCE(first_attempt_at,clock_timestamp())
- WHERE id=$1 AND (state='uncertain' OR (state='pending' AND (flagged_at IS NULL OR acknowledged_at IS NOT NULL))) RETURNING state,request_payload,first_attempt_at`, id).Scan(&state, &payload, &first)
+ WHERE id=$1 AND state IN ('pending','uncertain') AND (flagged_at IS NULL OR acknowledged_at IS NOT NULL) RETURNING state,request_payload,first_attempt_at`, id).Scan(&state, &payload, &first)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if current == "pending" || current == "uncertain" {
+			return fmt.Errorf("%w: matching credit dispatch is held", errCreditIssuanceDeferred)
+		}
 		return nil
 	}
 	if err != nil {
@@ -382,44 +399,58 @@ func (h *Handlers) confirmMatchingCredit(ctx context.Context, id uuid.UUID, gran
 	if err != nil {
 		return err
 	}
-	_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET state='issued',stripe_credit_grant_id=$2,issuance_evidence=$3,issued_at=clock_timestamp() WHERE id=$1 AND state='uncertain'`, id, grant.ID, raw)
+	_, err = h.Pool.Exec(ctx, `UPDATE billing_matching_credit SET state='issued',stripe_credit_grant_id=$2,issuance_evidence=$3,issued_at=clock_timestamp(),review_checked_at=NULL WHERE id=$1 AND state='uncertain'`, id, grant.ID, raw)
 	return err
 }
 
 // Past Stripe's idempotency window a replay could create a second grant, so
 // only the provider inventory can settle the outcome.
 func (h *Handlers) discoverMatchingCredit(ctx context.Context, client *stripeHTTPClient, id, contract uuid.UUID, customer string) error {
-	if err := h.syncCreditInventory(ctx, contract, customer, client); err != nil {
+	found, err := h.recoverMatchingCredit(ctx, client, id, contract, customer)
+	if err != nil {
 		return err
+	}
+	if !found {
+		return errors.New("matching credit outcome unknown after the replay window; operator recovery required")
+	}
+	return nil
+}
+
+func (h *Handlers) recoverMatchingCredit(ctx context.Context, client *stripeHTTPClient, id, contract uuid.UUID, customer string) (bool, error) {
+	if err := h.syncCreditInventory(ctx, contract, customer, client); err != nil {
+		return false, err
 	}
 	rows, err := h.Pool.Query(ctx, `SELECT grant_id FROM billing_provider_credit WHERE customer_id=$1 AND evidence->'metadata'->>'matching_credit_id'=$2 LIMIT 2`, customer, id.String())
 	if err != nil {
-		return err
+		return false, err
 	}
 	var ids []string
 	for rows.Next() {
 		var grant string
 		if err = rows.Scan(&grant); err != nil {
 			rows.Close()
-			return err
+			return false, err
 		}
 		ids = append(ids, grant)
 	}
 	rows.Close()
 	if err = rows.Err(); err != nil {
-		return err
+		return false, err
+	}
+	if len(ids) == 0 {
+		return false, nil
 	}
 	if len(ids) != 1 {
-		return fmt.Errorf("matching credit outcome unknown after the replay window (%d provider grants); operator recovery required", len(ids))
+		return false, fmt.Errorf("matching credit outcome unknown after the replay window (%d provider grants); operator recovery required", len(ids))
 	}
 	grant, err := client.retrieveEntitlementGrant(ctx, ids[0])
 	if err != nil {
-		return err
+		return false, err
 	}
 	if grant.VoidedAt != 0 {
-		return errors.New("recovered matching grant was voided; operator recovery required")
+		return false, errors.New("recovered matching grant was voided; operator recovery required")
 	}
-	return h.confirmMatchingCredit(ctx, id, grant)
+	return true, h.confirmMatchingCredit(ctx, id, grant)
 }
 
 // The form is derived exclusively from the frozen request so every replay
@@ -507,6 +538,9 @@ func (c *stripeHTTPClient) matchedInvoiceReversal(ctx context.Context, id, custo
 		raw, _ := json.Marshal(inv)
 		return "credit note issued or payment reversed on matched invoice", raw, nil
 	}
+	if inv.AmountPaid == nil || *inv.AmountPaid < 0 {
+		return "", nil, errors.New("matched invoice lacks supported cash-paid evidence")
+	}
 	var payments struct {
 		Data []struct {
 			Invoice    string `json:"invoice"`
@@ -528,10 +562,16 @@ func (c *stripeHTTPClient) matchedInvoiceReversal(ctx context.Context, id, custo
 	if payments.Data == nil {
 		return "", nil, errors.New("matched invoice lacks paid-payment evidence")
 	}
+	var verifiedCash int64
+	seenIntents := map[string]bool{}
 	for _, p := range payments.Data {
 		if p.Invoice != id || p.Payment.Type != "payment_intent" || p.Payment.Intent == "" {
 			return "", nil, errors.New("matched invoice has unsupported paid-payment evidence")
 		}
+		if p.AmountPaid <= 0 || p.AmountPaid > *inv.AmountPaid-verifiedCash || seenIntents[p.Payment.Intent] {
+			return "", nil, errors.New("matched invoice payments do not account for its cash-paid amount")
+		}
+		seenIntents[p.Payment.Intent] = true
 		var intent struct {
 			ID           string `json:"id"`
 			LatestCharge string `json:"latest_charge"`
@@ -550,6 +590,10 @@ func (c *stripeHTTPClient) matchedInvoiceReversal(ctx context.Context, id, custo
 		if err != nil {
 			return "", nil, err
 		}
+		verifiedCash += p.AmountPaid
+	}
+	if verifiedCash != *inv.AmountPaid {
+		return "", nil, errors.New("matched invoice payments do not account for its cash-paid amount")
 	}
 	return "", nil, nil
 }
