@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -252,7 +253,8 @@ func TestIntegration_PricingAdoptionCLIBlocksResidualRelease(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
 		t.Fatal(err)
 	}
-	team, _ := seedTeamAndKey(t)
+	fixture, router, key := newProFixture(t, "pro_monthly")
+	team := fixture.team
 	if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account(team_id,checkout_may_exist) VALUES($1,true)`, team); err != nil {
 		t.Fatal(err)
 	}
@@ -276,6 +278,27 @@ func TestIntegration_PricingAdoptionCLIBlocksResidualRelease(t *testing.T) {
 	cli(false, append([]string{"prepare"}, authority...)...)
 	if _, err := testPool.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version='v2'`); err != nil {
 		t.Fatal(err)
+	}
+	public := getPublicPlans(t, router)
+	if public.PricingVersion != "legacy" {
+		t.Fatalf("preparing exposed public v2: %+v", public)
+	}
+	for _, card := range public.Cards {
+		if card.Monthly != nil && card.Monthly.Available {
+			t.Fatal("preparing exposed subscription entry")
+		}
+	}
+	var choicesBefore, choicesAfter int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM billing_signup_choice WHERE team_id=$1`, team).Scan(&choicesBefore); err != nil {
+		t.Fatal(err)
+	}
+	response := do(router, http.MethodPost, "/stripe/plan-choice", key, `{"offer":"free"}`)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("preparing old-unassigned Free entry=%d %s", response.Code, response.Body.String())
+	}
+	var assignedAfter int
+	if err := testPool.QueryRow(ctx, `SELECT (SELECT count(*) FROM billing_signup_choice WHERE team_id=$1),(SELECT count(*) FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL)`, team).Scan(&choicesAfter, &assignedAfter); err != nil || choicesAfter != choicesBefore || assignedAfter != 0 {
+		t.Fatalf("blocked Free wrote choice: %d/%d %v", choicesBefore, choicesAfter, err)
 	}
 	captured := cli(false, append([]string{"capture"}, authority...)...)
 	var snapshot struct {

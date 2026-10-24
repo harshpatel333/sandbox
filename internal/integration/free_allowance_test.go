@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -930,5 +931,57 @@ func TestIntegration_FreeShape_AssignmentContentionFailsWithoutWaiting(t *testin
 				t.Fatalf("admission did not recover after assignment release: %v", err)
 			}
 		})
+	}
+}
+
+func TestIntegration_FreeAllowance_RetryQueueFairnessAndRecovery(t *testing.T) {
+	ctx := t.Context()
+	setPricingSwitch(t, "legacy")
+	ids := make([]uuid.UUID, 11)
+	for i := range ids {
+		ids[i], _ = seedTeamAndKey(t)
+		assignFreePlan(t, ids[i], time.Now())
+		seedActiveSandbox(t, ids[i], "retry-queue")
+		if err := testQueries.ScheduleFreeAllowanceRetry(ctx, ids[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM billing_free_allowance_retry WHERE team_id=ANY($1)`, ids)
+	})
+	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
+	after := ids[0]
+	for i := len(after) - 1; i >= 0; i-- {
+		if after[i] > 0 {
+			after[i]--
+			break
+		}
+		after[i] = 255
+	}
+	params := db.ListFreeTeamsWithActiveSandboxesParams{AfterTeamID: pgtype.UUID{Bytes: after, Valid: true}, BatchLimit: 1}
+	normal, err := testQueries.ListFreeTeamsWithActiveSandboxes(ctx, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(normal, ids[0]) {
+		t.Fatal("queued team can still consume the whole normal sweep deadline")
+	}
+	first, err := testQueries.ClaimFreeAllowanceRetries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := testQueries.ClaimFreeAllowanceRetries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 10 || len(second) != 1 {
+		t.Fatalf("eleventh retry postponed without dispatch capacity: %d/%d", len(first), len(second))
+	}
+	if err := testQueries.ClearFreeAllowanceRetry(ctx, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	normal, err = testQueries.ListFreeTeamsWithActiveSandboxes(ctx, params)
+	if err != nil || len(normal) != 1 || normal[0] != ids[0] {
+		t.Fatalf("recovered retry missing from normal work: %v %v", normal, err)
 	}
 }

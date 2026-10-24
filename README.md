@@ -270,3 +270,11 @@ evidence and opens the effective public v2 gate. Signup holds the switch lock an
 assigns Free even during preparation, so release cannot miss a planless newborn.
 Regional imports also fence on the switch and refuse every raw-v2 destination.
 Service roles can read/assert the gate but cannot prepare, capture or release it.
+
+Allowance refresh failures are handed to an indexed durable retry queue before
+normal sweep progress is acknowledged. Queued teams are excluded from normal
+pages; bounded retry claims match worker capacity so a slow prefix cannot starve
+later teams. Interrupted dispatched work gets a separate bounded persistence
+budget; if that handoff fails, the cursor remains before the failed prefix.
+Outstanding allowance retries also block adoption release and regional transfer.
+This work runs in the background and adds no sandbox start/resume I/O.
