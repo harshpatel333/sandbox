@@ -21,6 +21,61 @@ LANGUAGE sql STABLE AS $$
  WHERE a.team_id = p_team AND a.effective_to IS NULL AND a.kind = 'free';
 $$;
 
+CREATE OR REPLACE FUNCTION sandbox_snapshot_quota_on_insert() RETURNS trigger
+    LANGUAGE plpgsql
+AS $$
+DECLARE
+    team_limit      int;
+    sandbox_limit   int;
+    in_flight_limit int;
+    n               bigint;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('sandbox_snapshot_quota'), hashtext(NEW.team_id::text));
+    SELECT max_snapshots, max_snapshots_per_sandbox, max_snapshots_in_flight
+    INTO team_limit, sandbox_limit, in_flight_limit
+    FROM team
+    WHERE id = NEW.team_id
+    FOR SHARE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'team % does not exist', NEW.team_id;
+    END IF;
+
+    IF NEW.idempotency_key IS NOT NULL AND EXISTS (
+        SELECT 1 FROM sandbox_snapshot
+        WHERE team_id = NEW.team_id
+          AND sandbox_id = NEW.sandbox_id
+          AND idempotency_key = NEW.idempotency_key
+    ) THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT count(*) INTO n FROM sandbox_snapshot
+    WHERE team_id = NEW.team_id AND deleted_at IS NULL AND status = 'creating'
+      AND created_at > now() - interval '1 hour';
+    IF n >= in_flight_limit THEN
+        RAISE EXCEPTION 'snapshots in flight limit reached for team (count=%, max=%)', n, in_flight_limit
+            USING ERRCODE = 'SS003';
+    END IF;
+
+    SELECT count(*) INTO n FROM sandbox_snapshot
+    WHERE team_id = NEW.team_id AND deleted_at IS NULL AND status IN ('creating', 'ready');
+    IF n >= team_limit THEN
+        RAISE EXCEPTION 'snapshot quota exceeded for team (count=%, max=%)', n, team_limit
+            USING ERRCODE = 'SS002';
+    END IF;
+
+    SELECT count(*) INTO n FROM sandbox_snapshot
+    WHERE sandbox_id = NEW.sandbox_id AND deleted_at IS NULL AND status IN ('creating', 'ready');
+    IF n >= sandbox_limit THEN
+        RAISE EXCEPTION 'snapshot quota exceeded for sandbox (count=%, max=%)', n, sandbox_limit
+            USING ERRCODE = 'SS002';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
 CREATE FUNCTION guard_free_sandbox_shape() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE f record;
 BEGIN
