@@ -138,6 +138,29 @@ class CallerTest(unittest.TestCase):
             self.assertNotIn('NO_REMOTE_CALL', stdout.getvalue())
             self.assertNotIn('PRIVATE_SENTINEL', stdout.getvalue())
 
+    def test_interrupt_after_launch_is_ambiguous_and_consumes_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.setup_args(Path(directory))
+            with patch.object(caller.subprocess, 'run', side_effect=KeyboardInterrupt) as run:
+                result = caller.execute(args)
+            run.assert_called_once()
+            self.assertEqual(result['status'], 'CALLER_FAILED_OR_AMBIGUOUS_NO_RETRY')
+            self.assertNotIn('NOT_EXECUTED', Path(args.output).read_text())
+            self.assertTrue(Path(args.once_file).exists())
+
+    def test_short_config_write_refuses_before_ssh_and_keeps_marker(self):
+        import os
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.setup_args(Path(directory))
+            real_write = os.write
+            def short_write(descriptor, value):
+                return real_write(descriptor, value[:8])
+            with patch.object(caller.os, 'write', side_effect=short_write), patch.object(caller.subprocess, 'run') as run:
+                result = caller.execute(args)
+            run.assert_not_called()
+            self.assertEqual(result['status'], 'CALLER_FAILED_OR_AMBIGUOUS_NO_RETRY')
+            self.assertTrue(Path(args.once_file).exists())
+
     def test_complete_requires_bound_schema_and_preserved_prior(self):
         pins = {'backend-sha': 'a' * 40, 'console-sha': 'b' * 40, 'binary-sha256': 'c' * 64, 'schema-sha256': 'd' * 64, 'epoch': 'epoch'}
         runtime = {'backend_sha': pins['backend-sha'], 'console_sha': pins['console-sha'], 'binary_sha256': pins['binary-sha256'], 'schema_receipt_sha256': pins['schema-sha256'], 'epoch': 'epoch', 'pid': 2, 'console_container_id': 'e' * 64, 'pricing_version': 'v2', 'entry_open': True}

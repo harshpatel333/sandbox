@@ -123,11 +123,13 @@ def execute(args):
         os.close(once_fd)
         config_fd = os.memfd_create('reviewed-ssh-config', os.MFD_ALLOW_SEALING)
         os.fchmod(config_fd, 0o600)
-        os.write(config_fd, config_bytes)
+        if os.write(config_fd, config_bytes) != len(config_bytes):
+            raise OSError()
         fcntl.fcntl(config_fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
         payload = json.dumps({'source': base64.b64encode(leaf).decode(), 'args': [part for name in ARGUMENTS for part in ('--' + name, pins[name])]}).encode()
         remote = 'python3 -I -c ' + shlex.quote(BOOTSTRAP)
         command = ['/usr/bin/ssh', '-F', '/proc/' + str(os.getpid()) + '/fd/' + str(config_fd), '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no', '-o', 'PermitLocalCommand=no', '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no', '-o', 'ForwardX11=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '-o', 'ConnectionAttempts=1', '-o', 'ConnectTimeout=15', 'rc-billing-readonly', remote]
+        result['status'] = 'CALLER_POSSIBLE_EXECUTION_NO_RETRY'
         completed = subprocess.run(command, input=payload, capture_output=True, timeout=80)
         if len(completed.stdout) > 65536 or completed.returncode not in (0, 1):
             raise ValueError()
@@ -135,7 +137,7 @@ def execute(args):
         if (completed.returncode == 0) != (observed['status'] == 'STATIC_OBSERVATION_COMPLETE'):
             raise ValueError()
         result.update(status='STATIC_OBSERVATION_RECORDED', actual_static_result=observed)
-    except Exception as error:
+    except BaseException as error:
         result.update(status='CALLER_FAILED_OR_AMBIGUOUS_NO_RETRY', failure={'stage': 'caller.ssh_or_readback', 'exception_class': 'TimeoutError' if isinstance(error, subprocess.TimeoutExpired) else 'OSError', 'status': None})
     finally:
         if config_fd is not None:
@@ -158,7 +160,7 @@ def main():
     try:
         args = parser.parse_args()
         result = execute(args)
-    except Exception:
+    except BaseException:
         print(json.dumps({'status': 'CALLER_FAILED_EXECUTION_STATE_UNAVAILABLE_NO_RETRY'}))
         return 1
     print(json.dumps(result))
