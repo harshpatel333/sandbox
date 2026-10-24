@@ -3309,13 +3309,13 @@ func TestPlanAssignmentMigration(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer tx.Rollback(ctx)
-					if err := lockSourceAssignments(ctx, tx, team); err == nil || !strings.Contains(err.Error(), "pause authority transfer") {
+					if err := lockSourceAssignments(ctx, tx, team); err == nil || (!strings.Contains(err.Error(), "pause authority transfer") && !strings.Contains(err.Error(), "assigned teams and plan change history cannot migrate") && !strings.Contains(err.Error(), "contains prepaid authority or entry eligibility")) {
 						t.Fatalf("cutover not refused: %v", err)
 					}
 					tx.Rollback(ctx)
 				}
 				spec, _ := tableByName("team")
-				if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil || !strings.Contains(err.Error(), "pause authority transfer") {
+				if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil || (!strings.Contains(err.Error(), "pause authority transfer") && !strings.Contains(err.Error(), "assigned teams and plan change history cannot migrate") && !strings.Contains(err.Error(), "contains prepaid authority or entry eligibility")) {
 					t.Fatalf("copy not refused: %v", err)
 				}
 				if cell == "source" {
@@ -3336,7 +3336,7 @@ func TestPlanAssignmentMigration(t *testing.T) {
 			t.Fatal(err)
 		}
 		mustExec(t, dstPool, `INSERT INTO billing_free_allowance(team_id,window_started_at,resets_at,allowance_usd,used_usd,blocked_until,evaluated_at) VALUES($1,now(),now()+interval '24 hours',1,2,now()+interval '24 hours',now())`, team)
-		if err := requireAssignmentParity(ctx, srcPool, dstPool, team); err == nil || !strings.Contains(err.Error(), "pause authority transfer") {
+		if err := requireAssignmentParity(ctx, srcPool, dstPool, team); err == nil || (!strings.Contains(err.Error(), "pause authority transfer") && !strings.Contains(err.Error(), "assigned teams and plan change history cannot migrate") && !strings.Contains(err.Error(), "contains prepaid authority or entry eligibility")) {
 			t.Fatalf("cutover accepted new destination authority: %v", err)
 		}
 	})

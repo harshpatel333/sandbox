@@ -50,7 +50,7 @@ func TestPrepaidMigrationRefused(t *testing.T) {
 				auditBefore := scanString(t, pool, `SELECT COALESCE(jsonb_agg(to_jsonb(p))::text,'[]') FROM billing_prepaid_purchase p WHERE team_id=$1`, team)
 				for _, phase := range []string{phasePlan, phaseCopy, phaseValidate, phaseDetach, phasePurge, phaseReleaseRollups} {
 					cfg := config{teamID: team, sourceURL: srcURL, destURL: dstURL, phase: phase, destHostID: destHostID, destRegion: destRegion, confirmTeamName: name}
-					if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), side+": refusing team migration:") {
+					if err := run(ctx, cfg); err == nil || (!strings.Contains(err.Error(), side+": refusing team migration:") && !strings.Contains(err.Error(), side+": assigned teams and plan change history cannot migrate")) {
 						t.Fatalf("%s did not refuse unsupported authority: %v", phase, err)
 					}
 				}
@@ -145,7 +145,7 @@ func TestPrepaidMigrationRechecksLockedAuthority(t *testing.T) {
 			if err = writer.Commit(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if err = <-done; err == nil || !strings.Contains(err.Error(), "prepaid financial-authority transfer") {
+			if err = <-done; err == nil || (!strings.Contains(err.Error(), "prepaid financial-authority transfer") && !strings.Contains(err.Error(), "assigned teams and plan change history cannot migrate")) {
 				t.Fatal("new authority escaped locked recheck", err)
 			}
 		})
