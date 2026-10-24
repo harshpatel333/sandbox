@@ -2,6 +2,7 @@
 import argparse
 import base64
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -16,12 +17,14 @@ ARGUMENTS = ('devbox-name', 'devbox-id', 'prior-receipt', 'prior-sha256', 'backe
 RUNTIME_KEYS = ('backend_sha', 'console_sha', 'pid', 'binary_sha256', 'console_container_id', 'schema_receipt_sha256', 'epoch', 'pricing_version', 'entry_open')
 
 
-def private_bytes(path, digest=None):
+def private_bytes(path, digest):
+    if not isinstance(digest, str) or not re.fullmatch('[a-f0-9]{64}', digest):
+        raise ValueError()
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
         raise ValueError()
     value = path.read_bytes()
-    if len(value) > 131072 or (digest and hashlib.sha256(value).hexdigest() != digest):
+    if len(value) > 131072 or hashlib.sha256(value).hexdigest() != digest:
         raise ValueError()
     return value
 
@@ -54,6 +57,8 @@ def sanitized(value, pins):
             for name in ('console_container_id', 'schema_receipt_sha256'):
                 if not isinstance(item.get(name), str) or len(item[name]) != 64 or any(c not in '0123456789abcdef' for c in item[name]):
                     raise ValueError()
+            if item['schema_receipt_sha256'] != pins['schema-sha256']:
+                raise ValueError()
             if type(item.get('pid')) is not int or item['pid'] <= 1 or item.get('pricing_version') != 'v2' or item.get('entry_open') is not True:
                 raise ValueError()
             result[key] = {name: item[name] for name in RUNTIME_KEYS}
@@ -89,6 +94,8 @@ def sanitized(value, pins):
         kept['mailpit_counts']['counts_complete'] = True
         kept['prior_inspection_complete'] = False
         result['prior_observations'] = kept
+    if value['status'] == 'STATIC_OBSERVATION_COMPLETE' and result['prior_observations'] is None:
+        raise ValueError()
     result['sdk_readiness'] = 'UNAVAILABLE_NO_BROWSER_OR_SDK_PROBE'
     result['root_cause'] = 'NOT_ESTABLISHED'
     result['counts_requeried'] = False
@@ -100,7 +107,7 @@ def execute(args):
     if hashlib.sha256(leaf).hexdigest() != LEAF_SHA256:
         raise ValueError()
     config = Path(args.ssh_config).resolve(strict=True)
-    private_bytes(config, args.ssh_config_sha256)
+    config_bytes = private_bytes(config, args.ssh_config_sha256)
     pins = json.loads(private_bytes(Path(args.pins), args.pins_sha256))
     if set(pins) != set(ARGUMENTS) or any(not isinstance(value, str) or '\x00' in value or '\n' in value for value in pins.values()):
         raise ValueError()
@@ -109,14 +116,18 @@ def execute(args):
     if pins['devbox-name'] != 'awille-ai-dev-billing' or pins['devbox-id'] != '29baf003ad05':
         raise ValueError()
     output_fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    config_fd = None
     result = {'status': 'CALLER_NOT_EXECUTED', 'leaf_sha256': LEAF_SHA256, 'actual_static_result': None}
     try:
         once_fd = os.open(args.once_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(once_fd)
+        config_fd = os.memfd_create('reviewed-ssh-config', os.MFD_ALLOW_SEALING)
+        os.write(config_fd, config_bytes)
+        fcntl.fcntl(config_fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
         payload = json.dumps({'source': base64.b64encode(leaf).decode(), 'args': [part for name in ARGUMENTS for part in ('--' + name, pins[name])]}).encode()
         remote = 'python3 -I -c ' + shlex.quote(BOOTSTRAP)
-        command = ['/usr/bin/ssh', '-F', str(config), '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no', '-o', 'PermitLocalCommand=no', '-o', 'ClearAllForwardings=yes', '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '-o', 'ConnectionAttempts=1', '-o', 'ConnectTimeout=15', 'rc-billing-readonly', remote]
-        completed = subprocess.run(command, input=payload, capture_output=True, timeout=80)
+        command = ['/usr/bin/ssh', '-F', '/proc/self/fd/' + str(config_fd), '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no', '-o', 'PermitLocalCommand=no', '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no', '-o', 'ForwardX11=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '-o', 'ConnectionAttempts=1', '-o', 'ConnectTimeout=15', 'rc-billing-readonly', remote]
+        completed = subprocess.run(command, input=payload, capture_output=True, timeout=80, pass_fds=(config_fd,))
         if len(completed.stdout) > 65536 or completed.returncode not in (0, 1):
             raise ValueError()
         observed = sanitized(json.loads(completed.stdout), pins)
@@ -126,21 +137,28 @@ def execute(args):
     except Exception as error:
         result.update(status='CALLER_FAILED_OR_AMBIGUOUS_NO_RETRY', failure={'stage': 'caller.ssh_or_readback', 'exception_class': 'TimeoutError' if isinstance(error, subprocess.TimeoutExpired) else 'OSError', 'status': None})
     finally:
+        if config_fd is not None:
+            os.close(config_fd)
         with os.fdopen(output_fd, 'w') as stream:
             json.dump(result, stream, indent=2)
             stream.write('\n')
     return result
 
 
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError()
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = SafeParser(add_help=False)
     for name in ('ssh-config', 'ssh-config-sha256', 'pins', 'pins-sha256', 'once-file', 'output'):
         parser.add_argument('--' + name, required=True)
-    args = parser.parse_args()
     try:
+        args = parser.parse_args()
         result = execute(args)
     except Exception:
-        print(json.dumps({'status': 'CALLER_INPUT_REFUSED_NO_REMOTE_CALL'}))
+        print(json.dumps({'status': 'CALLER_FAILED_EXECUTION_STATE_UNAVAILABLE_NO_RETRY'}))
         return 1
     print(json.dumps(result))
     return 0 if result['status'] == 'STATIC_OBSERVATION_RECORDED' else 1
