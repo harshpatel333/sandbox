@@ -9,15 +9,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-var prepaidPricingV2Enabled = func(ctx context.Context, h *Handlers) (bool, error) {
-	return h.pricingV2Enabled(ctx)
-}
-
-var prepaidPlanAllowsPurchase = func(ctx context.Context, h *Handlers, team uuid.UUID) (bool, error) {
-	p, ok, err := currentTeamPlan(ctx, h.Pool, team)
-	return ok && (p.Kind == planKindFree || p.Kind == planKindPrepaid), err
-}
-
 type prepaidPurchasePlan struct {
 	Terms       planTerms  `json:"terms"`
 	Predecessor *uuid.UUID `json:"predecessor"`
@@ -25,6 +16,10 @@ type prepaidPurchasePlan struct {
 }
 
 func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, team uuid.UUID, customer string, actor uuid.UUID, amount int64) error {
+	raw, entryOpen, err := lockPricingEntry(ctx, tx)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, team); err != nil {
 		return err
 	}
@@ -35,11 +30,7 @@ func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, te
 	if exists {
 		return nil
 	}
-	var enabled bool
-	if err := tx.QueryRow(ctx, `SELECT billing_pricing_version()='v2'`).Scan(&enabled); err != nil {
-		return err
-	}
-	if !enabled {
+	if raw != "v2" || !entryOpen {
 		return errPricingV2Off
 	}
 	current, ok, err := currentTeamPlan(ctx, tx, team)

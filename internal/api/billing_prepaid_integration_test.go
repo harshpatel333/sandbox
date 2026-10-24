@@ -60,6 +60,7 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 	}
 	t.Cleanup(pool.Close)
 	h := &Handlers{Pool: pool, DB: db.New(pool), Config: &config.Config{}}
+	installPrepaidPublicStateFixture(t, h)
 	setPricingVersion(t, h, "v2")
 	team, err := h.DB.CreateTeam(t.Context(), "prepaid-"+uuid.NewString())
 	if err != nil {
@@ -82,9 +83,7 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 	f.exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status) VALUES($1,$2,$3,'active')`, f.team, f.customer, f.sub)
 	f.exec(`INSERT INTO billing_funding_account(team_id,observe) VALUES($1,true) ON CONFLICT(team_id) DO UPDATE SET observe=true`, f.team)
 	f.observe(1000, true)
-	enabled, allowed, assign := prepaidPricingV2Enabled, prepaidPlanAllowsPurchase, assignStarterAfterPurchase
-	prepaidPricingV2Enabled = func(context.Context, *Handlers) (bool, error) { return true, nil }
-	prepaidPlanAllowsPurchase = func(_ context.Context, _ *Handlers, team uuid.UUID) (bool, error) { return team == f.team, nil }
+	assign := assignStarterAfterPurchase
 	assignStarterAfterPurchase = func(_ context.Context, _ *Handlers, _ uuid.UUID, purchase uuid.UUID) error {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -92,7 +91,7 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 		return nil
 	}
 	t.Cleanup(func() {
-		prepaidPricingV2Enabled, prepaidPlanAllowsPurchase, assignStarterAfterPurchase = enabled, allowed, assign
+		assignStarterAfterPurchase = assign
 		_, _ = pool.Exec(context.Background(), `UPDATE billing_funding_account SET observe=false,enforce=false,prepaid=false WHERE team_id=$1`, f.team)
 		_, _ = pool.Exec(context.Background(), `UPDATE billing_prepaid_auto_recharge SET enabled=false WHERE team_id=$1`, f.team)
 		_, _ = pool.Exec(context.Background(), `UPDATE billing_prepaid_purchase SET next_attempt_at='9999-01-01',credit_balance_checked_at='9999-01-01' WHERE team_id=$1`, f.team)
@@ -385,7 +384,7 @@ func TestPrepaidAutoRechargeSafetyCaps(t *testing.T) {
 func TestPrepaidSwitchOffKeepsExistingAutoRecharge(t *testing.T) {
 	f := newPrepaidFixture(t)
 	f.enableAutoRecharge(2000, 5000)
-	prepaidPricingV2Enabled = func(context.Context, *Handlers) (bool, error) { return false, nil }
+	setPricingVersion(t, f.h, "legacy")
 	f.observe(0, true)
 	if err := f.tick(); err != nil {
 		t.Fatal(err)

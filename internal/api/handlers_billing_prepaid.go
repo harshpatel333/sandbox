@@ -62,30 +62,6 @@ func (h *Handlers) GetPrepaidCredit(c *gin.Context) {
 	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
 }
 
-// prepaidEntryAllowed refuses new prepaid commitments while pricing v2 is off
-// or the team's plan cannot buy credit. Existing balances are never affected.
-func (h *Handlers) prepaidEntryAllowed(c *gin.Context, team uuid.UUID) bool {
-	enabled, err := prepaidPricingV2Enabled(c.Request.Context(), h)
-	if err != nil {
-		respondError(c, ErrInternal)
-		return false
-	}
-	if !enabled {
-		respondErrorMsg(c, "conflict", "pricing v2 is not active", http.StatusConflict)
-		return false
-	}
-	allowed, err := prepaidPlanAllowsPurchase(c.Request.Context(), h, team)
-	if err != nil {
-		respondError(c, ErrInternal)
-		return false
-	}
-	if !allowed {
-		respondErrorMsg(c, "conflict", "this team's plan cannot buy prepaid credit", http.StatusConflict)
-		return false
-	}
-	return true
-}
-
 func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 	team, err := customerContextTeamID(c)
 	if err != nil {
@@ -111,9 +87,6 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 	}
 	if managed {
 		respondErrorMsg(c, "forbidden", "This team's billing is managed by QM", http.StatusForbidden)
-		return
-	}
-	if !h.prepaidEntryAllowed(c, team) {
 		return
 	}
 	client, ok := h.Stripe.(*stripeHTTPClient)
@@ -169,6 +142,10 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 	}
 	session, err := h.startPrepaidPaymentCheckout(ctx, client, team, actor, derefString(account.StripeCustomerID), req.AmountCents, successURL, cancelURL)
 	if err != nil {
+		if errors.Is(err, errPricingV2Off) {
+			respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
+			return
+		}
 		log.Error().Err(err).Str("team_id", team.String()).Msg("create prepaid checkout failed")
 		respondErrorMsg(c, "bad_gateway", "checkout could not be created; try again", http.StatusBadGateway)
 		return
@@ -176,8 +153,6 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 	c.JSON(http.StatusOK, billingSessionResponse{ID: session.ID, URL: session.URL})
 }
 
-// Turning auto-recharge off always works; turning it on or changing it is new
-// prepaid entry and needs pricing v2, a prepaid plan and a saved card.
 func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 	team, err := customerContextTeamID(c)
 	if err != nil {
@@ -200,9 +175,6 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 			respondErrorMsg(c, "bad_request", "threshold_cents and amount_cents must be multiples of 500 between 500 and 100000000", http.StatusBadRequest)
 			return
 		}
-		if !h.prepaidEntryAllowed(c, team) {
-			return
-		}
 	}
 	ctx := c.Request.Context()
 	tx, err := h.Pool.Begin(ctx)
@@ -211,6 +183,15 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
+	var rawVersion string
+	var entryOpen bool
+	if req.Enabled {
+		rawVersion, entryOpen, err = lockPricingEntry(ctx, tx)
+		if err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+	}
 	if err = tx.QueryRow(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, team).Scan(&team); err != nil {
 		respondError(c, ErrInternal)
 		return
@@ -219,27 +200,38 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 		_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,updated_by) VALUES($1,false,$2)
  ON CONFLICT(team_id) DO UPDATE SET enabled=false,updated_by=$2,updated_at=clock_timestamp()`, team, actor)
 	} else {
-		plan, ok, planErr := currentTeamPlan(ctx, tx, team)
-		if planErr != nil {
+		var replay bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_prepaid_auto_recharge WHERE team_id=$1 AND enabled AND threshold_cents=$2 AND amount_cents=$3 AND updated_by=$4)`, team, req.ThresholdCents, req.AmountCents, actor).Scan(&replay); err != nil {
 			respondError(c, ErrInternal)
 			return
 		}
-		if !ok || plan.Kind != planKindPrepaid {
-			respondErrorMsg(c, "conflict", "auto-recharge requires a prepaid plan", http.StatusConflict)
+		if !replay && (rawVersion != "v2" || !entryOpen) {
+			respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 			return
 		}
-		var ready bool
-		if err = tx.QueryRow(ctx, `SELECT COALESCE((SELECT observe AND payment_method_ready FROM billing_funding_account WHERE team_id=$1),false)`, team).Scan(&ready); err != nil {
-			respondError(c, ErrInternal)
-			return
-		}
-		if !ready {
-			respondErrorMsg(c, "conflict", "auto-recharge needs a card saved by an earlier credit purchase", http.StatusConflict)
-			return
-		}
-		_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,updated_by) VALUES($1,true,$2,$3,$4)
+		if !replay {
+			plan, ok, planErr := currentTeamPlan(ctx, tx, team)
+			if planErr != nil {
+				respondError(c, ErrInternal)
+				return
+			}
+			if !ok || plan.Kind != planKindPrepaid {
+				respondErrorMsg(c, "conflict", "auto-recharge requires a prepaid plan", http.StatusConflict)
+				return
+			}
+			var ready bool
+			if err = tx.QueryRow(ctx, `SELECT COALESCE((SELECT observe AND payment_method_ready FROM billing_funding_account WHERE team_id=$1),false)`, team).Scan(&ready); err != nil {
+				respondError(c, ErrInternal)
+				return
+			}
+			if !ready {
+				respondErrorMsg(c, "conflict", "auto-recharge needs a card saved by an earlier credit purchase", http.StatusConflict)
+				return
+			}
+			_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,updated_by) VALUES($1,true,$2,$3,$4)
  ON CONFLICT(team_id) DO UPDATE SET enabled=true,threshold_cents=$2,amount_cents=$3,updated_by=$4,updated_at=clock_timestamp(),
   disabled_reason=NULL,disabled_at=NULL,disabled_by=NULL,notified_at=NULL`, team, req.ThresholdCents, req.AmountCents, actor)
+		}
 	}
 	if err != nil {
 		respondError(c, ErrInternal)
