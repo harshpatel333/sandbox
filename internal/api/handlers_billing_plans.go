@@ -117,13 +117,13 @@ func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	model, err := h.pricingVersion(ctx)
+	state, err := h.publicPricingState(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("read pricing version failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	rows, err := h.Pool.Query(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE state='published' AND public AND pricing_version=$1 ORDER BY sort_order,family`, model)
+	rows, err := h.Pool.Query(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE state='published' AND public AND pricing_version=$1 ORDER BY sort_order,family`, state.Version)
 	if err != nil {
 		log.Error().Err(err).Msg("list billing plans failed")
 		respondError(c, ErrInternal)
@@ -153,8 +153,17 @@ func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-		cards = append(cards, h.planCard(v, allowance))
+		card := h.planCard(v, allowance)
+		if !state.EntryOpen {
+			if card.Monthly != nil {
+				card.Monthly.Available = false
+			}
+			if card.Annual != nil {
+				card.Annual.Available = false
+			}
+		}
+		cards = append(cards, card)
 	}
-	c.Header("Cache-Control", publicPricingCacheControl)
-	c.JSON(http.StatusOK, gin.H{"pricing_version": model, "cards": cards, "plans": purchasablePlans(cards)})
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{"pricing_version": state.Version, "cards": cards, "plans": purchasablePlans(cards)})
 }
