@@ -225,3 +225,5 @@ done
 
 docker image prune -f --filter label=superserve-devbox=console >/dev/null || true
 log "console $revision ready at $CONSOLE_URL"
+
+python3 "$SCRIPT_DIR/pricing-integration-smoke.py"
