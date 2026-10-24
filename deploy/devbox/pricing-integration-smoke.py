@@ -93,6 +93,9 @@ while sql(f"SELECT status FROM sandbox WHERE id='{sandbox}'") != "active":
         raise RuntimeError("Probe sandbox did not reach active")
     time.sleep(3)
 sql(f"SELECT row_to_json(t) FROM billing_transition_pricing_version('legacy','{actor}','dev OFF committed-worker proof') t;")
+off_receipt = json.loads(sql("SELECT json_build_object('pricing_version',pricing_version,'observed_at',clock_timestamp()) FROM billing_pricing_switch WHERE singleton"))
+if off_receipt["pricing_version"] != "legacy":
+    raise RuntimeError("Rollback was not committed before worker enqueue")
 queued = int(sql(f"SELECT request_team_pause_all('{team}','plan_switch_free');"))
 if queued < 1:
     raise RuntimeError("Worker probe queued no target")
@@ -106,6 +109,11 @@ while time.monotonic() < deadline:
     time.sleep(5)
 else:
     raise RuntimeError("Deployed OFF worker did not pause/snapshot/settle the real sandbox")
+if int(subprocess.check_output(["systemctl", "show", "superserve-devbox-api.service", "--property=MainPID", "--value"], text=True)) != pid:
+    raise RuntimeError("API process generation changed during worker probe")
+if sql("SELECT pricing_version FROM billing_pricing_switch WHERE singleton") != "legacy":
+    raise RuntimeError("Worker probe did not remain OFF")
+proof.update({"worker_pid": pid, "binary_sha256": binary_hash, "off_before_enqueue": off_receipt})
 (artifacts / "worker.json").write_text(json.dumps(proof, indent=2) + "\n")
 if request("/billing/plan", key=key).get("plan", {}).get("kind") != "free":
     raise RuntimeError("OFF lost assigned plan authority")
