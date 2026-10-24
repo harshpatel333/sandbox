@@ -61,9 +61,14 @@ func (h *Handlers) startPrepaidCredits(ctx context.Context, client *stripeHTTPCl
 }
 
 func (h *Handlers) prepaidTick(ctx context.Context, client *stripeHTTPClient) error {
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	return errors.Join(h.recordAutoRecharges(ctx), h.settleDuePrepaidPurchases(ctx, client), h.retryPrepaidEnrolment(ctx), h.startPrepaidEnforcement(ctx), h.voidSpentPrepaidGrants(ctx, client), h.notifyDisabledAutoRecharges(ctx))
+	return runBillingPhases(ctx, time.Minute,
+		h.recordAutoRecharges,
+		func(ctx context.Context) error { return h.settleDuePrepaidPurchases(ctx, client) },
+		h.retryPrepaidEnrolment,
+		h.startPrepaidEnforcement,
+		func(ctx context.Context) error { return h.voidSpentPrepaidGrants(ctx, client) },
+		h.notifyDisabledAutoRecharges,
+	)
 }
 
 // A charge is created only from a balance observed after the team's latest
