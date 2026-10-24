@@ -208,7 +208,7 @@ func (h *Handlers) AcknowledgeMatchingCreditFlag(c *gin.Context) {
 	reason := strings.TrimSpace(req.Reason)
 	acknowledged, state, err := acknowledgeMatchingFlag(c.Request.Context(), h.Pool, team, credit, actor, reason, req.Resolution)
 	if errors.Is(err, pgx.ErrNoRows) {
-		respondErrorMsg(c, "conflict", "no unacknowledged flag for this matching credit; a held match needs resolution withhold or issue, and only a held match accepts one", http.StatusConflict)
+		respondErrorMsg(c, "conflict", "no matching unacknowledged flag; pending needs withhold or issue, uncertain needs explicit issue or continued provider recovery, and completed states accept no resolution", http.StatusConflict)
 		return
 	}
 	if err != nil {
@@ -223,6 +223,7 @@ func acknowledgeMatchingFlag(ctx context.Context, q db.DBTX, team, credit, actor
 	var state string
 	err := q.QueryRow(ctx, `UPDATE billing_matching_credit SET acknowledged_at=clock_timestamp(),acknowledged_by=$3,acknowledgement_reason=$4,
  state=CASE WHEN state='pending' AND $5='withhold' THEN 'withheld' ELSE state END,next_attempt_at=clock_timestamp()
- WHERE id=$1 AND team_id=$2 AND flagged_at IS NOT NULL AND acknowledged_at IS NULL AND (state='pending')=($5<>'') RETURNING acknowledged_at,state`, credit, team, actor, reason, resolution).Scan(&acknowledged, &state)
+ WHERE id=$1 AND team_id=$2 AND flagged_at IS NOT NULL AND acknowledged_at IS NULL
+ AND ((state='pending' AND $5 IN ('withhold','issue')) OR (state='uncertain' AND $5='issue') OR (state NOT IN ('pending','uncertain') AND $5='')) RETURNING acknowledged_at,state`, credit, team, actor, reason, resolution).Scan(&acknowledged, &state)
 	return acknowledged, state, err
 }
