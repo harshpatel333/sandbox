@@ -41,6 +41,7 @@ const waitUntil = async (fn, code, timeout = 60000) => {
   fail(code)
 }
 try {
+  check('runner_debug_logging_disabled', !process.env.DEBUG && !process.env.PWDEBUG && !process.env.NODE_DEBUG)
   const consoleOrigin = localURL(args.console || 'http://localhost:3000', 'console')
   const authOrigin = localURL(args.auth || 'http://localhost:54321', 'auth')
   const sinkOrigin = localURL(args.mailpit || 'http://localhost:8025', 'mailpit')
