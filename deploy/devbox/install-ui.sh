@@ -227,3 +227,9 @@ docker image prune -f --filter label=superserve-devbox=console >/dev/null || tru
 log "console $revision ready at $CONSOLE_URL"
 
 python3 "$SCRIPT_DIR/pricing-integration-smoke.py"
+
+install -d -m 0700 /var/lib/superserve-devbox/pro-qa
+backend_revision="$(env_get "$DEVBOX_ENV" DEVBOX_SANDBOX_SHA)"
+python3 "$SCRIPT_DIR/pricing-pro-provider-qa.py" \
+  --state-dir /var/lib/superserve-devbox --expected-account acct_1UST2ILIAkKd3qgh \
+  --run-test-calendar --output "/var/lib/superserve-devbox/pro-qa/calendar-$backend_revision.json"
