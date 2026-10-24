@@ -20,8 +20,22 @@ func lockSourceAssignments(ctx context.Context, tx pgx.Tx, team uuid.UUID) error
 	if _, err := tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR UPDATE`, team); err != nil {
 		return fmt.Errorf("lock source assignment owner: %w", err)
 	}
-	_, err := tx.Exec(ctx, `SELECT id FROM team_plan_assignment WHERE team_id=$1 FOR UPDATE`, team)
-	return err
+	if _, err := tx.Exec(ctx, `SELECT id FROM team_plan_assignment WHERE team_id=$1 FOR UPDATE`, team); err != nil {
+		return err
+	}
+	return refusePlanChangeMigration(ctx, tx, team)
+}
+
+func refusePlanChangeMigration(ctx context.Context, q querier, team uuid.UUID) error {
+	var unsupported bool
+	if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1)
+        OR EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=$1)`, team).Scan(&unsupported); err != nil {
+		return fmt.Errorf("check plan change migration authority: %w", err)
+	}
+	if unsupported {
+		return fmt.Errorf("assigned teams and plan change history cannot migrate until scheduling, replay and provider authority can transfer together")
+	}
+	return nil
 }
 
 func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, spec tableSpec, team uuid.UUID, transform rowTransform) (int64, int64, error) {
@@ -33,6 +47,13 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, spec tableSp
 		return 0, 0, err
 	}
 	defer tx.Rollback(ctx)
+	var pricing string
+	if err := tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch WHERE singleton FOR SHARE`).Scan(&pricing); err != nil {
+		return 0, 0, err
+	}
+	if pricing == "v2" {
+		return 0, 0, fmt.Errorf("regional team import is unavailable while pricing v2 is active")
+	}
 	payload, count, err := assignmentSnapshot(ctx, src, team)
 	if err != nil {
 		return 0, 0, err

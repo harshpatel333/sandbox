@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -284,7 +285,13 @@ func (h *Handlers) GetTeamPlanAssignments(c *gin.Context) {
 	if len(history) > 0 && history[0].EffectiveTo == nil {
 		current = &history[0]
 	}
-	c.JSON(http.StatusOK, gin.H{"current": current, "history": history})
+	pending, err := pendingCustomerPlanChange(c.Request.Context(), h.Pool, team, "staff")
+	if err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("load pending plan change failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"current": current, "history": history, "pending_change": pending})
 }
 
 type customerPlan struct {
@@ -317,21 +324,36 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	current, assigned, err := currentTeamPlan(ctx, h.Pool, team)
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("begin billing plan read failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	defer tx.Rollback(ctx)
+	reader := &Handlers{DB: db.New(tx)}
+	current, assigned, err := currentTeamPlan(ctx, tx, team)
 	var limits teamLimits
 	if err == nil && assigned {
-		limits, err = h.teamEffectiveLimits(ctx, team)
+		limits, err = reader.teamEffectiveLimits(ctx, team)
 	}
 	var anchor pgtype.Timestamptz
 	if err == nil {
-		err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
+		err = tx.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
 		if errors.Is(err, pgx.ErrNoRows) {
 			err = nil
 		}
 	}
 	var start, end time.Time
 	if err == nil {
-		start, end, err = h.currentBillingPeriod(ctx, team, anchor, h.nowUTC())
+		start, end, err = reader.currentBillingPeriod(ctx, team, anchor, h.nowUTC())
+	}
+	var pending *customerPendingPlanChange
+	if err == nil {
+		pending, err = pendingCustomerPlanChange(ctx, tx, team, "customer")
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
 	}
 	if err != nil {
 		log.Error().Err(err).Str("team_id", team.String()).Msg("load billing plan failed")
@@ -346,7 +368,7 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"plan":           plan,
 		"period":         customerBillingPeriod{Start: start, End: end},
-		"pending_change": (*customerPendingPlanChange)(nil),
+		"pending_change": pending,
 	})
 }
 
@@ -391,6 +413,7 @@ type customerPlanChangePreview struct {
 	PausesRunning     bool       `json:"pauses_running"`
 	Limits            planLimits `json:"limits"`
 	Blocked           string     `json:"blocked,omitempty"`
+	PreviewToken      string     `json:"preview_token,omitempty"`
 }
 
 // GetBillingPlanChangePreview tells a team when a move to a plan would take
@@ -413,6 +436,10 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 	}
 	var current teamPlan
 	var assigned bool
+	var pricing pricingPublicState
+	if err == nil {
+		pricing, err = h.publicPricingState(ctx)
+	}
 	if err == nil {
 		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
 	}
@@ -430,20 +457,33 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		preview.Blocked = "this plan is no longer offered"
 	default:
 		preview.Timing, preview.Blocked = planChangeRule(current.Kind, kind)
+		if !pricing.EntryOpen && preview.Timing == planChangeAfterPurchase {
+			preview.Timing, preview.Blocked = "", "new plans are not available yet"
+		}
+	}
+	if preview.Blocked == "" && kind == planKindFree {
+		ready, err := planChangePausesReady(ctx, h.Pool)
+		if err != nil {
+			log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		if !ready {
+			preview.Blocked = planChangePausesUnavailable
+		}
 	}
 	if preview.Blocked == "" {
 		preview.PausesRunning = kind == planKindFree
 		at := h.nowUTC()
 		if preview.Timing == planChangeEndOfPeriod {
-			var anchor pgtype.Timestamptz
-			err = h.Pool.QueryRow(ctx, `SELECT commercial_billing_anchor FROM team_billing_account WHERE team_id=$1`, team).Scan(&anchor)
-			if errors.Is(err, pgx.ErrNoRows) {
-				err = nil
-			}
-			if err == nil {
-				_, at, err = h.currentBillingPeriod(ctx, team, anchor, at)
-			}
+			_, at, err = h.planChangeBoundary(ctx, team, current, at)
 			if err != nil {
+				var conflict teamPlanChangeConflictError
+				if errors.As(err, &conflict) {
+					preview.Timing, preview.Blocked = "", conflict.reason
+					c.JSON(http.StatusOK, preview)
+					return
+				}
 				log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
 				respondError(c, ErrInternal)
 				return
@@ -451,6 +491,12 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		}
 		if preview.Timing != planChangeAfterPurchase {
 			preview.EffectiveAt = &at
+			preview.PreviewToken, err = planChangeConsentToken(current, terms, preview.Timing, at)
+			if err != nil {
+				log.Error().Err(err).Str("team_id", team.String()).Msg("plan change preview failed")
+				respondError(c, ErrInternal)
+				return
+			}
 		}
 	} else {
 		preview.Timing = ""
@@ -477,14 +523,14 @@ func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 		return
 	}
 	var body staffPlanAssignmentBody
-	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 8192))
+	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&body) != nil || decoder.Decode(&struct{}{}) != io.EOF || body.VersionID == uuid.Nil {
 		respondErrorMsg(c, "bad_request", "idempotency_key, version_id and reason are required", http.StatusBadRequest)
 		return
 	}
 	body.Reason = strings.TrimSpace(body.Reason)
-	if strings.TrimSpace(body.Key) == "" || len(body.Key) > 200 || body.Reason == "" || len(body.Reason) > 2000 {
+	if strings.TrimSpace(body.Key) == "" || utf8.RuneCountInString(body.Key) > 200 || body.Reason == "" || utf8.RuneCountInString(body.Reason) > 2000 {
 		respondErrorMsg(c, "bad_request", "idempotency_key, version_id and reason are required", http.StatusBadRequest)
 		return
 	}
@@ -518,8 +564,8 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 		return teamPlan{}, err
 	}
 	defer tx.Rollback(ctx)
-	var version string
-	if err := tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch FOR SHARE`).Scan(&version); err != nil {
+	version, entryOpen, err := lockPricingEntry(ctx, tx)
+	if err != nil {
 		return teamPlan{}, err
 	}
 	if _, err := tx.Exec(ctx, `SELECT 1 FROM team WHERE id=$1 FOR NO KEY UPDATE`, team); err != nil {
@@ -535,7 +581,7 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return teamPlan{}, err
 	}
-	if version != "v2" {
+	if version != "v2" || !entryOpen {
 		return teamPlan{}, errPricingV2Off
 	}
 	catalogVersion, err := scanPlanVersion(tx.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1 AND state<>'draft' FOR SHARE`, body.VersionID))

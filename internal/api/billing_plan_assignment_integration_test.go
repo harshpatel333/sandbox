@@ -470,7 +470,7 @@ func TestPlanAssignmentConcurrentSameKeyReturnsOneAssignment(t *testing.T) {
 	}
 }
 
-func TestStaffPlanAssignmentUnderV2(t *testing.T) {
+func TestStaffPlanAssignmentWaitsForAdoptionAndReplaysCommitment(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
 	config := h.Pool.Config()
 	config.MaxConns = 1
@@ -493,7 +493,18 @@ func TestStaffPlanAssignmentUnderV2(t *testing.T) {
 	setPricingVersion(t, h, "v2")
 	actor := uuid.New()
 	body := staffPlanAssignmentBody{Key: "enterprise-approval:1", VersionID: version, Reason: "enterprise approval"}
-	plan, err := h.assignStaffPlan(ctx, team, actor, body)
+	if _, err := h.assignStaffPlan(ctx, team, actor, body); !errors.Is(err, errPricingV2Off) {
+		t.Fatalf("staff entry before adoption: %v", err)
+	}
+	catalogVersion, err := scanPlanVersion(h.Pool.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1`, version))
+	if err != nil {
+		t.Fatal(err)
+	}
+	terms, err := h.termsOfVersion(ctx, catalogVersion, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := assignInTx(t, h, planAssignment{Team: team, Terms: terms, Source: planSourceStaff, Actor: &actor, Reason: body.Reason, Key: body.Key})
 	if err != nil || plan.Kind != planKindCustom || plan.Source != planSourceStaff || *plan.AssignedBy != actor || *plan.VersionID != version {
 		t.Fatalf("staff assignment: %+v %v", plan, err)
 	}
@@ -507,8 +518,8 @@ func TestStaffPlanAssignmentUnderV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = h.assignStaffPlan(ctx, team, actor, staffPlanAssignmentBody{Key: "k2", VersionID: free.VersionID, Reason: "r"}); !errors.Is(err, errUnknownPlan) {
-		t.Fatalf("staff assigned a non-custom plan: %v", err)
+	if _, err = h.assignStaffPlan(ctx, team, actor, staffPlanAssignmentBody{Key: "k2", VersionID: free.VersionID, Reason: "r"}); !errors.Is(err, errPricingV2Off) {
+		t.Fatalf("staff entry before adoption assigned a non-custom plan: %v", err)
 	}
 	setPricingVersion(t, h, "legacy")
 	if _, err := h.assignStaffPlan(ctx, team, actor, staffPlanAssignmentBody{Key: "new-after-off", VersionID: version, Reason: "new custom deal"}); !errors.Is(err, errPricingV2Off) {
@@ -550,5 +561,27 @@ func TestPlanAssignmentHistorySurvivesTeamDeletion(t *testing.T) {
 	}
 	if _, err := assignInTx(t, h, planAssignment{Team: team.ID, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceSignup, Reason: "deleted"}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("assignment to deleted team: %v", err)
+	}
+}
+
+func TestPlanAssignmentMigrationBypassCannotEnterV2(t *testing.T) {
+	h, _ := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
+	team := uuid.New()
+	tx, err := h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(t.Context(), `SELECT set_config('superserve.migrating_team_id',$1,true)`, team.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `INSERT INTO team(id,name) VALUES($1,'isolated-import')`, team); err == nil || !strings.Contains(err.Error(), "regional team import is unavailable") {
+		t.Fatalf("v2 migration bypass accepted: %v", err)
+	}
+	tx.Rollback(t.Context())
+	var published bool
+	if err := h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1)`, team).Scan(&published); err != nil || published {
+		t.Fatalf("refused import persisted: %t %v", published, err)
 	}
 }
