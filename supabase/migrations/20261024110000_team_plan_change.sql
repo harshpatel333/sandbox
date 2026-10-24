@@ -45,7 +45,7 @@ CREATE TABLE team_plan_change (
 );
 CREATE UNIQUE INDEX team_plan_change_pending ON team_plan_change(team_id) WHERE state='scheduled';
 CREATE INDEX team_plan_change_due ON team_plan_change(next_check_at,id)
- WHERE state IN ('scheduled','applied') OR (state='undone' AND provider_cancel_requested_at IS NOT NULL AND provider_renewed_at IS NULL);
+ WHERE state IN ('scheduled','applied') OR (state='undone' AND subscription_id IS NOT NULL AND provider_renewed_at IS NULL);
 CREATE INDEX team_plan_change_history ON team_plan_change(team_id,requested_at DESC);
 
 ALTER TABLE billing_plan_release ADD COLUMN plan_change_id uuid REFERENCES team_plan_change(id);
@@ -65,7 +65,7 @@ BEGIN
    RAISE EXCEPTION 'a plan change starts scheduled';
   END IF;
   IF NEW.terminal_undo_of IS NOT NULL AND NOT EXISTS(SELECT 1 FROM team_plan_change p WHERE p.id=NEW.terminal_undo_of AND p.state='undone'
-   AND p.provider_cancel_requested_at IS NOT NULL AND p.team_id=NEW.team_id AND p.from_assignment_id=NEW.from_assignment_id
+   AND p.subscription_id IS NOT NULL AND p.team_id=NEW.team_id AND p.from_assignment_id=NEW.from_assignment_id
    AND p.subscription_id=NEW.subscription_id AND p.target_plan_key=NEW.target_plan_key AND p.target_kind=NEW.target_kind
    AND p.target_terms=NEW.target_terms AND p.target_limits=NEW.target_limits AND p.pauses_running=NEW.pauses_running
    AND p.requested_by=NEW.requested_by AND p.requested_via=NEW.requested_via) THEN
@@ -80,8 +80,8 @@ BEGIN
   RAISE EXCEPTION 'a finished plan change is immutable';
  END IF;
  IF NEW.provider_renewed_at IS DISTINCT FROM OLD.provider_renewed_at AND (OLD.provider_renewed_at IS NOT NULL OR NEW.state<>'undone'
-  OR OLD.provider_cancel_requested_at IS NULL) THEN
-  RAISE EXCEPTION 'renewal is restored once, after an undone change asked Stripe not to renew';
+  OR OLD.subscription_id IS NULL) THEN
+  RAISE EXCEPTION 'a subscription undo is reconciled once';
  END IF;
  IF (NEW.provider_cancel_requested_at IS DISTINCT FROM OLD.provider_cancel_requested_at
   OR NEW.provider_cancel_preexisting IS DISTINCT FROM OLD.provider_cancel_preexisting)
@@ -121,7 +121,7 @@ BEGIN
   state=CASE WHEN state='scheduled' THEN 'undone' WHEN state='applied' THEN 'completed' ELSE state END,
   undone_at=CASE WHEN state='scheduled' THEN clock_timestamp() ELSE undone_at END,
   undo_reason=CASE WHEN state='scheduled' THEN 'the team was deleted' ELSE undo_reason END,
-  provider_renewed_at=CASE WHEN state IN ('scheduled','undone') AND provider_cancel_requested_at IS NOT NULL
+  provider_renewed_at=CASE WHEN state IN ('scheduled','undone') AND subscription_id IS NOT NULL
    THEN COALESCE(provider_renewed_at,clock_timestamp()) ELSE provider_renewed_at END,
   completed_at=CASE WHEN state='applied' THEN clock_timestamp() ELSE completed_at END,
   next_check_at='infinity',lease_token=NULL,lease_until=NULL

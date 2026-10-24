@@ -68,6 +68,7 @@ type teamPlanChange struct {
 	CompletedAt        *time.Time      `json:"completed_at"`
 	Failures           int             `json:"-"`
 	LastError          *string         `json:"last_error"`
+	terminalUndoOf     *uuid.UUID
 	leaseHeldElsewhere bool
 	lease              uuid.UUID
 }
@@ -77,22 +78,20 @@ func (c teamPlanChange) Undoable(now time.Time) bool {
 	return c.State == "scheduled" && now.Before(c.EffectiveAt.Add(-planChangeUndoCutoff))
 }
 
-// needsRenewal reports whether an undone change told Stripe not to renew a
-// subscription that had been renewing, so renewal must be turned back on.
-func (c teamPlanChange) needsRenewal() bool {
-	return c.State == "undone" && c.CancelRequestedAt != nil && c.ProviderRenewedAt == nil
+func (c teamPlanChange) needsUndoReconciliation() bool {
+	return c.State == "undone" && c.Subscription != nil && c.ProviderRenewedAt == nil
 }
 
 const teamPlanChangeColumns = `id,team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,subscription_id,
 requested_by,requested_via,reason,idempotency_key,requested_at,state,provider_cancel_requested_at,provider_cancel_preexisting,provider_cancel_at,provider_renewed_at,
-undone_at,undone_by,undo_reason,applied_at,applied_assignment_id,completed_at,failures,last_error,lease_until IS NOT NULL AND lease_until>clock_timestamp()`
+undone_at,undone_by,undo_reason,applied_at,applied_assignment_id,completed_at,failures,last_error,lease_until IS NOT NULL AND lease_until>clock_timestamp(),terminal_undo_of`
 
 func scanTeamPlanChange(row pgx.Row) (teamPlanChange, error) {
 	var c teamPlanChange
 	var terms, limits []byte
 	err := row.Scan(&c.ID, &c.Team, &c.FromAssignment, &c.TargetPlanKey, &c.TargetKind, &terms, &limits, &c.EffectiveAt, &c.PausesRunning, &c.Subscription,
 		&c.RequestedBy, &c.RequestedVia, &c.Reason, &c.Key, &c.RequestedAt, &c.State, &c.CancelRequestedAt, &c.CancelPreexisting, &c.ProviderCancelAt, &c.ProviderRenewedAt,
-		&c.UndoneAt, &c.UndoneBy, &c.UndoReason, &c.AppliedAt, &c.AppliedPlan, &c.CompletedAt, &c.Failures, &c.LastError, &c.leaseHeldElsewhere)
+		&c.UndoneAt, &c.UndoneBy, &c.UndoReason, &c.AppliedAt, &c.AppliedPlan, &c.CompletedAt, &c.Failures, &c.LastError, &c.leaseHeldElsewhere, &c.terminalUndoOf)
 	if err != nil {
 		return c, err
 	}
@@ -248,7 +247,7 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 	}
 	var pending bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=$1 AND
-        (state='scheduled' OR (state='undone' AND provider_cancel_requested_at IS NOT NULL AND provider_renewed_at IS NULL)))`, req.Team).Scan(&pending); err != nil || pending {
+        (state='scheduled' OR (state='undone' AND subscription_id IS NOT NULL AND provider_renewed_at IS NULL)))`, req.Team).Scan(&pending); err != nil || pending {
 		if err == nil {
 			err = teamPlanChangeConflict("the team already has a pending plan change; wait for it to finish or undo it")
 		}
@@ -399,7 +398,7 @@ func (h *Handlers) undoTeamPlanChange(ctx context.Context, team, id, actor uuid.
 		}
 	}
 	tag, err := h.Pool.Exec(ctx, `UPDATE team_plan_change SET state='undone',undone_at=clock_timestamp(),undone_by=$2,undo_reason=$4,
-        next_check_at=CASE WHEN provider_cancel_requested_at IS NOT NULL THEN clock_timestamp() ELSE 'infinity'::timestamptz END
+        next_check_at=CASE WHEN subscription_id IS NOT NULL THEN clock_timestamp() ELSE 'infinity'::timestamptz END
         WHERE id=$1 AND state='scheduled' AND effective_at>clock_timestamp()+$3::interval AND (lease_until IS NULL OR lease_until<clock_timestamp())
         AND ($5='staff' OR ($5='customer' AND requested_via='customer'))`,
 		c.ID, actor, planChangeUndoCutoff.String(), reason, via)
@@ -485,7 +484,7 @@ func (h *Handlers) teamPlanChangeTick(ctx context.Context) (bool, error) {
 func (h *Handlers) runDueTeamPlanChange(ctx context.Context, team uuid.UUID) (bool, error) {
 	token := uuid.New()
 	c, err := scanTeamPlanChange(h.Pool.QueryRow(ctx, `WITH due AS (SELECT id AS due_id FROM team_plan_change WHERE next_check_at<=clock_timestamp()
-        AND (state IN ('scheduled','applied') OR (state='undone' AND provider_cancel_requested_at IS NOT NULL AND provider_renewed_at IS NULL))
+        AND (state IN ('scheduled','applied') OR (state='undone' AND subscription_id IS NOT NULL AND provider_renewed_at IS NULL))
         AND (lease_until IS NULL OR lease_until<clock_timestamp()) AND ($2::uuid=$3::uuid OR team_id=$2::uuid)
         ORDER BY next_check_at,id FOR UPDATE SKIP LOCKED LIMIT 1)
         UPDATE team_plan_change p SET lease_token=$1,lease_until=clock_timestamp()+interval '3 minutes' FROM due WHERE p.id=due.due_id
@@ -513,7 +512,7 @@ func (h *Handlers) runDueTeamPlanChange(ctx context.Context, team uuid.UUID) (bo
 	ack, cancelAck := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancelAck()
 	_, err = h.Pool.Exec(ack, `UPDATE team_plan_change SET lease_token=NULL,lease_until=NULL,
-        next_check_at=CASE WHEN state='completed' OR (state='undone' AND (provider_cancel_requested_at IS NULL OR provider_renewed_at IS NOT NULL))
+        next_check_at=CASE WHEN state='completed' OR (state='undone' AND (subscription_id IS NULL OR provider_renewed_at IS NOT NULL))
          THEN 'infinity'::timestamptz ELSE $3::timestamptz END,
         failures=CASE WHEN $4='' THEN 0 ELSE failures+1 END,last_error=NULLIF($4,'') WHERE id=$1 AND lease_token=$2`, c.ID, token, next, msg)
 	return true, err
@@ -610,6 +609,9 @@ func (h *Handlers) stopPlanChangeRenewal(ctx context.Context, c teamPlanChange, 
 	if err != nil {
 		return now, err
 	}
+	if c.terminalUndoOf != nil && !subscriptionEnded(sub) {
+		return now, errors.New("terminal undo settlement cannot cancel a live subscription")
+	}
 	if !subscriptionEnded(sub) {
 		end := subscriptionPeriodEnd(sub)
 		if end.After(c.EffectiveAt) {
@@ -660,7 +662,7 @@ func (h *Handlers) stopPlanChangeRenewal(ctx context.Context, c teamPlanChange, 
 // restorePlanChangeRenewal turns renewal back on for a subscription an undone
 // change had told Stripe not to renew.
 func (h *Handlers) restorePlanChangeRenewal(ctx context.Context, c teamPlanChange) error {
-	if !c.needsRenewal() {
+	if !c.needsUndoReconciliation() {
 		return nil
 	}
 	tx, err := h.Pool.Begin(ctx)
@@ -696,7 +698,7 @@ func (h *Handlers) restorePlanChangeRenewal(ctx context.Context, c teamPlanChang
                 ON CONFLICT(terminal_undo_of) DO NOTHING`, c.ID, ended); err != nil {
 				return err
 			}
-		} else if sub.CancelAtPeriodEnd && sub.Metadata["plan_change_cancellation"] == c.ID.String() &&
+		} else if c.CancelRequestedAt != nil && sub.CancelAtPeriodEnd && sub.Metadata["plan_change_cancellation"] == c.ID.String() &&
 			(sub.CancelAt == 0 || sub.CancelAt == subscriptionPeriodEnd(sub).Unix()) {
 			if err = h.setSubscriptionRenewal(ctx, *c.Subscription, c.ID, true); err != nil {
 				return err
@@ -749,7 +751,8 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 			return now, err
 		}
 		if !closed {
-			return now.Add(time.Minute), nil
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_signup_choice SET next_check_at=LEAST(next_check_at,clock_timestamp()) WHERE team_id=$1 AND subscription_id=$2`, c.Team, sub.ID)
+			return now.Add(time.Minute), err
 		}
 		terminal = sub
 	}
@@ -773,7 +776,7 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 	}
 	if !assigned || current.ID != c.FromAssignment {
 		if _, err = tx.Exec(ctx, `UPDATE team_plan_change SET state='undone',undone_at=clock_timestamp(),undo_reason='the team changed plans first',
-            provider_renewed_at=CASE WHEN provider_cancel_requested_at IS NULL THEN NULL ELSE clock_timestamp() END WHERE id=$1`, c.ID); err != nil {
+            provider_renewed_at=CASE WHEN subscription_id IS NULL THEN NULL ELSE clock_timestamp() END WHERE id=$1`, c.ID); err != nil {
 			return now, err
 		}
 		log.Warn().Str("plan_change_id", c.ID.String()).Str("team_id", c.Team.String()).Msg("plan change withdrawn: the team changed plans first")

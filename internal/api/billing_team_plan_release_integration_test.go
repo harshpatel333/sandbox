@@ -210,6 +210,14 @@ func TestTeamPlanChangeUndoLosingTerminalRaceSettlesOnce(t *testing.T) {
 		s.status, s.endedAt = "incomplete_expired", time.Now().Add(-time.Minute).Unix()
 	})
 	f.tick(t)
+	f.stripe.set(func(s *renewalStripe) { s.status, s.cancel, s.endedAt = "active", false, 0 })
+	f.tick(t)
+	if len(f.stripe.writes) != 1 || f.plan(t).PlanKey != "pro_monthly" {
+		t.Fatalf("automatic terminal settlement canceled a live subscription: %v", f.stripe.writes)
+	}
+	f.stripe.set(func(s *renewalStripe) {
+		s.status, s.endedAt = "incomplete_expired", time.Now().Add(-time.Minute).Unix()
+	})
 	f.tick(t)
 	f.tick(t)
 	var followup uuid.UUID
@@ -247,5 +255,26 @@ func TestTeamPlanChangeWaitingForTerminalDoesNotBackOff(t *testing.T) {
 		if got := f.reload(t, c.ID); got.State != "scheduled" || got.Failures != 0 || got.LastError != nil {
 			t.Fatalf("normal terminal wait is treated as provider failure: %+v", got)
 		}
+	}
+}
+
+func TestTeamPlanChangeUndoBeforeFirstTickReconcilesTerminalReadRace(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindSubscription)
+	c, err := f.request(t, "starter", "undo-before-first-tick")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.stripe.set(func(s *renewalStripe) { s.endAfterRead = s.reads + 1 })
+	if _, err = f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "keep plan", "customer"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.reload(t, c.ID); got.CancelRequestedAt != nil || !got.needsUndoReconciliation() {
+		t.Fatalf("undo without prior provider write was not retained for reconciliation: %+v", got)
+	}
+	f.tick(t)
+	f.tick(t)
+	var count int
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM team_plan_change WHERE terminal_undo_of=$1 AND state='completed'`, c.ID).Scan(&count); err != nil || count != 1 || f.plan(t).PlanKey != "starter" || len(f.stripe.writes) != 0 {
+		t.Fatalf("pre-intent terminal undo stranded source authority: %d %v writes=%v", count, err, f.stripe.writes)
 	}
 }

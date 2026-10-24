@@ -27,6 +27,7 @@ type renewalStripe struct {
 	sub            string
 	customer       string
 	endedAt        int64
+	endAfterRead   int
 	checkout       *StripeRetrievedCheckoutSession
 	metadata       map[string]string
 	invoices       []proPaidInvoice
@@ -96,6 +97,9 @@ func (s *renewalStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"id": s.sub, "customer": s.customer, "status": s.status, "ended_at": s.endedAt, "cancel_at_period_end": s.cancel, "cancel_at": s.cancelAt, "metadata": metadata,
 		"items": map[string]any{"data": []map[string]any{{"id": "si_x", "current_period_start": s.periodEnd.AddDate(0, -1, 0).Unix(), "current_period_end": s.periodEnd.Unix()}}}})
+	if r.Method == http.MethodGet && s.reads == s.endAfterRead {
+		s.status, s.endedAt = "canceled", time.Now().Add(-time.Minute).Unix()
+	}
 }
 
 func (s *renewalStripe) set(f func(*renewalStripe)) {
@@ -312,7 +316,7 @@ func TestTeamPlanChangeProDowngradeStopsRenewalAndUndoRestoresIt(t *testing.T) {
 		t.Fatalf("replacement raced renewal restoration: %v", err)
 	}
 	f.tick(t)
-	if c = f.reload(t, c.ID); c.needsRenewal() || c.ProviderRenewedAt == nil || f.stripe.cancel {
+	if c = f.reload(t, c.ID); c.needsUndoReconciliation() || c.ProviderRenewedAt == nil || f.stripe.cancel {
 		t.Fatalf("renewal not restored after undo: %+v %v", c, f.stripe.writes)
 	}
 	if again, err := f.h.undoTeamPlanChange(t.Context(), f.team, c.ID, f.actor, "changed my mind", "customer"); err != nil || again.State != "undone" {
@@ -753,7 +757,7 @@ func TestTeamPlanChangeHistorySurvivesTeamDeletionWithoutRestoringRenewal(t *tes
 				t.Fatal(err)
 			}
 			retained := f.reload(t, c.ID)
-			if retained.State != "undone" || retained.needsRenewal() || retained.FromAssignment != c.FromAssignment {
+			if retained.State != "undone" || retained.needsUndoReconciliation() || retained.FromAssignment != c.FromAssignment {
 				t.Fatalf("deleted team has active work or lost history: %+v", retained)
 			}
 			if ran, err := f.h.runDueTeamPlanChange(t.Context(), f.team); err != nil || ran || len(f.stripe.writes) != writes {
@@ -797,7 +801,7 @@ func TestTeamPlanChangeCancellationOwnershipSurvivesRetries(t *testing.T) {
 			}
 			f.tick(t)
 			shouldRemainCancelled := scenario != "lost_write_response" && scenario != "cancel_removed_between_reads"
-			if f.stripe.cancel != shouldRemainCancelled || f.reload(t, c.ID).needsRenewal() {
+			if f.stripe.cancel != shouldRemainCancelled || f.reload(t, c.ID).needsUndoReconciliation() {
 				t.Fatalf("renewed independent cancellation or failed to restore owned cancellation: %+v %+v", f.stripe, f.reload(t, c.ID))
 			}
 		})
