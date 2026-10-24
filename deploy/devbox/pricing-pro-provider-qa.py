@@ -94,12 +94,17 @@ def ready(provider, clock, target):
     raise QAError('Clock advance timed out; retain IDs and reconcile before retry')
 
 
-def run_calendar(provider, year, run_id, result, save):
+def fixture_email(run_id, year):
+    require(re.fullmatch(r'[0-9a-f]{32}', run_id) and year in (2027, 2028), 'Invalid fixture email scope')
+    return f'dev-pro-qa-{run_id}-{year}@example.com'
+
+
+def run_calendar(provider, year, run_id, result, save, existing=None):
     prefix = 'dev-pro-qa:' + run_id + ':' + str(year)
     start = timestamp(year, 1, 31)
     feb = timestamp(year, 2, calendar.monthrange(year, 2)[1])
     march = timestamp(year, 3, 31)
-    row = {'year': year, 'status': 'pending', 'expected_boundaries': [start, feb, march]}
+    row = dict(existing) if existing is not None else {'year': year, 'status': 'pending', 'expected_boundaries': [start, feb, march]}
     result['calendars'].append(row)
 
     def create(label, path, fields):
@@ -109,12 +114,17 @@ def run_calendar(provider, year, run_id, result, save):
         save()
         return obj
 
-    clock = create('clock', '/v1/test_helpers/test_clocks', {'frozen_time': start, 'name': prefix})
-    require(clock.get('livemode') is False, 'Clock did not confirm test mode')
-    customer = create('customer', '/v1/customers', {'test_clock': clock['id'], 'name': prefix})
-    product = create('product', '/v1/products', {'name': prefix})
-    price = create('price', '/v1/prices', {'product': product['id'], 'currency': 'usd', 'unit_amount': 25000,
-                                        'recurring[interval]': 'month'})
+    if existing is None:
+        clock = create('clock', '/v1/test_helpers/test_clocks', {'frozen_time': start, 'name': prefix})
+        require(clock.get('livemode') is False, 'Clock did not confirm test mode')
+        customer = create('customer', '/v1/customers', {'test_clock': clock['id'], 'name': prefix,
+                          'email': fixture_email(run_id, year)})
+        product = create('product', '/v1/products', {'name': prefix})
+        price = create('price', '/v1/prices', {'product': product['id'], 'currency': 'usd', 'unit_amount': 25000,
+                                            'recurring[interval]': 'month'})
+    else:
+        customer, price = {'id': row['customer']}, {'id': row['price']}
+        clock = {'id': row['clock']}
     sub = create('subscription', '/v1/subscriptions', {'customer': customer['id'], 'items[0][price]': price['id'],
                    'collection_method': 'send_invoice', 'days_until_due': 30, 'proration_behavior': 'none',
                    'billing_mode[type]': 'flexible', 'metadata[dev_pro_qa]': run_id})

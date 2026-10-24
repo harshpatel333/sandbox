@@ -96,12 +96,14 @@ class CalendarTests(unittest.TestCase):
                 provider = Mock()
                 provider.request.side_effect = request
                 result = {'calendars': []}
-                qa.run_calendar(provider, year, 'run', result, lambda: None)
+                qa.run_calendar(provider, year, 'a' * 32, result, lambda: None)
                 self.assertEqual(result['calendars'][0]['status'], 'passed_calendar_control_only')
                 self.assertEqual(result['calendars'][0]['expected_boundaries'], [start, end, march])
                 create = next(params for method, path, params in calls if method == 'POST' and path == '/v1/subscriptions')
                 self.assertEqual(create['collection_method'], 'send_invoice')
                 self.assertNotIn('pause_collection[behavior]', create)
+                customer = next(params for method, path, params in calls if method == 'POST' and path == '/v1/customers')
+                self.assertEqual(customer['email'], qa.fixture_email('a' * 32, year))
 
 
 if __name__ == '__main__':
