@@ -54,25 +54,26 @@ type ActivationTeam struct {
 }
 
 type ActivationReport struct {
-	Adoption           *PricingAdoptionState     `json:"adoption"`
-	ResidualCount      int                       `json:"residual_unassigned_count"`
-	ResidualUnassigned []PricingAdoptionResidual `json:"residual_unassigned"`
-	Region             string                    `json:"region"`
-	PricingVersion     string                    `json:"pricing_version"`
-	AsOf               time.Time                 `json:"as_of"`
-	ToFree             int                       `json:"to_free"`
-	ToContract         int                       `json:"to_contract"`
-	ToLegacyPAYG       int                       `json:"to_legacy_payg"`
-	BlockedToFree      []ActivationTeam          `json:"blocked_to_free"`
-	LapsedWithCredit   []ActivationTeam          `json:"lapsed_with_credit"`
-	LapsedNoCredit     []ActivationTeam          `json:"lapsed_no_credit"`
-	LapsedUnchecked    []ActivationTeam          `json:"lapsed_unchecked"`
-	AlreadyAssigned    int                       `json:"already_assigned"`
-	Skipped            []ActivationTeam          `json:"skipped"`
-	SkippedReasons     map[string]int            `json:"skipped_reasons"`
-	Pending            int                       `json:"pending"`
-	CreditReads        int                       `json:"credit_reads"`
-	ElapsedMS          int64                     `json:"elapsed_ms"`
+	Adoption            *PricingAdoptionState     `json:"adoption"`
+	DeferredObligations []PricingAdoptionResidual `json:"deferred_obligations"`
+	ResidualCount       int                       `json:"residual_unassigned_count"`
+	ResidualUnassigned  []PricingAdoptionResidual `json:"residual_unassigned"`
+	Region              string                    `json:"region"`
+	PricingVersion      string                    `json:"pricing_version"`
+	AsOf                time.Time                 `json:"as_of"`
+	ToFree              int                       `json:"to_free"`
+	ToContract          int                       `json:"to_contract"`
+	ToLegacyPAYG        int                       `json:"to_legacy_payg"`
+	BlockedToFree       []ActivationTeam          `json:"blocked_to_free"`
+	LapsedWithCredit    []ActivationTeam          `json:"lapsed_with_credit"`
+	LapsedNoCredit      []ActivationTeam          `json:"lapsed_no_credit"`
+	LapsedUnchecked     []ActivationTeam          `json:"lapsed_unchecked"`
+	AlreadyAssigned     int                       `json:"already_assigned"`
+	Skipped             []ActivationTeam          `json:"skipped"`
+	SkippedReasons      map[string]int            `json:"skipped_reasons"`
+	Pending             int                       `json:"pending"`
+	CreditReads         int                       `json:"credit_reads"`
+	ElapsedMS           int64                     `json:"elapsed_ms"`
 }
 
 type ActivationCursor struct {
@@ -256,6 +257,9 @@ func (a *PricingV2Activation) ApplyBatchAfter(ctx context.Context, actor, reason
 	if version != "v2" {
 		return ActivationBatch{}, ErrPricingV2Off
 	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM billing_pricing_adoption WHERE singleton FOR UPDATE`); err != nil {
+		return ActivationBatch{}, err
+	}
 	ids := make([]uuid.UUID, len(teams))
 	for i, t := range teams {
 		ids[i] = t.TeamID
@@ -263,11 +267,7 @@ func (a *PricingV2Activation) ApplyBatchAfter(ctx context.Context, actor, reason
 	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
 		return ActivationBatch{}, err
 	}
-	accounts, err := tx.Query(ctx, `SELECT team_id FROM team_billing_account WHERE team_id = ANY($1) ORDER BY team_id FOR UPDATE`, ids)
-	if err != nil {
-		return ActivationBatch{}, err
-	}
-	if _, err := pgx.CollectRows(accounts, pgx.RowTo[uuid.UUID]); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT team_id FROM team_billing_account WHERE team_id=ANY($1) ORDER BY team_id FOR UPDATE`, ids); err != nil {
 		return ActivationBatch{}, err
 	}
 	locked, err := tx.Query(ctx, `SELECT id FROM team WHERE id = ANY($1) ORDER BY id FOR UPDATE SKIP LOCKED`, ids)
@@ -276,6 +276,9 @@ func (a *PricingV2Activation) ApplyBatchAfter(ctx context.Context, actor, reason
 	}
 	ids, err = pgx.CollectRows(locked, pgx.RowTo[uuid.UUID])
 	if err != nil {
+		return ActivationBatch{}, err
+	}
+	if _, err := tx.Exec(ctx, `SELECT team_id FROM team_billing_account WHERE team_id=ANY($1) ORDER BY team_id FOR UPDATE`, ids); err != nil {
 		return ActivationBatch{}, err
 	}
 	current := map[uuid.UUID]db.ListPricingV2ActivationBucketsRow{}
@@ -294,6 +297,23 @@ func (a *PricingV2Activation) ApplyBatchAfter(ctx context.Context, actor, reason
 	}
 	if err := recheck.Err(); err != nil {
 		return ActivationBatch{}, err
+	}
+	var unknownIDs []uuid.UUID
+	var unknownReasons []string
+	for i, team := range teams {
+		if current[team.TeamID].Bucket != team.Bucket || current[team.TeamID].StripeCustomerID != rows[i].StripeCustomerID {
+			continue
+		}
+		if team.Reason == "credit_unknown" || team.Reason == "lapsed_unchecked" {
+			unknownIDs = append(unknownIDs, team.TeamID)
+			unknownReasons = append(unknownReasons, team.Reason)
+		}
+	}
+	if len(unknownIDs) > 0 {
+		if _, err := tx.Exec(ctx, `INSERT INTO billing_pricing_adoption_credit_hold(team_id,reason)
+ SELECT * FROM unnest($1::uuid[],$2::text[]) ON CONFLICT(team_id) DO UPDATE SET reason=EXCLUDED.reason,observed_at=clock_timestamp()`, unknownIDs, unknownReasons); err != nil {
+			return ActivationBatch{}, err
+		}
 	}
 	var batch ActivationBatch
 	if len(pending) == int(params.BatchLimit) && len(pending) > 0 {
@@ -329,6 +349,15 @@ func (a *PricingV2Activation) ApplyBatchAfter(ctx context.Context, actor, reason
 		if batch.Assigned, err = assignInitialTeamPlans(ctx, tx, as); err != nil {
 			return ActivationBatch{}, err
 		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO billing_pricing_adoption_credit_resolution(team_id,assignment_id,source)
+ SELECT pa.team_id,pa.id,billing_pricing_adoption_credit_source(pa.team_id) FROM team_plan_assignment pa
+ WHERE pa.team_id=ANY($1) AND pa.effective_to IS NULL ON CONFLICT(team_id) DO UPDATE
+ SET assignment_id=EXCLUDED.assignment_id,source=EXCLUDED.source,verified_at=clock_timestamp()`, batch.Assigned); err != nil {
+		return ActivationBatch{}, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM billing_pricing_adoption_credit_hold WHERE team_id=ANY($1)`, batch.Assigned); err != nil {
+		return ActivationBatch{}, err
 	}
 	for _, id := range batch.Assigned {
 		if target[id] == activationTargetContract {

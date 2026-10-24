@@ -28,6 +28,7 @@ type PricingAdoptionSnapshot struct {
 	Total      int       `json:"total"`
 	Assigned   int       `json:"assigned"`
 	Unassigned int       `json:"unassigned"`
+	Deferred   int       `json:"deferred"`
 	Released   bool      `json:"released"`
 	Blocker    string    `json:"blocker,omitempty"`
 }
@@ -101,7 +102,24 @@ func (a *PricingV2Activation) adoptionReport(ctx context.Context, r *ActivationR
 		r.ResidualUnassigned = append(r.ResidualUnassigned, item)
 	}
 	r.ResidualCount = len(r.ResidualUnassigned)
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	deferred, err := a.h.Pool.Query(ctx, `SELECT t.id,b.reason FROM team t CROSS JOIN LATERAL (SELECT billing_pricing_adoption_blocker(t.id) AS reason) b WHERE t.id<>$1 AND b.reason IS NOT NULL ORDER BY t.id`, system)
+	if err != nil {
+		return err
+	}
+	defer deferred.Close()
+	r.DeferredObligations = []PricingAdoptionResidual{}
+	for deferred.Next() {
+		item := PricingAdoptionResidual{Bucket: "skipped"}
+		if err := deferred.Scan(&item.TeamID, &item.Reason); err != nil {
+			return err
+		}
+		r.DeferredObligations = append(r.DeferredObligations, item)
+	}
+	return deferred.Err()
 }
 
 func (a *PricingV2Activation) adoptionSystemTeam() (uuid.UUID, error) {

@@ -732,6 +732,19 @@ func TestIntegration_PricingV2Activation_ContinuesPastUnreadableCustomers(t *tes
 	if err != nil || second.AssignedLegacyPAYG != 1 || !slices.Contains(second.Assigned, healthy) {
 		t.Fatalf("healthy customer behind failed reads = %+v, %v", second, err)
 	}
+	var holds int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM billing_pricing_adoption_credit_hold WHERE team_id=ANY($1)`, ids).Scan(&holds); err != nil || holds != 200 {
+		t.Fatalf("durable unknown holds=%d %v", holds, err)
+	}
+	recovered := api.NewPricingV2Activation(testPool, activationStripe{credit: map[string]float64{"cus_" + ids[0].String(): 0}, unknownErrors: true}, "usw", testSystemTeamID.String())
+	batch, err := recovered.ApplyBatch(ctx, "operator@example.com", "verified provider recovery", 500)
+	if err != nil || !slices.Contains(batch.Assigned, ids[0]) {
+		t.Fatalf("verified recovery=%+v %v", batch, err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM billing_pricing_adoption_credit_hold WHERE team_id=$1`, ids[0]).Scan(&holds); err != nil || holds != 0 {
+		t.Fatalf("verified recovery retained hold=%d %v", holds, err)
+	}
+
 }
 
 func TestIntegration_TeamPauseAll_WorkerConsumesTargetsWhileSwitchOff(t *testing.T) {

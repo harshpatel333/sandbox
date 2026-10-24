@@ -209,6 +209,9 @@ func writeReport(out io.Writer, format string, r api.ActivationReport) error {
 		for _, item := range r.ResidualUnassigned {
 			_ = w.Write([]string{"residual_unassigned", item.TeamID.String(), item.Reason, ""})
 		}
+		for _, item := range r.DeferredObligations {
+			_ = w.Write([]string{"deferred_obligation", item.TeamID.String(), item.Reason, ""})
+		}
 		w.Flush()
 		return w.Error()
 	}
@@ -222,6 +225,10 @@ func writeReport(out io.Writer, format string, r api.ActivationReport) error {
 	fmt.Fprintf(out, "  residual unassigned (all cell teams): %d\n", r.ResidualCount)
 	if r.Adoption != nil {
 		fmt.Fprintf(out, "  adoption: %s epoch %s public %s entry_open=%t\n", r.Adoption.State, r.Adoption.Epoch, r.Adoption.PublicPricingVersion, r.Adoption.EntryOpen)
+	}
+	fmt.Fprintf(out, "  deferred obligations: %d\n", len(r.DeferredObligations))
+	for _, item := range r.DeferredObligations {
+		fmt.Fprintf(out, "    %s %s\n", item.TeamID, item.Reason)
 	}
 	fmt.Fprintf(out, "  pending:              %d\n", r.Pending)
 	fmt.Fprintf(out, "  Stripe reads:         %d in %dms\n", r.CreditReads, r.ElapsedMS)

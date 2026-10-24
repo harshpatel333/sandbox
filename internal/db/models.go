@@ -890,6 +890,19 @@ type BillingPricingAdoption struct {
 	ReleasedAt   pgtype.Timestamptz `json:"released_at"`
 }
 
+type BillingPricingAdoptionCreditHold struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Reason     string    `json:"reason"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+type BillingPricingAdoptionCreditResolution struct {
+	TeamID       uuid.UUID `json:"team_id"`
+	AssignmentID uuid.UUID `json:"assignment_id"`
+	Source       []byte    `json:"source"`
+	VerifiedAt   time.Time `json:"verified_at"`
+}
+
 type BillingPricingAdoptionEvent struct {
 	ID        uuid.UUID `json:"id"`
 	Epoch     uuid.UUID `json:"epoch"`

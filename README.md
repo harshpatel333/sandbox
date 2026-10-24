@@ -262,8 +262,8 @@ prerequisites and deployment evidence remain separate required release gates.
 `billing_release_pricing_adoption(region text, system_team_id uuid, epoch uuid, actor text, reason text, evidence jsonb)`
 requires READ COMMITTED isolation and unfiltered row visibility, and locks
 switch/adoption state, published Free terms and every live non-system team
-before recapturing inventory. Every such team must have an open durable assignment;
-any residual or unsettled pause target returns `released: false`, persists the
+before recapturing inventory. Existing billing accounts are locked first, followed by team UPDATE locks to fence new account insertion. Every such team must have an open durable assignment;
+any residual, unresolved financial obligation, allowance retry or unsettled pause target returns `released: false`, persists the
 blocked inventory/event and makes the CLI exit nonzero. Enabled signup/shape
 triggers and allowance/pause schema are required. Successful release records its
 evidence and opens the effective public v2 gate. Signup holds the switch lock and
@@ -278,3 +278,15 @@ later teams. Interrupted dispatched work gets a separate bounded persistence
 budget; if that handoff fails, the cursor remains before the failed prefix.
 Outstanding allowance retries also block adoption release and regional transfer.
 This work runs in the background and adds no sandbox start/resume I/O.
+
+Adoption inventories financial obligations independently of assignment existence.
+Pending checkouts/contracts, managed billing and unresolved YC/sponsored operations
+remain blockers after assignment. Unknown provider reads are durably retained across
+epoch rotation and cleared only by a successfully validated initial CLI assignment.
+Existing Stripe authority requires a durable validation receipt bound to the current
+assignment and customer/subscription/status. Changed source identity invalidates
+that receipt. Active-contract assignments require matching migrated contract authority.
+Unreconciled financial assignments remain held for owner reconciliation; assignment alone is insufficient.
+Do not clear hold rows manually. Public exposure caching must be removed by its
+owners and previously served TTLs drained before release; local source checks do
+not establish that drain or deployment evidence.

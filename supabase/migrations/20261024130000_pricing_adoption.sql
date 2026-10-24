@@ -24,6 +24,42 @@ CREATE TABLE billing_pricing_adoption_inventory (
 );
 CREATE INDEX billing_pricing_adoption_residual ON billing_pricing_adoption_inventory(epoch) WHERE present AND assignment_id IS NULL;
 
+CREATE TABLE billing_pricing_adoption_credit_hold (
+ team_id uuid PRIMARY KEY,
+ reason text NOT NULL CHECK(reason IN ('credit_unknown','lapsed_unchecked')),
+ observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE billing_pricing_adoption_credit_resolution (
+ team_id uuid PRIMARY KEY,
+ assignment_id uuid NOT NULL,
+ source jsonb NOT NULL,
+ verified_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE FUNCTION billing_pricing_adoption_credit_source(p_team uuid) RETURNS jsonb
+LANGUAGE sql STABLE SET search_path=public,pg_temp AS $$
+ SELECT jsonb_build_object('customer',a.stripe_customer_id,'subscription',a.stripe_subscription_id,'status',a.stripe_subscription_status)
+ FROM (SELECT p_team AS team_id) t LEFT JOIN team_billing_account a USING(team_id);
+$$;
+
+CREATE FUNCTION billing_pricing_adoption_blocker(p_team uuid) RETURNS text
+LANGUAGE sql STABLE SET search_path=public,pg_temp AS $$
+ SELECT CASE
+  WHEN EXISTS(SELECT 1 FROM billing_pricing_adoption_credit_hold WHERE team_id=p_team) THEN (SELECT reason FROM billing_pricing_adoption_credit_hold WHERE team_id=p_team)
+  WHEN EXISTS(SELECT 1 FROM team_billing_account a WHERE a.team_id=p_team AND (a.stripe_customer_id IS NOT NULL OR a.stripe_subscription_id IS NOT NULL)
+   AND NOT EXISTS(SELECT 1 FROM billing_pricing_adoption_credit_resolution r JOIN team_plan_assignment pa ON pa.id=r.assignment_id
+    WHERE r.team_id=p_team AND pa.team_id=p_team AND pa.effective_to IS NULL AND r.source=billing_pricing_adoption_credit_source(p_team))) THEN 'financial_source_unreconciled'
+  WHEN EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id=p_team AND c.status='active'
+   AND NOT EXISTS(SELECT 1 FROM team_plan_assignment pa WHERE pa.team_id=p_team AND pa.effective_to IS NULL AND pa.contract_id=c.id AND pa.source='migration')) THEN 'active_contract_unreconciled'
+  WHEN qm_team_managed_billing(p_team) THEN 'qm_managed_billing'
+  WHEN EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=p_team AND status='pending') THEN 'pending_contract'
+  WHEN EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=p_team AND (checkout_initializing_at IS NOT NULL OR checkout_may_exist))
+   OR EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=p_team AND state='pending' AND offer_key<>'free') THEN 'checkout_pending'
+  WHEN EXISTS(SELECT 1 FROM billing_yc_operation WHERE team_id=p_team AND state<>'ended') THEN 'yc_operation'
+  WHEN EXISTS(SELECT 1 FROM billing_sponsored_operation WHERE team_id=p_team AND state NOT IN ('revoked','expired')) THEN 'sponsored_operation'
+ END;
+$$;
+
 CREATE TABLE billing_pricing_adoption_event (
  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
  epoch uuid NOT NULL,
@@ -112,7 +148,7 @@ END $$;
 
 CREATE FUNCTION billing_capture_pricing_adoption(p_region text,p_system uuid,p_actor text,p_reason text)
 RETURNS jsonb LANGUAGE plpgsql SET search_path=public,pg_temp SET row_security=off AS $$
-DECLARE a billing_pricing_adoption; total bigint; residual bigint;
+DECLARE a billing_pricing_adoption; total bigint; residual bigint; deferred bigint;
 BEGIN
  IF COALESCE(btrim(p_actor),'')='' OR COALESCE(btrim(p_reason),'')='' THEN RAISE EXCEPTION 'actor and reason required'; END IF;
  PERFORM 1 FROM billing_pricing_switch WHERE singleton FOR SHARE;
@@ -122,15 +158,16 @@ BEGIN
  END IF;
  UPDATE billing_pricing_adoption_inventory SET present=false WHERE epoch=a.epoch AND present;
  INSERT INTO billing_pricing_adoption_inventory(epoch,team_id,assignment_id,bucket,reason,observed_at)
- SELECT a.epoch,t.id,pa.id,b.bucket,COALESCE(NULLIF(b.reason,''),b.bucket),clock_timestamp()
+ SELECT a.epoch,t.id,pa.id,CASE WHEN d.reason IS NULL THEN b.bucket ELSE 'skipped' END,COALESCE(d.reason,NULLIF(b.reason,''),b.bucket),clock_timestamp()
  FROM team t CROSS JOIN LATERAL pricing_v2_activation_bucket(t.id) b
+ CROSS JOIN LATERAL (SELECT billing_pricing_adoption_blocker(t.id) AS reason) d
  LEFT JOIN team_plan_assignment pa ON pa.team_id=t.id AND pa.effective_to IS NULL
  WHERE t.id<>p_system
  ON CONFLICT(epoch,team_id) DO UPDATE SET assignment_id=EXCLUDED.assignment_id,bucket=EXCLUDED.bucket,reason=EXCLUDED.reason,present=true,observed_at=EXCLUDED.observed_at;
- SELECT count(*),count(*) FILTER(WHERE assignment_id IS NULL) INTO total,residual FROM billing_pricing_adoption_inventory WHERE epoch=a.epoch AND present;
+ SELECT count(*),count(*) FILTER(WHERE assignment_id IS NULL),count(*) FILTER(WHERE bucket='skipped') INTO total,residual,deferred FROM billing_pricing_adoption_inventory WHERE epoch=a.epoch AND present;
  INSERT INTO billing_pricing_adoption_event(epoch,region,action,actor,reason,details)
- VALUES(a.epoch,p_region,'capture',p_actor,p_reason,jsonb_build_object('total',total,'unassigned',residual));
- RETURN jsonb_build_object('epoch',a.epoch,'state',a.state,'total',total,'assigned',total-residual,'unassigned',residual);
+ VALUES(a.epoch,p_region,'capture',p_actor,p_reason,jsonb_build_object('total',total,'unassigned',residual,'deferred',deferred));
+ RETURN jsonb_build_object('epoch',a.epoch,'state',a.state,'total',total,'assigned',total-residual,'unassigned',residual,'deferred',deferred);
 END $$;
 
 CREATE FUNCTION billing_release_pricing_adoption(p_region text,p_system uuid,p_epoch uuid,p_actor text,p_reason text,p_evidence jsonb)
@@ -160,11 +197,13 @@ BEGIN
   OR f.allowance_period IS DISTINCT FROM 'day_window' OR f.allowance_on_exhausted IS DISTINCT FROM 'pause' OR (f.allowance_cents IS NULL AND f.allowance_compute_seconds IS NULL) THEN
   RAISE EXCEPTION 'published usable v2 Free catalog required';
  END IF;
- PERFORM id FROM team WHERE id<>p_system ORDER BY id FOR SHARE;
+ PERFORM team_id FROM team_billing_account WHERE team_id<>p_system ORDER BY team_id FOR UPDATE;
+ PERFORM id FROM team WHERE id<>p_system ORDER BY id FOR UPDATE;
+ PERFORM team_id FROM team_billing_account WHERE team_id<>p_system ORDER BY team_id FOR UPDATE;
  snapshot:=billing_capture_pricing_adoption(p_region,p_system,p_actor,p_reason);
- IF (snapshot->>'unassigned')::bigint<>0 OR EXISTS(SELECT 1 FROM billing_free_allowance_retry WHERE team_id<>p_system) OR EXISTS(SELECT 1 FROM billing_team_pause_target t WHERE t.team_id<>p_system AND t.done_at IS NULL AND NOT billing_pause_target_settled(t)) THEN
+ IF (snapshot->>'unassigned')::bigint<>0 OR (snapshot->>'deferred')::bigint<>0 OR EXISTS(SELECT 1 FROM billing_free_allowance_retry WHERE team_id<>p_system) OR EXISTS(SELECT 1 FROM billing_team_pause_target t WHERE t.team_id<>p_system AND t.done_at IS NULL AND NOT billing_pause_target_settled(t)) THEN
   INSERT INTO billing_pricing_adoption_event(epoch,region,action,actor,reason,details) VALUES(a.epoch,p_region,'release_blocked',p_actor,p_reason,snapshot);
-  RETURN snapshot||jsonb_build_object('released',false,'blocker','unassigned teams, allowance retries or unsettled pause targets');
+  RETURN snapshot||jsonb_build_object('released',false,'blocker','unassigned teams, unresolved obligations, allowance retries or unsettled pause targets');
  END IF;
  UPDATE billing_pricing_adoption SET state='released',evidence=p_evidence,released_at=clock_timestamp() WHERE singleton;
  INSERT INTO billing_pricing_adoption_event(epoch,region,action,actor,reason,details) VALUES(a.epoch,p_region,'release',p_actor,p_reason,p_evidence||snapshot);
@@ -172,7 +211,7 @@ BEGIN
 END $$;
 
 DO $$ DECLARE r text; t text; f regprocedure; BEGIN
- FOREACH t IN ARRAY ARRAY['billing_pricing_adoption','billing_pricing_adoption_inventory','billing_pricing_adoption_event'] LOOP
+ FOREACH t IN ARRAY ARRAY['billing_pricing_adoption','billing_pricing_adoption_inventory','billing_pricing_adoption_event','billing_pricing_adoption_credit_hold','billing_pricing_adoption_credit_resolution'] LOOP
   EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY',t);
   EXECUTE format('REVOKE ALL ON %I FROM PUBLIC',t);
   FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
@@ -183,7 +222,7 @@ DO $$ DECLARE r text; t text; f regprocedure; BEGIN
    EXECUTE format('CREATE POLICY adoption_backend_read ON %I TO service_role USING(true)',t);
   END IF;
  END LOOP;
- FOREACH f IN ARRAY ARRAY['billing_pricing_adoption_rotate()'::regprocedure,'billing_pricing_adoption_evidence_valid(text,uuid,uuid,jsonb)'::regprocedure,'billing_pricing_public_state()'::regprocedure,'billing_assert_pricing_entry_open(uuid,text)'::regprocedure,
+ FOREACH f IN ARRAY ARRAY['billing_pricing_adoption_credit_source(uuid)'::regprocedure,'billing_pricing_adoption_blocker(uuid)'::regprocedure,'billing_pricing_adoption_rotate()'::regprocedure,'billing_pricing_adoption_evidence_valid(text,uuid,uuid,jsonb)'::regprocedure,'billing_pricing_public_state()'::regprocedure,'billing_assert_pricing_entry_open(uuid,text)'::regprocedure,
   'billing_prepare_pricing_adoption(text,uuid,text,text)'::regprocedure,'billing_capture_pricing_adoption(text,uuid,text,text)'::regprocedure,'billing_release_pricing_adoption(text,uuid,uuid,text,text,jsonb)'::regprocedure] LOOP
   EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC',f);
   FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP

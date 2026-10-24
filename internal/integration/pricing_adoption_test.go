@@ -11,13 +11,50 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/superserve-ai/sandbox/internal/integrationdb"
 )
 
 func TestIntegration_PricingAdoptionBarrier(t *testing.T) {
 	ctx := t.Context()
+	admin := testPool
+	name := "adoption_" + uuid.NewString()[:8] + "_test"
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := admin.Config().Copy()
+	cfg.ConnConfig.Database = name
+	testPool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		testPool.Close()
+		_, _ = admin.Exec(context.Background(), "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+	})
+	testSystemTeamID, err := integrationdb.Reset(ctx, testPool)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	financialTeams := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	for i, team := range financialTeams {
+		if _, err := testPool.Exec(ctx, `INSERT INTO team(id,name) VALUES($1::uuid,'concurrent-financial-'||$1::uuid::text);`, team); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testPool.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free','{}','{"max_concurrent":1}',clock_timestamp(),'migration','local fixture')`, team); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	tx, err := testPool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +131,102 @@ func TestIntegration_PricingAdoptionBarrier(t *testing.T) {
 		}
 		return result
 	}
-	blocked := release()
+	for i, team := range financialTeams[:2] {
+		producer, err := testPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer producer.Rollback(context.Background())
+		query := `UPDATE team_billing_account SET checkout_may_exist=true WHERE team_id=$1`
+		if i == 1 {
+			query = `INSERT INTO team_billing_account(team_id,checkout_may_exist) VALUES($1,true)`
+		}
+		if _, err := producer.Exec(ctx, query, team); err != nil {
+			t.Fatal(err)
+		}
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sp.Exec(ctx, `SET LOCAL lock_timeout='100ms'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sp.Exec(ctx, `SELECT billing_release_pricing_adoption('usw',$1,$2,'operator@example.com','concurrent financial authority',$3::jsonb)`, testSystemTeamID, epoch, evidence); pgCode(err) != "55P03" {
+			t.Fatalf("release escaped financial lock case=%d: %v", i, err)
+		}
+		if err := sp.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := producer.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	between, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer between.Rollback(context.Background())
+	if _, err := between.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR UPDATE`, financialTeams[2]); err != nil {
+		t.Fatal(err)
+	}
+	var releasePID int
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&releasePID); err != nil {
+		t.Fatal(err)
+	}
+	type releaseResult struct {
+		raw []byte
+		err error
+	}
+	resultCh := make(chan releaseResult, 1)
+	go func() {
+		var raw []byte
+		err := tx.QueryRow(ctx, `SELECT billing_release_pricing_adoption('usw',$1,$2,'operator@example.com','between-phase account creation',$3::jsonb)`, testSystemTeamID, epoch, evidence).Scan(&raw)
+		resultCh <- releaseResult{raw, err}
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var waiting bool
+		if err := testPool.QueryRow(ctx, `SELECT cardinality(pg_blocking_pids($1))>0`, releasePID).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("release did not wait for team lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := between.Exec(ctx, `INSERT INTO team_billing_account(team_id,checkout_may_exist) VALUES($1,true)`, financialTeams[2]); err != nil {
+		t.Fatal(err)
+	}
+	if err := between.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result := <-resultCh
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	var blocked map[string]any
+	if err := json.Unmarshal(result.raw, &blocked); err != nil {
+		t.Fatal(err)
+	}
+	accountWriter, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer accountWriter.Rollback(context.Background())
+	if _, err := accountWriter.Exec(ctx, `SET LOCAL lock_timeout='100ms'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accountWriter.Exec(ctx, `UPDATE team_billing_account SET checkout_may_exist=false WHERE team_id=$1`, financialTeams[2]); pgCode(err) != "55P03" {
+		t.Fatalf("between-phase account escaped final lock: %v", err)
+	}
+	accountWriter.Rollback(ctx)
+	if blocked["deferred"] != float64(4) {
+		t.Fatalf("release missed newly committed obligations: %v", blocked)
+	}
+	exec(`UPDATE team_billing_account SET checkout_may_exist=false WHERE team_id=ANY($1)`, financialTeams)
 	if blocked["released"] != false || blocked["unassigned"] != float64(2) {
 		t.Fatalf("release ignored pending/foreign unassigned teams: %v", blocked)
 	}
@@ -108,6 +240,23 @@ func TestIntegration_PricingAdoptionBarrier(t *testing.T) {
 	}
 	exec(`INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
  SELECT id,'free','free','{}','{"max_concurrent":1}',clock_timestamp(),'migration','local adoption test' FROM team WHERE id IN ($1,$2)`, pending, foreign)
+	if result := release(); result["released"] != false || result["unassigned"] != float64(0) || result["deferred"] != float64(1) {
+		t.Fatalf("assignment hid unresolved checkout: %v", result)
+	}
+	if err := tx.QueryRow(ctx, `SELECT reason FROM billing_pricing_adoption_inventory WHERE epoch=$1 AND team_id=$2`, epoch, pending).Scan(&deferredReason); err != nil || deferredReason != "checkout_pending" {
+		t.Fatalf("assigned checkout reason=%s %v", deferredReason, err)
+	}
+	exec(`UPDATE team_billing_account SET checkout_may_exist=false WHERE team_id=$1`, pending)
+	exec(`INSERT INTO billing_pricing_adoption_credit_hold(team_id,reason) VALUES($1,'credit_unknown')`, foreign)
+	if result := release(); result["released"] != false || result["deferred"] != float64(1) {
+		t.Fatalf("assignment hid unresolved provider credit: %v", result)
+	}
+	exec(`DELETE FROM billing_pricing_adoption_credit_hold WHERE team_id=$1`, foreign)
+	exec(`UPDATE team_billing_account SET stripe_customer_id='cus_changed_source' WHERE team_id=$1`, financialTeams[0])
+	if result := release(); result["released"] != false || result["deferred"] != float64(1) {
+		t.Fatalf("migration assignment hid changed financial source: %v", result)
+	}
+	exec(`UPDATE team_billing_account SET stripe_customer_id=NULL WHERE team_id=$1`, financialTeams[0])
 	var pauseSandbox uuid.UUID
 	if err := tx.QueryRow(ctx, `INSERT INTO sandbox(team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib) VALUES($1,'adoption-worker-proof','active','default',1,1024,4096) RETURNING id`, pending).Scan(&pauseSandbox); err != nil {
 		t.Fatal(err)
