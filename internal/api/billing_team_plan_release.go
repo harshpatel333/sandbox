@@ -45,8 +45,16 @@ func (h *Handlers) releasePlanChangeSubscription(ctx context.Context, tx pgx.Tx,
 	if pending || state == "pending" || a.StripeActivationCreditReservedAt.Valid || (subscription != nil && *subscription != sub.ID) || (a.CheckoutSubscriptionID != nil && *a.CheckoutSubscriptionID != sub.ID) {
 		return errors.New("the previous checkout still has unresolved authority")
 	}
+	upgrade, err := h.proUpgradeRelease(ctx, tx, c, current, sub)
+	if err != nil {
+		return err
+	}
 	var checkout *StripeRetrievedCheckoutSession
-	if state == "committed" {
+	if upgrade != nil {
+		if a.CheckoutInitializingAt.Valid || a.CheckoutSessionID != nil || mayExist || requestKey != nil || state == "pending" {
+			return errors.New("a different checkout owns the released upgrade account")
+		}
+	} else if state == "committed" {
 		choice, e := scanProChoice(tx.QueryRow(ctx, `SELECT `+proChoiceColumns+` FROM billing_signup_choice WHERE team_id=$1`, c.Team))
 		if e != nil {
 			return e
@@ -74,6 +82,24 @@ func (h *Handlers) releasePlanChangeSubscription(ctx context.Context, tx pgx.Tx,
 	} else if state != "selecting" || subscription != nil || a.CheckoutInitializingAt.Valid || a.CheckoutSessionID != nil || a.CheckoutCompletedAt.Valid || mayExist {
 		return errors.New("the source checkout is not reconciled")
 	}
+	var invoiceSnapshot *invoiceAccount
+	var invoiceOwner invoiceAccount
+	invoiceErr := tx.QueryRow(ctx, `SELECT customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at FROM billing_invoice_account WHERE team_id=$1 FOR SHARE`, c.Team).Scan(&invoiceOwner.Customer, &invoiceOwner.Subscription, &invoiceOwner.Price, &invoiceOwner.Event, &invoiceOwner.Meter, &invoiceOwner.EnrolledAt)
+	if invoiceErr == nil {
+		if invoiceOwner.Customer != sub.Customer || invoiceOwner.Subscription != sub.ID {
+			return errors.New("invoice reconciliation still belongs to a different purchase")
+		}
+		if err = h.loadInvoiceBase(ctx, c.Team, &invoiceOwner, tx); err != nil {
+			return err
+		}
+		invoiceOwner.Base.TerminatedAt = sub.EndedAt
+		if invoiceOwner.Base.TerminatedAt <= 0 {
+			invoiceOwner.Base.TerminatedAt = h.nowUTC().Unix()
+		}
+		invoiceSnapshot = &invoiceOwner
+	} else if !errors.Is(invoiceErr, pgx.ErrNoRows) {
+		return invoiceErr
+	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_commercial_contract SET status='ended',revision=revision+1 WHERE id=$1 AND status<>'ended'`, current.ContractID); err != nil {
 		return err
 	}
@@ -83,7 +109,9 @@ func (h *Handlers) releasePlanChangeSubscription(ctx context.Context, tx pgx.Tx,
 	evidence, err := json.Marshal(struct {
 		invoiceSubscription
 		Checkout *StripeRetrievedCheckoutSession `json:"checkout,omitempty"`
-	}{sub, checkout})
+		Upgrade  *proUpgradeReleaseEvidence      `json:"pro_upgrade,omitempty"`
+		Invoice  *invoiceAccount                 `json:"invoice_account,omitempty"`
+	}{sub, checkout, upgrade, invoiceSnapshot})
 	if err != nil {
 		return err
 	}

@@ -433,6 +433,10 @@ func (h *Handlers) StartProPaymentReconciliation(ctx context.Context) {
 	}()
 }
 func (h *Handlers) proPaymentReconciliationTick(ctx context.Context) (int, error) {
+	released, err := h.releasedProInvoiceTick(ctx)
+	if err != nil {
+		return released, err
+	}
 	// offer_key<>'free' matches the partial recovery index predicate.
 	rows, err := h.Pool.Query(ctx, `WITH candidate AS (SELECT team_id FROM billing_signup_choice WHERE offer_key<>'free' AND offer_key IN `+paidPlanOffers+` AND next_check_at<=clock_timestamp() AND NOT EXISTS(SELECT 1 FROM billing_pro_upgrade u WHERE u.team_id=billing_signup_choice.team_id AND u.state NOT IN ('expired','ended')) ORDER BY next_check_at,team_id FOR UPDATE SKIP LOCKED LIMIT 4), legacy AS (UPDATE billing_signup_choice c SET next_check_at=clock_timestamp()+interval '2 minutes' FROM candidate WHERE c.team_id=candidate.team_id RETURNING c.team_id), upgrade_candidate AS (SELECT id FROM billing_pro_upgrade WHERE state NOT IN ('expired','ended') AND team_id IS NOT NULL AND next_check_at<=clock_timestamp() ORDER BY next_check_at,id FOR UPDATE SKIP LOCKED LIMIT 4), upgrades AS (UPDATE billing_pro_upgrade u SET next_check_at=clock_timestamp()+interval '2 minutes' FROM upgrade_candidate c WHERE u.id=c.id RETURNING u.team_id) SELECT team_id FROM legacy UNION SELECT team_id FROM upgrades`)
 	if err != nil {
@@ -480,7 +484,7 @@ func (h *Handlers) proPaymentReconciliationTick(ctx context.Context) (int, error
 		}()
 	}
 	wg.Wait()
-	return len(teams), ctx.Err()
+	return released + len(teams), ctx.Err()
 }
 
 func (h *Handlers) validateProResourceIdentities(ctx context.Context, team uuid.UUID, sub invoiceSubscription, params StripeCreateCheckoutSessionParams) error {

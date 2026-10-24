@@ -36,6 +36,11 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 	}
 	offer := proOffer{Key: terms.OfferKey, Name: terms.DisplayName, Price: "price_upgrade", Amount: terms.FeeCents, Months: 1, Credit: terms.MonthlyCreditCents, VersionID: terms.VersionID, Version: terms.Version, Family: terms.Family, Limits: &terms.Limits, Grants: terms.Grants, Allowance: terms.Allowance, PricingV2: true}
 	u := proUpgrade{ID: uuid.New(), Team: team, Actor: uuid.New(), Customer: "cus_" + uuid.NewString(), Subscription: stringPtr("sub_" + uuid.NewString()), Offer: offer.Key, Anchor: anchor, Start: anchor, End: end, Quoted: now, Amount: 12500, Grant: stringPtr("grant_" + uuid.NewString())}
+	initial, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", "free", 2, nil), Source: "signup", Reason: "accepted Free predecessor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.InitialAssignment = &initial.ID
 	token := uuid.New()
 	if _, err = h.Pool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status,commercial_billing_anchor) VALUES($1,$2,$3,'active',$4) ON CONFLICT(team_id) DO UPDATE SET stripe_customer_id=$2,stripe_subscription_id=$3,stripe_subscription_status='active',commercial_billing_anchor=$4`, team, u.Customer, *u.Subscription, anchor); err != nil {
 		t.Fatal(err)
@@ -79,6 +84,20 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Release()
+	if _, err = conn.Exec(t.Context(), `CREATE FUNCTION pg_temp.reject_pro_assignment() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.source='checkout' THEN RAISE EXCEPTION 'injected assignment failure'; END IF; RETURN NEW; END $$;
+ CREATE TRIGGER pro_assignment_fault BEFORE INSERT ON team_plan_assignment FOR EACH ROW EXECUTE FUNCTION pg_temp.reject_pro_assignment()`); err != nil {
+		t.Fatal(err)
+	}
+	if err = h.commitProUpgrade(t.Context(), conn, &u, sub, offer, "pm_example", client, token); err == nil {
+		t.Fatal("assignment failure committed paid authority")
+	}
+	if _, err = conn.Exec(t.Context(), `DROP TRIGGER pro_assignment_fault ON team_plan_assignment`); err != nil {
+		t.Fatal(err)
+	}
+	var rolledBack bool
+	if err = conn.QueryRow(t.Context(), `SELECT NOT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1) AND EXISTS(SELECT 1 FROM team_plan_assignment WHERE id=$2 AND effective_to IS NULL) AND (SELECT max_sandboxes=2 FROM team WHERE id=$1)`, team, initial.ID).Scan(&rolledBack); err != nil || !rolledBack {
+		t.Fatalf("partial paid activation: %v %v", rolledBack, err)
+	}
 	for range 2 {
 		if err = h.commitProUpgrade(t.Context(), conn, &u, sub, offer, "pm_example", client, token); err != nil {
 			t.Fatal(err)
@@ -96,7 +115,7 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 	if err = conn.QueryRow(t.Context(), `SELECT count(*) FROM team_plan_assignment WHERE team_id=$1`, team).Scan(&assignments); err != nil {
 		t.Fatal(err)
 	}
-	if assignments != 1 || requests != 2 {
+	if assignments != 2 || requests != 3 {
 		t.Fatalf("replay duplicated assignment or mutation: assignments=%d reads=%d", assignments, requests)
 	}
 	var max int32
@@ -105,6 +124,25 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 	}
 	if max != *terms.Limits.MaxConcurrent {
 		t.Fatalf("paid limits delayed: %d", max)
+	}
+	tx, e := conn.Begin(t.Context())
+	if e != nil {
+		t.Fatal(e)
+	}
+	newer, e := assignTeamPlan(t.Context(), tx, planAssignment{Team: team, Terms: testPlanTerms("free", "free", 1, nil), Source: "plan_change", Reason: "later Free"})
+	if e != nil {
+		tx.Rollback(t.Context())
+		t.Fatal(e)
+	}
+	if e = tx.Commit(t.Context()); e != nil {
+		t.Fatal(e)
+	}
+	if err = h.commitProUpgrade(t.Context(), conn, &u, sub, offer, "pm_example", client, token); err != nil {
+		t.Fatal(err)
+	}
+	var retained bool
+	if err = conn.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE id=$1 AND effective_to IS NULL) AND (SELECT max_sandboxes=1 FROM team WHERE id=$2)`, newer.ID, team).Scan(&retained); err != nil || !retained {
+		t.Fatalf("replay overwrote newer plan: %v %v", retained, err)
 	}
 	if _, err = conn.Exec(context.WithoutCancel(t.Context()), `SELECT 1`); err != nil {
 		t.Fatal(err)
@@ -178,7 +216,7 @@ func TestProUpgradeCreditRecoversLostAcknowledgmentWithoutExpiry(t *testing.T) {
 func TestProUpgradePaymentReviewSurvivesProviderFailure(t *testing.T) {
 	h, team := newPlanAssignmentFixture(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	u := proUpgrade{ID: uuid.New(), Team: team, Actor: uuid.New(), Customer: "cus_" + uuid.NewString(), Session: stringPtr("cs_example"), Offer: "pro_monthly", Amount: 12500}
+	u := proUpgrade{ID: uuid.New(), Team: team, Actor: uuid.New(), Customer: "cus_" + uuid.NewString(), Session: stringPtr("cs_example_" + uuid.NewString()), Offer: "pro_monthly", Amount: 12500}
 	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,session_id) VALUES($1,$2,$3,$4,$5,'{}',$6,$6,$7,$6,$8,'paid','{}',$9)`, u.ID, team, u.Actor, u.Customer, u.Offer, now, now.Add(time.Hour), u.Amount, u.Session); err != nil {
 		t.Fatal(err)
 	}

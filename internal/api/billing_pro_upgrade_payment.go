@@ -231,14 +231,8 @@ func (h *Handlers) commitProUpgrade(ctx context.Context, conn *pgxpool.Conn, u *
 	if derefString(a.StripeCustomerID) != u.Customer || derefString(a.StripeSubscriptionID) != sub.ID || !a.CommercialBillingAnchor.Valid || !a.CommercialBillingAnchor.Time.Equal(u.Anchor) {
 		return errors.New("upgrade billing association changed")
 	}
-	current, assigned, e := currentTeamPlan(ctx, tx, u.Team)
-	if e != nil {
-		return e
-	}
-	own := assigned && current.Key != nil && u.Contract != nil && *current.Key == "checkout:"+u.Contract.String()
-	if !own && ((u.InitialAssignment == nil && assigned) || (u.InitialAssignment != nil && (!assigned || current.ID != *u.InitialAssignment))) {
-		return errors.New("team plan changed during upgrade payment")
-	}
+	offer.PredecessorKnown = true
+	offer.InitialAssignment = u.InitialAssignment
 	contract, err := q.GetCurrentCommercialContract(ctx, u.Team)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err

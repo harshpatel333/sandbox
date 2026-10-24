@@ -764,6 +764,11 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 	if err = lease.lock(ctx, h.DB.WithTx(tx)); err != nil {
 		return now, err
 	}
+	if c.Subscription != nil {
+		if _, err = h.DB.WithTx(tx).LockTeamBillingAccount(ctx, c.Team); err != nil {
+			return now, err
+		}
+	}
 	if err = tx.QueryRow(ctx, `SELECT 1 FROM team WHERE id=$1 FOR NO KEY UPDATE`, c.Team).Scan(new(int)); err != nil {
 		return now, err
 	}

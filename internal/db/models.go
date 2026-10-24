@@ -977,6 +977,21 @@ type BillingProPaymentVerification struct {
 	Evidence       []byte    `json:"evidence"`
 }
 
+type BillingProReleasedInvoice struct {
+	ReleaseID        uuid.UUID `json:"release_id"`
+	InvoiceID        string    `json:"invoice_id"`
+	ContractID       uuid.UUID `json:"contract_id"`
+	State            string    `json:"state"`
+	Receipt          []byte    `json:"receipt"`
+	PaymentReference *string   `json:"payment_reference"`
+	Revision         int64     `json:"revision"`
+	VerifiedRevision int64     `json:"verified_revision"`
+	CreditState      string    `json:"credit_state"`
+	NextCheckAt      time.Time `json:"next_check_at"`
+	LastError        *string   `json:"last_error"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
 type BillingProUpgrade struct {
 	ID                     uuid.UUID          `json:"id"`
 	TeamID                 pgtype.UUID        `json:"team_id"`

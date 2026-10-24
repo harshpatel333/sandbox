@@ -148,10 +148,12 @@ type StripeBillingCreditGrant struct {
 }
 
 type StripeCreateCheckoutSessionParams struct {
-	OneOffProduct            string `json:",omitempty"`
-	SetupOnly                bool   `json:",omitempty"`
-	OneOffAmount             int64  `json:",omitempty"`
-	OneOffName               string `json:",omitempty"`
+	ReleaseID                *uuid.UUID `json:",omitempty"`
+	OperationID              uuid.UUID  `json:",omitempty"`
+	OneOffProduct            string     `json:",omitempty"`
+	SetupOnly                bool       `json:",omitempty"`
+	OneOffAmount             int64      `json:",omitempty"`
+	OneOffName               string     `json:",omitempty"`
 	BasePriceID              string
 	DeferredResourcePriceIDs []string                      `json:",omitempty"`
 	ResourceTerms            []StripeCheckoutResourceTerms `json:",omitempty"`
@@ -171,12 +173,14 @@ type StripeCreateCheckoutSessionParams struct {
 // StripeCheckoutPlanTerms freezes the catalog terms a purchase started with.
 // It is recorded with the request and never sent to Stripe.
 type StripeCheckoutPlanTerms struct {
-	Amount    int64
-	Months    int32
-	Credit    int64
-	VersionID uuid.UUID
-	Matching  *planMatching `json:",omitempty"`
-	Limits    *planLimits   `json:",omitempty"`
+	PredecessorKnown  bool       `json:",omitempty"`
+	InitialAssignment *uuid.UUID `json:",omitempty"`
+	Amount            int64
+	Months            int32
+	Credit            int64
+	VersionID         uuid.UUID
+	Matching          *planMatching `json:",omitempty"`
+	Limits            *planLimits   `json:",omitempty"`
 	// PricingV2 purchases also freeze the plan identity they assign.
 	PricingV2   bool           `json:",omitempty"`
 	Family      string         `json:",omitempty"`

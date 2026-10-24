@@ -378,6 +378,30 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 	if a.CommercialBillingAnchor.Valid && a.CommercialBillingAnchor.Time.Unix() != anchor {
 		return errors.New("Pro anniversary changed")
 	}
+	var frozenParams StripeCreateCheckoutSessionParams
+	if err = json.Unmarshal(choice.Payload, &frozenParams); err != nil {
+		return err
+	}
+	releaseValidated := false
+	if frozenParams.ReleaseID != nil {
+		var currentContract bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND status<>'ended')`, choice.Team).Scan(&currentContract); err != nil {
+			return err
+		}
+		if !currentContract {
+			if _, err = tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, choice.Team); err != nil {
+				return err
+			}
+			release, e := proReleaseForReentry(ctx, tx, choice.Team, sub.Customer)
+			if e != nil {
+				return e
+			}
+			if release == nil || *release != *frozenParams.ReleaseID {
+				return errors.New("paid release provenance changed")
+			}
+			releaseValidated = true
+		}
+	}
 	_, err = tx.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status=$3,current_period_start=CASE WHEN $8 THEN $4 ELSE current_period_start END,current_period_end=CASE WHEN $8 THEN $5 ELSE current_period_end END,commercial_billing_anchor=COALESCE(commercial_billing_anchor,$6),cancel_at_period_end=$7 WHERE team_id=$1`, choice.Team, sub.ID, sub.Status, time.Unix(start, 0), time.Unix(end, 0), time.Unix(anchor, 0), sub.CancelAtPeriodEnd || sub.CancelAt > 0, resourcesReady)
 	if err != nil {
 		return err
@@ -394,7 +418,7 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 		if err != nil {
 			return err
 		}
-		if ended {
+		if ended && !releaseValidated {
 			return tx.Commit(ctx)
 		}
 		contract, err = q.CreateCommercialContract(ctx, db.CreateCommercialContractParams{TeamID: choice.Team, OfferKey: choice.Offer, StartsAt: time.Unix(anchor, 0), CustomerID: sub.Customer, SubscriptionID: sub.ID, BasePriceID: choice.Price, ChargeAmountCents: offer.Amount, ChargeIntervalMonths: offer.Months, EntitlementKind: "metered_usage", EntitlementAmountCents: offer.Credit, EntitlementCadence: "monthly", EntitlementAnchor: time.Unix(anchor, 0)})
@@ -571,13 +595,38 @@ func proMeteredPeriod(sub invoiceSubscription, offer proOffer) (int64, int64, er
 	return start, end, nil
 }
 
-// assignCheckoutPlan puts a team that paid for a pricing v2 plan on it from
-// activation, with the terms and limits frozen at checkout. It reads nothing
-// that can change after payment, so a catalog edit cannot block activation.
 func assignCheckoutPlan(ctx context.Context, tx pgx.Tx, choice proChoice, offer proOffer, contract uuid.UUID) error {
+	if _, err := tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, choice.Team); err != nil {
+		return err
+	}
+	key := "checkout:" + contract.String()
+	prior, err := scanTeamPlan(tx.QueryRow(ctx, `SELECT `+teamPlanColumns+` FROM team_plan_assignment WHERE team_id=$1 AND idempotency_key=$2`, choice.Team, key))
+	if err == nil {
+		if prior.Source != planSourceCheckout || prior.ContractID == nil || *prior.ContractID != contract || prior.PlanKey != choice.Offer || prior.Terms.VersionID != offer.VersionID {
+			return errPlanAssignmentReused
+		}
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	current, assigned, err := currentTeamPlan(ctx, tx, choice.Team)
+	if err != nil {
+		return err
+	}
+	if offer.PredecessorKnown {
+		if (offer.InitialAssignment == nil && assigned) || (offer.InitialAssignment != nil && (!assigned || current.ID != *offer.InitialAssignment)) {
+			return errors.New("team plan changed after paid acceptance")
+		}
+	} else if assigned && !(current.Kind == planKindFree && current.Source == "signup" && !current.EffectiveFrom.After(choice.Generation)) {
+		return errors.New("accepted purchase has no matching predecessor")
+	}
+	if offer.Limits == nil {
+		return errors.New("accepted purchase limits are missing")
+	}
 	terms := planTerms{OfferKey: choice.Offer, DisplayName: offer.Name, FeeCents: offer.Amount, IntervalMonths: offer.Months, MonthlyCreditCents: offer.Credit,
 		VersionID: offer.VersionID, Version: offer.Version, PricingVersion: "v2", Family: offer.Family, Kind: "subscription", Grants: offer.Grants, Allowance: offer.Allowance, Matching: offer.Matching, Limits: *offer.Limits}
-	_, err := assignTeamPlan(ctx, tx, planAssignment{Team: choice.Team, Terms: terms, Source: planSourceCheckout, Actor: &choice.Actor, Reason: "paid checkout", ContractID: &contract, Key: "checkout:" + contract.String()})
+	_, err = assignTeamPlan(ctx, tx, planAssignment{Team: choice.Team, Terms: terms, Source: planSourceCheckout, Actor: &choice.Actor, Reason: "paid checkout", ContractID: &contract, Key: "checkout:" + contract.String()})
 	return err
 }
 

@@ -89,7 +89,7 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	write := func(v any) { _ = json.NewEncoder(w).Encode(v) }
-	basePrice := map[string]any{"id": f.price, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": fmt.Sprint(f.amount), "recurring": map[string]any{"usage_type": "licensed", "interval": f.interval, "interval_count": 1}}
+	basePrice := map[string]any{"product": "prod_pro_fixture", "id": f.price, "active": true, "currency": "usd", "billing_scheme": "per_unit", "unit_amount_decimal": fmt.Sprint(f.amount), "recurring": map[string]any{"usage_type": "licensed", "interval": f.interval, "interval_count": 1}}
 	switch {
 	case r.URL.Path == "/v1/prices" && r.Method == "POST":
 		_ = r.ParseForm()

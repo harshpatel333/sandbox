@@ -57,7 +57,7 @@ func proratedProAmount(amount int64, start, end, at time.Time) (int64, error) {
 	return n.Int64(), nil
 }
 
-func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer proOffer, params StripeCreateCheckoutSessionParams) {
+func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer proOffer, params StripeCreateCheckoutSessionParams, admission pricingPublicState) {
 	ctx := c.Request.Context()
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
@@ -65,13 +65,22 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 		return
 	}
 	defer tx.Rollback(ctx)
-	var version string
-	if err = tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch FOR SHARE`).Scan(&version); err != nil {
+	priorReplay, replayErr := scanProUpgrade(tx.QueryRow(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE team_id=$1 AND state NOT IN ('expired','ended')`, team))
+	if replayErr == nil {
+		if priorReplay.Actor != actor || priorReplay.Offer != offer.Key || (params.OperationID != uuid.Nil && params.OperationID != priorReplay.ID) {
+			proConflict(c)
+			return
+		}
+		tx.Rollback(ctx)
+		h.resumeProUpgradeCheckout(c, priorReplay)
+		return
+	}
+	if !errors.Is(replayErr, pgx.ErrNoRows) {
 		respondError(c, ErrInternal)
 		return
 	}
-	if _, err = tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, team); err != nil {
-		respondError(c, ErrInternal)
+	if err = lockProAdmission(ctx, tx, admission); err != nil {
+		respondProAdmission(c, err)
 		return
 	}
 	a, err := h.DB.WithTx(tx).LockTeamBillingAccount(ctx, team)
@@ -81,7 +90,7 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 	}
 	prior, priorErr := scanProUpgrade(tx.QueryRow(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE team_id=$1 AND state NOT IN ('expired','ended')`, team))
 	if priorErr == nil {
-		if prior.Offer != offer.Key {
+		if prior.Actor != actor || prior.Offer != offer.Key || (params.OperationID != uuid.Nil && params.OperationID != prior.ID) {
 			proConflict(c)
 			return
 		}
@@ -96,12 +105,11 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 		respondError(c, ErrInternal)
 		return
 	}
-	var published uuid.UUID
-	if err = tx.QueryRow(ctx, `SELECT id FROM billing_plan_version WHERE family=$1 AND state='published' AND pricing_version='v2' FOR SHARE`, offer.Family).Scan(&published); err != nil || published != offer.VersionID {
-		proConflict(c)
+	if _, err = tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, team); err != nil {
+		respondError(c, ErrInternal)
 		return
 	}
-	if version != "v2" {
+	if err = lockProOffer(ctx, tx, offer); err != nil {
 		proConflict(c)
 		return
 	}
@@ -150,7 +158,30 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 		respondErrorMsg(c, "billing_boundary", "The remaining prorated payment is below the card minimum or the billing date is too close. Retry after the next billing date.", 409)
 		return
 	}
-	id := uuid.New()
+	id := params.OperationID
+	if id == uuid.Nil {
+		id = uuid.New()
+	}
+	params.OperationID = id
+	var previous bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1)`, team).Scan(&previous); err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if previous {
+		release, e := proReleaseForReentry(ctx, tx, team, params.CustomerID)
+		if e != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if release == nil || params.OperationID == uuid.Nil {
+			proConflict(c)
+			return
+		}
+		params.ReleaseID = release
+	}
+	params.PlanTerms.PredecessorKnown = true
+	params.PlanTerms.InitialAssignment = initial
 	params.PriceIDs = nil
 	params.OneOffAmount = amount
 	params.OneOffName = fmt.Sprintf("%s upgrade through %s; equal non-expiring usage credit", offer.Name, end.UTC().Format("2006-01-02 15:04 MST"))
