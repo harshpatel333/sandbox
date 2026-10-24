@@ -94,7 +94,7 @@ CREATE TRIGGER team_plan_assignment_limits AFTER INSERT ON team_plan_assignment
 -- Under pricing v2 every new team starts on Free, whichever path created it.
 -- The terms and limits are frozen in the same shape as an assignment made by
 -- the backend.
-CREATE FUNCTION assign_new_team_free_plan() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION assign_new_team_free_plan() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE v billing_plan_version; pricing text;
 BEGIN
  IF current_setting('superserve.migrating_team_id',true)=NEW.id::text THEN RETURN NULL; END IF;
@@ -155,6 +155,9 @@ DO $$ DECLARE r text; f regprocedure; BEGIN
  END LOOP;
  FOREACH f IN ARRAY ARRAY['guard_team_plan_assignment()'::regprocedure,'apply_assignment_limits(uuid,jsonb)'::regprocedure,'team_plan_assignment_apply_limits()'::regprocedure,'team_limits_follow_assignment()'::regprocedure,'assign_new_team_free_plan()'::regprocedure] LOOP
   EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC',f);
+  FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
+   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I',f,r); END IF;
+  END LOOP;
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role',f); END IF;
  END LOOP;
 END $$;
