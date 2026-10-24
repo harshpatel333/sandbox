@@ -67,7 +67,7 @@ def cli(command, *args):
     return process.stdout
 
 binding = json.loads((state / "pricing-stripe-binding.json").read_text())
-if not binding.get("verified_test_mode"):
+if not binding.get("verified_test_mode") or binding.get("account_id") != "acct_1UST2ILIAkKd3qgh":
     raise SystemExit("Deployment is ready, but full dev enablement awaits verified test-mode Stripe binding")
 actor = str(uuid.uuid4())
 team = str(uuid.uuid4())

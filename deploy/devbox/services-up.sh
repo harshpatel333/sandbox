@@ -25,7 +25,9 @@ esac
 
 load_box_config
 [[ ${DEVBOX_NAME:-} == awille-ai-dev-billing && ${DEVBOX_ID:-} == 29baf003ad05 ]] || die "integration branch is restricted to its named devbox"
-python3 "$here/pricing-integration-provider.py"
+if [[ $dry_run != true ]]; then
+  python3 "$here/pricing-integration-provider.py"
+fi
 
 # Docker must never manage iptables here: its default FORWARD policy and
 # bridge rules would break VMD's sandbox forwarding. The daemon config is

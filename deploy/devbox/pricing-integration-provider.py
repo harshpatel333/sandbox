@@ -18,6 +18,8 @@ if key:
         except urllib.error.HTTPError as error:
             raise SystemExit("Stripe test preflight rejected /v1/" + endpoint + " HTTP " + str(error.code)) from None
         if endpoint == "account":
+            if body.get("id") != "acct_1UST2ILIAkKd3qgh":
+                raise SystemExit("Stripe test preflight account does not match the independently expected DEV account")
             receipt["account_id"] = body["id"]
         elif body.get("livemode") is not False:
             raise SystemExit("Stripe test preflight did not confirm test-mode balance")
