@@ -18,18 +18,20 @@ import (
 )
 
 type proOffer struct {
-	Key, Price string
-	Name       string
-	Amount     int64
-	Months     int32
-	Credit     int64
-	VersionID  uuid.UUID
-	Version    int32
-	Pricing    string
-	Matching   *planMatching
-	Grants     []planGrant
-	Allowance  *planAllowance
-	Limits     *planLimits
+	PredecessorKnown  bool
+	InitialAssignment *uuid.UUID
+	Key, Price        string
+	Name              string
+	Amount            int64
+	Months            int32
+	Credit            int64
+	VersionID         uuid.UUID
+	Version           int32
+	Pricing           string
+	Matching          *planMatching
+	Grants            []planGrant
+	Allowance         *planAllowance
+	Limits            *planLimits
 	// PricingV2 purchases accept a promotion code at checkout and assign the
 	// team's plan when they activate.
 	PricingV2 bool
@@ -55,7 +57,18 @@ func (h *Handlers) proOffer(ctx context.Context, key string) (proOffer, error) {
 	if h.Config == nil || h.Pool == nil {
 		return proOffer{}, errors.New("billing is not configured")
 	}
-	t, err := h.planTerms(ctx, key)
+	model, err := h.pricingVersion(ctx)
+	if err != nil {
+		return proOffer{}, err
+	}
+	return h.proOfferForPricingVersion(ctx, key, model)
+}
+
+func (h *Handlers) proOfferForPricingVersion(ctx context.Context, key, model string) (proOffer, error) {
+	if h.Config == nil || h.Pool == nil {
+		return proOffer{}, errors.New("billing is not configured")
+	}
+	t, err := h.planTermsForPricingVersion(ctx, key, model)
 	if errors.Is(err, errUnknownPlan) || (err == nil && !t.Available) || (err == nil && !h.planPriced(t)) {
 		return proOffer{Key: key}, errOfferUnavailable
 	}
@@ -96,7 +109,7 @@ func frozenProOffer(key string, payload StripeCreateCheckoutSessionParams) (proO
 	if payload.AllowPromotionCodes != t.PricingV2 || (t.PricingV2 && (t.Months != 1 || t.VersionID == uuid.Nil || t.Limits == nil || t.Limits.MaxConcurrent == nil || t.Family == "" || t.Version <= 0)) {
 		return proOffer{}, errors.New("invalid frozen pricing v2 terms")
 	}
-	o := proOffer{Key: key, Name: t.DisplayName, Amount: t.Amount, Months: t.Months, Credit: t.Credit, VersionID: t.VersionID, Matching: t.Matching, Limits: t.Limits, PricingV2: t.PricingV2, Family: t.Family, Version: t.Version, Grants: t.Grants, Allowance: t.Allowance}
+	o := proOffer{PredecessorKnown: t.PredecessorKnown, InitialAssignment: t.InitialAssignment, Key: key, Name: t.DisplayName, Amount: t.Amount, Months: t.Months, Credit: t.Credit, VersionID: t.VersionID, Matching: t.Matching, Limits: t.Limits, PricingV2: t.PricingV2, Family: t.Family, Version: t.Version, Grants: t.Grants, Allowance: t.Allowance}
 	if t.PricingV2 {
 		o.Pricing = "v2"
 	}
@@ -145,7 +158,35 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
-	offer, resuming, err := h.checkoutOffer(c.Request.Context(), team, req.Offer)
+	if upgrade, err := h.proUpgrade(c.Request.Context(), team); err == nil {
+		if upgrade.Team != team || upgrade.Actor != actor || upgrade.Offer != req.Offer || (req.OperationID != uuid.Nil && req.OperationID != upgrade.ID) {
+			proConflict(c)
+			return
+		}
+		h.resumeProUpgradeCheckout(c, upgrade)
+		return
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		respondError(c, ErrInternal)
+		return
+	}
+	if choice, e := h.getProChoice(c.Request.Context(), team); e == nil && choice.State == "pending" {
+		h.resumeAcceptedProCheckout(c, choice, actor, req)
+		return
+	} else if e != nil && !errors.Is(e, pgx.ErrNoRows) {
+		respondError(c, ErrInternal)
+		return
+	}
+	admission, err := h.publicPricingState(c.Request.Context())
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if !admission.EntryOpen && !admission.LegacyOpen {
+		proConflict(c)
+		return
+	}
+	offer, err := h.proOfferForPricingVersion(c.Request.Context(), req.Offer, admission.Version)
+	resuming := false
 	if errors.Is(err, errOfferUnavailable) {
 		respondErrorMsg(c, "invalid_offer", "plan is not available", http.StatusBadRequest)
 		return
@@ -157,6 +198,17 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 	if _, ok := h.Stripe.(*stripeHTTPClient); !ok {
 		respondErrorMsg(c, "service_unavailable", "Pro payment verification is unavailable", http.StatusServiceUnavailable)
 		return
+	}
+	if req.OperationID != uuid.Nil {
+		var historical bool
+		if err = h.Pool.QueryRow(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE id=$1) OR EXISTS(SELECT 1 FROM billing_plan_release WHERE team_id=$2 AND previous_choice->'request_payload'->>'OperationID'=$1::uuid::text)`, req.OperationID, team).Scan(&historical); err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if historical {
+			proConflict(c)
+			return
+		}
 	}
 	enabled, err := h.billingExportEnabled(c.Request.Context(), team)
 	if err != nil {
@@ -188,6 +240,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		return
 	}
 	client := h.Stripe.(*stripeHTTPClient)
+	var product string
 	// A resumed purchase keeps the price it was started with.
 	if resuming {
 		err = client.validateProPrice(c.Request.Context(), offer)
@@ -195,6 +248,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		var price storagePrice
 		price, err = h.ensurePlanPrice(c.Request.Context(), client, planTerms{OfferKey: offer.Key, DisplayName: offer.Name, FeeCents: offer.Amount, IntervalMonths: offer.Months, VersionID: offer.VersionID, Version: offer.Version, PricingVersion: offer.Pricing})
 		offer.Price = price.ID
+		product = price.Product
 	}
 	if err != nil {
 		respondErrorMsg(c, "service_unavailable", "Pro price configuration requires verification", 503)
@@ -210,7 +264,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
-	params := StripeCreateCheckoutSessionParams{CustomerID: customer, SuccessURL: success, CancelURL: cancelURL, ClientReferenceID: team.String(), PriceIDs: prices, BasePriceID: offer.Price, Flexible: true, ResourceTerms: terms,
+	params := StripeCreateCheckoutSessionParams{OperationID: req.OperationID, OneOffProduct: product, CustomerID: customer, SuccessURL: success, CancelURL: cancelURL, ClientReferenceID: team.String(), PriceIDs: prices, BasePriceID: offer.Price, Flexible: true, ResourceTerms: terms,
 		PlanTerms: &StripeCheckoutPlanTerms{Amount: offer.Amount, Months: offer.Months, Credit: offer.Credit, VersionID: offer.VersionID, Matching: offer.Matching, Limits: offer.Limits}}
 	v2 := offer.Pricing == "v2"
 	if v2 && !resuming {
@@ -222,11 +276,30 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 			return
 		}
 	}
+	if admission.LegacyOpen && !resuming {
+		a, e := h.DB.GetTeamBillingAccount(c.Request.Context(), team)
+		if e == nil && a.CommercialBillingAnchor.Valid {
+			proConflict(c)
+			return
+		}
+		if e != nil && !errors.Is(e, pgx.ErrNoRows) {
+			respondError(c, ErrInternal)
+			return
+		}
+	}
 	if offer.Months == 12 {
 		// Checkout cannot mix annual fees with monthly usage. Keep the actual
 		// request frozen so older replicas also replay the base-only session.
 		params.PriceIDs = nil
 		params.DeferredResourcePriceIDs = prices
+	}
+	if v2 && !resuming {
+		if params.OneOffProduct == "" {
+			respondErrorMsg(c, "service_unavailable", "Pro product identity requires verification", 503)
+			return
+		}
+		h.createProUpgrade(c, team, actor, offer, params, admission)
+		return
 	}
 	ctx := c.Request.Context()
 	tx, err := h.Pool.Begin(ctx)
@@ -235,6 +308,18 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		return
 	}
 	defer tx.Rollback(ctx)
+	if !resuming {
+		if err = lockProAdmission(ctx, tx, admission); err != nil {
+			respondProAdmission(c, err)
+			return
+		}
+	}
+	if !resuming {
+		if err = lockProOffer(ctx, tx, offer); err != nil {
+			proConflict(c)
+			return
+		}
+	}
 	q := h.DB.WithTx(tx)
 	account, err := q.LockTeamBillingAccount(ctx, team)
 	if err != nil {
@@ -252,18 +337,31 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
+	if !resuming {
+		if _, err = tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, team); err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		release, e := proReleaseForReentry(ctx, tx, team, customer)
+		if e != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		params.ReleaseID = release
+	}
+	reentry := params.ReleaseID != nil
 	if !v2 && !resuming {
 		_, assigned, assignmentErr := currentTeamPlan(ctx, tx, team)
 		if assignmentErr != nil {
 			respondError(c, ErrInternal)
 			return
 		}
-		if assigned {
+		if assigned && !reentry {
 			proConflict(c)
 			return
 		}
 	}
-	if state == "committed" || (v2 && !resuming && account.CommercialBillingAnchor.Valid) || (selected != nil && *selected != offer.Key) || account.StripeSubscriptionID != nil || (account.TrialEndedAt.Valid && !v2) || account.StripeActivationCreditReservedAt.Valid || account.StripeActivationCreditGrantID != nil {
+	if state == "committed" || (v2 && !resuming && account.CommercialBillingAnchor.Valid) || (selected != nil && *selected != offer.Key) || account.StripeSubscriptionID != nil || (account.TrialEndedAt.Valid && !v2 && !reentry) || account.StripeActivationCreditReservedAt.Valid || (account.StripeActivationCreditGrantID != nil && !reentry) {
 		proConflict(c)
 		return
 	}
@@ -273,6 +371,19 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		if resuming || account.CheckoutInitializingAt.Valid || account.CheckoutCompletedAt.Valid {
 			proConflict(c)
 			return
+		}
+		if _, err = tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, team); err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		initial, assigned, e := currentTeamPlan(ctx, tx, team)
+		if e != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		params.PlanTerms.PredecessorKnown = true
+		if assigned {
+			params.PlanTerms.InitialAssignment = &initial.ID
 		}
 		var generation time.Time
 		if err = tx.QueryRow(ctx, `SELECT now()`).Scan(&generation); err != nil {
@@ -295,7 +406,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 			params = StripeCreateCheckoutSessionParams{}
 			err = json.Unmarshal(choice.Payload, &params)
 		}
-		if err == nil && (choice.Actor != actor || params.SuccessURL != success || params.CancelURL != cancelURL) {
+		if err == nil && (choice.Actor != actor || (req.OperationID != uuid.Nil && req.OperationID != params.OperationID) || params.SuccessURL != success || params.CancelURL != cancelURL) {
 			proConflict(c)
 			return
 		}
@@ -433,6 +544,11 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 	if obj.Parent.SubscriptionDetails != nil {
 		subscription = obj.Parent.SubscriptionDetails.Subscription
 	}
+	if strings.HasPrefix(event.Type, "invoice.") {
+		if handled, err := h.enqueueReleasedProInvoice(ctx, event, obj.Customer, subscription, obj.ID); handled || err != nil {
+			return handled, err
+		}
+	}
 	var adopted bool
 	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_sponsored_annual_authority WHERE customer_id=$1 AND subscription_id=$2 AND state<>'ended')`, obj.Customer, subscription).Scan(&adopted); err != nil {
 		return false, err
@@ -459,6 +575,20 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 		}
 		_, err := h.DB.MarkStripeWebhookEventProcessed(ctx, event.ID)
 		return true, err
+	}
+	var upgradeTeam uuid.UUID
+	upgradeErr := h.Pool.QueryRow(ctx, `UPDATE billing_pro_upgrade SET next_check_at=clock_timestamp() WHERE customer_id=$1 AND team_id IS NOT NULL AND state NOT IN ('expired','ended') RETURNING team_id`, obj.Customer).Scan(&upgradeTeam)
+	if upgradeErr == nil {
+		if strings.HasPrefix(event.Type, "invoice.") {
+			if _, err := h.Pool.Exec(ctx, `UPDATE billing_invoice_collection SET next_attempt_at=LEAST(next_attempt_at,clock_timestamp()) WHERE invoice_id=$1 AND customer_id=$2 AND state NOT IN ('paid','void')`, obj.ID, obj.Customer); err != nil {
+				return true, err
+			}
+		}
+		_, err := h.DB.MarkStripeWebhookEventProcessed(ctx, event.ID)
+		return true, err
+	}
+	if !errors.Is(upgradeErr, pgx.ErrNoRows) {
+		return false, upgradeErr
 	}
 	var released bool
 	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE customer_id=$1 AND (subscription_id=$2 OR previous_choice->>'session_id'=$3))`, obj.Customer, subscription, obj.ID).Scan(&released); err != nil {

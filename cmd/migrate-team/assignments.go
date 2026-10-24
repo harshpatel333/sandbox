@@ -179,6 +179,9 @@ func checkAssignmentReferences(ctx context.Context, src querier, dst pgx.Tx, tea
 		if err := checkFreePauseTransfer(ctx, q, team); err != nil {
 			return err
 		}
+		if err := checkProUpgradeMigration(ctx, q, team); err != nil {
+			return err
+		}
 	}
 	var contractBacked bool
 	if err := src.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND contract_id IS NOT NULL)`, team).Scan(&contractBacked); err != nil {
@@ -218,11 +221,6 @@ func checkAssignmentReferences(ctx context.Context, src querier, dst pgx.Tx, tea
 }
 
 func requireAssignmentParity(ctx context.Context, src, dst querier, team uuid.UUID) error {
-	for _, q := range []querier{src, dst} {
-		if err := checkFreePauseTransfer(ctx, q, team); err != nil {
-			return err
-		}
-	}
 	spec := tableSpec{"team_plan_assignment", "team_id=$1"}
 	source, err := rowChecksums(ctx, src, spec, team, nil)
 	if err != nil {
