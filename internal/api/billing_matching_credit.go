@@ -498,7 +498,7 @@ func (c *stripeHTTPClient) matchedInvoiceReversal(ctx context.Context, id, custo
 	if err != nil {
 		return "", nil, err
 	}
-	if inv.Customer != customer {
+	if inv.ID != id || inv.Customer != customer {
 		return "", nil, errors.New("matched invoice ownership changed")
 	}
 	if inv.Status != "paid" || inv.PrePaymentCreditNotes != 0 || inv.PostPaymentCreditNotes != 0 {
@@ -523,9 +523,12 @@ func (c *stripeHTTPClient) matchedInvoiceReversal(ctx context.Context, id, custo
 	if payments.HasMore {
 		return "", nil, errors.New("matched invoice payments exceed the supported bound")
 	}
+	if payments.Data == nil {
+		return "", nil, errors.New("matched invoice lacks paid-payment evidence")
+	}
 	for _, p := range payments.Data {
 		if p.Invoice != id || p.Payment.Type != "payment_intent" || p.Payment.Intent == "" {
-			continue
+			return "", nil, errors.New("matched invoice has unsupported paid-payment evidence")
 		}
 		var intent struct {
 			ID           string `json:"id"`
@@ -533,6 +536,9 @@ func (c *stripeHTTPClient) matchedInvoiceReversal(ctx context.Context, id, custo
 		}
 		if err = c.doForm(ctx, http.MethodGet, "/v1/payment_intents/"+url.PathEscape(p.Payment.Intent), nil, &intent, ""); err != nil {
 			return "", nil, err
+		}
+		if intent.ID != p.Payment.Intent {
+			return "", nil, errors.New("matched invoice payment intent identity changed")
 		}
 		raw, err := c.verifyProCharge(ctx, intent.LatestCharge, p.Payment.Intent, customer, p.AmountPaid)
 		var review *proPaymentReviewError
