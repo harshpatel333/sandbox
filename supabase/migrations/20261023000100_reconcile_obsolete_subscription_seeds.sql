@@ -18,7 +18,8 @@ BEGIN
     FOR relation IN
         SELECT c.oid, n.nspname, c.relname
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'm')
+        WHERE (n.nspname = 'public' OR (n.nspname = 'supabase_migrations'
+            AND c.relname = 'schema_migrations')) AND c.relkind IN ('r', 'p', 'm')
         ORDER BY c.oid
     LOOP
         EXECUTE format('LOCK TABLE ONLY %I.%I IN ACCESS EXCLUSIVE MODE NOWAIT', relation.nspname, relation.relname);
@@ -36,11 +37,29 @@ BEGIN
     JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
     WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f');
 
-    IF schema_fingerprint IS DISTINCT FROM '864226d10c5c2f1f7cb04a2e45155030'
+    IF schema_fingerprint IS NULL OR schema_fingerprint NOT IN (
+        '864226d10c5c2f1f7cb04a2e45155030', 'd4ade84aa27a5aff64b1d2e06428e88b')
         OR EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE left(n.nspname, 3) <> 'pg_' AND n.nspname NOT IN ('public', 'information_schema')
+                AND NOT (n.nspname = 'supabase_migrations' AND c.relname = 'schema_migrations')
                 AND c.relkind IN ('r', 'p', 'm', 'f')) THEN
         RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'obsolete catalog reconciliation requires a recognized schema';
+    END IF;
+
+    IF to_regclass('supabase_migrations.schema_migrations') IS NOT NULL AND (
+        (SELECT array_agg(a.attname || ':' || format_type(a.atttypid, a.atttypmod) || ':' || a.attnotnull::text ORDER BY a.attnum)
+            FROM pg_attribute a WHERE a.attrelid = to_regclass('supabase_migrations.schema_migrations')
+                AND a.attnum > 0 AND NOT a.attisdropped)
+            IS DISTINCT FROM ARRAY['version:text:true', 'statements:text[]:false', 'name:text:false']::text[]
+        OR NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass('supabase_migrations.schema_migrations')
+            AND relkind = 'r' AND NOT relrowsecurity AND NOT relforcerowsecurity)
+        OR EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = to_regclass('supabase_migrations.schema_migrations') AND NOT tgisinternal)
+        OR EXISTS (SELECT 1 FROM pg_rewrite WHERE ev_class = to_regclass('supabase_migrations.schema_migrations'))
+        OR (SELECT array_agg(pg_get_constraintdef(oid) ORDER BY conname) FROM pg_constraint
+            WHERE conrelid = to_regclass('supabase_migrations.schema_migrations'))
+            IS DISTINCT FROM ARRAY['PRIMARY KEY (version)']::text[]
+    ) THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'obsolete catalog reconciliation refuses unknown migration bookkeeping';
     END IF;
 
     IF (SELECT jsonb_agg(to_jsonb(p) ORDER BY offer_key) FROM public.billing_plan p
@@ -86,7 +105,7 @@ BEGIN
 
     FOR relation IN
         SELECT c.oid, c.relname,
-            c.relname ~ '(billing|stripe|checkout|payment|contract|entitlement|invoice|audit|history|journal|credit|ledger|grant|funding|recharge)'
+            c.relname ~ '(billing|stripe|checkout|payment|contract|entitlement|invoice|audit|history|journal|credit|ledger|grant|funding|recharge|evidence)'
             OR EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid
                 AND a.attnum > 0 AND NOT a.attisdropped
                 AND a.attname ~ '(stripe|checkout|subscription|invoice|contract|payment|entitlement|request_payload|evidence)') AS financial

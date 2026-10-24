@@ -1,5 +1,8 @@
 import hashlib
 import json
+import os
+import shutil
+import tempfile
 import subprocess
 import time
 import unittest
@@ -11,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "supabase/migrations"
 CATALOG = "20261023000000_billing_plan_catalog.sql"
 SUCCESSOR = "20261023000100_reconcile_obsolete_subscription_seeds.sql"
+CLI = os.environ.get("SUPABASE_CLI", "supabase")
 
 
 class CatalogSeedReconciliationTest(unittest.TestCase):
@@ -32,7 +36,7 @@ class CatalogSeedReconciliationTest(unittest.TestCase):
     def setUpClass(cls):
         subprocess.run(
             ["docker", "run", "--rm", "-d", "--name", cls.container,
-             "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "postgres:16"],
+             "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "postgres:17.6"],
             check=True, capture_output=True,
         )
         cls.addClassCleanup(lambda: subprocess.run(
@@ -48,7 +52,16 @@ class CatalogSeedReconciliationTest(unittest.TestCase):
             time.sleep(0.1)
         else:
             raise AssertionError("disposable PostgreSQL did not become ready")
+        cli_version = subprocess.run([CLI, "--version"], text=True, capture_output=True, check=True).stdout.strip()
+        if cli_version != "2.119.0":
+            raise AssertionError("use the deployment-pinned Supabase CLI 2.119.0")
+        cls.address = subprocess.run(
+            ["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", cls.container],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        cls.projects = {}
         for variant in ("current", "deployed", "guarded"):
+
             database = "seed_" + variant
             cls.sql("postgres", "CREATE DATABASE " + database)
             replacement = None
@@ -57,17 +70,50 @@ class CatalogSeedReconciliationTest(unittest.TestCase):
                 replacement = fixture["sql"]
                 if hashlib.sha256(replacement.encode()).hexdigest() != fixture["sha256"]:
                     raise AssertionError("historical fixture checksum differs")
-            started = time.monotonic()
+            temporary = tempfile.TemporaryDirectory(prefix="catalog-migrations-")
+            cls.addClassCleanup(temporary.cleanup)
+            project = Path(temporary.name)
+            directory = project / "supabase/migrations"
+            directory.mkdir(parents=True)
+            (project / "supabase/config.toml").write_text('project_id = "catalog-reconciliation-test"\n')
             applied = []
             for migration in sorted(MIGRATIONS.glob("*.sql")):
                 if migration.name == SUCCESSOR:
                     continue
                 statement = replacement if replacement is not None and migration.name == CATALOG else migration.read_text()
-                cls.sql(database, "BEGIN;\n" + statement + "\nCOMMIT;")
+                (directory / migration.name).write_text(statement)
                 applied.append(migration.name)
+            if variant == "deployed":
+                for migration in (ROOT / "supabase/shared-auth-history").glob("*.sql"):
+                    shutil.copyfile(migration, directory / migration.name)
+                    applied.append(migration.name)
+            cls.projects[variant] = project
+            started = time.monotonic()
+            cls.push(database, project)
             cls.evidence.append({"variant": variant, "migrations": len(applied), "seconds": round(time.monotonic() - started, 3)})
             print(json.dumps(cls.evidence[-1]), flush=True)
         cls.migration = (MIGRATIONS / SUCCESSOR).read_text()
+
+    @classmethod
+    def push(cls, database, project):
+        result = subprocess.run(
+            [CLI, "db", "push", "--db-url", "postgresql://postgres@" + cls.address + ":5432/" + database + "?sslmode=disable",
+             "--workdir", str(project), "--yes"], text=True, capture_output=True, check=False,
+        )
+        if result.returncode:
+            raise AssertionError(result.stdout + result.stderr)
+
+    def apply_successor(self, database, variant):
+        original_history = self.sql(database, "SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM supabase_migrations.schema_migrations m;").stdout
+        temporary = tempfile.TemporaryDirectory(prefix="catalog-successor-")
+        self.addCleanup(temporary.cleanup)
+        project = Path(temporary.name) / "project"
+        shutil.copytree(self.projects[variant], project)
+        shutil.copyfile(MIGRATIONS / SUCCESSOR, project / "supabase/migrations" / SUCCESSOR)
+        self.push(database, project)
+        preserved_history = self.sql(database, "SELECT jsonb_agg(to_jsonb(m) ORDER BY version) FROM supabase_migrations.schema_migrations m WHERE version <> '20261023000100';").stdout
+        self.assertEqual(original_history, preserved_history)
+        self.assertEqual(self.sql(database, "SELECT count(*) FROM supabase_migrations.schema_migrations WHERE version='20261023000100';").stdout.strip(), "1")
 
     def database(self, variant="deployed"):
         database = "case_" + uuid.uuid4().hex
@@ -88,7 +134,7 @@ class CatalogSeedReconciliationTest(unittest.TestCase):
     def test_current_main_first_and_fresh_remain_unchanged(self):
         database = self.database("current")
         before = self.snapshot(database)
-        self.sql(database, self.migration)
+        self.apply_successor(database, "current")
         self.assertEqual(before, self.snapshot(database))
         self.assertEqual(self.sql(database, "SELECT billing_plan_offer('starter_monthly'),billing_plan_offer('starter_annual');").stdout.strip(), "f|f")
         self.assertEqual(self.sql(database, "SELECT count(*) FROM plan_limits WHERE offer_key IN ('starter_monthly','starter_annual');").stdout.strip(), "0")
@@ -98,7 +144,7 @@ class CatalogSeedReconciliationTest(unittest.TestCase):
             with self.subTest(variant=variant):
                 database = self.database(variant)
                 before = json.loads(self.snapshot(database))
-                self.sql(database, self.migration)
+                self.apply_successor(database, variant)
                 after = json.loads(self.snapshot(database))
                 self.assertEqual(after["catalog"], [row for row in before["catalog"] if row["family"] != "starter"])
                 self.assertEqual(before["limits"], after["limits"])
@@ -114,6 +160,8 @@ class CatalogSeedReconciliationTest(unittest.TestCase):
             "changed_availability": "UPDATE billing_plan SET available=true WHERE offer_key='starter_annual'",
             "partial_seed": "DELETE FROM billing_plan WHERE offer_key='starter_annual'",
             "unknown_schema": "CREATE TABLE unknown_journal(payload jsonb)",
+            "unknown_ledger_column": "ALTER TABLE supabase_migrations.schema_migrations ADD COLUMN authority jsonb",
+            "unknown_ledger_relation": "CREATE TABLE supabase_migrations.authority(id text)",
             "unexpected_namespace": "CREATE SCHEMA pgx; CREATE TABLE pgx.opaque_authority(id text)",
             "incoming_reference": "ALTER TABLE plan_limits ADD CONSTRAINT obsolete_catalog_reference FOREIGN KEY(offer_key) REFERENCES billing_plan(offer_key) NOT VALID",
             "unknown_guard": "CREATE TRIGGER unknown_guard BEFORE DELETE ON billing_plan FOR EACH ROW EXECUTE FUNCTION guard_billing_plan_contract()",
