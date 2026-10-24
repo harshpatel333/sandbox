@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -36,6 +37,17 @@ func (s *staffCreditStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/billing/credit_balance_summary" {
+		for _, grant := range s.grants {
+			if grant.ID == r.URL.Query().Get("filter[credit_grant]") {
+				_ = json.NewEncoder(w).Encode(map[string]any{"balances": []any{map[string]any{"ledger_balance": map[string]any{"monetary": map[string]any{"currency": "usd", "value": grant.Amount.Monetary.Value}}}}})
+				return
+			}
+		}
+		s.t.Error("balance requested for unknown grant")
+		http.Error(w, "unknown grant", 500)
+		return
+	}
 	if r.URL.Path != "/v1/billing/credit_grants" {
 		s.t.Errorf("unexpected provider request %s %s", r.Method, r.URL)
 		http.Error(w, "unexpected", 500)
@@ -56,6 +68,7 @@ func (s *staffCreditStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var g entitlementGrant
 	g.ID = fmt.Sprintf("credgr_staff_%d_%s", s.creates, uuid.NewString())
 	g.Customer = r.PostForm.Get("customer")
+	g.EffectiveAt = time.Now().Unix()
 	g.Category = r.PostForm.Get("category")
 	g.Amount.Type = r.PostForm.Get("amount[type]")
 	g.Amount.Monetary.Currency = r.PostForm.Get("amount[monetary][currency]")
@@ -229,10 +242,10 @@ func TestStaffCreditGrantFollowsCurrentCustomer(t *testing.T) {
 
 func TestStaffCreditGrantWaitsForPeriodClose(t *testing.T) {
 	h, team, s := newStaffCreditFixture(t, true)
-	end := time.Now().Add(-time.Hour).Truncate(time.Second)
-	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$4,'price_round','round','mtr_round',$3::timestamptz-interval '2 months')`, team, s.customer, end, "sub_"+uuid.NewString()); err != nil {
-		t.Fatal(err)
-	}
+	end := time.Now().UTC().Add(-9 * 24 * time.Hour).Truncate(time.Second)
+	anchor := time.Date(end.Year(), end.Month()-1, min(end.Day(), 28), end.Hour(), end.Minute(), end.Second(), 0, time.UTC)
+	_, end, _ = billing.AnniversaryPeriod(anchor, anchor)
+	enrollStaffCreditCalendar(t, h, team, s, anchor, anchor.AddDate(0, -1, 0))
 	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2::timestamptz-interval '1 month',$2,'open')`, team, end); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +270,10 @@ func TestStaffCreditGrantWaitsForPeriodClose(t *testing.T) {
 	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "after-contract", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
 		t.Fatalf("a team back on the usage-only ledger after its contract ended was not held: %v", err)
 	}
-	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_period SET period_start=period_start-interval '8 days',period_end=period_end-interval '8 days' WHERE team_id=$1`, team); err != nil {
+	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k2", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
+		t.Fatalf("credit granted while an old usage-ledger period was unreleased: %v", err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan,state) SELECT team_id,period_start,period_end,'in_staff_credit_'||team_id,'{}'::jsonb,'released' FROM team_billing_period WHERE team_id=$1`, team); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,clock_timestamp()-interval '1 day',clock_timestamp()+interval '2 minutes','open')`, team); err != nil {
@@ -267,12 +283,6 @@ func TestStaffCreditGrantWaitsForPeriodClose(t *testing.T) {
 		t.Fatalf("credit granted moments before the period it would land after ends: %v", err)
 	}
 	if _, err := h.Pool.Exec(t.Context(), `DELETE FROM team_billing_period WHERE team_id=$1 AND period_end>clock_timestamp()`, team); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k2", AmountCents: 100, Reason: "r"}); !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
-		t.Fatalf("credit granted while an old usage-ledger period was unreleased: %v", err)
-	}
-	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan,state) SELECT team_id,period_start,period_end,'in_staff_credit_'||team_id,'{}'::jsonb,'released' FROM team_billing_period WHERE team_id=$1`, team); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "k2", AmountCents: 100, Reason: "r"}); err != nil || s.creates != 1 {
@@ -410,5 +420,119 @@ func TestStaffCreditIgnoresPricingSwitch(t *testing.T) {
 	next, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "issued-after-switch-off", AmountCents: 500, Reason: "Top-up after switch-off"})
 	if err != nil || next.State != "issued" || s.creates != 2 {
 		t.Fatalf("staff credit refused with the switch off: %+v %v", next, err)
+	}
+}
+
+func TestStaffCreditGrantWaitsForUnmeasuredPeriod(t *testing.T) {
+	h, team, s := newStaffCreditFixture(t, true)
+	end := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	anchor := time.Date(end.Year(), end.Month()-1, min(end.Day(), 28), end.Hour(), end.Minute(), end.Second(), 0, time.UTC)
+	_, end, _ = billing.AnniversaryPeriod(anchor, anchor)
+	enrollStaffCreditCalendar(t, h, team, s, anchor, anchor.Add(time.Hour))
+	req := staffCreditRequest{Key: "unmeasured", AmountCents: 100, Reason: "Correction"}
+	credit, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req)
+	if !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
+		t.Fatalf("credit issued before delayed period was measured: state=%s creates=%d error=%v", credit.State, s.creates, err)
+	}
+	if _, err = h.Pool.Exec(t.Context(), `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, team, anchor, end); err != nil {
+		t.Fatal(err)
+	}
+	period := billing.ExportPeriod{TeamID: team, Start: anchor, End: end}
+	account, enrolled, err := h.invoiceAccountForPeriod(t.Context(), period)
+	if err != nil || !enrolled {
+		t.Fatalf("account unavailable: %v", err)
+	}
+	path, err := h.invoiceCreditPath(t.Context(), period, account, h.Pool)
+	if err != nil || path != invoiceCreditsLedger {
+		t.Fatalf("wrong delayed-period credit path: %v %v", path, err)
+	}
+	client := h.Stripe.(*stripeHTTPClient)
+	if balance, err := client.invoiceCreditLedger(t.Context(), s.customer, end.Unix()); err != nil || balance != 0 {
+		t.Fatalf("delayed invoice ledger blocked: balance=%d %v", balance, err)
+	}
+	if _, err = h.grantStaffCredit(t.Context(), team, uuid.New(), req); !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
+		t.Fatalf("measured unreleased period was not protected: %v", err)
+	}
+	if _, err = h.Pool.Exec(t.Context(), `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan,state) VALUES($1,$2,$3,$4,'{}'::jsonb,'released')`, team, anchor, end, "in_"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req)
+	if err != nil || issued.ID != credit.ID || issued.State != "issued" || s.creates != 1 {
+		t.Fatalf("same request did not resume after release: creates=%d %+v %v", s.creates, issued, err)
+	}
+	if len(s.grants) != 1 || s.grants[0].EffectiveAt <= end.Unix() || s.grants[0].Amount.Monetary.Value != 100 {
+		t.Fatal("provider did not model a newly effective positive grant")
+	}
+	if balance, err := client.invoiceCreditLedger(t.Context(), s.customer, time.Now().Unix()); err != nil || balance != 100 {
+		t.Fatalf("new credit not usable for current usage: balance=%d %v", balance, err)
+	}
+	replay, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req)
+	if err != nil || replay.ID != issued.ID || s.creates != 1 {
+		t.Fatalf("retry created another grant: creates=%d %v", s.creates, err)
+	}
+}
+
+func enrollStaffCreditCalendar(t *testing.T, h *Handlers, team uuid.UUID, s *staffCreditStripe, anchor, enrolled time.Time) {
+	t.Helper()
+	subscription := "sub_" + uuid.NewString()
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status='active',commercial_billing_anchor=$3 WHERE team_id=$1`, team, subscription, anchor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','mtr_round',$4)`, team, s.customer, subscription, enrolled); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaffCreditGrantProtectsUnmeasuredCalendarGap(t *testing.T) {
+	h, team, s := newStaffCreditFixture(t, true)
+	end := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	anchor := time.Date(end.Year(), end.Month()-2, min(end.Day(), 28), end.Hour(), end.Minute(), end.Second(), 0, time.UTC)
+	_, middle, ok := billing.AnniversaryPeriod(anchor, anchor)
+	if !ok {
+		t.Fatal("missing calendar")
+	}
+	_, end, _ = billing.AnniversaryPeriod(anchor, middle)
+	enrollStaffCreditCalendar(t, h, team, s, anchor, anchor.Add(time.Hour))
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, team, middle, end); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan,state) VALUES($1,$2,$3,$4,'{}'::jsonb,'released')`, team, middle, end, "in_"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	req := staffCreditRequest{Key: "gap", AmountCents: 100, Reason: "Correction"}
+	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req); !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
+		t.Fatalf("latest release hid an unmeasured older period: creates=%d error=%v", s.creates, err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, team, anchor, middle); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan,state) VALUES($1,$2,$3,$4,'{}'::jsonb,'released')`, team, anchor, middle, "in_"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.grantStaffCredit(t.Context(), team, uuid.New(), req); err != nil || s.creates != 1 {
+		t.Fatalf("credit did not resume after closing calendar gap: %v", err)
+	}
+}
+
+func TestStaffCreditGrantRequiresEnrolledCalendar(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("missing_anchor=%t", missing), func(t *testing.T) {
+			h, team, s := newStaffCreditFixture(t, true)
+			anchor := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+			enrollStaffCreditCalendar(t, h, team, s, anchor, anchor.Add(time.Minute))
+			if missing {
+				if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET commercial_billing_anchor=NULL WHERE team_id=$1`, team); err != nil {
+					t.Fatal(err)
+				}
+			}
+			credit, err := h.grantStaffCredit(t.Context(), team, uuid.New(), staffCreditRequest{Key: "calendar", AmountCents: 100, Reason: "Correction"})
+			if missing {
+				if !errors.Is(err, errStaffCreditConflict) || s.creates != 0 {
+					t.Fatalf("missing enrolled calendar accepted: %v", err)
+				}
+			} else if err != nil || credit.State != "issued" || s.creates != 1 {
+				t.Fatalf("fresh enrollment without ended periods rejected: %v", err)
+			}
+		})
 	}
 }

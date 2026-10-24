@@ -94,14 +94,44 @@ func (h *Handlers) CreateStaffCreditGrant(c *gin.Context) {
 	c.JSON(http.StatusOK, credit)
 }
 
-// usageLedgerPeriodClosing reports a period ending within the attempt window or
-// ended and still being closed through the usage-only credit ledger,
-// which cannot place credit that became effective after the period ended into
-// that period's held invoice.
+// usageLedgerPeriodClosing includes the enrolled commercial calendar because
+// delayed measurement can create a period after a grant would become effective.
 func (h *Handlers) usageLedgerPeriodClosing(ctx context.Context, team uuid.UUID, reader db.DBTX) (bool, error) {
-	rows, err := reader.Query(ctx, `SELECT p.period_start,p.period_end FROM team_billing_period p JOIN billing_invoice_account i USING(team_id)
-        WHERE p.team_id=$1 AND i.enrolled_at<p.period_end AND p.period_end<=clock_timestamp()+interval '5 minutes'
-        AND NOT EXISTS(SELECT 1 FROM billing_invoice_close c WHERE c.team_id=p.team_id AND c.period_start=p.period_start AND c.period_end=p.period_end AND c.state='released')`, team)
+	var enrolledAt, through time.Time
+	var anchor *time.Time
+	err := reader.QueryRow(ctx, `SELECT i.enrolled_at,a.commercial_billing_anchor,clock_timestamp()+interval '5 minutes'
+ FROM billing_invoice_account i JOIN team_billing_account a USING(team_id) WHERE i.team_id=$1`, team).Scan(&enrolledAt, &anchor, &through)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if anchor == nil {
+		return true, nil
+	}
+	at := enrolledAt
+	if at.Before(*anchor) {
+		at = *anchor
+	}
+	var starts, ends []time.Time
+	for at.Before(through) {
+		start, end, ok := billing.AnniversaryPeriod(*anchor, at)
+		if !ok {
+			return true, nil
+		}
+		if end.After(through) {
+			break
+		}
+		starts = append(starts, start)
+		ends = append(ends, end)
+		at = end
+	}
+	rows, err := reader.Query(ctx, `WITH candidates AS (
+ SELECT period_start,period_end FROM team_billing_period WHERE team_id=$1 AND period_end>$2 AND period_end<=$3
+ UNION SELECT * FROM unnest($4::timestamptz[],$5::timestamptz[])
+ ) SELECT p.period_start,p.period_end FROM candidates p
+ WHERE NOT EXISTS(SELECT 1 FROM billing_invoice_close c WHERE c.team_id=$1 AND c.period_start=p.period_start AND c.period_end=p.period_end AND c.state='released')`, team, enrolledAt, through, starts, ends)
 	if err != nil {
 		return false, err
 	}
@@ -235,7 +265,7 @@ func (h *Handlers) beginStaffCreditAttempt(ctx context.Context, team uuid.UUID, 
 		return err
 	}
 	if closing {
-		return staffCreditConflict("the team's invoice period is ending or still being closed; retry once it is finalized")
+		return staffCreditConflict("required invoice periods are not fully measured and released; complete invoice reconciliation before retrying")
 	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_staff_credit_grant SET attempts=attempts+1,attempted_at=clock_timestamp() WHERE id=$1 AND state='pending'`, credit.ID); err != nil {
 		return err
