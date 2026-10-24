@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1008,7 +1007,8 @@ func TestIntegration_UnassignedFreeEntryWaitsForPricingAdoption(t *testing.T) {
 }
 
 func TestIntegration_PricingEntryReaderUsesRestrictedRole(t *testing.T) {
-	tx, err := testPool.Begin(t.Context())
+	pool := teamCreationDatabase(t)
+	tx, err := pool.Begin(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
