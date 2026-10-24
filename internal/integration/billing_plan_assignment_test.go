@@ -53,10 +53,19 @@ func TestIntegration_BillingPlanUnderPricingV2(t *testing.T) {
         VALUES($1,'starter','prepaid','{"display_name":"Starter"}','{"max_concurrent":100,"max_vcpu":2}',clock_timestamp(),'credit_purchase','first purchase')`, teamID); err != nil {
 		t.Fatal(err)
 	}
+	r := newRouter(t)
+	upgradeResponse := do(r, http.MethodGet, "/billing/plan-change-preview?target_plan=pro_monthly", key, "")
+	var upgrade struct {
+		Timing       string `json:"timing"`
+		Blocked      string `json:"blocked"`
+		PreviewToken string `json:"preview_token"`
+	}
+	if upgradeResponse.Code != http.StatusOK || json.Unmarshal(upgradeResponse.Body.Bytes(), &upgrade) != nil || upgrade.Blocked == "" || upgrade.Timing != "" || upgrade.PreviewToken != "" {
+		t.Fatalf("upgrade offered before adoption release: %d %s", upgradeResponse.Code, upgradeResponse.Body)
+	}
 	if w := operatorRequest(internal, http.MethodPost, "/internal/billing/pricing-version", admin, `{"pricing_version":"legacy","reason":"test entry gate"}`); w.Code != http.StatusOK {
 		t.Fatal(w.Body.String())
 	}
-	r := newRouter(t)
 	for _, k := range []string{key, viewerKey} {
 		w := do(r, "GET", "/billing/plan", k, "")
 		var body struct {

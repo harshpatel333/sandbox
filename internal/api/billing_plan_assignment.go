@@ -425,9 +425,10 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		return
 	}
 	var current teamPlan
-	var assigned, on bool
+	var assigned bool
+	var pricing pricingPublicState
 	if err == nil {
-		on, err = h.pricingV2Enabled(ctx)
+		pricing, err = h.publicPricingState(ctx)
 	}
 	if err == nil {
 		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
@@ -446,7 +447,7 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 		preview.Blocked = "this plan is no longer offered"
 	default:
 		preview.Timing, preview.Blocked = planChangeRule(current.Kind, kind)
-		if !on && preview.Timing == planChangeAfterPurchase {
+		if !pricing.EntryOpen && preview.Timing == planChangeAfterPurchase {
 			preview.Timing, preview.Blocked = "", "new plans are not available yet"
 		}
 	}
@@ -553,8 +554,8 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 		return teamPlan{}, err
 	}
 	defer tx.Rollback(ctx)
-	var version string
-	if err := tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch FOR SHARE`).Scan(&version); err != nil {
+	version, entryOpen, err := lockPricingEntry(ctx, tx)
+	if err != nil {
 		return teamPlan{}, err
 	}
 	if _, err := tx.Exec(ctx, `SELECT 1 FROM team WHERE id=$1 FOR NO KEY UPDATE`, team); err != nil {
@@ -570,7 +571,7 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return teamPlan{}, err
 	}
-	if version != "v2" {
+	if version != "v2" || !entryOpen {
 		return teamPlan{}, errPricingV2Off
 	}
 	catalogVersion, err := scanPlanVersion(tx.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1 AND state<>'draft' FOR SHARE`, body.VersionID))

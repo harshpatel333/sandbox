@@ -47,6 +47,13 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, spec tableSp
 		return 0, 0, err
 	}
 	defer tx.Rollback(ctx)
+	var pricing string
+	if err := tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch WHERE singleton FOR SHARE`).Scan(&pricing); err != nil {
+		return 0, 0, err
+	}
+	if pricing == "v2" {
+		return 0, 0, fmt.Errorf("regional team import is unavailable while pricing v2 is active")
+	}
 	payload, count, err := assignmentSnapshot(ctx, src, team)
 	if err != nil {
 		return 0, 0, err

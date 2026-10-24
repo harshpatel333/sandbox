@@ -3188,6 +3188,16 @@ func TestPlanAssignmentMigration(t *testing.T) {
     VALUES($1,$2,'custom_example','custom','{"display_name":"Frozen Custom"}','{"max_concurrent":30,"max_memory_mib":8192}',clock_timestamp(),'staff','agreement','request-one')`, second, team)
 			mustExec(t, srcPool, `UPDATE team SET max_sandboxes=17,max_template_memory_mib=2048,limits_customized=true WHERE id=$1`, team)
 			spec, _ := tableByName("team")
+			if pricing == "v2" {
+				if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil || !strings.Contains(err.Error(), "regional team import is unavailable") {
+					t.Fatalf("assigned v2 import not refused: %v", err)
+				}
+				var published bool
+				if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1)`, team).Scan(&published); err != nil || published {
+					t.Fatalf("refused assigned import persisted: %t %v", published, err)
+				}
+				return
+			}
 			for i := 0; i < 2; i++ {
 				if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err != nil {
 					t.Fatal(err)
@@ -3238,13 +3248,21 @@ func TestPlanAssignmentMigration(t *testing.T) {
 			}
 		})
 	}
-	t.Run("unassigned legacy team stays unassigned in v2", func(t *testing.T) {
+	t.Run("v2 destination refuses unassigned import before publication", func(t *testing.T) {
 		team := uuid.New()
 		mustExec(t, srcPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
 		mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='v2'`)
 		t.Cleanup(func() { mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`) })
 		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "unassigned-"+team.String())
 		spec, _ := tableByName("team")
+		if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil || !strings.Contains(err.Error(), "regional team import is unavailable") {
+			t.Fatalf("v2 import not refused: %v", err)
+		}
+		var published bool
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1)`, team).Scan(&published); err != nil || published {
+			t.Fatalf("refused import published destination: %t %v", published, err)
+		}
+		mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
 		if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err != nil {
 			t.Fatal(err)
 		}
