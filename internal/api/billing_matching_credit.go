@@ -146,9 +146,11 @@ func (h *Handlers) startMatchingCredits(ctx context.Context, client *stripeHTTPC
 }
 
 func (h *Handlers) matchingCreditTick(ctx context.Context, client *stripeHTTPClient) error {
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	return errors.Join(h.recordPaidMatchingInvoices(ctx, client), h.issueDueMatchingCredits(ctx, client), h.reviewMatchedInvoices(ctx, client))
+	return runBillingPhases(ctx, time.Minute,
+		func(ctx context.Context) error { return h.recordPaidMatchingInvoices(ctx, client) },
+		func(ctx context.Context) error { return h.issueDueMatchingCredits(ctx, client) },
+		func(ctx context.Context) error { return h.reviewMatchedInvoices(ctx, client) },
+	)
 }
 
 type matchingCandidate struct {
