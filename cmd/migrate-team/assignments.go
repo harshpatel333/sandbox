@@ -27,7 +27,7 @@ func lockSourceAssignments(ctx context.Context, tx pgx.Tx, team uuid.UUID) error
 }
 
 func checkFreePauseTransfer(ctx context.Context, q querier, team uuid.UUID) error {
-	for _, table := range []string{"billing_free_allowance", "billing_team_pause_request", "billing_team_pause_target"} {
+	for _, table := range []string{"billing_free_allowance", "billing_team_pause_request", "billing_team_pause_target", "billing_free_allowance_retry"} {
 		var exists bool
 		if err := q.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "public."+table).Scan(&exists); err != nil {
 			return err

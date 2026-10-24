@@ -34,6 +34,20 @@ func (h *Handlers) refreshFreeAllowances(ctx context.Context) {
 		}
 		return
 	}
+	retryBudget := time.Second
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline)/4 < retryBudget {
+		retryBudget = time.Until(deadline) / 4
+	}
+	if retryBudget > 0 {
+		retryCtx, cancel := context.WithTimeout(ctx, retryBudget)
+		retries, retryErr := h.DB.ClaimFreeAllowanceRetries(retryCtx)
+		if retryErr != nil {
+			log.Error().Err(retryErr).Msg("billing: claim allowance retries failed")
+		} else {
+			processSweepPage(retryCtx, retries, 10, func(id uuid.UUID) bool { return h.refreshFreeAllowanceTeam(retryCtx, id, true) })
+		}
+		cancel()
+	}
 	for ctx.Err() == nil {
 		teams, err := h.DB.ListFreeTeamsWithActiveSandboxes(ctx, db.ListFreeTeamsWithActiveSandboxesParams{AfterTeamID: afterID, BatchLimit: freeAllowancePageSize})
 		if err != nil {
@@ -41,11 +55,7 @@ func (h *Handlers) refreshFreeAllowances(ctx context.Context) {
 			return
 		}
 		next, advance := processSweepPage(ctx, teams, freeAllowancePageSize, func(teamID uuid.UUID) bool {
-			if _, err := h.DB.RefreshFreeAllowance(ctx, teamID); err != nil {
-				log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh free allowance failed")
-				return false
-			}
-			return true
+			return h.refreshFreeAllowanceTeam(ctx, teamID, false)
 		})
 		if advance {
 			h.advanceSweepCursor(ctx, freeAllowanceSweepName, next)
@@ -55,6 +65,28 @@ func (h *Handlers) refreshFreeAllowances(ctx context.Context) {
 		}
 		afterID = next
 	}
+}
+
+func (h *Handlers) refreshFreeAllowanceTeam(ctx context.Context, team uuid.UUID, retry bool) bool {
+	if _, err := h.DB.RefreshFreeAllowance(ctx, team); err != nil {
+		log.Error().Err(err).Str("team_id", team.String()).Msg("billing: refresh free allowance failed")
+		if retry {
+			return false
+		}
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+		if err := h.DB.ScheduleFreeAllowanceRetry(persistCtx, team); err != nil {
+			log.Error().Err(err).Str("team_id", team.String()).Msg("billing: persist allowance retry failed")
+			return false
+		}
+		return true
+	}
+	if retry {
+		if err := h.DB.ClearFreeAllowanceRetry(ctx, team); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func requestTeamPauseAll(ctx context.Context, q *db.Queries, teamID uuid.UUID, reason string) (int32, error) {

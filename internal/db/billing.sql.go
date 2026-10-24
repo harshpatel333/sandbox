@@ -416,6 +416,36 @@ func (q *Queries) BlockTeamBillingPeriod(ctx context.Context, arg BlockTeamBilli
 	return i, err
 }
 
+const claimFreeAllowanceRetries = `-- name: ClaimFreeAllowanceRetries :many
+WITH due AS (
+ SELECT team_id FROM billing_free_allowance_retry WHERE next_attempt_at<=clock_timestamp()
+ ORDER BY next_attempt_at,team_id LIMIT 10 FOR UPDATE SKIP LOCKED
+)
+UPDATE billing_free_allowance_retry r
+SET next_attempt_at=clock_timestamp()+interval '15 seconds',attempts=r.attempts+1
+FROM due WHERE r.team_id=due.team_id RETURNING r.team_id
+`
+
+func (q *Queries) ClaimFreeAllowanceRetries(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, claimFreeAllowanceRetries)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var team_id uuid.UUID
+		if err := rows.Scan(&team_id); err != nil {
+			return nil, err
+		}
+		items = append(items, team_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const claimStripeWebhookProcessingLease = `-- name: ClaimStripeWebhookProcessingLease :one
 INSERT INTO stripe_webhook_processing_lease(customer_id, token, expires_at)
 VALUES($1, $2, now() + interval '1 minute')
@@ -521,6 +551,15 @@ func (q *Queries) ClaimTrialCreditWarningForLifecycle(ctx context.Context, arg C
 	var claim_token pgtype.UUID
 	err := row.Scan(&claim_token)
 	return claim_token, err
+}
+
+const clearFreeAllowanceRetry = `-- name: ClearFreeAllowanceRetry :exec
+DELETE FROM billing_free_allowance_retry WHERE team_id=$1
+`
+
+func (q *Queries) ClearFreeAllowanceRetry(ctx context.Context, teamID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, clearFreeAllowanceRetry, teamID)
+	return err
 }
 
 const completeStripeActivationCreditRevocation = `-- name: CompleteStripeActivationCreditRevocation :one
@@ -2418,6 +2457,7 @@ FROM team_plan_assignment a
 WHERE a.effective_to IS NULL
   AND a.kind = 'free'
   AND a.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+  AND NOT EXISTS(SELECT 1 FROM billing_free_allowance_retry r WHERE r.team_id=a.team_id)
   AND EXISTS (
       SELECT 1 FROM sandbox s
       WHERE s.team_id = a.team_id AND s.destroyed_at IS NULL AND s.status = 'active'
@@ -3887,6 +3927,17 @@ func (q *Queries) ResumeTeamBillingCheckout(ctx context.Context, arg ResumeTeamB
 		&i.StripeActivationIdentityEvidenceVersion,
 	)
 	return i, err
+}
+
+const scheduleFreeAllowanceRetry = `-- name: ScheduleFreeAllowanceRetry :exec
+INSERT INTO billing_free_allowance_retry(team_id)
+SELECT id FROM team WHERE id=$1
+ON CONFLICT(team_id) DO NOTHING
+`
+
+func (q *Queries) ScheduleFreeAllowanceRetry(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, scheduleFreeAllowanceRetry, id)
+	return err
 }
 
 const setBillingUsageExportIdempotencyKey = `-- name: SetBillingUsageExportIdempotencyKey :one

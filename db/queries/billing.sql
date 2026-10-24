@@ -1656,6 +1656,7 @@ FROM team_plan_assignment a
 WHERE a.effective_to IS NULL
   AND a.kind = 'free'
   AND a.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+  AND NOT EXISTS(SELECT 1 FROM billing_free_allowance_retry r WHERE r.team_id=a.team_id)
   AND EXISTS (
       SELECT 1 FROM sandbox s
       WHERE s.team_id = a.team_id AND s.destroyed_at IS NULL AND s.status = 'active'
@@ -1715,3 +1716,20 @@ SELECT billing_pricing_version()::text AS pricing_version;
 SELECT count(*)::int FROM team t CROSS JOIN LATERAL pricing_v2_activation_bucket(t.id) b
 WHERE t.home_region=sqlc.arg(region) AND t.id<>sqlc.arg(system_team_id)
   AND b.bucket IN ('free','legacy_payg','blocked','lapsed','contract');
+
+-- name: ScheduleFreeAllowanceRetry :exec
+INSERT INTO billing_free_allowance_retry(team_id)
+SELECT id FROM team WHERE id=$1
+ON CONFLICT(team_id) DO NOTHING;
+
+-- name: ClaimFreeAllowanceRetries :many
+WITH due AS (
+ SELECT team_id FROM billing_free_allowance_retry WHERE next_attempt_at<=clock_timestamp()
+ ORDER BY next_attempt_at,team_id LIMIT 10 FOR UPDATE SKIP LOCKED
+)
+UPDATE billing_free_allowance_retry r
+SET next_attempt_at=clock_timestamp()+interval '15 seconds',attempts=r.attempts+1
+FROM due WHERE r.team_id=due.team_id RETURNING r.team_id;
+
+-- name: ClearFreeAllowanceRetry :exec
+DELETE FROM billing_free_allowance_retry WHERE team_id=$1;

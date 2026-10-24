@@ -614,6 +614,12 @@ type BillingFreeAllowance struct {
 	EvaluatedAt     time.Time          `json:"evaluated_at"`
 }
 
+type BillingFreeAllowanceRetry struct {
+	TeamID        uuid.UUID `json:"team_id"`
+	NextAttemptAt time.Time `json:"next_attempt_at"`
+	Attempts      int64     `json:"attempts"`
+}
+
 type BillingFundingAccount struct {
 	TeamID             uuid.UUID          `json:"team_id"`
 	Observe            bool               `json:"observe"`

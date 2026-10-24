@@ -83,9 +83,7 @@ CREATE FUNCTION billing_assert_pricing_entry_open(p_epoch uuid DEFAULT NULL,p_pr
 RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path=public,pg_temp AS $$
 DECLARE actual_epoch uuid; model text; opened boolean;
 BEGIN
- PERFORM 1 FROM billing_pricing_switch WHERE singleton FOR SHARE;
- PERFORM 1 FROM billing_pricing_adoption WHERE singleton FOR SHARE;
- SELECT pricing_version,entry_open,epoch INTO model,opened,actual_epoch FROM billing_pricing_public_state();
+ SELECT pricing_version,entry_open,epoch INTO model,opened,actual_epoch FROM billing_lock_pricing_public_state();
  IF NOT opened OR actual_epoch IS NULL OR (p_epoch IS NULL)<>(p_pricing_version IS NULL)
   OR (p_epoch IS NOT NULL AND p_epoch<>actual_epoch) OR (p_pricing_version IS NOT NULL AND p_pricing_version<>model) THEN
   RAISE EXCEPTION 'pricing adoption entry is closed or epoch changed' USING ERRCODE='55000';
@@ -149,7 +147,7 @@ BEGIN
  IF NOT billing_pricing_adoption_evidence_valid(p_region,p_system,p_epoch,p_evidence) THEN
   RAISE EXCEPTION 'explicit current region/system/epoch and matching assembled/schema/worker SHA with deployment/verified worker evidence required';
  END IF;
- IF to_regprocedure('request_team_pause_all(uuid,text)') IS NULL OR to_regprocedure('billing_pause_target_settled(billing_team_pause_target)') IS NULL
+ IF to_regprocedure('billing_lock_pricing_public_state()') IS NULL OR to_regclass('public.billing_free_allowance_retry') IS NULL OR to_regprocedure('request_team_pause_all(uuid,text)') IS NULL OR to_regprocedure('billing_pause_target_settled(billing_team_pause_target)') IS NULL
   OR to_regprocedure('billing_free_allowance_refresh(uuid)') IS NULL OR to_regprocedure('guard_free_sandbox_shape()') IS NULL THEN
   RAISE EXCEPTION 'required allowance and pause worker schema missing';
  END IF;
@@ -164,9 +162,9 @@ BEGIN
  END IF;
  PERFORM id FROM team WHERE id<>p_system ORDER BY id FOR SHARE;
  snapshot:=billing_capture_pricing_adoption(p_region,p_system,p_actor,p_reason);
- IF (snapshot->>'unassigned')::bigint<>0 OR EXISTS(SELECT 1 FROM billing_team_pause_target t WHERE t.team_id<>p_system AND t.done_at IS NULL AND NOT billing_pause_target_settled(t)) THEN
+ IF (snapshot->>'unassigned')::bigint<>0 OR EXISTS(SELECT 1 FROM billing_free_allowance_retry WHERE team_id<>p_system) OR EXISTS(SELECT 1 FROM billing_team_pause_target t WHERE t.team_id<>p_system AND t.done_at IS NULL AND NOT billing_pause_target_settled(t)) THEN
   INSERT INTO billing_pricing_adoption_event(epoch,region,action,actor,reason,details) VALUES(a.epoch,p_region,'release_blocked',p_actor,p_reason,snapshot);
-  RETURN snapshot||jsonb_build_object('released',false,'blocker','unassigned teams or unsettled pause targets');
+  RETURN snapshot||jsonb_build_object('released',false,'blocker','unassigned teams, allowance retries or unsettled pause targets');
  END IF;
  UPDATE billing_pricing_adoption SET state='released',evidence=p_evidence,released_at=clock_timestamp() WHERE singleton;
  INSERT INTO billing_pricing_adoption_event(epoch,region,action,actor,reason,details) VALUES(a.epoch,p_region,'release',p_actor,p_reason,p_evidence||snapshot);
