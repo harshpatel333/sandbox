@@ -268,5 +268,5 @@ blocked inventory/event and makes the CLI exit nonzero. Enabled signup/shape
 triggers and allowance/pause schema are required. Successful release records its
 evidence and opens the effective public v2 gate. Signup holds the switch lock and
 assigns Free even during preparation, so release cannot miss a planless newborn.
-Regional imports also fence on the switch and refuse released v2 destinations.
+Regional imports also fence on the switch and refuse every raw-v2 destination.
 Service roles can read/assert the gate but cannot prepare, capture or release it.
