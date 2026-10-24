@@ -638,37 +638,40 @@ type BillingFreeAllowanceRetry struct {
 }
 
 type BillingFundingAccount struct {
-	TeamID             uuid.UUID          `json:"team_id"`
-	Observe            bool               `json:"observe"`
-	Enforce            bool               `json:"enforce"`
-	Generation         int64              `json:"generation"`
-	NextCheckAt        time.Time          `json:"next_check_at"`
-	LeaseToken         pgtype.UUID        `json:"lease_token"`
-	LeaseUntil         pgtype.Timestamptz `json:"lease_until"`
-	CustomerID         *string            `json:"customer_id"`
-	SubscriptionID     *string            `json:"subscription_id"`
-	ObservedGeneration *int64             `json:"observed_generation"`
-	CreditUsd          pgtype.Numeric     `json:"credit_usd"`
-	CreditValidUntil   pgtype.Timestamptz `json:"credit_valid_until"`
-	CreditEvidence     []byte             `json:"credit_evidence"`
-	PaymentMethodID    *string            `json:"payment_method_id"`
-	PaymentMethodReady bool               `json:"payment_method_ready"`
-	CollectionReady    bool               `json:"collection_ready"`
-	CashChargeID       *string            `json:"cash_charge_id"`
-	CashCollected      bool               `json:"cash_collected"`
-	ChargeCursor       *string            `json:"charge_cursor"`
-	ProviderValidUntil pgtype.Timestamptz `json:"provider_valid_until"`
-	ProviderEvidence   []byte             `json:"provider_evidence"`
-	CheckedAt          pgtype.Timestamptz `json:"checked_at"`
-	ProviderCheckedAt  pgtype.Timestamptz `json:"provider_checked_at"`
-	CreditCheckedAt    pgtype.Timestamptz `json:"credit_checked_at"`
-	LastError          *string            `json:"last_error"`
-	Failures           int32              `json:"failures"`
+	TeamID                uuid.UUID          `json:"team_id"`
+	Observe               bool               `json:"observe"`
+	Enforce               bool               `json:"enforce"`
+	Generation            int64              `json:"generation"`
+	NextCheckAt           time.Time          `json:"next_check_at"`
+	LeaseToken            pgtype.UUID        `json:"lease_token"`
+	LeaseUntil            pgtype.Timestamptz `json:"lease_until"`
+	CustomerID            *string            `json:"customer_id"`
+	SubscriptionID        *string            `json:"subscription_id"`
+	ObservedGeneration    *int64             `json:"observed_generation"`
+	CreditUsd             pgtype.Numeric     `json:"credit_usd"`
+	CreditValidUntil      pgtype.Timestamptz `json:"credit_valid_until"`
+	CreditEvidence        []byte             `json:"credit_evidence"`
+	PaymentMethodID       *string            `json:"payment_method_id"`
+	PaymentMethodReady    bool               `json:"payment_method_ready"`
+	CollectionReady       bool               `json:"collection_ready"`
+	CashChargeID          *string            `json:"cash_charge_id"`
+	CashCollected         bool               `json:"cash_collected"`
+	ChargeCursor          *string            `json:"charge_cursor"`
+	ProviderValidUntil    pgtype.Timestamptz `json:"provider_valid_until"`
+	ProviderEvidence      []byte             `json:"provider_evidence"`
+	CheckedAt             pgtype.Timestamptz `json:"checked_at"`
+	ProviderCheckedAt     pgtype.Timestamptz `json:"provider_checked_at"`
+	CreditCheckedAt       pgtype.Timestamptz `json:"credit_checked_at"`
+	LastError             *string            `json:"last_error"`
+	Failures              int32              `json:"failures"`
+	Prepaid               bool               `json:"prepaid"`
+	PrepaidEnrolmentDueAt pgtype.Timestamptz `json:"prepaid_enrolment_due_at"`
 }
 
 type BillingFundingPolicy struct {
 	Singleton        bool  `json:"singleton"`
 	MaxObservedTeams int32 `json:"max_observed_teams"`
+	BatchSize        int32 `json:"batch_size"`
 }
 
 type BillingIncrementalPeriod struct {
@@ -939,6 +942,53 @@ type BillingPlanVersion struct {
 	PublishedAt               pgtype.Timestamptz `json:"published_at"`
 	RetiredBy                 pgtype.UUID        `json:"retired_by"`
 	RetiredAt                 pgtype.Timestamptz `json:"retired_at"`
+}
+
+type BillingPrepaidAutoRecharge struct {
+	TeamID         uuid.UUID          `json:"team_id"`
+	Enabled        bool               `json:"enabled"`
+	ThresholdCents *int64             `json:"threshold_cents"`
+	AmountCents    *int64             `json:"amount_cents"`
+	UpdatedBy      pgtype.UUID        `json:"updated_by"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+	DisabledReason *string            `json:"disabled_reason"`
+	DisabledAt     pgtype.Timestamptz `json:"disabled_at"`
+	DisabledBy     pgtype.UUID        `json:"disabled_by"`
+	NotifiedAt     pgtype.Timestamptz `json:"notified_at"`
+}
+
+type BillingPrepaidPurchase struct {
+	ID                     uuid.UUID          `json:"id"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	CustomerID             string             `json:"customer_id"`
+	Source                 string             `json:"source"`
+	AmountCents            int64              `json:"amount_cents"`
+	ActorID                pgtype.UUID        `json:"actor_id"`
+	PlanSnapshot           []byte             `json:"plan_snapshot"`
+	PaymentState           string             `json:"payment_state"`
+	PaymentIdempotencyKey  string             `json:"payment_idempotency_key"`
+	PaymentRequest         []byte             `json:"payment_request"`
+	PaymentFirstAttemptAt  pgtype.Timestamptz `json:"payment_first_attempt_at"`
+	CheckoutSessionID      *string            `json:"checkout_session_id"`
+	PaymentIntentID        *string            `json:"payment_intent_id"`
+	InvoiceID              *string            `json:"invoice_id"`
+	PaymentEvidence        []byte             `json:"payment_evidence"`
+	PaidAt                 pgtype.Timestamptz `json:"paid_at"`
+	FailureCode            *string            `json:"failure_code"`
+	FailureReason          *string            `json:"failure_reason"`
+	CreditState            string             `json:"credit_state"`
+	CreditIdempotencyKey   string             `json:"credit_idempotency_key"`
+	CreditRequest          []byte             `json:"credit_request"`
+	CreditFirstAttemptAt   pgtype.Timestamptz `json:"credit_first_attempt_at"`
+	StripeCreditGrantID    *string            `json:"stripe_credit_grant_id"`
+	CreditEvidence         []byte             `json:"credit_evidence"`
+	CreditedAt             pgtype.Timestamptz `json:"credited_at"`
+	CreditVoidedAt         pgtype.Timestamptz `json:"credit_voided_at"`
+	NextAttemptAt          time.Time          `json:"next_attempt_at"`
+	Failures               int32              `json:"failures"`
+	LastError              *string            `json:"last_error"`
+	CreatedAt              time.Time          `json:"created_at"`
+	CreditBalanceCheckedAt pgtype.Timestamptz `json:"credit_balance_checked_at"`
 }
 
 type BillingPricingAdoption struct {

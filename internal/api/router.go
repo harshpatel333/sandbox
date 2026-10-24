@@ -120,6 +120,9 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/stripe/plan-choice", h.CommitFreeSignupPlan)
 		api.POST("/stripe/pro-checkout/recover", h.RecoverProCheckout)
 		api.POST("/stripe/customer-portal-session", h.CreateStripeCustomerPortalSession)
+		api.GET("/billing/prepaid", h.GetPrepaidCredit)
+		api.POST("/billing/prepaid/checkout", h.CreatePrepaidCheckout)
+		api.PUT("/billing/prepaid/auto-recharge", h.PutPrepaidAutoRecharge)
 
 		// RBAC Phase 2b customer-facing team management.
 		api.GET("/teams/:team_id/management", h.GetTeamManagement)
@@ -187,6 +190,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.POST("/teams/:team_id/billing/matching", h.AttachTeamMatchingRule)
 		operator.POST("/teams/:team_id/billing/matching/revoke", h.RevokeTeamMatchingRule)
 		operator.POST("/teams/:team_id/billing/matching/credits/:credit_id/acknowledge", h.AcknowledgeMatchingCreditFlag)
+		operator.POST("/teams/:team_id/billing/prepaid/auto-recharge/disable", h.DisablePlatformAutoRecharge)
 		operator.POST("/teams/:team_id/billing/sponsored-annual/preflight", h.SponsoredAnnualPreflight)
 		operator.POST("/teams/:team_id/billing/sponsored-annual", h.SponsoredAnnualApply)
 		operator.GET("/teams/:team_id/billing/sponsored-annual/:operation_id", h.SponsoredAnnualStatus)
@@ -275,6 +279,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/teams/:team_id/billing/periods/:period_id/export-accounting", h.GetBillingExportAccounting)
 		internal.GET("/teams/:team_id/billing/matching", h.GetTeamMatchingCredit)
 		internal.GET("/billing/matching/flags", h.ListMatchingCreditFlags)
+		internal.GET("/teams/:team_id/billing/prepaid", h.GetPlatformTeamPrepaid)
+		internal.GET("/billing/prepaid/purchases", h.ListPrepaidPurchases)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)
