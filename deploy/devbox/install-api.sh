@@ -143,6 +143,44 @@ pending_list=$(pending_migrations)
 mapfile -t pending <<<"$pending_list"
 [[ -n ${pending[0]} ]] || pending=()
 workdir=$(migration_workdir)
+phase_dirs=()
+
+push_migrations() {
+  local directory=$1 role=$2
+  (cd "$directory" && PGPASSWORD=$POSTGRES_PASSWORD SUPABASE_TELEMETRY_DISABLED=1 "$supabase" db push --yes \
+    --db-url "postgresql://$role@127.0.0.1:54322/postgres?sslmode=disable")
+}
+
+ordered_phase() {
+  local directory=$1 inclusive=$2 file version
+  cp -a "$workdir/." "$directory/" || return
+  for file in "$directory"/supabase/migrations/*.sql; do
+    version=$(basename "$file"); version=${version%%_*}
+    if [[ $version > 20261023000100 || ( $inclusive == false && $version == 20261023000100 ) ]]; then
+      rm "$file" || return
+    fi
+  done
+}
+
+apply_integration_migrations() {
+  local version before through applied
+  if printf '%s\n' "${pending[@]}" | grep -qx 20261023000100; then
+    applied=$(applied_versions) || return
+    while IFS= read -r version; do
+      [[ $version > 20261023000100 ]] && die "catalog maintenance refuses a database with later applied migrations"
+    done <<<"$applied"
+    before=$(mktemp -d) || return
+    phase_dirs+=("$before")
+    through=$(mktemp -d) || return
+    phase_dirs+=("$through")
+    ordered_phase "$before" false || return
+    ordered_phase "$through" true || return
+    push_migrations "$before" postgres || return
+    log "applying only the catalog successor with the existing elevated maintenance role"
+    push_migrations "$through" supabase_admin || return
+  fi
+  push_migrations "$workdir" postgres
+}
 
 record_partial_failure() {
   local still done_versions
@@ -154,14 +192,13 @@ record_partial_failure() {
 # A run cancelled or killed while migrating still reports failed, with the
 # versions that committed before it stopped.
 migrating=true
-trap 'if [[ $migrating == true ]]; then migrating=false; record_partial_failure || true; fi; rm -rf "$workdir"' EXIT
+trap 'if [[ $migrating == true ]]; then migrating=false; record_partial_failure || true; fi; rm -rf "$workdir" "${phase_dirs[@]}"' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 trap 'exit 129' HUP
 trap 'exit 141' PIPE
 log "applying ${#pending[@]} pending migration(s)"
-if ! (cd "$workdir" && PGPASSWORD=$POSTGRES_PASSWORD SUPABASE_TELEMETRY_DISABLED=1 "$supabase" db push --yes \
-  --db-url "postgresql://postgres@127.0.0.1:54322/postgres?sslmode=disable"); then
+if ! apply_integration_migrations; then
   migrating=false
   record_partial_failure
   die "migrations failed; the running API was not changed"
