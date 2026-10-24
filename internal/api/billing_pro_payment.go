@@ -21,6 +21,7 @@ var errProResourcesPending = errors.New("paid purchase is awaiting monthly usage
 var errProEnrollmentPending = errors.New("paid purchase is awaiting invoice enrollment")
 
 type proPaidInvoice struct {
+	Metadata map[string]string `json:"metadata"`
 	StripeInvoiceAmounts
 	AmountPaid        int64 `json:"amount_paid"`
 	AmountRemaining   int64 `json:"amount_remaining"`
@@ -129,6 +130,12 @@ func (c *stripeHTTPClient) verifyProInvoice(ctx context.Context, id string, o pr
 	if err := c.verifyProCreditNotes(ctx, inv, o.Price); err != nil {
 		return ev, false, err
 	}
+	return c.verifyProInvoiceCash(ctx, ev)
+}
+
+func (c *stripeHTTPClient) verifyProInvoiceCash(ctx context.Context, ev proPaymentEvidence) (proPaymentEvidence, bool, error) {
+	inv := ev.Invoice
+	id, customer := inv.ID, inv.Customer
 	cashTotal := new(big.Int).Add(big.NewInt(inv.Total), big.NewInt(inv.StartingBalance))
 	cashTotal.Sub(cashTotal, big.NewInt(*inv.EndingBalance))
 	if cashTotal.Cmp(big.NewInt(inv.AmountDue)) != 0 {

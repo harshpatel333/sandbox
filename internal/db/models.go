@@ -916,6 +916,55 @@ type BillingProPaymentVerification struct {
 	Evidence       []byte    `json:"evidence"`
 }
 
+type BillingProUpgrade struct {
+	ID                     uuid.UUID          `json:"id"`
+	TeamID                 pgtype.UUID        `json:"team_id"`
+	ActorID                uuid.UUID          `json:"actor_id"`
+	CustomerID             string             `json:"customer_id"`
+	SubscriptionID         *string            `json:"subscription_id"`
+	OfferKey               string             `json:"offer_key"`
+	RequestPayload         []byte             `json:"request_payload"`
+	Anchor                 time.Time          `json:"anchor"`
+	PeriodStart            time.Time          `json:"period_start"`
+	PeriodEnd              time.Time          `json:"period_end"`
+	QuotedAt               time.Time          `json:"quoted_at"`
+	AmountCents            int64              `json:"amount_cents"`
+	State                  string             `json:"state"`
+	SessionID              *string            `json:"session_id"`
+	PaymentEvidence        []byte             `json:"payment_evidence"`
+	PaymentReviewRequired  bool               `json:"payment_review_required"`
+	PaymentReviewEvidence  []byte             `json:"payment_review_evidence"`
+	PaymentReviewCheckedAt pgtype.Timestamptz `json:"payment_review_checked_at"`
+	PaymentMethodID        *string            `json:"payment_method_id"`
+	GrantID                *string            `json:"grant_id"`
+	GrantAttemptedAt       pgtype.Timestamptz `json:"grant_attempted_at"`
+	RecurringAttemptedAt   pgtype.Timestamptz `json:"recurring_attempted_at"`
+	BaseCreatedAt          pgtype.Timestamptz `json:"base_created_at"`
+	InitialAssignmentID    pgtype.UUID        `json:"initial_assignment_id"`
+	ContractID             pgtype.UUID        `json:"contract_id"`
+	NextCheckAt            time.Time          `json:"next_check_at"`
+	LastError              *string            `json:"last_error"`
+}
+
+type BillingProUpgradeCatchup struct {
+	ID          uuid.UUID `json:"id"`
+	UpgradeID   uuid.UUID `json:"upgrade_id"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	AmountCents int64     `json:"amount_cents"`
+	CreatedAt   time.Time `json:"created_at"`
+	InvoiceID   *string   `json:"invoice_id"`
+}
+
+type BillingProUpgradeSetup struct {
+	ID             uuid.UUID `json:"id"`
+	UpgradeID      uuid.UUID `json:"upgrade_id"`
+	RequestPayload []byte    `json:"request_payload"`
+	CreatedAt      time.Time `json:"created_at"`
+	SessionID      *string   `json:"session_id"`
+	State          string    `json:"state"`
+}
+
 type BillingProviderCredit struct {
 	CustomerID    string    `json:"customer_id"`
 	GrantID       string    `json:"grant_id"`

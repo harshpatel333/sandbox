@@ -126,6 +126,15 @@ func run(ctx context.Context, cfg config) error {
 	if err := checkYCClaimMigration(ctx, src, cfg.teamID); err != nil {
 		return err
 	}
+	checks := []querier{src}
+	if dst != nil {
+		checks = append(checks, dst)
+	}
+	for _, q := range checks {
+		if err := checkProUpgradeMigration(ctx, q, cfg.teamID); err != nil {
+			return err
+		}
+	}
 
 	switch cfg.phase {
 	case phasePlan:

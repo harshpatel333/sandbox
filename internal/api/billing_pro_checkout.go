@@ -145,6 +145,17 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
+	if upgrade, err := h.proUpgrade(c.Request.Context(), team); err == nil {
+		if upgrade.Offer != req.Offer {
+			proConflict(c)
+			return
+		}
+		h.resumeProUpgradeCheckout(c, upgrade)
+		return
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		respondError(c, ErrInternal)
+		return
+	}
 	offer, resuming, err := h.checkoutOffer(c.Request.Context(), team, req.Offer)
 	if errors.Is(err, errOfferUnavailable) {
 		respondErrorMsg(c, "invalid_offer", "plan is not available", http.StatusBadRequest)
@@ -188,6 +199,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		return
 	}
 	client := h.Stripe.(*stripeHTTPClient)
+	var product string
 	// A resumed purchase keeps the price it was started with.
 	if resuming {
 		err = client.validateProPrice(c.Request.Context(), offer)
@@ -195,6 +207,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		var price storagePrice
 		price, err = h.ensurePlanPrice(c.Request.Context(), client, planTerms{OfferKey: offer.Key, DisplayName: offer.Name, FeeCents: offer.Amount, IntervalMonths: offer.Months, VersionID: offer.VersionID, Version: offer.Version, PricingVersion: offer.Pricing})
 		offer.Price = price.ID
+		product = price.Product
 	}
 	if err != nil {
 		respondErrorMsg(c, "service_unavailable", "Pro price configuration requires verification", 503)
@@ -210,7 +223,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
-	params := StripeCreateCheckoutSessionParams{CustomerID: customer, SuccessURL: success, CancelURL: cancelURL, ClientReferenceID: team.String(), PriceIDs: prices, BasePriceID: offer.Price, Flexible: true, ResourceTerms: terms,
+	params := StripeCreateCheckoutSessionParams{OneOffProduct: product, CustomerID: customer, SuccessURL: success, CancelURL: cancelURL, ClientReferenceID: team.String(), PriceIDs: prices, BasePriceID: offer.Price, Flexible: true, ResourceTerms: terms,
 		PlanTerms: &StripeCheckoutPlanTerms{Amount: offer.Amount, Months: offer.Months, Credit: offer.Credit, VersionID: offer.VersionID, Matching: offer.Matching, Limits: offer.Limits}}
 	v2 := offer.Pricing == "v2"
 	if v2 && !resuming {
@@ -227,6 +240,14 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		// request frozen so older replicas also replay the base-only session.
 		params.PriceIDs = nil
 		params.DeferredResourcePriceIDs = prices
+	}
+	if v2 && !resuming {
+		if params.OneOffProduct == "" {
+			respondErrorMsg(c, "service_unavailable", "Pro product identity requires verification", 503)
+			return
+		}
+		h.createProUpgrade(c, team, actor, offer, params)
+		return
 	}
 	ctx := c.Request.Context()
 	tx, err := h.Pool.Begin(ctx)
@@ -459,6 +480,20 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 		}
 		_, err := h.DB.MarkStripeWebhookEventProcessed(ctx, event.ID)
 		return true, err
+	}
+	var upgradeTeam uuid.UUID
+	upgradeErr := h.Pool.QueryRow(ctx, `UPDATE billing_pro_upgrade SET next_check_at=clock_timestamp() WHERE customer_id=$1 AND team_id IS NOT NULL AND state NOT IN ('expired','ended') RETURNING team_id`, obj.Customer).Scan(&upgradeTeam)
+	if upgradeErr == nil {
+		if strings.HasPrefix(event.Type, "invoice.") {
+			if _, err := h.Pool.Exec(ctx, `UPDATE billing_invoice_collection SET next_attempt_at=LEAST(next_attempt_at,clock_timestamp()) WHERE invoice_id=$1 AND customer_id=$2 AND state NOT IN ('paid','void')`, obj.ID, obj.Customer); err != nil {
+				return true, err
+			}
+		}
+		_, err := h.DB.MarkStripeWebhookEventProcessed(ctx, event.ID)
+		return true, err
+	}
+	if !errors.Is(upgradeErr, pgx.ErrNoRows) {
+		return false, upgradeErr
 	}
 	var released bool
 	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE customer_id=$1 AND (subscription_id=$2 OR previous_choice->>'session_id'=$3))`, obj.Customer, subscription, obj.ID).Scan(&released); err != nil {

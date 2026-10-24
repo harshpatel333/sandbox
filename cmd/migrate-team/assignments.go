@@ -123,6 +123,11 @@ func assignmentSnapshot(ctx context.Context, src querier, team uuid.UUID) ([]byt
 }
 
 func checkAssignmentReferences(ctx context.Context, src querier, dst pgx.Tx, team uuid.UUID) error {
+	for _, q := range []querier{src, dst} {
+		if err := checkProUpgradeMigration(ctx, q, team); err != nil {
+			return err
+		}
+	}
 	var contractBacked bool
 	if err := src.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND contract_id IS NOT NULL)`, team).Scan(&contractBacked); err != nil {
 		return err

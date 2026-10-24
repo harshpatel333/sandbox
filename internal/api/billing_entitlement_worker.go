@@ -385,7 +385,7 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		if err != nil {
 			return next, err
 		}
-		payment, verified, verifyErr := client.verifyProInvoice(ctx, paymentInvoice, proOffer{Key: c.OfferKey, Price: c.BasePriceID, Amount: c.ChargeAmountCents, Months: c.ChargeIntervalMonths, Promotion: promotion}, c.CustomerID, c.SubscriptionID)
+		payment, verified, verifyErr := h.verifyProContractInvoice(ctx, client, id, paymentInvoice, proOffer{Key: c.OfferKey, Price: c.BasePriceID, Amount: c.ChargeAmountCents, Months: c.ChargeIntervalMonths, Promotion: promotion}, c.CustomerID, c.SubscriptionID)
 		if observeErr := h.observeProPaymentReview(ctx, team, paymentInvoice, payment, verifyErr); observeErr != nil {
 			return next, observeErr
 		}
