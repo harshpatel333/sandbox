@@ -82,7 +82,11 @@ try {
       const u = new URL(req.url())
       if (!['http:', 'https:'].includes(u.protocol)) return route.continue()
       if (![consoleOrigin, authOrigin, sinkOrigin].includes(u.origin)) return route.abort('blockedbyclient')
-      if (req.method() !== 'GET' && /(?:checkout|stripe|plan-changes|plan-assignments|buy-credit|prepaid|auto-recharge)/.test(u.pathname)) return route.abort('blockedbyclient')
+      if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method())) {
+        let pathname
+        try { pathname = decodeURIComponent(u.pathname).replace(/^\/(?:(?:api|v1|internal)\/)+/, '/') } catch { return route.abort('blockedbyclient') }
+        if (/^\/(?:billing(?:\/|$)|stripe(?:\/|$)|teams\/[^/]+\/billing(?:\/|$)|checkout(?:[-/]|$)|plan-(?:changes|assignments)(?:\/|$)|prepaid(?:\/|$)|auto[-_]recharge(?:\/|$)|plan-usage\/buy-credit(?:\/|$)|onboarding\/plan(?:\/|$))/.test(pathname)) return route.abort('blockedbyclient')
+      }
       return route.continue()
     })
     const page = await context.newPage()
