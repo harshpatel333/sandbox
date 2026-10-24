@@ -1,9 +1,14 @@
 package api
 
 import (
+	"errors"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog/log"
 )
 
@@ -54,37 +59,59 @@ func (h *Handlers) SetPlatformPricingVersion(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	tx, err := h.Pool.Begin(ctx)
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		respondError(c, ErrInternal)
+		log.Error().Err(err).Msg("begin pricing transition failed")
+		respondErrorMsg(c, "service_unavailable", "Pricing transition is temporarily unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	defer tx.Rollback(ctx)
-	var current string
-	if err = tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch FOR UPDATE`).Scan(&current); err != nil {
-		log.Error().Err(err).Msg("lock pricing switch failed")
-		respondError(c, ErrInternal)
+	rows, err := tx.Query(ctx, `SELECT pricing_version,changed_by::text,reason,changed_at,epoch,adoption_state,changed
+ FROM public.billing_transition_pricing_version($1,$2,$3)`, req.PricingVersion, actor, reason)
+	if err != nil {
+		respondPricingTransitionError(c, err)
 		return
 	}
-	if current == req.PricingVersion {
-		if err = tx.Rollback(ctx); err != nil {
-			log.Error().Err(err).Msg("release pricing switch failed")
-			respondError(c, ErrInternal)
-			return
-		}
-	} else {
-		if _, err = tx.Exec(ctx, `UPDATE billing_pricing_switch SET pricing_version=$1,changed_by=$2,reason=$3,changed_at=clock_timestamp()`, req.PricingVersion, actor, reason); err == nil {
-			_, err = tx.Exec(ctx, `INSERT INTO billing_pricing_switch_audit(actor_id,from_version,to_version,reason) VALUES($1,$2,$3,$4)`, actor, current, req.PricingVersion, reason)
-		}
-		if err == nil {
-			err = tx.Commit(ctx)
-		}
+	var changed bool
+	state, err := pgx.CollectExactlyOneRow(rows, func(row pgx.CollectableRow) (pricingSwitchState, error) {
+		var state pricingSwitchState
+		var at time.Time
+		var epoch uuid.UUID
+		var adoptionState string
+		err := row.Scan(&state.PricingVersion, &state.ChangedBy, &state.Reason, &at, &epoch, &adoptionState, &changed)
+		state.ChangedAt = at.UTC().Format("2006-01-02T15:04:05Z")
+		return state, err
+	})
+	if err != nil {
+		respondPricingTransitionError(c, err)
+		return
+	}
+	if err = tx.Commit(ctx); err != nil {
+		log.Error().Err(err).Msg("commit pricing transition failed")
+		respondErrorMsg(c, "service_unavailable", "Pricing transition is temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if changed {
 		forgetPricingVersion()
 	}
-	if err != nil {
-		log.Error().Err(err).Msg("flip pricing switch failed")
-		respondError(c, ErrInternal)
-		return
+	c.JSON(http.StatusOK, state)
+}
+
+func respondPricingTransitionError(c *gin.Context, err error) {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case pgErr.Code == "22023" && pgErr.ConstraintName == "billing_pricing_transition_input":
+			respondErrorMsg(c, "bad_request", "Invalid pricing transition input", http.StatusBadRequest)
+			return
+		case pgErr.Code == "42501" && pgErr.ConstraintName == "billing_pricing_transition_actor":
+			respondError(c, ErrForbidden)
+			return
+		case pgErr.Code == "55000" && pgErr.ConstraintName == "billing_pricing_transition_prerequisite":
+			respondErrorMsg(c, "conflict", "Pricing transition prerequisites are not satisfied", http.StatusConflict)
+			return
+		}
 	}
-	h.writePricingSwitch(c)
+	log.Error().Err(err).Msg("pricing transition failed")
+	respondErrorMsg(c, "service_unavailable", "Pricing transition is temporarily unavailable", http.StatusServiceUnavailable)
 }
