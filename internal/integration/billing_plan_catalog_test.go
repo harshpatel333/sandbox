@@ -267,6 +267,7 @@ type publicPlansBody struct {
 			Available  bool   `json:"available"`
 		} `json:"monthly"`
 		Annual *struct {
+			Available              bool  `json:"available"`
 			PriceCents             int64 `json:"price_cents"`
 			MonthlyEquivalentCents int64 `json:"monthly_equivalent_cents"`
 		} `json:"annual"`
@@ -295,7 +296,7 @@ func getPublicPlans(t *testing.T, r http.Handler) publicPlansBody {
 	t.Helper()
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/billing/plans/public", nil))
-	if w.Code != 200 || w.Header().Get("Cache-Control") != "public, max-age=300, s-maxage=300" {
+	if w.Code != 200 || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("status=%d cache=%q body=%s", w.Code, w.Header().Get("Cache-Control"), w.Body)
 	}
 	var body publicPlansBody
@@ -755,7 +756,7 @@ func operatorRequest(r http.Handler, method, path, actor, body string) *httptest
 	return w
 }
 
-func TestIntegration_PricingSwitchActivatesTheV2Catalog(t *testing.T) {
+func TestIntegration_PricingSwitchDoesNotReleasePublicCatalog(t *testing.T) {
 	ctx := t.Context()
 	r := newInternalRouter(t)
 	admin := seedPlatformAdminProfile(t).String()
@@ -788,33 +789,16 @@ func TestIntegration_PricingSwitchActivatesTheV2Catalog(t *testing.T) {
 	}
 
 	body := getPublicPlans(t, r)
-	families := []string{}
+	if body.PricingVersion != "legacy" || len(body.Cards) != 2 || body.Cards[0].Family != "pro" || body.Cards[1].Family != "enterprise" {
+		t.Fatalf("unreleased catalog=%+v", body)
+	}
 	for _, card := range body.Cards {
-		families = append(families, card.Family+":"+card.Kind)
+		if (card.Monthly != nil && card.Monthly.Available) || (card.Annual != nil && card.Annual.Available) {
+			t.Fatalf("unreleased purchase available: %+v", card)
+		}
 	}
-	if body.PricingVersion != "v2" || strings.Join(families, ",") != "free:free,starter:prepaid,pro:subscription,enterprise:custom" {
-		t.Fatalf("v2 cards=%v version=%s", families, body.PricingVersion)
-	}
-	var freeCents int64
-	var freeUSD string
-	if err := testPool.QueryRow(ctx, `WITH r AS (SELECT DISTINCT ON (resource) resource, price_usd FROM pricing_rate r JOIN pricing_plan p ON p.key = r.plan_key
-		WHERE r.plan_key = 'payg' AND p.active AND unit = 'second' AND effective_from <= now() AND (effective_to IS NULL OR effective_to > now())
-		ORDER BY resource, effective_from DESC, r.created_at DESC, r.id DESC)
-		, usd AS (SELECT 7200 * ((SELECT price_usd FROM r WHERE resource = 'vcpu') + (SELECT price_usd FROM r WHERE resource = 'memory_gib')) AS v)
-		SELECT round(v * 100)::bigint, trim_scale(v)::text FROM usd`).Scan(&freeCents, &freeUSD); err != nil {
-		t.Fatal(err)
-	}
-	free, pro := body.Cards[0], body.Cards[2]
-	if free.Allowance == nil || free.Allowance.Period != "day_window" || free.Allowance.OnExhausted != "pause" ||
-		free.Allowance.AmountCents != freeCents || freeCents <= 0 || free.Allowance.AmountUSD != freeUSD || *free.Limits.MaxConcurrent != 1 || *free.Limits.MaxDiskMiB != 4096 {
-		t.Fatalf("free card=%+v", free)
-	}
-	if pro.Monthly == nil || pro.Monthly.PriceCents != 25000 || pro.Annual != nil || pro.Allowance == nil || pro.Allowance.AmountCents != 25000 || pro.Allowance.AmountUSD != "250" ||
-		pro.Allowance.OnExhausted != "payg" || *pro.Limits.MaxConcurrent != 1000 || *pro.Limits.MaxVCPU != 8 {
-		t.Fatalf("pro card=%+v", pro)
-	}
-	if pro.Monthly.Available || len(body.Plans) != 0 {
-		t.Fatalf("offers advertised without Stripe: %+v", body)
+	if len(body.Plans) != 0 {
+		t.Fatalf("unreleased offers=%+v", body.Plans)
 	}
 	var monthly int64
 	var annualAvailable bool
@@ -989,5 +973,34 @@ func TestIntegration_PricingSwitchRollbackRestoresTheLegacyOfferRows(t *testing.
 		FROM billing_plan m, billing_plan a WHERE m.offer_key='pro_monthly' AND a.offer_key='pro_annual'`).
 		Scan(&monthly, &monthlyAvailable, &annual, &annualAvailable); err != nil || monthly != 120000 || annual != 1200000 || !monthlyAvailable || !annualAvailable {
 		t.Fatalf("legacy Pro after rollback monthly=%d/%v annual=%d/%v err=%v", monthly, monthlyAvailable, annual, annualAvailable, err)
+	}
+}
+
+func TestIntegration_UnassignedFreeEntryWaitsForPricingAdoption(t *testing.T) {
+	for _, replay := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replay=%t", replay), func(t *testing.T) {
+			fixture, r, key := newProFixture(t, "pro_monthly")
+			if replay {
+				assertProResponse(t, r, key, "/stripe/plan-choice", `{"offer":"free"}`, 200, "committed")
+			}
+			setPricingSwitch(t, "v2")
+			status, code := 409, "plan_conflict"
+			if replay {
+				status, code = 200, "committed"
+			}
+			assertProResponse(t, r, key, "/stripe/plan-choice", `{"offer":"free"}`, status, code)
+			var choices int
+			if err := testPool.QueryRow(t.Context(), `SELECT count(*) FROM billing_signup_choice WHERE team_id=$1 AND offer_key='free' AND state='committed'`, fixture.team).Scan(&choices); err != nil {
+				t.Fatal(err)
+			}
+			expected := 0
+			if replay {
+				expected = 1
+			}
+			if choices != expected {
+				t.Fatalf("choice rows=%d want=%d", choices, expected)
+			}
+
+		})
 	}
 }
