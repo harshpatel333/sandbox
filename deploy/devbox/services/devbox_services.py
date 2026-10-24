@@ -43,6 +43,8 @@ COMPOSE_SECRETS = ("POSTGRES_PASSWORD", "JWT_SECRET", "ANON_KEY", "SERVICE_ROLE_
 
 # API settings taken verbatim from devbox.env or secrets.env when present.
 API_PASSTHROUGH = (
+    "TEAM_CREATION_REGION",
+    "STRIPE_PLAN_PRICE_IDS",
     "STRIPE_SECRET_KEY",
     "STRIPE_API_VERSION",
     "STRIPE_CHECKOUT_PRICE_IDS",

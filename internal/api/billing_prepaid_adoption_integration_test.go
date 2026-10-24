@@ -19,16 +19,24 @@ const closedPrepaidAssertionSQL = `CREATE OR REPLACE FUNCTION billing_assert_pri
 
 func installPrepaidPublicStateFixture(t *testing.T, h *Handlers) {
 	t.Helper()
-	_, err := h.Pool.Exec(t.Context(), `CREATE TABLE billing_pricing_adoption(singleton boolean PRIMARY KEY DEFAULT true,fixture_released boolean NOT NULL);
- INSERT INTO billing_pricing_adoption VALUES(true,true);
- CREATE FUNCTION billing_pricing_public_state() RETURNS TABLE(pricing_version text,entry_open boolean,epoch uuid)
+	original := map[string]string{}
+	for _, name := range []string{"billing_pricing_public_state()", "billing_assert_pricing_entry_open(uuid,text)"} {
+		var definition string
+		if err := h.Pool.QueryRow(t.Context(), `SELECT COALESCE(pg_get_functiondef(to_regprocedure($1)),'')`, name).Scan(&definition); err != nil {
+			t.Fatal(err)
+		}
+		original[name] = definition
+	}
+	_, err := h.Pool.Exec(t.Context(), `CREATE TABLE billing_prepaid_adoption_fixture(singleton boolean PRIMARY KEY DEFAULT true,fixture_released boolean NOT NULL);
+ INSERT INTO billing_prepaid_adoption_fixture VALUES(true,true);
+ CREATE OR REPLACE FUNCTION billing_pricing_public_state() RETURNS TABLE(pricing_version text,entry_open boolean,epoch uuid)
  LANGUAGE sql AS $$ SELECT CASE WHEN s.pricing_version='v2' AND a.fixture_released THEN 'v2' ELSE 'legacy' END,
- COALESCE(s.pricing_version='v2' AND a.fixture_released,false),CASE WHEN a.singleton THEN '97cb97ef-7fde-4676-8d81-2d438939d47c'::uuid END FROM (SELECT 1) seed LEFT JOIN billing_pricing_switch s ON s.singleton LEFT JOIN billing_pricing_adoption a ON a.singleton $$`)
+ COALESCE(s.pricing_version='v2' AND a.fixture_released,false),CASE WHEN a.singleton THEN '97cb97ef-7fde-4676-8d81-2d438939d47c'::uuid END FROM (SELECT 1) seed LEFT JOIN billing_pricing_switch s ON s.singleton LEFT JOIN billing_prepaid_adoption_fixture a ON a.singleton $$`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = h.Pool.Exec(t.Context(), `CREATE FUNCTION billing_assert_pricing_entry_open(p_epoch uuid DEFAULT NULL,p_pricing_version text DEFAULT NULL)
+	_, err = h.Pool.Exec(t.Context(), `CREATE OR REPLACE FUNCTION billing_assert_pricing_entry_open(p_epoch uuid DEFAULT NULL,p_pricing_version text DEFAULT NULL)
  RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path=public,pg_temp AS $$
  DECLARE actual_epoch uuid; model text; opened boolean;
  BEGIN
@@ -43,7 +51,16 @@ func installPrepaidPublicStateFixture(t *testing.T, h *Handlers) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := h.Pool.Exec(context.Background(), `DROP FUNCTION billing_assert_pricing_entry_open(uuid,text); DROP FUNCTION billing_pricing_public_state(); DROP TABLE billing_pricing_adoption`); err != nil {
+		for _, name := range []string{"billing_assert_pricing_entry_open(uuid,text)", "billing_pricing_public_state()"} {
+			statement := original[name]
+			if statement == "" {
+				statement = "DROP FUNCTION " + name
+			}
+			if _, err := h.Pool.Exec(context.Background(), statement); err != nil {
+				t.Error(err)
+			}
+		}
+		if _, err := h.Pool.Exec(context.Background(), `DROP TABLE billing_prepaid_adoption_fixture`); err != nil {
 			t.Error(err)
 		}
 	})
@@ -59,12 +76,12 @@ func TestPrepaidAdoptionGateReplaysAcceptedPurchaseButRejectsNewEntry(t *testing
 		t.Run(state, func(t *testing.T) {
 			switch state {
 			case "preparing":
-				f.exec(`UPDATE billing_pricing_adoption SET fixture_released=false`)
+				f.exec(`UPDATE billing_prepaid_adoption_fixture SET fixture_released=false`)
 			case "missing-row":
-				f.exec(`DELETE FROM billing_pricing_adoption`)
+				f.exec(`DELETE FROM billing_prepaid_adoption_fixture`)
 			case "missing":
-				f.exec(`ALTER TABLE billing_pricing_adoption RENAME TO prepaid_fixture_adoption`)
-				defer f.exec(`ALTER TABLE prepaid_fixture_adoption RENAME TO billing_pricing_adoption`)
+				f.exec(`ALTER FUNCTION billing_pricing_public_state() RENAME TO prepaid_fixture_public_state_hidden`)
+				defer f.exec(`ALTER FUNCTION prepaid_fixture_public_state_hidden() RENAME TO billing_pricing_public_state`)
 			case "off":
 				setPricingVersion(t, f.h, "legacy")
 			}
@@ -112,7 +129,7 @@ func TestPrepaidAutoRechargeAdoptionGatePreservesBoundNoopAndDisable(t *testing.
 	if status := put(accepted); status != http.StatusOK {
 		t.Fatal("no-op replay reached closed assertion", status)
 	}
-	f.exec(`UPDATE billing_pricing_adoption SET fixture_released=false`)
+	f.exec(`UPDATE billing_prepaid_adoption_fixture SET fixture_released=false`)
 	for _, state := range []string{"preparing", "off"} {
 		t.Run(state, func(t *testing.T) {
 			if state == "off" {

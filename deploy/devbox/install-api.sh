@@ -134,7 +134,10 @@ ensure_supabase_cli
 
 log "building control plane at $sha"
 mkdir -p "$release"
-(cd "$src" && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$release/" ./cmd/controlplane ./cmd/seed-templates ./cmd/hostctl)
+(cd "$src" && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$release/" ./cmd/controlplane ./cmd/seed-templates ./cmd/hostctl ./cmd/pricing-v2-migrate)
+
+"$here/pricing-integration-reset.sh"
+export TEAM_CREATION_REGION=use
 
 pending_list=$(pending_migrations)
 mapfile -t pending <<<"$pending_list"
@@ -200,3 +203,6 @@ until curl -fs -o /dev/null --max-time 5 "http://127.0.0.1:$API_PORT/health"; do
   sleep 2
 done
 log "API ready at $sha"
+
+systemctl start superserve-vmd
+"$here/seed-base.sh"
