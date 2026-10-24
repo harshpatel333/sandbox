@@ -11,7 +11,15 @@ marker="$DEVBOX_STATE_DIR/pricing-integration-reset.json"
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup="$DEVBOX_DATA_DIR/pricing-integration-backup-$stamp"
 install -d -m 0700 "$backup"
-cp "$DEVBOX_STATE_DIR/api-deploy.json" "$backup/previous-api-deploy.json" 2>/dev/null || true
+python3 - "$backup" <<'PYCODE'
+import hashlib,json,subprocess,sys
+from pathlib import Path
+backup=Path(sys.argv[1])
+pid=int(subprocess.check_output(['systemctl','show','superserve-devbox-api.service','--property=MainPID','--value'],text=True))
+exe=Path('/proc')/str(pid)/'exe'
+record={'pid':pid,'executable':str(exe.resolve()),'binary_sha256':hashlib.sha256(exe.read_bytes()).hexdigest(),'original_api_deploy_receipt_present':Path('/var/lib/superserve-devbox/api-deploy.json').exists(),'receipt_note':'The workflow removes api-deploy.json before invoking selected scripts; retained prior workflow logs are separate from this live process observation.'}
+(backup/'previous-api-runtime.json').write_text(json.dumps(record)+'\n')
+PYCODE
 cp "$DEVBOX_STATE_DIR/runtime.json" "$backup/previous-runtime.json"
 compose exec -T db psql -X -At -U supabase_admin -d postgres -p 54322 -v ON_ERROR_STOP=1 -c "SELECT jsonb_build_object('versions',(SELECT jsonb_agg(version ORDER BY version) FROM supabase_migrations.schema_migrations),'team_count',(SELECT count(*) FROM team),'sandbox_count',(SELECT count(*) FROM sandbox),'pricing_version',(SELECT pricing_version FROM billing_pricing_switch WHERE singleton));" > "$backup/previous-history.json"
 systemctl stop superserve-devbox-console.service superserve-devbox-api.service superserve-vmd
