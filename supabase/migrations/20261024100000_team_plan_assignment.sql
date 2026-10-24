@@ -97,8 +97,11 @@ CREATE TRIGGER team_plan_assignment_limits AFTER INSERT ON team_plan_assignment
 CREATE FUNCTION assign_new_team_free_plan() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE v billing_plan_version; pricing text;
 BEGIN
- IF current_setting('superserve.migrating_team_id',true)=NEW.id::text THEN RETURN NULL; END IF;
  SELECT pricing_version INTO pricing FROM billing_pricing_switch FOR SHARE;
+ IF current_setting('superserve.migrating_team_id',true)=NEW.id::text THEN
+  IF pricing='v2' THEN RAISE EXCEPTION 'regional team import is unavailable while pricing v2 is active' USING ERRCODE='55000'; END IF;
+  RETURN NULL;
+ END IF;
  IF pricing IS DISTINCT FROM 'v2' THEN RETURN NULL; END IF;
  SELECT * INTO v FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published' FOR SHARE;
  IF NOT FOUND THEN RAISE EXCEPTION 'published v2 Free plan is required for team creation' USING ERRCODE='55000'; END IF;
