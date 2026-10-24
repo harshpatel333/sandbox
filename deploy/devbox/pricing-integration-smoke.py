@@ -86,7 +86,7 @@ if public.get("pricing_version") != "legacy":
     raise RuntimeError("PREPARING exposed public v2")
 old_entry_query = f"SELECT jsonb_build_object('assignments',(SELECT count(*) FROM team_plan_assignment WHERE team_id='{old_team}'),'choice',(SELECT to_jsonb(c) FROM billing_signup_choice c WHERE team_id='{old_team}'))"
 old_entry_before = json.loads(sql(old_entry_query))
-if old_entry_before["assignments"] != 0 or (old_entry_before["choice"] and old_entry_before["choice"]["state"] != "selecting"):
+if old_entry_before["assignments"] != 0 or not old_entry_before["choice"] or old_entry_before["choice"]["state"] != "selecting":
     raise RuntimeError("Old unassigned entry fixture already has accepted authority")
 request("/stripe/plan-choice", {"offer": "free"}, key=old_key, expected=(409,))
 if json.loads(sql(old_entry_query)) != old_entry_before:
