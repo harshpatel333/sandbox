@@ -165,6 +165,7 @@ ordered_phase() {
 apply_integration_migrations() {
   local version before through applied
   if printf '%s\n' "${pending[@]}" | grep -qx 20261023000100; then
+    systemctl stop superserve-devbox-console.service superserve-devbox-api.service superserve-vmd || return
     applied=$(applied_versions) || return
     while IFS= read -r version; do
       [[ $version > 20261023000100 ]] && die "catalog maintenance refuses a database with later applied migrations"
