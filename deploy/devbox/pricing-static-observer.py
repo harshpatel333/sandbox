@@ -4,6 +4,8 @@ import datetime
 import hashlib
 import json
 import multiprocessing
+import os
+import signal
 import re
 import shlex
 import subprocess
@@ -195,6 +197,7 @@ class Observer:
         context = multiprocessing.get_context('fork')
         parent, child = context.Pipe(duplex=False)
         def observe():
+            os.setsid()
             parent.close()
             try:
                 child.send({'snapshot': self.runtime_inner(stage)})
@@ -219,7 +222,13 @@ class Observer:
             return result['snapshot']
         finally:
             if worker.is_alive():
-                worker.kill()
+                try:
+                    if os.getpgid(worker.pid) == worker.pid:
+                        os.killpg(worker.pid, signal.SIGKILL)
+                    else:
+                        worker.kill()
+                except ProcessLookupError:
+                    pass
             worker.join(timeout=1)
             parent.close()
 
