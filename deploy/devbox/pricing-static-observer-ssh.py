@@ -122,12 +122,13 @@ def execute(args):
         once_fd = os.open(args.once_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(once_fd)
         config_fd = os.memfd_create('reviewed-ssh-config', os.MFD_ALLOW_SEALING)
+        os.fchmod(config_fd, 0o600)
         os.write(config_fd, config_bytes)
         fcntl.fcntl(config_fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
         payload = json.dumps({'source': base64.b64encode(leaf).decode(), 'args': [part for name in ARGUMENTS for part in ('--' + name, pins[name])]}).encode()
         remote = 'python3 -I -c ' + shlex.quote(BOOTSTRAP)
-        command = ['/usr/bin/ssh', '-F', '/proc/self/fd/' + str(config_fd), '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no', '-o', 'PermitLocalCommand=no', '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no', '-o', 'ForwardX11=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '-o', 'ConnectionAttempts=1', '-o', 'ConnectTimeout=15', 'rc-billing-readonly', remote]
-        completed = subprocess.run(command, input=payload, capture_output=True, timeout=80, pass_fds=(config_fd,))
+        command = ['/usr/bin/ssh', '-F', '/proc/' + str(os.getpid()) + '/fd/' + str(config_fd), '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UpdateHostKeys=no', '-o', 'PermitLocalCommand=no', '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no', '-o', 'ForwardX11=no', '-o', 'ControlMaster=no', '-o', 'ControlPath=none', '-o', 'ConnectionAttempts=1', '-o', 'ConnectTimeout=15', 'rc-billing-readonly', remote]
+        completed = subprocess.run(command, input=payload, capture_output=True, timeout=80)
         if len(completed.stdout) > 65536 or completed.returncode not in (0, 1):
             raise ValueError()
         observed = sanitized(json.loads(completed.stdout), pins)

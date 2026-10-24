@@ -57,16 +57,17 @@ class CallerTest(unittest.TestCase):
             config = Path(args.ssh_config)
             config.write_text('Host rc-billing-readonly\n HostName example.invalid\n ForwardAgent yes\n ForwardX11 yes\n')
             args.ssh_config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-            completed = subprocess.CompletedProcess([], 1, b'{"status":"PARTIAL_OR_FAILED_STATIC_OBSERVATION"}', b'')
-            with patch.object(caller.subprocess, 'run', return_value=completed) as run:
-                caller.execute(args)
-                command = run.call_args.args[0]
-            command[command.index('-F') + 1] = str(config)
-            effective = subprocess.run([command[0], '-G', *command[1:-1]], check=True, capture_output=True, text=True)
-            settings = dict(line.split(' ', 1) for line in effective.stdout.splitlines() if ' ' in line)
-            self.assertEqual(settings['forwardagent'], 'no')
-            self.assertEqual(settings['forwardx11'], 'no')
-            self.assertEqual(settings['clearallforwardings'], 'yes')
+            real_run = subprocess.run
+            def run(command, **kwargs):
+                effective = real_run([command[0], '-G', *command[1:-1]], check=True, capture_output=True, text=True)
+                settings = dict(line.split(' ', 1) for line in effective.stdout.splitlines() if ' ' in line)
+                self.assertEqual(settings['hostname'], 'example.invalid')
+                self.assertEqual(settings['forwardagent'], 'no')
+                self.assertEqual(settings['forwardx11'], 'no')
+                self.assertEqual(settings['clearallforwardings'], 'yes')
+                return subprocess.CompletedProcess([], 1, b'{"status":"PARTIAL_OR_FAILED_STATIC_OBSERVATION"}', b'')
+            with patch.object(caller.subprocess, 'run', side_effect=run):
+                self.assertEqual(caller.execute(args)['status'], 'STATIC_OBSERVATION_RECORDED')
 
     def test_timeout_is_sanitized_and_consumes_one_execution_marker(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -92,7 +93,7 @@ class CallerTest(unittest.TestCase):
             expected = Path(args.ssh_config).read_bytes()
             def run(command, **kwargs):
                 Path(args.ssh_config).write_text('changed after validation')
-                descriptor = kwargs['pass_fds'][0]
+                descriptor = int(command[command.index('-F') + 1].rsplit('/', 1)[1])
                 import os
                 import errno
                 os.lseek(descriptor, 0, os.SEEK_SET)
@@ -100,7 +101,7 @@ class CallerTest(unittest.TestCase):
                 with self.assertRaises(OSError) as raised:
                     os.write(descriptor, b'changed')
                 self.assertEqual(raised.exception.errno, errno.EPERM)
-                self.assertEqual(command[command.index('-F') + 1], '/proc/self/fd/' + str(descriptor))
+                self.assertEqual(command[command.index('-F') + 1], '/proc/' + str(os.getpid()) + '/fd/' + str(descriptor))
                 return subprocess.CompletedProcess([], 1, b'{"status":"PARTIAL_OR_FAILED_STATIC_OBSERVATION"}', b'')
             with patch.object(caller.subprocess, 'run', side_effect=run):
                 self.assertEqual(caller.execute(args)['status'], 'STATIC_OBSERVATION_RECORDED')
