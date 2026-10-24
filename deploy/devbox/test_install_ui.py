@@ -9,6 +9,7 @@ SCRIPT = Path(__file__).with_name('install-ui.sh')
 LOCAL_SECRETS = {
     'SERVICE_ROLE_KEY': 'service-role-secret',
     'INTERNAL_API_TOKEN': 'internal-secret',
+    'OPERATOR_API_TOKEN': 'operator-secret',
     'PROMOTION_CAPTURE_TOKEN': 'capture-secret',
     'PROMOTION_ACCOUNT_TOKEN': 'account-secret',
     'POSTGRES_PASSWORD': 'postgres-secret',
