@@ -41,6 +41,13 @@ func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, te
 	if exists {
 		return nil
 	}
+	live, err := prepaidUnspentPurchases(ctx, tx, team)
+	if err != nil {
+		return err
+	}
+	if live >= prepaidLiveGrantLimit {
+		return errPrepaidTooManyUnspent
+	}
 	if raw != "v2" || !entryOpen {
 		return errPricingV2Off
 	}

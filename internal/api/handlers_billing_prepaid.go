@@ -94,15 +94,6 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		respondErrorMsg(c, "service_unavailable", "Stripe billing is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	unspent, err := h.prepaidUnspentPurchases(ctx, team)
-	if err != nil {
-		respondError(c, ErrInternal)
-		return
-	}
-	if unspent >= prepaidLiveGrantLimit {
-		respondErrorMsg(c, "conflict", "too many unspent credit purchases; use some credit or buy a larger amount later", http.StatusConflict)
-		return
-	}
 	capacity, err := h.prepaidCapacityAvailable(ctx, team)
 	if err != nil {
 		respondError(c, ErrInternal)
@@ -142,6 +133,10 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 	}
 	session, err := h.startPrepaidPaymentCheckout(ctx, client, team, actor, derefString(account.StripeCustomerID), req.AmountCents, successURL, cancelURL)
 	if err != nil {
+		if errors.Is(err, errPrepaidTooManyUnspent) {
+			respondErrorMsg(c, "conflict", errPrepaidTooManyUnspent.Error(), http.StatusConflict)
+			return
+		}
 		if errors.Is(err, errPricingV2Off) {
 			respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 			return

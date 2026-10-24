@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog/log"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // Spent purchase grants are voided only after the invoice that consumes them
@@ -40,9 +41,9 @@ func (h *Handlers) enrolPrepaidObservation(ctx context.Context, team uuid.UUID) 
 	return err
 }
 
-func (h *Handlers) prepaidUnspentPurchases(ctx context.Context, team uuid.UUID) (int, error) {
+func prepaidUnspentPurchases(ctx context.Context, q db.DBTX, team uuid.UUID) (int, error) {
 	var live int
-	err := h.Pool.QueryRow(ctx, `SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1 AND payment_state<>'failed' AND credit_voided_at IS NULL`, team).Scan(&live)
+	err := q.QueryRow(ctx, `SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1 AND payment_state<>'failed' AND credit_voided_at IS NULL`, team).Scan(&live)
 	return live, err
 }
 

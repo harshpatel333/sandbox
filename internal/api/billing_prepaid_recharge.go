@@ -79,10 +79,13 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
 		fmt.Sprintf("more than %d automatic recharges in 24 hours", prepaidAutoRechargeDailyCap), prepaidAutoRechargeDailyCap); err != nil {
 		return err
 	}
-	_, err := h.Pool.Exec(ctx, `INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,payment_idempotency_key,credit_idempotency_key,payment_request)
- SELECT a.team_id,b.stripe_customer_id,'auto_recharge',a.amount_cents,'','',
-  jsonb_build_object('customer',b.stripe_customer_id,'payment_method',f.payment_method_id,'amount_cents',a.amount_cents)
- FROM billing_prepaid_auto_recharge a
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	selection := ` FROM billing_prepaid_auto_recharge a
+ JOIN team t ON t.id=a.team_id
  JOIN billing_funding_account f USING(team_id)
  JOIN team_billing_account b USING(team_id)
  WHERE a.enabled AND EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=a.team_id AND p.effective_to IS NULL AND p.kind='prepaid')
@@ -92,10 +95,23 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
   AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id
    AND ((p.source='auto_recharge' AND p.payment_state IN ('pending','uncertain','processing'))
     OR (p.payment_state='succeeded' AND (p.credit_state<>'issued' OR p.credited_at>=f.credit_checked_at))))
-  AND (SELECT count(*) FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id AND p.payment_state<>'failed' AND p.credit_voided_at IS NULL)<$1
- LIMIT 50
- ON CONFLICT DO NOTHING`, prepaidLiveGrantLimit)
-	return err
+  AND (SELECT count(*) FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id AND p.payment_state<>'failed' AND p.credit_voided_at IS NULL)<$1`
+	rows, err := tx.Query(ctx, `SELECT t.id`+selection+` ORDER BY t.id LIMIT 50 FOR NO KEY UPDATE OF t SKIP LOCKED`, prepaidLiveGrantLimit)
+	if err != nil {
+		return err
+	}
+	teams, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,payment_idempotency_key,credit_idempotency_key,payment_request)
+ SELECT a.team_id,b.stripe_customer_id,'auto_recharge',a.amount_cents,'','',
+  jsonb_build_object('customer',b.stripe_customer_id,'payment_method',f.payment_method_id,'amount_cents',a.amount_cents)`+selection+`
+ AND a.team_id=ANY($2) ON CONFLICT DO NOTHING`, prepaidLiveGrantLimit, teams)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (h *Handlers) settleDuePrepaidPurchases(ctx context.Context, client *stripeHTTPClient) error {

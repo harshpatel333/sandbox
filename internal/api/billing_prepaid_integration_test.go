@@ -625,7 +625,7 @@ func TestPrepaidSpentGrantIsVoidedOnlyOutsideClose(t *testing.T) {
 	if f.grants[grant].VoidedAt == 0 {
 		t.Fatal("spent grant was not voided")
 	}
-	if n, _ := f.h.prepaidUnspentPurchases(t.Context(), f.team); n != 0 {
+	if n, _ := prepaidUnspentPurchases(t.Context(), f.h.Pool, f.team); n != 0 {
 		t.Fatal("voided purchase still counts as unspent", n)
 	}
 }

@@ -1828,6 +1828,10 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 		purchaseID = prepaidCheckoutPurchaseID(teamID, leaseStartedAt, prepaid.AmountCents)
 		if err := h.recordCheckoutPurchase(c.Request.Context(), purchaseID, teamID, customerID, checkoutActor, prepaid.AmountCents, ""); err != nil {
 			h.finishFailedStripeCheckoutAttempt(teamID, attemptID, checkoutAccount.CheckoutInitializingAt, false)
+			if errors.Is(err, errPrepaidTooManyUnspent) {
+				respondErrorMsg(c, "conflict", errPrepaidTooManyUnspent.Error(), http.StatusConflict)
+				return
+			}
 			if errors.Is(err, errPricingV2Off) {
 				respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 				return
