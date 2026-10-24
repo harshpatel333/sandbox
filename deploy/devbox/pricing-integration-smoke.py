@@ -74,11 +74,18 @@ team = str(uuid.uuid4())
 key = "devprobe_" + secrets.token_hex(32)
 keyhash = hashlib.sha256(key.encode()).hexdigest()
 sql(f"INSERT INTO profile(id,email,provider,provider_id) VALUES('{actor}','dev-probe@example.com','google','{actor}'); INSERT INTO user_role_assignments(user_id,role_id,scope_type) SELECT '{actor}',id,'platform' FROM roles WHERE name='platform_admin';")
+old_team = str(uuid.uuid4())
+old_key = "devprobe_" + secrets.token_hex(32)
+old_hash = hashlib.sha256(old_key.encode()).hexdigest()
+sql(f"INSERT INTO team(id,name) VALUES('{old_team}','dev-old-unassigned-{old_team}'); INSERT INTO team_memberships(team_id,user_id,status) VALUES('{old_team}','{actor}','active'); INSERT INTO user_role_assignments(user_id,role_id,scope_type,team_id) SELECT '{actor}',id,'team','{old_team}' FROM roles WHERE name='team_owner'; INSERT INTO api_key(team_id,key_hash,name,created_by) VALUES('{old_team}','{old_hash}','dev-old-entry-probe','{actor}');")
 cli("prepare")
 sql(f"SELECT row_to_json(t) FROM billing_transition_pricing_version('v2','{actor}','authorized devbox E2E prepare') t;")
 public = request("/billing/plans/public")
 if public.get("pricing_version") != "legacy":
     raise RuntimeError("PREPARING exposed public v2")
+request("/stripe/plan-choice", {"offer": "free"}, key=old_key, expected=(409,))
+if sql(f"SELECT (SELECT count(*) FROM team_plan_assignment WHERE team_id='{old_team}')+(SELECT count(*) FROM billing_signup_choice WHERE team_id='{old_team}')") != "0":
+    raise RuntimeError("Old unassigned Free entry created choice or assignment while PREPARING")
 sql(f"INSERT INTO team(id,name) VALUES('{team}','dev-worker-{team}'); INSERT INTO team_memberships(team_id,user_id,status) VALUES('{team}','{actor}','active'); INSERT INTO user_role_assignments(user_id,role_id,scope_type,team_id) SELECT '{actor}',id,'team','{team}' FROM roles WHERE name='team_owner'; INSERT INTO api_key(team_id,key_hash,name,created_by,scopes) VALUES('{team}','{keyhash}','dev-worker-probe','{actor}',ARRAY['sandbox:read','sandbox:write']); INSERT INTO team_feature_flag(team_id,key,enabled) VALUES('{team}','tenant_usage_dashboard',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true;")
 plan = request("/billing/plan", key=key)
 if plan.get("plan", {}).get("kind") != "free":
