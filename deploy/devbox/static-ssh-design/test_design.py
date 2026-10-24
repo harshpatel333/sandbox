@@ -28,17 +28,29 @@ class DesignTests(unittest.TestCase):
         runner = module('run_once')
         class Child:
             pid = 123456
-            calls = 0
 
             def wait(self, timeout):
-                self.calls += 1
-                if self.calls == 1:
-                    raise subprocess.TimeoutExpired('synthetic', timeout)
+                events.append('reap')
                 return 0
-        with patch.object(runner.os, 'killpg') as kill:
+        events = []
+        with patch.object(runner, 'await_exit', side_effect=[subprocess.TimeoutExpired('synthetic', 90), 0]), patch.object(runner.os, 'killpg', side_effect=lambda pid, sig: events.append((pid, sig))):
             with self.assertRaises(subprocess.TimeoutExpired):
                 runner.invoke(['unused'], run=lambda *args, **kwargs: Child())
-            self.assertEqual([call.args[0] for call in kill.call_args_list], [123456, 123456])
+        self.assertEqual(events, [(123456, runner.signal.SIGTERM), (123456, runner.signal.SIGKILL), 'reap'])
+
+    def test_real_child_remains_unreaped_through_signals(self):
+        runner = module('run_once')
+        states = []
+        actual_kill = runner.os.killpg
+
+        def checked_kill(pid, sig):
+            state = runner.os.waitid(runner.os.P_PID, pid, runner.os.WEXITED | runner.os.WNOHANG | runner.os.WNOWAIT)
+            states.append(state is not None)
+            actual_kill(pid, sig)
+
+        with patch.object(runner.os, 'killpg', side_effect=checked_kill):
+            self.assertEqual(runner.invoke(['/bin/true']), 0)
+        self.assertEqual(states, [True, True])
 
     def test_proxy_has_no_key_registration(self):
         proxy = module('iap_proxy')

@@ -6,16 +6,28 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 
 CALLER_SHA256 = '1a197d5f21ffb54278fcf2cd72a1b474afb46839c5670853d0c3343c480f3e27'
 LEAF_SHA256 = '1deee84a5e77170f8c5d9eeb877a867a8083e6876d6f8e68c6de99123daebb80'
+
+
+def await_exit(child, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        state = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if state is not None:
+            return state.si_status if state.si_code == os.CLD_EXITED else -state.si_status
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired('owned-child', timeout)
+        time.sleep(0.01)
 
 
 def invoke(argv, run=subprocess.Popen):
     child = None
     try:
         child = run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        return child.wait(timeout=90)
+        return await_exit(child, 90)
     finally:
         if child is not None:
             try:
@@ -23,7 +35,7 @@ def invoke(argv, run=subprocess.Popen):
             except ProcessLookupError:
                 pass
             try:
-                child.wait(timeout=3)
+                await_exit(child, 3)
             except subprocess.TimeoutExpired:
                 pass
             try:
