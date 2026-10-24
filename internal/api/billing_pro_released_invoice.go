@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -87,6 +88,7 @@ func (h *Handlers) releasedProInvoiceTick(ctx context.Context) (int, error) {
 		if e != nil {
 			s := e.Error()
 			message = &s
+			log.Warn().Err(e).Str("invoice_id", job.ID).Msg("released Pro invoice requires reconciliation")
 		}
 		if _, err = h.Pool.Exec(ctx, `UPDATE billing_pro_released_invoice SET last_error=$2,updated_at=clock_timestamp(),next_check_at=clock_timestamp()+interval '1 hour' WHERE invoice_id=$1 AND revision=$3`, job.ID, message, job.Revision); err != nil {
 			return len(invoices), err
@@ -183,23 +185,31 @@ func (h *Handlers) reconcileReleasedProInvoice(ctx context.Context, client *stri
 	if err != nil {
 		return err
 	}
-	var covered bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_usage_entitlement WHERE contract_id=$1 AND period_start<=$2 AND period_end>=$3 AND state='issued')`, contract, time.Unix(receipt.Start, 0), time.Unix(receipt.End, 0)).Scan(&covered)
+	covered, expiredMissing, err := releasedProCreditCoverage(ctx, tx, contract, time.Unix(receipt.Start, 0), offer.Months, h.nowUTC())
 	if err != nil {
 		return err
 	}
+
 	creditState := "pending"
+	var liability *string
 	if covered {
 		creditState = "covered"
+	} else {
+		reason := "released payment recorded; original credit remains pending resolution"
+		if expiredMissing {
+			creditState = "review_required"
+			reason = "released payment recorded; expired original monthly credit was not issued and requires operator resolution; original terms preserved"
+		}
+		liability = &reason
 	}
-	if _, err = tx.Exec(ctx, `UPDATE billing_pro_released_invoice SET state='recorded',credit_state=$2,verified_revision=$3 WHERE invoice_id=$1`, invoice, creditState, revision); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE billing_pro_released_invoice SET state='recorded',credit_state=$2,verified_revision=$3,last_error=$4 WHERE invoice_id=$1`, invoice, creditState, revision, liability); err != nil {
 		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
 	if !covered {
-		return fmt.Errorf("released payment recorded; historical credit recovery remains pending for %s", invoice)
+		return errors.New(*liability)
 	}
 	return nil
 }
@@ -248,4 +258,21 @@ func (h *Handlers) reconcileReleasedUsageInvoice(ctx context.Context, client *st
 	}
 	_, err = h.Pool.Exec(ctx, `UPDATE billing_pro_released_invoice SET receipt=COALESCE(receipt,$2),payment_reference=COALESCE(payment_reference,$3),state='recorded',credit_state='covered',verified_revision=$4 WHERE invoice_id=$1`, invoice, receipt.Raw, receipt.Reference, revision)
 	return err
+}
+
+func releasedProCreditCoverage(ctx context.Context, q db.DBTX, contract uuid.UUID, start time.Time, months int32, now time.Time) (bool, bool, error) {
+	if months != 1 && months != 12 {
+		return false, false, errors.New("unsupported frozen payment cadence")
+	}
+	var covered, expiredMissing bool
+	err := q.QueryRow(ctx, `WITH windows AS (
+ SELECT p.period_start,p.period_end,p.amount_cents
+ FROM billing_commercial_contract c CROSS JOIN generate_series(0,$3::integer-1) offset_month
+ CROSS JOIN LATERAL billing_contract_entitlement(c,billing_anniversary_boundary(c.entitlement_anchor,
+ (extract(year FROM $2::timestamptz AT TIME ZONE 'UTC')::integer-extract(year FROM c.entitlement_anchor AT TIME ZONE 'UTC')::integer)*12
+ +extract(month FROM $2::timestamptz AT TIME ZONE 'UTC')::integer-extract(month FROM c.entitlement_anchor AT TIME ZONE 'UTC')::integer+offset_month)) p
+ WHERE c.id=$1), coverage AS (
+ SELECT w.*,EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.contract_id=$1 AND e.period_start=w.period_start AND e.period_end=w.period_end AND e.amount_cents=w.amount_cents AND e.state='issued') issued FROM windows w)
+ SELECT count(*)=$3 AND COALESCE(bool_and(issued),false),COALESCE(bool_or(period_end<=$4 AND NOT issued),false) FROM coverage`, contract, start, months, now).Scan(&covered, &expiredMissing)
+	return covered, expiredMissing, err
 }
