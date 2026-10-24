@@ -1,0 +1,29 @@
+name: Static observation design
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  observe:
+    if: ${{ false }}
+    runs-on: ubuntu-24.04
+    environment: devbox
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: static-observer-single-authorization
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 69c1c752b317e2a09e344e956135dfac9841cf23
+          persist-credentials: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.DEVBOX_GCP_WORKLOAD_IDENTITY }}
+          service_account: ${{ vars.DEVBOX_GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Refuse unapproved envelope
+        run: exit 1

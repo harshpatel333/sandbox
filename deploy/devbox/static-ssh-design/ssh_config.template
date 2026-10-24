@@ -1,0 +1,24 @@
+Host rc-billing-readonly
+    HostName @INSTANCE@
+    User @OSLOGIN_USER@
+    Port 22
+    IdentityFile @IDENTITY_FILE@
+    IdentitiesOnly yes
+    IdentityAgent none
+    UserKnownHostsFile @KNOWN_HOSTS@
+    GlobalKnownHostsFile /dev/null
+    HostKeyAlias @HOST_KEY_ALIAS@
+    StrictHostKeyChecking yes
+    UpdateHostKeys no
+    VerifyHostKeyDNS no
+    ProxyCommand @PROXY_EXECUTABLE@ @PROXY_PLAN@
+    ProxyJump none
+    ForwardAgent no
+    ForwardX11 no
+    ClearAllForwardings yes
+    PermitLocalCommand no
+    BatchMode yes
+    RequestTTY no
+    ControlMaster no
+    ControlPath none
+    CanonicalizeHostname no
