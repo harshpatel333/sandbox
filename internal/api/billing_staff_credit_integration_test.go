@@ -69,6 +69,7 @@ func (s *staffCreditStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.ID = fmt.Sprintf("credgr_staff_%d_%s", s.creates, uuid.NewString())
 	g.Customer = r.PostForm.Get("customer")
 	g.EffectiveAt = time.Now().Unix()
+	g.Created = g.EffectiveAt
 	g.Category = r.PostForm.Get("category")
 	g.Amount.Type = r.PostForm.Get("amount[type]")
 	g.Amount.Monetary.Currency = r.PostForm.Get("amount[monetary][currency]")

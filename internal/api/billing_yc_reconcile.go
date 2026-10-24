@@ -537,6 +537,21 @@ func (h *Handlers) adoptYCGrant(ctx context.Context, o ycOperation, c db.Billing
 	if err != nil {
 		return err
 	}
+	staff, err := h.issuedStaffCredits(ctx, h.Pool, c.CustomerID)
+	if err != nil {
+		return err
+	}
+	candidates := grants[:0]
+	for _, candidate := range grants {
+		var evidence entitlementGrant
+		if err := json.Unmarshal(candidate.Evidence, &evidence); err != nil {
+			return err
+		}
+		if !isStaffCredit(evidence, staff) {
+			candidates = append(candidates, candidate)
+		}
+	}
+	grants = candidates
 	grantID := ""
 	balance := int64(0)
 	if o.currentApprovedGrant() != "" {
