@@ -822,6 +822,7 @@ type BillingPlanRelease struct {
 	ProviderStatus   string      `json:"provider_status"`
 	ProviderEvidence []byte      `json:"provider_evidence"`
 	ReleasedAt       time.Time   `json:"released_at"`
+	PlanChangeID     pgtype.UUID `json:"plan_change_id"`
 }
 
 type BillingPlanVersion struct {

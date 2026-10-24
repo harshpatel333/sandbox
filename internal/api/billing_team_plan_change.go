@@ -511,8 +511,24 @@ func (h *Handlers) advanceTeamPlanChange(ctx context.Context, c teamPlanChange) 
 	switch {
 	case c.State == "undone":
 		return now, h.restorePlanChangeRenewal(ctx, c)
-	case c.State == "scheduled" && c.Subscription != nil && c.ProviderCancelAt == nil:
-		return h.stopPlanChangeRenewal(ctx, c, now)
+	case c.State == "scheduled" && c.Subscription != nil && (c.ProviderCancelAt == nil || now.Before(c.EffectiveAt)):
+		next, err := h.stopPlanChangeRenewal(ctx, c, now)
+		if err != nil {
+			return now, err
+		}
+		if !next.After(now) {
+			lease := c.lease
+			c, err = getTeamPlanChange(ctx, h.Pool, c.ID)
+			if err != nil {
+				return now, err
+			}
+			c.lease = lease
+			return h.applyTeamPlanChange(ctx, c)
+		}
+		if next.After(now.Add(time.Minute)) {
+			next = now.Add(time.Minute)
+		}
+		return next, nil
 	case c.State == "scheduled" && now.Before(c.EffectiveAt):
 		return c.EffectiveAt, nil
 	case c.State == "scheduled":
@@ -612,10 +628,16 @@ func (h *Handlers) stopPlanChangeRenewal(ctx context.Context, c teamPlanChange, 
 	if !subscriptionStopsBy(sub, c.EffectiveAt) {
 		return now, errors.New("the subscription would continue beyond the confirmed plan change")
 	}
-	if err = fencedPlanChangeUpdate(ctx, tx, c, `provider_cancel_at=clock_timestamp()`); err != nil {
-		return now, err
+	if c.ProviderCancelAt == nil {
+		if err = fencedPlanChangeUpdate(ctx, tx, c, `provider_cancel_at=clock_timestamp()`); err != nil {
+			return now, err
+		}
 	}
-	return c.EffectiveAt, tx.Commit(ctx)
+	next := c.EffectiveAt
+	if subscriptionEnded(sub) {
+		next = now
+	}
+	return next, tx.Commit(ctx)
 }
 
 // restorePlanChangeRenewal turns renewal back on for a subscription an undone
@@ -663,6 +685,18 @@ func (h *Handlers) restorePlanChangeRenewal(ctx context.Context, c teamPlanChang
 // requested is withdrawn instead, leaving the subscription to the new plan.
 func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (time.Time, error) {
 	now := time.Now()
+	lease, err := h.planChangeProcessingLease(ctx, c)
+	if err != nil {
+		return now, err
+	}
+	if lease != nil {
+		defer func() {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+			defer cancel()
+			_ = h.DB.ReleaseStripeWebhookProcessingLease(cleanup, db.ReleaseStripeWebhookProcessingLeaseParams{CustomerID: lease.CustomerID, Token: lease.Token})
+		}()
+	}
+	var terminal invoiceSubscription
 	if c.Subscription != nil {
 		client, ok := h.Stripe.(*stripeHTTPClient)
 		if !ok {
@@ -678,15 +712,19 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 		if end := subscriptionPeriodEnd(sub); !subscriptionEnded(sub) && end.After(c.EffectiveAt) {
 			return end, fencedPlanChangeUpdate(ctx, h.Pool, c, `effective_at=$3`, end)
 		}
-		if !subscriptionStopsBy(sub, c.EffectiveAt) {
-			return now, errors.New("the subscription cancellation does not match the confirmed plan change")
+		if !subscriptionEnded(sub) {
+			return now, errors.New("waiting for the source subscription to end before releasing its authority")
 		}
+		terminal = sub
 	}
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return now, err
 	}
 	defer tx.Rollback(ctx)
+	if err = lease.lock(ctx, h.DB.WithTx(tx)); err != nil {
+		return now, err
+	}
 	if err = tx.QueryRow(ctx, `SELECT 1 FROM team WHERE id=$1 FOR NO KEY UPDATE`, c.Team).Scan(new(int)); err != nil {
 		return now, err
 	}
@@ -705,6 +743,18 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 		log.Warn().Str("plan_change_id", c.ID.String()).Str("team_id", c.Team.String()).Msg("plan change withdrawn: the team changed plans first")
 		return now, tx.Commit(ctx)
 	}
+	if c.Subscription != nil {
+		if err = h.releasePlanChangeSubscription(ctx, tx, c, current, terminal); err != nil {
+			return now, err
+		}
+		ended := now
+		if terminal.EndedAt > 0 && !time.Unix(terminal.EndedAt, 0).After(now) {
+			ended = time.Unix(terminal.EndedAt, 0)
+		}
+		if ended.Before(c.EffectiveAt) {
+			c.EffectiveAt = ended
+		}
+	}
 	terms := planTerms{OfferKey: c.TargetPlanKey, DisplayName: c.TargetTerms.DisplayName, FeeCents: c.TargetTerms.FeeCents, IntervalMonths: c.TargetTerms.IntervalMonths,
 		MonthlyCreditCents: c.TargetTerms.MonthlyCreditCents, VersionID: c.TargetTerms.VersionID, Version: c.TargetTerms.Version, Family: c.TargetTerms.Family,
 		PricingVersion: c.TargetTerms.PricingVersion, Kind: c.TargetKind, Grants: c.TargetTerms.Grants, Matching: c.TargetTerms.Matching,
@@ -720,7 +770,7 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 			return now, err
 		}
 	}
-	if _, err = tx.Exec(ctx, `UPDATE team_plan_change SET state='applied',applied_at=clock_timestamp(),applied_assignment_id=$2 WHERE id=$1`, c.ID, plan.ID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE team_plan_change SET state='applied',effective_at=$3,applied_at=clock_timestamp(),applied_assignment_id=$2 WHERE id=$1`, c.ID, plan.ID, c.EffectiveAt); err != nil {
 		return now, err
 	}
 	if !c.PausesRunning {

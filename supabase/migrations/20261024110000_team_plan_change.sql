@@ -47,6 +47,9 @@ CREATE INDEX team_plan_change_due ON team_plan_change(next_check_at,id)
  WHERE state IN ('scheduled','applied') OR (state='undone' AND provider_cancel_requested_at IS NOT NULL AND provider_renewed_at IS NULL);
 CREATE INDEX team_plan_change_history ON team_plan_change(team_id,requested_at DESC);
 
+ALTER TABLE billing_plan_release ADD COLUMN plan_change_id uuid REFERENCES team_plan_change(id);
+CREATE UNIQUE INDEX billing_plan_release_change ON billing_plan_release(plan_change_id) WHERE plan_change_id IS NOT NULL;
+
 CREATE FUNCTION guard_team_plan_change() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE bookkeeping text[]:=ARRAY['next_check_at','lease_token','lease_until','failures','last_error'];
  progress text[]:=ARRAY['state','effective_at','provider_cancel_requested_at','provider_cancel_preexisting','provider_cancel_at','provider_renewed_at',
@@ -86,9 +89,13 @@ BEGIN
  END IF;
  -- A change whose subscription cancellation never reached Stripe before the
  -- period ended waits for the next period end rather than applying early.
- IF NEW.effective_at IS DISTINCT FROM OLD.effective_at AND (OLD.state<>'scheduled' OR NEW.state<>'scheduled'
-  OR NEW.effective_at<=OLD.effective_at) THEN
-  RAISE EXCEPTION 'only a scheduled change can move to a later effective time';
+ IF NEW.effective_at IS DISTINCT FROM OLD.effective_at AND NOT (
+  OLD.state='scheduled' AND NEW.state='scheduled' AND NEW.effective_at>OLD.effective_at
+  OR OLD.state='scheduled' AND NEW.state='applied' AND NEW.effective_at<OLD.effective_at
+   AND NEW.effective_at<=clock_timestamp() AND EXISTS(SELECT 1 FROM billing_plan_release r
+    WHERE r.plan_change_id=NEW.id AND r.team_id=NEW.team_id AND r.subscription_id=NEW.subscription_id
+     AND r.provider_status IN ('canceled','incomplete_expired') AND r.released_at>=NEW.requested_at)) THEN
+  RAISE EXCEPTION 'effective time requires a scheduled deferral or an applied terminal-subscription release';
  END IF;
  IF NEW.state='applied' AND OLD.state='scheduled' AND NEW.effective_at>clock_timestamp() THEN
   RAISE EXCEPTION 'a plan change cannot apply before it takes effect';

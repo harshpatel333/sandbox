@@ -25,6 +25,10 @@ type renewalStripe struct {
 	t              *testing.T
 	mu             sync.Mutex
 	sub            string
+	customer       string
+	endedAt        int64
+	checkout       *StripeRetrievedCheckoutSession
+	metadata       map[string]string
 	periodEnd      time.Time
 	status         string
 	cancel         bool
@@ -42,6 +46,10 @@ type renewalStripe struct {
 func (s *renewalStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.checkout != nil && r.Method == http.MethodGet && r.URL.Path == "/v1/checkout/sessions/"+s.checkout.ID {
+		_ = json.NewEncoder(w).Encode(s.checkout)
+		return
+	}
 	if r.URL.Path != "/v1/subscriptions/"+s.sub {
 		s.t.Errorf("unexpected provider request %s %s", r.Method, r.URL)
 		http.Error(w, "unexpected", 500)
@@ -77,7 +85,11 @@ func (s *renewalStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"id": s.sub, "customer": "cus_x", "status": s.status, "cancel_at_period_end": s.cancel, "cancel_at": s.cancelAt, "metadata": map[string]string{"plan_change_cancellation": s.owner},
+	metadata := map[string]string{"plan_change_cancellation": s.owner}
+	for k, v := range s.metadata {
+		metadata[k] = v
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"id": s.sub, "customer": s.customer, "status": s.status, "ended_at": s.endedAt, "cancel_at_period_end": s.cancel, "cancel_at": s.cancelAt, "metadata": metadata,
 		"items": map[string]any{"data": []map[string]any{{"id": "si_x", "current_period_start": s.periodEnd.AddDate(0, -1, 0).Unix(), "current_period_end": s.periodEnd.Unix()}}}})
 }
 
@@ -108,6 +120,7 @@ func newPlanChangeV2Fixture(t *testing.T, kind string) planChangeV2Fixture {
 	h.Stripe = &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
 	anchor := time.Now().UTC().AddDate(0, -2, -3).Truncate(time.Second)
 	customer := "cus_" + uuid.NewString()
+	f.stripe.customer = customer
 	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status,commercial_billing_anchor) VALUES($1,$2,$3,'active',$4)`,
 		team, customer, f.stripe.sub, anchor); err != nil {
 		t.Fatal(err)
