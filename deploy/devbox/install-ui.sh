@@ -184,6 +184,8 @@ for tool in docker curl openssl; do
   command -v "$tool" >/dev/null || die "$tool is not installed"
 done
 
+systemctl start superserve-vmd
+"$SCRIPT_DIR/seed-base.sh"
 ensure_console_secrets
 
 revision="$(env_get "$DEVBOX_ENV" DEVBOX_UI_SHA)"

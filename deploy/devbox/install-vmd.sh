@@ -12,6 +12,11 @@ set -euo pipefail
 main() {
   devbox_require_root
   devbox_load_env
+  [[ $DEVBOX_NAME == awille-ai-dev-billing && $DEVBOX_ID == 29baf003ad05 ]] || devbox_die "integration branch is restricted to its named devbox"
+  if ! curl -fs -o /dev/null --max-time 5 "$DEVBOX_API_URL/health"; then
+    "$DEVBOX_REPO/deploy/devbox/services-up.sh"
+    "$DEVBOX_REPO/deploy/devbox/install-api.sh"
+  fi
   devbox_require_bootstrapped
   devbox_instance
   devbox_load_local_secrets INTERNAL_API_TOKEN DATABASE_URL
