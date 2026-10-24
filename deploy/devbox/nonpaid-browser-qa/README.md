@@ -11,7 +11,7 @@ npm ci --ignore-scripts
 npx playwright install chromium
 ```
 
-Use existing system dependencies; if Chromium requires OS packages, RC decides installation on that explicit devbox. No public ingress is needed.
+Alternatively supply --browser-executable /usr/bin/google-chrome to use an already installed Chromium-compatible browser; the executable path must be absolute and is checked by Playwright launch. No browser installation is necessary when an existing compatible browser works. Use existing system dependencies; if Chromium requires OS packages, RC decides installation on that explicit devbox. No public ingress is needed.
 
 RC supplies these files privately, mode600:
 
@@ -21,7 +21,7 @@ RC supplies these files privately, mode600:
 {"backend_sha":"<measured40hex>","console_sha":"<measured40hex>","observed_at":"<freshUTC-ISO>","phase":"released","pricing_version":"v2","epoch":"<actualUUID>","email_sink_only":true,"target_devbox":true}
 ```
 
-`free-limits.json` is the expected effective Free limits from the exact reviewed published dev catalog, independently checked by RC. Include all effective fields being asserted, with numbers/null as appropriate. At least positive max_concurrent is required; do not copy observed response into expected values after a failure.
+`free-limits.json` is the expected effective Free limits from the exact reviewed published dev catalog, independently checked by RC. Include all effective fields being asserted, with numbers/null as appropriate. All five listed limit keys are required; values must be finite nonnegative numbers or null, with positive max_concurrent; do not copy observed response into expected values after a failure.
 
 ```json
 {"max_concurrent":<expected>,"max_vcpu":<expected>,"max_memory_mib":<expected>,"max_disk_mib":<expected>,"max_templates":<expected>}
@@ -51,11 +51,13 @@ node nonpaid-signup.mjs \
   --output /private/nonpaid-qa-result
 ```
 
-Only loopback HTTP origins are accepted. Third-party browser resources/analytics/Calendly and explicit paid-write paths are blocked, not simulated. Bot checks requiring external network may therefore fail: report the exact QA step instead of disabling server guards. The raw failure URL/message is never emitted; network evidence records only origin category, allowlisted pathname, status and safe cancellation classification, with no queries, headers or bodies. Expected unauthenticated401s are recorded; internal5xx/non-cancelled network failures fail the run.
+Only loopback HTTP origins are accepted. Node Mailpit fetches reject redirects, and browser routing rejects non-loopback origins. Third-party browser resources/analytics/Calendly and explicit paid-write paths are blocked, not simulated. Bot checks requiring external network may therefore fail: report the exact QA step instead of disabling server guards. The raw failure URL/message is never emitted; network evidence records only origin category, allowlisted pathname, status and safe cancellation classification, with no queries, headers or bodies. Expected unauthenticated401s are recorded; internal5xx/non-cancelled network failures fail the run.
 
-Assertions: actual UI signup and check-email state; actual sink confirmation link followed unchanged in same browser context; observed Console callback and expected destination; fresh-context password login; Free GET /api/billing/plan200 with kind/keyFree and expected effective limits; one confirmed Free user, one owned team and one current signup-Free assignment; Enterprise confirmation/login pending UI, dashboard access denied, plan endpoint denied, server-owned pending metadata with zero memberships, no approval email. Email Enterprise callback may sign out deliberately; this is expected. No endpoint wrappers, paid checkout, staff permissions, preparing-state exception or worker/adoption evidence is inferred from this released-state browser run.
+Assertions: actual UI signup and check-email state; actual sink confirmation link followed unchanged in same browser context; observed Console callback and expected destination; fresh-context password login; Free GET /api/billing/plan200 with kind/keyFree and expected effective limits; one confirmed Free user, one owned team and one current signup-Free assignment with effective_from<=CURRENT_TIMESTAMP, and exactly one open assignment of any kind; Enterprise confirmation/login pending UI and dashboard access denied; fresh-context password login must return actual Auth200 with server-owned pending metadata, and its normally issued bearer is used only in memory to assert403 signup_review_pending from the actual Console plan endpoint; server-owned pending metadata with zero memberships, no approval email. Email Enterprise callback may sign out deliberately; this is expected. No endpoint wrappers, paid checkout, staff permissions, preparing-state exception or worker/adoption evidence is inferred from this released-state browser run.
 
-Artifacts: receipt.json contains measured timings/checks, sanitized network outcomes, RC runtime pin receipt and aggregate DB counts. PNGs capture only known successful UI states, masking all inputs/iframes and generated email text. Unknown failure pages are not screenshotted to avoid token leakage. No Mailpit screenshots or HTML dumps are taken. Verify masks before sharing; keep all outputs private until reviewed. Final stdout is one sanitized result record; nonzero exit is FAIL, not partial success. Missing browser/dependencies/prerequisites produce FAIL, never a fabricated E2E pass.
+A localhost_browser_preflight step precedes signup writes: actual signup GET200, visible signup fields/button, localhost-browser-preflight.png and live Mailpit search reachability. It does not infer Auth reachability; actual password Auth200 is measured later.
+
+Artifacts: receipt.json contains measured timings/checks, sanitized network outcomes, RC runtime pin receipt and aggregate DB counts. Browser engine/version and session cookie COUNTS/httpOnly COUNTS are included; no cookie names/values or tokens are exported. Supplied runtime pins remain explicitly RC-measured evidence. PNGs capture only known successful UI states, masking all inputs/iframes and generated email text. Unknown failure pages are not screenshotted to avoid token leakage. No Mailpit screenshots or HTML dumps are taken. Verify masks before sharing; keep all outputs private until reviewed. Final stdout is one sanitized result record; nonzero exit is FAIL, not partial success. Missing browser/dependencies/prerequisites produce FAIL, never a fabricated E2E pass.
 
 Return receipt.json plus reviewed redacted PNGs and execution command with nonsecret pins. Preserve the test rows and sink messages for RC ownership; this harness performs no cleanup/deletion. Existing PM core smoke and W2 serializer proof remain distinct evidence.
 

@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import subprocess
 import uuid
+import tempfile
+import tarfile
+import base64
 
 root = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("devbox_services", root / "services/devbox_services.py")
@@ -60,23 +63,45 @@ def observe():
         raise RuntimeError("runtime is not released public v2")
     return {"backend_sha": backend, "console_sha": console, "pid": pid, "binary_sha256": digest, "console_container_id": inspected["Id"], "schema_receipt_sha256": hashlib.sha256(schema_path.read_bytes()).hexdigest(), "observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "pricing_version": public["pricing_version"], "phase": adoption["state"], "epoch": adoption["epoch"], "email_sink_only": True, "target_devbox": True}
 
+old_ids = output(["docker", "ps", "-aq", "--filter", "ancestor=mcr.microsoft.com/playwright:v1.56.1-noble"]).splitlines()
+for old_id in old_ids:
+    old = json.loads(output(["docker", "inspect", old_id]))[0]
+    for mount in old.get("Mounts", []):
+        source = Path(mount["Source"])
+        if mount["Destination"] == "/results" and source.parent == state and source.name.startswith("nonpaid-browser-"):
+            subprocess.run(["docker", "rm", "-f", old_id], check=True, capture_output=True, timeout=30)
+            (source / "pgpass").unlink(missing_ok=True)
+            break
+
+for stale in state.glob("nonpaid-browser-*/pgpass"):
+    if stale.parent.parent == state and stale.is_file():
+        stale.unlink()
+
 before = observe()
 (artifacts / "runtime-before.json").write_text(json.dumps(before))
 limits = json.loads(sql("SELECT json_build_object('max_concurrent',max_sandboxes,'max_vcpu',max_template_vcpu,'max_memory_mib',max_template_memory_mib,'max_disk_mib',max_template_disk_mib,'max_templates',max_templates) FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'"))
 (artifacts / "free-limits.json").write_text(json.dumps(limits))
-pgpass = artifacts / "pgpass"
-password = helpers.read_env(state / "services.env")["POSTGRES_PASSWORD"]
-pgpass.write_text("127.0.0.1:54322:postgres:supabase_admin:" + password.replace("\\", "\\\\").replace(":", "\\:") + "\n")
-pgpass.chmod(0o600)
-argv = ["psql", "-X", "-q", "-At", "-h", "127.0.0.1", "-p", "54322", "-U", "supabase_admin", "-d", "postgres", "-v", "ON_ERROR_STOP=1"]
-(artifacts / "psql-argv.json").write_text(json.dumps(argv))
-command = ["docker", "run", "--rm", "--network", "host", "--shm-size", "256m", "--mount", f"type=bind,src={root / 'nonpaid-browser-qa'},dst=/qa,readonly", "--mount", f"type=bind,src={artifacts},dst=/results", "-e", "PGPASSFILE=/results/pgpass", "mcr.microsoft.com/playwright:v1.56.1-noble", "bash", "-euc", "apt-get update -qq && apt-get install -y -qq postgresql-client >/dev/null && mkdir -p /tmp/qa && cp /qa/package.json /qa/package-lock.json /qa/nonpaid-signup.mjs /tmp/qa/ && cd /tmp/qa && npm ci --ignore-scripts --no-audit --no-fund >/dev/null && node nonpaid-signup.mjs --console http://localhost:3000 --auth http://localhost:54321 --mailpit http://localhost:8025 --backend-sha " + backend + " --console-sha " + console + " --runtime-proof /results/runtime-before.json --free-limits /results/free-limits.json --psql-argv /results/psql-argv.json --output /results/browser"]
+credential_context = tempfile.TemporaryDirectory(prefix="nonpaid-credential-", dir=state)
+credential_dir = Path(credential_context.name)
+pgpass = credential_dir / "pgpass"
+container_name = "pricing-nonpaid-" + uuid.uuid4().hex
 status = 1
 try:
+    password = helpers.read_env(state / "services.env")["POSTGRES_PASSWORD"]
+    pgpass.write_text("127.0.0.1:54322:postgres:supabase_admin:" + password.replace("\\", "\\\\").replace(":", "\\:") + "\n")
+    pgpass.chmod(0o600)
+    argv = ["psql", "-X", "-q", "-At", "-h", "127.0.0.1", "-p", "54322", "-U", "supabase_admin", "-d", "postgres", "-v", "ON_ERROR_STOP=1"]
+    (artifacts / "psql-argv.json").write_text(json.dumps(argv))
+    command = ["docker", "run", "--name", container_name, "--label", "pricing-nonpaid-qa=true", "--rm", "--network", "host", "--shm-size", "256m", "--mount", f"type=bind,src={root / 'nonpaid-browser-qa'},dst=/qa,readonly", "--mount", f"type=bind,src={artifacts},dst=/results", "--mount", f"type=bind,src={credential_dir},dst=/credentials,readonly", "-e", "PGPASSFILE=/credentials/pgpass", "mcr.microsoft.com/playwright:v1.56.1-noble", "bash", "-euc", "apt-get update -qq && apt-get install -y -qq postgresql-client >/dev/null && mkdir -p /tmp/qa && cp /qa/package.json /qa/package-lock.json /qa/nonpaid-signup.mjs /tmp/qa/ && cd /tmp/qa && npm ci --ignore-scripts --no-audit --no-fund >/dev/null && node nonpaid-signup.mjs --console http://localhost:3000 --auth http://localhost:54321 --mailpit http://localhost:8025 --backend-sha " + backend + " --console-sha " + console + " --runtime-proof /results/runtime-before.json --free-limits /results/free-limits.json --psql-argv /results/psql-argv.json --output /results/browser"]
     with (artifacts / "runner-private.log").open("w") as log:
         status = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=1200).returncode
 finally:
-    pgpass.unlink(missing_ok=True)
+    try:
+        remaining = output(["docker", "ps", "-aq", "--filter", "name=^/" + container_name + "$"])
+        if remaining:
+            subprocess.run(["docker", "rm", "-f", container_name], check=True, capture_output=True, timeout=30)
+    finally:
+        credential_context.cleanup()
     after = observe()
     (artifacts / "runtime-after.json").write_text(json.dumps(after))
     unchanged = all(before[key] == after[key] for key in ("pid", "binary_sha256", "console_container_id", "schema_receipt_sha256", "epoch", "phase", "pricing_version"))
@@ -85,4 +110,17 @@ finally:
     result = {"scope": "dev_only_nonpaid_browser", "artifacts": str(artifacts), "runtime_before": before, "runtime_after": after, "runtime_unchanged": unchanged, "runner_status": status, "browser_receipt": receipt}
     (artifacts / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
+    archive = artifacts / "review-artifacts.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        for name in ("summary.json", "runtime-before.json", "runtime-after.json", "browser/receipt.json"):
+            item = artifacts / name
+            if item.is_file():
+                bundle.add(item, arcname=name, recursive=False)
+        for item in sorted((artifacts / "browser").glob("*.png")):
+            bundle.add(item, arcname="browser/" + item.name, recursive=False)
+    ciphertext = artifacts / "review-artifacts.cms"
+    subprocess.run(["openssl", "cms", "-encrypt", "-binary", "-aes-256-gcm", "-outform", "DER", "-in", str(archive), "-out", str(ciphertext), str(root / "nonpaid-browser-qa/artifact-recipient.pem")], check=True, capture_output=True)
+    encoded = base64.b64encode(ciphertext.read_bytes()).decode()
+    for offset in range(0, len(encoded), 2048):
+        print("RC_PRIVATE_QA_CHUNK " + encoded[offset:offset+2048])
 raise SystemExit(0 if status == 0 and unchanged and receipt.get("result") == "PASS" else 1)

@@ -53,9 +53,10 @@ try {
   check('psql_argv_valid', Array.isArray(psqlArgv) && psqlArgv.length > 0 && psqlArgv.every(x => typeof x === 'string') && !psqlArgv.some(x => /password=|postgres(?:ql)?:\/\/.*@/i.test(x)))
   check('runtime_pins_match', proof.backend_sha === backendSha && proof.console_sha === consoleSha)
   check('runtime_observed_recently', Date.now() - Date.parse(proof.observed_at) >= 0 && Date.now() - Date.parse(proof.observed_at) < 1800000)
-  check('runtime_released_public_v2', String(proof.phase).toLowerCase() === 'released' && proof.pricing_version === 'v2' && typeof proof.epoch === 'string' && proof.epoch.length > 0)
+  check('runtime_released_public_v2', String(proof.phase).toLowerCase() === 'released' && proof.pricing_version === 'v2' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(proof.epoch))
   check('runtime_isolated_sink', proof.email_sink_only === true && proof.target_devbox === true)
-  check('expected_free_limits_valid', expectedLimits && typeof expectedLimits.max_concurrent === 'number' && expectedLimits.max_concurrent > 0)
+  const limitKeys = ['max_concurrent', 'max_vcpu', 'max_memory_mib', 'max_disk_mib', 'max_templates']
+  check('expected_free_limits_valid', expectedLimits && Object.keys(expectedLimits).length === limitKeys.length && limitKeys.every(key => Object.hasOwn(expectedLimits, key) && (expectedLimits[key] === null || (typeof expectedLimits[key] === 'number' && Number.isFinite(expectedLimits[key]) && expectedLimits[key] >= 0))) && expectedLimits.max_concurrent > 0)
   receipt.runtime = { backend_sha: backendSha, console_sha: consoleSha, observed_at: proof.observed_at, phase: proof.phase, pricing_version: proof.pricing_version, epoch: proof.epoch }
   const suffix = randomBytes(10).toString('hex')
   const identities = {
@@ -69,17 +70,19 @@ try {
     const known = /^\/(?:auth\/(?:v1\/(?:token|user|logout|settings|verify|authorize)|signup|signin|callback|pending|auth-code-error)|api\/billing\/plan|sandboxes|_next\/.*)$/
     return { origin: category, path: category !== 'external' && known.test(u.pathname) ? u.pathname.replace(/\/_next\/.*/, '/_next/:asset') : ':other' }
   }
-  browser = await chromium.launch({ headless: true })
+  check('browser_executable_absolute', !args['browser-executable'] || path.isAbsolute(args['browser-executable']))
+  browser = await chromium.launch({ headless: true, ...(args['browser-executable'] ? { executablePath: args['browser-executable'] } : {}) })
+  receipt.browser = { engine: 'chromium', version: browser.version(), executable: args['browser-executable'] ? 'runner-supplied' : 'playwright-bundled', headless: true }
   const contexts = []
   const newPage = async label => {
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, serviceWorkers: 'block' })
-    contexts.push(context)
+    contexts.push({ label, context })
     await context.route('**/*', route => {
       const req = route.request()
       const u = new URL(req.url())
       if (!['http:', 'https:'].includes(u.protocol)) return route.continue()
       if (![consoleOrigin, authOrigin, sinkOrigin].includes(u.origin)) return route.abort('blockedbyclient')
-      if (req.method() !== 'GET' && /(?:checkout|stripe|plan-changes|plan-assignments|buy-credit)/.test(u.pathname)) return route.abort('blockedbyclient')
+      if (req.method() !== 'GET' && /(?:checkout|stripe|plan-changes|plan-assignments|buy-credit|prepaid|auto-recharge)/.test(u.pathname)) return route.abort('blockedbyclient')
       return route.continue()
     })
     const page = await context.newPage()
@@ -94,7 +97,7 @@ try {
     await page.screenshot({ path: path.join(output, `${label}.png`), animations: 'disabled', mask: [page.locator('input,textarea,iframe'), ...Object.values(identities).map(v => page.getByText(v.email, { exact: false }))] })
   }
   const messages = async email => {
-    const response = await fetch(`${sinkOrigin}/api/v1/search?query=${encodeURIComponent('to:' + email)}`, { signal: AbortSignal.timeout(5000) })
+    const response = await fetch(`${sinkOrigin}/api/v1/search?query=${encodeURIComponent('to:' + email)}`, { signal: AbortSignal.timeout(5000), redirect: 'error' })
     if (!response.ok) fail('mailpit_search_unavailable')
     const data = await response.json()
     return (data.messages || []).filter(m => (m.To || []).some(t => t.Address?.toLowerCase() === email))
@@ -104,7 +107,7 @@ try {
     await waitUntil(async () => {
       const candidates = await messages(email)
       for (const message of candidates) {
-        const response = await fetch(`${sinkOrigin}/api/v1/message/${encodeURIComponent(message.ID)}`, { signal: AbortSignal.timeout(5000) })
+        const response = await fetch(`${sinkOrigin}/api/v1/message/${encodeURIComponent(message.ID)}`, { signal: AbortSignal.timeout(5000), redirect: 'error' })
         if (!response.ok) fail('mailpit_message_unavailable')
         const content = await response.json()
         const html = String(content.HTML || '')
@@ -148,10 +151,37 @@ try {
     await page.goto(`${consoleOrigin}/auth/signin`, { waitUntil: 'domcontentloaded' })
     await page.getByPlaceholder('Email', { exact: true }).fill(identities[kind].email)
     await page.getByPlaceholder('Password', { exact: true }).fill(identities[kind].password)
+    const responsePromise = page.waitForResponse(response => {
+      const u = new URL(response.url())
+      return u.origin === authOrigin && /\/(?:auth\/v1\/)?token$/.test(u.pathname) && response.request().method() === 'POST'
+    })
     await page.getByRole('button', { name: 'Sign In', exact: true }).click()
+    const tokenResponse = await responsePromise
+    check(`${kind}_real_password_auth_200`, tokenResponse.status() === 200, { status: tokenResponse.status() })
+    const issued = await tokenResponse.json()
+    check(`${kind}_real_auth_user`, Boolean(issued.user?.id) && typeof issued.access_token === 'string')
+    if (kind === 'enterprise') {
+      check('enterprise_server_owned_pending', issued.user.app_metadata?.signup_review === 'pending')
+      const denied = await page.context().request.get(`${consoleOrigin}/api/billing/plan`, { maxRedirects: 0, headers: { Authorization: `Bearer ${issued.access_token}` } })
+      let payload
+      try { payload = await denied.json() } catch { fail('enterprise_authenticated_denial_not_json') }
+      check('enterprise_authenticated_plan_denied', denied.status() === 403 && payload.error?.code === 'signup_review_pending', { status: denied.status(), code: payload.error?.code === 'signup_review_pending' ? 'signup_review_pending' : 'unexpected' })
+      receipt.enterprise_authenticated_denial = { issued_email_password_auth_status: tokenResponse.status(), server_pending: true, plan_status: denied.status(), code: 'signup_review_pending', credential_source: 'normally-issued-password-session; not retained' }
+    }
     await waitUntil(async () => new URL(page.url()).pathname === (kind === 'free' ? '/sandboxes' : '/auth/pending'), `${kind}_login_destination`)
     return page
   }
+  await step('localhost_browser_preflight', async () => {
+    const page = await newPage('preflight')
+    const response = await page.goto(`${consoleOrigin}/auth/signup?offer=free`, { waitUntil: 'domcontentloaded' })
+    check('preflight_console_http_200', response?.status() === 200, { status: response?.status() ?? null })
+    await page.getByPlaceholder('Full Name', { exact: true }).waitFor()
+    await page.getByPlaceholder('Email', { exact: true }).waitFor()
+    await page.getByRole('button', { name: 'Sign Up', exact: true }).waitFor()
+    await screenshot(page, 'localhost-browser-preflight')
+    await messages(`w0-preflight-${suffix}@example.com`)
+    await page.context().close()
+  })
   let freePage
   await step('free_email_signup_and_sink_confirmation', async () => { freePage = await signup('free'); await confirm(freePage, 'free') })
   await step('free_fresh_context_password_login_and_plan_limits', async () => {
@@ -162,6 +192,8 @@ try {
     check('free_plan_authoritative', body.plan?.kind === 'free' && body.plan?.plan_key === 'free')
     check('free_effective_limits_match', Object.entries(expectedLimits).every(([key, value]) => body.plan?.limits?.[key] === value))
     receipt.free_effective_limits = Object.fromEntries(Object.keys(expectedLimits).map(key => [key, body.plan.limits[key]]))
+    const cookies = await freePage.context().cookies()
+    receipt.free_session = { fresh_context_password_login: true, authenticated_plan_status: response.status(), cookie_count: cookies.length, http_only_cookie_count: cookies.filter(c => c.httpOnly).length }
     await screenshot(freePage, 'free-password-login')
   })
   await step('enterprise_email_confirm_remains_held', async () => {
@@ -169,10 +201,10 @@ try {
     await confirm(page, 'enterprise')
     await page.goto(`${consoleOrigin}/sandboxes`, { waitUntil: 'domcontentloaded' })
     await waitUntil(async () => ['/auth/pending', '/auth/signin'].includes(new URL(page.url()).pathname), 'enterprise_dashboard_forbidden')
-    const response = await page.context().request.get(`${consoleOrigin}/api/billing/plan`, { maxRedirects: 0 })
-    check('enterprise_plan_access_denied', [401, 403, 307, 302, 303].includes(response.status()), { status: response.status() })
     const logged = await login('enterprise')
     await logged.getByRole('heading', { name: /set up your Enterprise plan/ }).waitFor()
+    const cookies = await logged.context().cookies()
+    receipt.enterprise_session = { fresh_context_password_login: true, landing_path: '/auth/pending', authenticated_plan_denied_status: receipt.enterprise_authenticated_denial.plan_status, cookie_count: cookies.length, http_only_cookie_count: cookies.filter(c => c.httpOnly).length }
     await screenshot(logged, 'enterprise-password-login-held')
     const mail = await messages(identities.enterprise.email)
     check('enterprise_no_approval_email', !mail.some(m => /approved|account is ready|access.*ready/i.test(String(m.Subject || ''))))
@@ -182,7 +214,8 @@ try {
     const sql = `BEGIN READ ONLY; SET LOCAL statement_timeout='10s'; SELECT json_build_object(
       'free_users',(SELECT count(*) FROM auth.users WHERE email=${literal(identities.free.email)} AND email_confirmed_at IS NOT NULL),
       'free_teams',(SELECT count(DISTINCT tm.team_id) FROM team_member tm JOIN auth.users u ON u.id=tm.profile_id WHERE u.email=${literal(identities.free.email)} AND tm.role='owner'),
-      'free_assignments',(SELECT count(*) FROM team_plan_assignment a JOIN team_member tm ON tm.team_id=a.team_id JOIN auth.users u ON u.id=tm.profile_id WHERE u.email=${literal(identities.free.email)} AND tm.role='owner' AND a.effective_to IS NULL AND a.kind='free' AND a.source='signup'),
+      'free_assignments',(SELECT count(*) FROM team_plan_assignment a JOIN team_member tm ON tm.team_id=a.team_id JOIN auth.users u ON u.id=tm.profile_id WHERE u.email=${literal(identities.free.email)} AND tm.role='owner' AND a.effective_to IS NULL AND a.effective_from<=CURRENT_TIMESTAMP AND a.kind='free' AND a.source='signup'),
+      'free_all_active_assignments',(SELECT count(*) FROM team_plan_assignment a JOIN team_member tm ON tm.team_id=a.team_id JOIN auth.users u ON u.id=tm.profile_id WHERE u.email=${literal(identities.free.email)} AND tm.role='owner' AND a.effective_to IS NULL),
       'held_users',(SELECT count(*) FROM auth.users WHERE email=${literal(identities.enterprise.email)} AND app_metadata_placeholder),
       'held_teams',(SELECT count(*) FROM team_member tm JOIN auth.users u ON u.id=tm.profile_id WHERE u.email=${literal(identities.enterprise.email)})
     ); ROLLBACK;`.replace('app_metadata_placeholder', "raw_app_meta_data->>'signup_review'='pending'")
@@ -190,7 +223,7 @@ try {
     check('readonly_db_command_success', result.status === 0)
     let counts
     try { counts = JSON.parse(result.stdout.trim()) } catch { fail('readonly_db_invalid_sanitized_counts') }
-    check('durable_free_once_and_enterprise_held', counts.free_users === 1 && counts.free_teams === 1 && counts.free_assignments === 1 && counts.held_users === 1 && counts.held_teams === 0)
+    check('durable_free_once_and_enterprise_held', counts.free_users === 1 && counts.free_teams === 1 && counts.free_assignments === 1 && counts.free_all_active_assignments === 1 && counts.held_users === 1 && counts.held_teams === 0)
     receipt.database_counts = counts
   })
   const material = receipt.network.filter(n => n.origin !== 'external' && (n.status >= 500 || (n.failed && !n.navigation_cancelled)))
