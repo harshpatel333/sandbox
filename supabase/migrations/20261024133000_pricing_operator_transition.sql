@@ -24,8 +24,12 @@ BEGIN
    RAISE EXCEPTION 'pricing transition schema prerequisites missing' USING ERRCODE='55000',CONSTRAINT='billing_pricing_transition_prerequisite';
   END IF;
  END LOOP;
- SELECT * INTO STRICT s FROM public.billing_pricing_switch WHERE singleton FOR UPDATE;
- SELECT * INTO STRICT a FROM public.billing_pricing_adoption WHERE singleton FOR UPDATE;
+ BEGIN
+  SELECT * INTO STRICT s FROM public.billing_pricing_switch WHERE singleton FOR UPDATE;
+  SELECT * INTO STRICT a FROM public.billing_pricing_adoption WHERE singleton FOR UPDATE;
+ EXCEPTION WHEN no_data_found OR too_many_rows THEN
+  RAISE EXCEPTION 'pricing singleton prerequisites missing or invalid' USING ERRCODE='55000',CONSTRAINT='billing_pricing_transition_prerequisite';
+ END;
  IF NOT EXISTS(SELECT 1 FROM public.profile pr JOIN public.user_role_assignments ura ON ura.user_id=pr.id
   JOIN public.roles r ON r.id=ura.role_id AND r.scope_type='platform'
   JOIN public.role_permissions rp ON rp.role_id=r.id JOIN public.permissions p ON p.id=rp.permission_id
@@ -68,8 +72,6 @@ BEGIN
  END IF;
  INSERT INTO public.billing_pricing_switch_audit(actor_id,from_version,to_version,reason) VALUES(p_actor,old_version,p_target,btrim(p_reason));
  RETURN QUERY SELECT s.pricing_version,s.changed_by,s.reason,s.changed_at,a.epoch,a.state,true;
-EXCEPTION WHEN no_data_found OR too_many_rows THEN
- RAISE EXCEPTION 'pricing singleton prerequisites missing or invalid' USING ERRCODE='55000',CONSTRAINT='billing_pricing_transition_prerequisite';
 END $$;
 
 REVOKE ALL ON FUNCTION public.billing_transition_pricing_version(text,uuid,text) FROM PUBLIC;

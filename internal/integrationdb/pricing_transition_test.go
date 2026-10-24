@@ -247,7 +247,7 @@ func TestPricingOperatorTransition(t *testing.T) {
 			checkTransitionError(t, e, "55000", "billing_pricing_transition_prerequisite")
 		})
 	}
-	for _, fault := range []string{"reset", "sync", "audit", "no_rotation"} {
+	for _, fault := range []string{"reset", "sync", "sync_no_data", "audit", "no_rotation"} {
 		t.Run("atomic_fault_"+fault, func(t *testing.T) {
 			tx, e := pool.Begin(ctx)
 			if e != nil {
@@ -255,12 +255,15 @@ func TestPricingOperatorTransition(t *testing.T) {
 			}
 			defer tx.Rollback(ctx)
 			sql := `CREATE FUNCTION transition_fixture_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected fault'; END $$; CREATE TRIGGER transition_fixture_fault BEFORE INSERT ON billing_pricing_switch_audit FOR EACH ROW EXECUTE FUNCTION transition_fixture_fault()`
-			if fault == "reset" || fault == "sync" {
+			if fault == "reset" || fault == "sync" || fault == "sync_no_data" {
 				fn := "billing_pricing_adoption_rotate"
-				if fault == "sync" {
+				if fault == "sync" || fault == "sync_no_data" {
 					fn = "sync_all_billing_plan_offers"
 				}
 				sql = "CREATE OR REPLACE FUNCTION " + fn + `() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected fault'; END $$`
+			}
+			if fault == "sync_no_data" {
+				sql = `CREATE OR REPLACE FUNCTION sync_all_billing_plan_offers() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected dependency no-data failure' USING ERRCODE='P0002'; END $$`
 			}
 			if fault == "no_rotation" {
 				sql = `CREATE OR REPLACE FUNCTION billing_pricing_adoption_rotate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$`
@@ -278,6 +281,9 @@ func TestPricingOperatorTransition(t *testing.T) {
 			}
 			_, e = sp.Exec(ctx, `SELECT * FROM billing_transition_pricing_version('v2',$1,'fault')`, actor)
 			code, marker := "P0001", ""
+			if fault == "sync_no_data" {
+				code = "P0002"
+			}
 			if fault == "no_rotation" {
 				code = "55000"
 				marker = "billing_pricing_transition_prerequisite"
