@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -477,14 +478,14 @@ func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 		return
 	}
 	var body staffPlanAssignmentBody
-	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 8192))
+	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&body) != nil || decoder.Decode(&struct{}{}) != io.EOF || body.VersionID == uuid.Nil {
 		respondErrorMsg(c, "bad_request", "idempotency_key, version_id and reason are required", http.StatusBadRequest)
 		return
 	}
 	body.Reason = strings.TrimSpace(body.Reason)
-	if strings.TrimSpace(body.Key) == "" || len(body.Key) > 200 || body.Reason == "" || len(body.Reason) > 2000 {
+	if strings.TrimSpace(body.Key) == "" || utf8.RuneCountInString(body.Key) > 200 || body.Reason == "" || utf8.RuneCountInString(body.Reason) > 2000 {
 		respondErrorMsg(c, "bad_request", "idempotency_key, version_id and reason are required", http.StatusBadRequest)
 		return
 	}
