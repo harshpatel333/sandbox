@@ -10,7 +10,7 @@ This migration requires a coordinated, quiesced API/schema cutover. Old API writ
 
 ## Existing assignments
 
-Catalog publication does not rewrite existing Free assignments. The operator must inspect them and apply a separate fenced transition:
+Catalog publication does not rewrite existing Free assignments. Effective template limits keep their existing frozen/manual precedence; there is no unconditional kind-Free zero overlay. New custom admission is denied independently for every Free assignment, including frozen cap ten. The assignment cap changes to zero through the fenced history successor. The operator must inspect them and apply a separate fenced transition:
 
 ```sh
 pricing-v2-migrate policy-report
@@ -21,6 +21,8 @@ pricing-v2-migrate policy-report
 ```
 
 Use the existing authenticated operator switch transition to enter raw v2 before preparing. Public entry remains closed during preparation. The commands use the region database and configured system team from the existing CLI environment. Run them only within an explicitly authorized environment.
+
+The frozen SQL signature is `public.billing_migrate_free_template_assignment(p_region text, p_system uuid, p_team uuid, p_expected_assignment uuid, p_actor text, p_reason text) RETURNS uuid`. All six arguments are required. The result is the successor assignment UUID captured inside the transaction; matching immutable predecessor/team receipt replay returns the recorded successor, including after raw pricing is OFF or the catalog changes. Scope binding is checked even on replay. There is no epoch argument or service-role transition RPC. A signature or replay-scope change requires a new explicit consumer contract.
 
 `policy-apply` uses a fresh READ COMMITTED transaction and calls `billing_migrate_free_template_assignment(text,uuid,uuid,uuid,text,text) RETURNS uuid`. The function is available only to a privileged human database caller. It is not an HTTP or service-role RPC. Actor and reason identify that human operation; they do not authenticate an HTTP caller.
 

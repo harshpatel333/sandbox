@@ -100,12 +100,20 @@ func TestIntegration_FreeTemplatePolicy_PreservesFrozenUsageAndHistory(t *testin
 		t.Fatal(err)
 	}
 	prepareFreeTemplatePolicy(t)
+	var beforeCap int
+	if err := testPool.QueryRow(t.Context(), `SELECT max_templates FROM team_effective_limits($1)`, team).Scan(&beforeCap); err != nil || beforeCap != 10 {
+		t.Fatalf("predecessor cap overlaid: %d %v", beforeCap, err)
+	}
 	var successor uuid.UUID
 	if err := testPool.QueryRow(t.Context(), `SELECT billing_migrate_free_template_assignment('use',$3,$1,$2,'operator@example.com','no custom templates')`, team, predecessor, testSystemTeamID).Scan(&successor); err != nil {
 		t.Fatal(err)
 	}
 	if successor == predecessor {
 		t.Fatal("did not append a successor")
+	}
+	var afterCap int
+	if err := testPool.QueryRow(t.Context(), `SELECT max_templates FROM team_effective_limits($1)`, team).Scan(&afterCap); err != nil || afterCap != 0 {
+		t.Fatalf("successor frozen cap missing: %d %v", afterCap, err)
 	}
 	var oldAfter, allowanceAfter, creditAfter []byte
 	var origin, oldStart time.Time
@@ -173,6 +181,20 @@ func TestIntegration_FreeTemplatePolicy_FencesOwnershipAndRollsBackFaults(t *tes
 
 	if _, err := testPool.Exec(t.Context(), apply, team, uuid.New()); pgCode(err) != "55000" {
 		t.Fatalf("stale identity: %v", err)
+	}
+	missingCatalog, err := testPool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := missingCatalog.Exec(t.Context(), `SELECT retire_billing_plan_version(md5('billing-plan-version:v2:free:no-custom-templates:1')::uuid,NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	_, missingErr := missingCatalog.Exec(t.Context(), apply, team, predecessor)
+	if err := missingCatalog.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if pgCode(missingErr) != "55000" {
+		t.Fatalf("fresh missing target ABI: %v", missingErr)
 	}
 	sandbox := seedActiveSandbox(t, team, "unsettled-policy")
 	if _, err := testQueries.RequestTeamPauseAll(t.Context(), db.RequestTeamPauseAllParams{TeamID: team, Reason: "plan_switch_free"}); err != nil {

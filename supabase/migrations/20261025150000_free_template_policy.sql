@@ -219,8 +219,9 @@ BEGIN
   OR adoption.system_team_id IS NULL OR p_team=adoption.system_team_id THEN
   RAISE EXCEPTION 'Free policy transition requires prepared raw v2' USING ERRCODE='55000';
  END IF;
- SELECT * INTO STRICT v FROM public.billing_plan_version
+ SELECT * INTO v FROM public.billing_plan_version
  WHERE id=md5('billing-plan-version:v2:free:no-custom-templates:1')::uuid AND family='free' AND pricing_version='v2' AND state='published' AND kind='free' AND max_templates=0 FOR SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION 'published canonical Free0 successor required' USING ERRCODE='55000'; END IF;
  PERFORM 1 FROM public.team_billing_account WHERE team_id=p_team FOR UPDATE NOWAIT;
  PERFORM 1 FROM public.team WHERE id=p_team AND home_region=adoption.region FOR UPDATE NOWAIT;
  IF NOT FOUND THEN RAISE EXCEPTION 'team missing or outside prepared region' USING ERRCODE='55000'; END IF;
@@ -301,29 +302,6 @@ DO $$ DECLARE r text; BEGIN
   END IF;
  END LOOP;
 END $$;
-
-CREATE OR REPLACE FUNCTION team_effective_limits(p_team uuid)
-RETURNS TABLE(max_concurrent integer, max_vcpu integer, max_memory_mib integer, max_disk_mib integer, max_templates integer)
-LANGUAGE sql STABLE AS $$
-    WITH base AS (
-        SELECT max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates
-        FROM billing_plan_version WHERE family = 'payg' AND pricing_version = 'legacy' AND kind = 'legacy_payg' AND state <> 'draft'
-        ORDER BY state = 'published' DESC, version DESC LIMIT 1
-    ), assigned AS (
-        SELECT kind, (limits->>'max_templates')::integer AS max_templates FROM team_plan_assignment
-        WHERE team_id=p_team AND effective_to IS NULL
-    ), frozen AS (
-        SELECT l.max_templates FROM billing_commercial_contract c JOIN billing_contract_limits l ON l.contract_id = c.id
-        WHERE c.team_id = p_team AND c.status = 'active' ORDER BY c.starts_at DESC LIMIT 1
-    )
-    SELECT t.max_sandboxes,
-        COALESCE(t.max_template_vcpu, b.max_template_vcpu),
-        COALESCE(t.max_template_memory_mib, b.max_template_memory_mib),
-        COALESCE(t.max_template_disk_mib, b.max_template_disk_mib),
-        CASE WHEN (SELECT kind FROM assigned)='free' THEN 0 ELSE COALESCE(t.max_templates, (SELECT max_templates FROM assigned), (SELECT max_templates FROM frozen), b.max_templates) END
-    FROM team t LEFT JOIN base b ON true WHERE t.id = p_team;
-$$;
-
 
 CREATE OR REPLACE FUNCTION billing_pricing_adoption_evidence_valid(p_region text,p_system uuid,p_epoch uuid,p_evidence jsonb)
 RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
