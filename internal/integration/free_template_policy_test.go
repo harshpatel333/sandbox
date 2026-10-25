@@ -46,6 +46,16 @@ func isolatedFreeTemplatePolicy(t *testing.T) {
 	})
 }
 
+func assignFreePolicyPredecessor(t *testing.T, team uuid.UUID, since time.Time) {
+	t.Helper()
+	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
+ VALUES($1,'free','free',md5('billing-plan-version:v2:free:1')::uuid,
+ '{"allowance":{"amount_cents":13,"period":"day_window","on_exhausted":"pause","compute":{"seconds":7200,"vcpu":1,"memory_gib":1}}}',
+ '{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096,"max_templates":10}',$2,'migration','test')`, team, since); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func prepareFreeTemplatePolicy(t *testing.T) {
 	t.Helper()
 	setPricingSwitch(t, "v2")
@@ -58,7 +68,7 @@ func prepareFreeTemplatePolicy(t *testing.T) {
 func TestIntegration_FreeTemplatePolicy_PreservesFrozenUsageAndHistory(t *testing.T) {
 	isolatedFreeTemplatePolicy(t)
 	team, _ := seedTeamAndKey(t)
-	assignFreePlan(t, team, time.Now().Add(-5*time.Hour))
+	assignFreePolicyPredecessor(t, team, time.Now().Add(-5*time.Hour))
 	var predecessor uuid.UUID
 	var frozen []byte
 	if err := testPool.QueryRow(t.Context(), `SELECT id,to_jsonb(a)-'effective_to' FROM team_plan_assignment a WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor, &frozen); err != nil {
@@ -144,7 +154,7 @@ func TestIntegration_FreeTemplatePolicy_PreservesFrozenUsageAndHistory(t *testin
 func TestIntegration_FreeTemplatePolicy_FencesOwnershipAndRollsBackFaults(t *testing.T) {
 	isolatedFreeTemplatePolicy(t)
 	team, _ := seedTeamAndKey(t)
-	assignFreePlan(t, team, time.Now().Add(-time.Hour))
+	assignFreePolicyPredecessor(t, team, time.Now().Add(-time.Hour))
 	var predecessor uuid.UUID
 	if err := testPool.QueryRow(t.Context(), `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor); err != nil {
 		t.Fatal(err)
@@ -220,7 +230,7 @@ func TestIntegration_FreeTemplatePolicy_FencesOwnershipAndRollsBackFaults(t *tes
 func TestIntegration_FreeTemplatePolicy_ReleaseRejectsCommittedOldFreeTarget(t *testing.T) {
 	isolatedFreeTemplatePolicy(t)
 	team, _ := seedTeamAndKey(t)
-	assignFreePlan(t, team, time.Now().Add(-time.Hour))
+	assignFreePolicyPredecessor(t, team, time.Now().Add(-time.Hour))
 	var predecessor uuid.UUID
 	if err := testPool.QueryRow(t.Context(), `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor); err != nil {
 		t.Fatal(err)
@@ -261,7 +271,7 @@ func TestIntegration_FreeTemplatePolicy_ReleaseRejectsCommittedOldFreeTarget(t *
 func TestIntegration_FreeTemplatePolicy_CLIContextAndReplay(t *testing.T) {
 	isolatedFreeTemplatePolicy(t)
 	team, _ := seedTeamAndKey(t)
-	assignFreePlan(t, team, time.Now().Add(-time.Hour))
+	assignFreePolicyPredecessor(t, team, time.Now().Add(-time.Hour))
 	var predecessor uuid.UUID
 	if err := testPool.QueryRow(t.Context(), `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor); err != nil {
 		t.Fatal(err)
@@ -318,5 +328,84 @@ func TestIntegration_FreeTemplatePolicy_CLIContextAndReplay(t *testing.T) {
 	}
 	if err := json.Unmarshal(cli("use", testSystemTeamID.String(), false, args...), &replay); err != nil || replay.AssignmentID != result.AssignmentID {
 		t.Fatalf("OFF CLI replay=%s %v", replay.AssignmentID, err)
+	}
+}
+
+func TestIntegration_FreeTemplatePolicy_RejectsUnknownPredecessor(t *testing.T) {
+	isolatedFreeTemplatePolicy(t)
+	team, _ := seedTeamAndKey(t)
+	assignFreePlan(t, team, time.Now().Add(-time.Hour))
+	prepareFreeTemplatePolicy(t)
+	var predecessor uuid.UUID
+	if err := testPool.QueryRow(t.Context(), `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor); err != nil {
+		t.Fatal(err)
+	}
+	_, err := testPool.Exec(t.Context(), `SELECT billing_migrate_free_template_assignment('use',$1,$2,$3,'operator@example.com','unknown predecessor')`, testSystemTeamID, team, predecessor)
+	if pgCode(err) != "55000" {
+		t.Fatalf("unknown Free predecessor accepted: %v", err)
+	}
+	var current uuid.UUID
+	if err := testPool.QueryRow(t.Context(), `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&current); err != nil || current != predecessor {
+		t.Fatalf("unknown predecessor mutated: %s %v", current, err)
+	}
+}
+
+func TestIntegration_FreeTemplatePolicy_LatePauseUsesSuccessor(t *testing.T) {
+	isolatedFreeTemplatePolicy(t)
+	team, _ := seedTeamAndKey(t)
+	assignFreePolicyPredecessor(t, team, time.Now().Add(-time.Hour))
+	prepareFreeTemplatePolicy(t)
+	sandbox := seedActiveSandbox(t, team, "late-pause-policy")
+	var predecessor uuid.UUID
+	if err := testPool.QueryRow(t.Context(), `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := testPool.BeginTx(t.Context(), pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(context.Background())
+	var pid int
+	if err := holder.QueryRow(t.Context(), `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	var successor uuid.UUID
+	if err := holder.QueryRow(t.Context(), `SELECT billing_migrate_free_template_assignment('use',$1,$2,$3,'operator@example.com','pause race')`, testSystemTeamID, team, predecessor).Scan(&successor); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := testQueries.RequestTeamPauseAll(t.Context(), db.RequestTeamPauseAllParams{TeamID: team, Reason: "plan_switch_free"})
+		result <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		select {
+		case err := <-result:
+			t.Fatalf("pause request escaped transition fence: %v", err)
+		default:
+		}
+		var waiting bool
+		if err := testPool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pause request did not wait for team transition")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := holder.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	var target uuid.UUID
+	var settled bool
+	if err := testPool.QueryRow(t.Context(), `SELECT assignment_id,billing_pause_target_settled(t) FROM billing_team_pause_target t WHERE sandbox_id=$1`, sandbox).Scan(&target, &settled); err != nil || target != successor || settled {
+		t.Fatalf("late pause target=%s successor=%s settled=%v err=%v", target, successor, settled, err)
 	}
 }

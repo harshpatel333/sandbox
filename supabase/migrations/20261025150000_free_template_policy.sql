@@ -45,8 +45,13 @@ BEGIN
     SELECT * INTO STRICT predecessor FROM billing_plan_version
     WHERE pricing_version = 'v2' AND family = 'free' AND kind = 'free' AND state = 'published'
     FOR UPDATE;
-    IF predecessor.max_templates = 0 THEN
+    IF predecessor.id=md5('billing-plan-version:v2:free:no-custom-templates:1')::uuid AND predecessor.max_templates=0
+       AND EXISTS(SELECT 1 FROM billing_plan_version WHERE id=md5('billing-plan-version:v2:free:1')::uuid
+        AND family='free' AND pricing_version='v2' AND kind='free' AND state='retired' AND max_templates=10) THEN
         RETURN;
+    END IF;
+    IF predecessor.id IS DISTINCT FROM md5('billing-plan-version:v2:free:1')::uuid OR predecessor.max_templates IS DISTINCT FROM 10 THEN
+        RAISE EXCEPTION 'unexpected Free catalog predecessor' USING ERRCODE='55000';
     END IF;
 
     successor := predecessor;
@@ -142,13 +147,35 @@ REVOKE ALL ON billing_free_template_policy_transition FROM PUBLIC;
 CREATE TRIGGER billing_free_template_policy_transition_immutable BEFORE UPDATE OR DELETE OR TRUNCATE
  ON billing_free_template_policy_transition FOR EACH STATEMENT EXECUTE FUNCTION guard_billing_catalog_append_only();
 
+CREATE OR REPLACE FUNCTION request_team_pause_all(p_team uuid,p_reason text)
+RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE targets integer;
+BEGIN
+ PERFORM id FROM team WHERE id=p_team FOR SHARE;
+WITH requested AS (
+  INSERT INTO billing_team_pause_request(assignment_id,team_id)
+  SELECT id,team_id FROM team_plan_assignment
+  WHERE team_id=p_team AND effective_to IS NULL AND kind='free' FOR SHARE
+  ON CONFLICT DO NOTHING
+  RETURNING assignment_id,team_id,requested_at
+ ), added AS (
+  INSERT INTO billing_team_pause_target (sandbox_id, team_id, assignment_id, reason, requested_at)
+  SELECT s.id, s.team_id, r.assignment_id, p_reason, r.requested_at
+  FROM requested r JOIN sandbox s ON s.team_id=r.team_id
+  WHERE s.destroyed_at IS NULL AND s.status NOT IN ('paused', 'failed', 'deleted')
+  RETURNING 1
+ )
+ SELECT count(*)::int INTO targets FROM added;
+ RETURN targets;
+END $$;
+
 CREATE OR REPLACE FUNCTION billing_free_template_policy_blocker(p_team uuid)
 RETURNS text LANGUAGE plpgsql STABLE SET search_path=pg_catalog,public,pg_temp SET row_security=off AS $$
 DECLARE blocked text; pending boolean;
 BEGIN
  blocked:=public.billing_pricing_adoption_blocker(p_team);
  IF blocked IS NOT NULL THEN RETURN blocked; END IF;
- IF EXISTS(SELECT 1 FROM public.billing_team_pause_target WHERE team_id=p_team AND done_at IS NULL) THEN RETURN 'unfinished_pause_target'; END IF;
+ IF EXISTS(SELECT 1 FROM public.billing_team_pause_target t WHERE team_id=p_team AND done_at IS NULL AND NOT public.billing_pause_target_settled(t)) THEN RETURN 'unfinished_pause_target'; END IF;
  IF EXISTS(SELECT 1 FROM public.billing_free_allowance_retry WHERE team_id=p_team) THEN RETURN 'allowance_retry'; END IF;
  IF to_regclass('public.team_plan_change') IS NOT NULL THEN
   EXECUTE 'SELECT EXISTS(SELECT 1 FROM public.team_plan_change WHERE team_id=$1)' INTO pending USING p_team;
@@ -191,16 +218,17 @@ BEGIN
   RAISE EXCEPTION 'Free policy transition requires prepared raw v2' USING ERRCODE='55000';
  END IF;
  SELECT * INTO STRICT v FROM public.billing_plan_version
- WHERE family='free' AND pricing_version='v2' AND state='published' AND kind='free' AND max_templates=0 FOR SHARE;
+ WHERE id=md5('billing-plan-version:v2:free:no-custom-templates:1')::uuid AND family='free' AND pricing_version='v2' AND state='published' AND kind='free' AND max_templates=0 FOR SHARE;
  PERFORM 1 FROM public.team_billing_account WHERE team_id=p_team FOR UPDATE NOWAIT;
  PERFORM 1 FROM public.team WHERE id=p_team AND home_region=adoption.region FOR UPDATE NOWAIT;
  IF NOT FOUND THEN RAISE EXCEPTION 'team missing or outside prepared region' USING ERRCODE='55000'; END IF;
  PERFORM 1 FROM public.team_billing_account WHERE team_id=p_team FOR UPDATE NOWAIT;
  SELECT * INTO old_assignment FROM public.team_plan_assignment WHERE team_id=p_team AND effective_to IS NULL FOR UPDATE NOWAIT;
- IF NOT FOUND OR old_assignment.id<>p_expected_assignment OR old_assignment.kind<>'free' OR old_assignment.contract_id IS NOT NULL THEN
+ IF NOT FOUND OR old_assignment.id<>p_expected_assignment OR old_assignment.kind<>'free' OR old_assignment.plan_key<>'free'
+  OR old_assignment.plan_version_id IS DISTINCT FROM md5('billing-plan-version:v2:free:1')::uuid
+  OR old_assignment.limits->'max_templates' IS DISTINCT FROM '10'::jsonb OR old_assignment.contract_id IS NOT NULL THEN
   RAISE EXCEPTION 'current Free assignment identity changed' USING ERRCODE='55000';
  END IF;
- IF old_assignment.limits->'max_templates'='0'::jsonb THEN RETURN old_assignment.id; END IF;
  blocked:=public.billing_free_template_policy_blocker(p_team);
  IF blocked IS NOT NULL THEN RAISE EXCEPTION 'unresolved authority: %',blocked USING ERRCODE='55000'; END IF;
  SELECT * INTO credit FROM public.billing_pricing_adoption_credit_resolution WHERE team_id=p_team FOR UPDATE;
