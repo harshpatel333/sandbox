@@ -188,10 +188,13 @@ func (v planVersion) validate() error {
 			return errors.New("fees must be positive")
 		}
 	}
-	for _, limit := range []*int32{v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB, v.Limits.MaxTemplates} {
+	for _, limit := range []*int32{v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB} {
 		if limit != nil && *limit <= 0 {
 			return errors.New("limits must be positive")
 		}
+	}
+	if v.Limits.MaxTemplates != nil && *v.Limits.MaxTemplates < 0 {
+		return errors.New("max_templates must be nonnegative")
 	}
 	if v.Limits.MaxMemoryMiB != nil && *v.Limits.MaxMemoryMiB < minimumTemplateMemoryMiB {
 		return errors.New("max_memory_mib must allow at least 256 MiB")

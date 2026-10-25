@@ -88,6 +88,11 @@ func TestPlanVersionValidate(t *testing.T) {
 	if err := valid.validate(); err != nil {
 		t.Fatal(err)
 	}
+	free := planVersion{PricingVersion: "v2", Family: "free", Kind: "free", DisplayName: "Free",
+		Limits: planLimits{MaxConcurrent: int32p(1), MaxVCPU: int32p(1), MaxMemoryMiB: int32p(1024), MaxDiskMiB: int32p(4096), MaxTemplates: int32p(0)}}
+	if err := free.validate(); err != nil {
+		t.Fatalf("Free with no custom templates: %v", err)
+	}
 	for name, mutate := range map[string]func(*planVersion){
 		"family":               func(v *planVersion) { v.Family = "Pro_1" },
 		"pricing version":      func(v *planVersion) { v.PricingVersion = "v3" },
@@ -98,7 +103,7 @@ func TestPlanVersionValidate(t *testing.T) {
 		"fee with underscore":  func(v *planVersion) { v.Family = "custom_example" },
 		"zero fee":             func(v *planVersion) { v.MonthlyFeeCents = int64p(0) },
 		"limits":               func(v *planVersion) { v.Limits.MaxConcurrent = nil },
-		"zero templates":       func(v *planVersion) { v.Limits.MaxTemplates = int32p(0) },
+		"negative templates":   func(v *planVersion) { v.Limits.MaxTemplates = int32p(-1) },
 		"memory below minimum": func(v *planVersion) { v.Limits.MaxMemoryMiB = int32p(255) },
 		"disk below minimum":   func(v *planVersion) { v.Limits.MaxDiskMiB = int32p(1023) },
 		"payg without caps": func(v *planVersion) {
