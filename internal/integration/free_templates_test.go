@@ -37,7 +37,11 @@ func TestIntegration_FreeTemplates_RejectNewBuildsRetainArtifactsAndReplay(t *te
 	if err := json.Unmarshal(created.Body.Bytes(), &template); err != nil {
 		t.Fatal(err)
 	}
-	assignFreePlan(t, team, time.Now().Add(-time.Hour))
+	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_plan_assignment
+     (team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+     VALUES($1,'free','free','{}','{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096,"max_templates":10}',now()-interval '1 hour','migration','retained Free terms')`, team); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := testPool.Exec(t.Context(), `UPDATE team SET max_templates=100, limits_customized=true WHERE id=$1`, team); err != nil {
 		t.Fatal(err)
 	}

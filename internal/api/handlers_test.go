@@ -487,8 +487,9 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		if s.RoutingVersion == 0 {
 			*dest[37].(*int64) = 1
 		}
-		*dest[38].(*pgtype.UUID) = s.SourceSnapshotID
-		for _, target := range dest[39:] {
+		*dest[38].(*bool) = s.SystemTemplate
+		*dest[39].(*pgtype.UUID) = s.SourceSnapshotID
+		for _, target := range dest[40:] {
 			switch v := target.(type) {
 			case *time.Time:
 				*v = time.Now()
@@ -1234,7 +1235,7 @@ func snapshotRow(s db.Snapshot) *mockRow {
 // missing snapshot row.
 func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
-		if err := sandboxRow(sb).scanFn(dest[:39]...); err != nil {
+		if err := sandboxRow(sb).scanFn(dest[:40]...); err != nil {
 			return err
 		}
 		var snapPath, snapMemPath *string
@@ -1244,15 +1245,15 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			snapPath, snapMemPath = &p, snap.MemPath
 			snapCreatedAt = pgtype.Timestamptz{Time: snap.CreatedAt, Valid: true}
 		}
-		*dest[39].(**string) = snapPath
-		*dest[40].(**string) = snapMemPath
-		*dest[41].(*pgtype.Timestamptz) = snapCreatedAt
+		*dest[40].(**string) = snapPath
+		*dest[41].(**string) = snapMemPath
+		*dest[42].(*pgtype.Timestamptz) = snapCreatedAt
 		if access == "" {
 			access = preview.AccessLegacyPublic
 		}
-		*dest[42].(*string) = access
 		*dest[43].(*string) = access
-		*dest[44].(*int64) = revision
+		*dest[44].(*string) = access
+		*dest[45].(*int64) = revision
 		numbers, accesses, versions := []int32{}, []string{}, []int64{}
 		for _, port := range ports {
 			version := port.TokenVersion
@@ -1263,14 +1264,14 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			accesses = append(accesses, port.Access)
 			versions = append(versions, version)
 		}
-		*dest[45].(*[]int32) = numbers
-		*dest[46].(*[]string) = accesses
-		*dest[47].(*[]int64) = versions
-		*dest[48].(**string) = nil
-		*dest[49].(*time.Time) = time.Now()
-		*dest[50].(*bool) = false
-		*dest[51].(*pgtype.UUID) = pgtype.UUID{}
+		*dest[46].(*[]int32) = numbers
+		*dest[47].(*[]string) = accesses
+		*dest[48].(*[]int64) = versions
+		*dest[49].(**string) = nil
+		*dest[50].(*time.Time) = time.Now()
+		*dest[51].(*bool) = false
 		*dest[52].(*pgtype.UUID) = pgtype.UUID{}
+		*dest[53].(*pgtype.UUID) = pgtype.UUID{}
 		return nil
 	}}
 }
@@ -2354,9 +2355,9 @@ func TestActivateSandbox_UnclassifiedOwnershipFailsInsteadOfOmittingToken(t *tes
 		scan := row.scanFn
 		row.scanFn = func(dest ...any) error {
 			err := scan(dest...)
-			if len(dest) == 44 {
+			if len(dest) == 45 {
 				// Owner columns without the presence flag cannot be classified.
-				*dest[42].(*pgtype.UUID) = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+				*dest[43].(*pgtype.UUID) = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 			}
 			return err
 		}

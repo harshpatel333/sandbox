@@ -74,9 +74,9 @@ func TestSharedResumePreservesMachineOwner(t *testing.T) {
 								return err
 							}
 							if scenario == "machine" || scenario == "machine_caller" {
-								*dest[50].(*bool) = true
-								*dest[51].(*pgtype.UUID) = pgtype.UUID{Bytes: principal, Valid: true}
-								*dest[52].(*pgtype.UUID) = pgtype.UUID{Bytes: team, Valid: true}
+								*dest[51].(*bool) = true
+								*dest[52].(*pgtype.UUID) = pgtype.UUID{Bytes: principal, Valid: true}
+								*dest[53].(*pgtype.UUID) = pgtype.UUID{Bytes: team, Valid: true}
 							}
 							return nil
 						}}
@@ -211,10 +211,10 @@ func TestMachineActivateEnforcesOwnershipFromRoutingRead(t *testing.T) {
 			scan := row.scanFn
 			row.scanFn = func(dest ...any) error {
 				err := scan(dest...)
-				if len(dest) == 44 {
-					*dest[41].(*bool) = true
-					*dest[42].(*pgtype.UUID) = pgtype.UUID{Bytes: principal, Valid: true}
-					*dest[43].(*pgtype.UUID) = pgtype.UUID{Bytes: team, Valid: true}
+				if len(dest) == 45 {
+					*dest[42].(*bool) = true
+					*dest[43].(*pgtype.UUID) = pgtype.UUID{Bytes: principal, Valid: true}
+					*dest[44].(*pgtype.UUID) = pgtype.UUID{Bytes: team, Valid: true}
 				}
 				return err
 			}
@@ -272,13 +272,13 @@ func TestMachineFileListEnforcesJoinedOwnership(t *testing.T) {
 						if err := scan(dest...); err != nil {
 							return err
 						}
-						if len(dest) != 44 {
+						if len(dest) != 45 {
 							t.Fatalf("expected joined routing read, got %d columns", len(dest))
 						}
 						if scenario != "missing_owner" {
-							*dest[41].(*bool) = true
-							*dest[42].(*pgtype.UUID) = pgtype.UUID{Bytes: principal, Valid: true}
-							*dest[43].(*pgtype.UUID) = pgtype.UUID{Bytes: team, Valid: true}
+							*dest[42].(*bool) = true
+							*dest[43].(*pgtype.UUID) = pgtype.UUID{Bytes: principal, Valid: true}
+							*dest[44].(*pgtype.UUID) = pgtype.UUID{Bytes: team, Valid: true}
 						}
 						return nil
 					}
