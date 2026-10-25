@@ -38,6 +38,7 @@ SOURCE_DIRS = {"sandbox": "sandbox", "ui": "superserve"}
 PROFILE_PATH = Path(__file__).resolve().parents[3] / "deploy" / "devbox" / "profile.json"
 SECRET_PREFIX = "DEVBOX_SECRET_"
 CONFIG_PREFIX = "DEVBOX_CONFIG_"
+CALENDLY_SECRETS = frozenset({"CALENDLY_API_TOKEN", "CALENDLY_ORGANIZATION_URI", "CALENDLY_ENTERPRISE_EVENT_TYPE_URI"})
 # Tuning knobs the product defaults when absent; an empty value is left out of
 # devbox.env instead of failing the run like every other forwarded value.
 OPTIONAL_CONFIG = frozenset({"RECAPTCHA_SCORE_THRESHOLD"})
@@ -469,7 +470,11 @@ def box_config(manifest, env):
 
 
 def configuration(manifest, env):
-    return env_file(box_config(manifest, env)), env_file(prefixed(env, SECRET_PREFIX, "secrets"))
+    secrets = prefixed(env, SECRET_PREFIX, "secrets", optional=CALENDLY_SECRETS)
+    present = set(secrets) & CALENDLY_SECRETS
+    if present and present != CALENDLY_SECRETS:
+        raise StepError("Calendly configuration requires all three server runtime secrets")
+    return env_file(box_config(manifest, env)), env_file(secrets)
 
 
 def deliver_configuration(box, files):

@@ -951,5 +951,25 @@ class DeployTests(WorkflowCase):
         self.assertEqual(cloud.metadata_writes[-1]["deploys"][-1]["result"], "succeeded")
 
 
+
+class CalendlyConfigurationTest(unittest.TestCase):
+    def manifest(self):
+        return {'name': 'example-box', 'devbox_id': '123456789abc', 'owner': 'example-owner', 'project': 'example-project', 'zone': 'us-central1-a', 'expires_at': '2027-01-01T00:00:00Z', 'revisions': {'sandbox': {'sha': SANDBOX_SHA}, 'ui': {'sha': UI_SHA}}}
+
+    def test_empty_optional_set_omitted_and_partial_refused(self):
+        env = {'DEVBOX_SECRET_' + key: '' for key in workflow.CALENDLY_SECRETS}
+        self.assertEqual(workflow.configuration(self.manifest(), env)[1], '')
+        for key in workflow.CALENDLY_SECRETS:
+            with self.subTest(key=key), self.assertRaises(workflow.StepError):
+                workflow.configuration(self.manifest(), {**env, 'DEVBOX_SECRET_' + key: 'synthetic'})
+
+    def test_complete_set_shell_quotes_without_public_config(self):
+        values = {key: "synthetic value's $literal" for key in workflow.CALENDLY_SECRETS}
+        public, private = workflow.configuration(self.manifest(), {'DEVBOX_SECRET_' + key: value for key, value in values.items()})
+        for key, value in values.items():
+            self.assertNotIn(key, public)
+            self.assertIn(key + '=' + shlex.quote(value) + '\n', private)
+        self.assertNotIn('GOOGLE_SIGNUP_PROOF_SECRET', private)
+
 if __name__ == "__main__":
     unittest.main()
