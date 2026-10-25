@@ -43,13 +43,9 @@ CREATE TABLE billing_pro_upgrade_setup (
 );
 CREATE UNIQUE INDEX billing_pro_upgrade_setup_pending ON billing_pro_upgrade_setup(upgrade_id) WHERE state<>'expired';
 ALTER TABLE billing_pro_upgrade_setup ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON billing_pro_upgrade_setup FROM PUBLIC, anon, authenticated;
-GRANT SELECT,INSERT,UPDATE ON billing_pro_upgrade_setup TO service_role;
-CREATE POLICY billing_pro_upgrade_setup_backend ON billing_pro_upgrade_setup TO service_role USING(true) WITH CHECK(true);
+REVOKE ALL ON billing_pro_upgrade_setup FROM PUBLIC;
 ALTER TABLE billing_pro_upgrade ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON billing_pro_upgrade FROM PUBLIC, anon, authenticated;
-GRANT SELECT,INSERT,UPDATE ON billing_pro_upgrade TO service_role;
-CREATE POLICY billing_pro_upgrade_backend ON billing_pro_upgrade TO service_role USING(true) WITH CHECK(true);
+REVOKE ALL ON billing_pro_upgrade FROM PUBLIC;
 
 CREATE FUNCTION guard_pro_upgrade_entry() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -84,9 +80,22 @@ CREATE TABLE billing_pro_upgrade_catchup (
  UNIQUE(upgrade_id,period_start)
 );
 ALTER TABLE billing_pro_upgrade_catchup ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON billing_pro_upgrade_catchup FROM PUBLIC, anon, authenticated;
-GRANT SELECT,INSERT,UPDATE ON billing_pro_upgrade_catchup TO service_role;
-CREATE POLICY billing_pro_upgrade_catchup_backend ON billing_pro_upgrade_catchup TO service_role USING(true) WITH CHECK(true);
+REVOKE ALL ON billing_pro_upgrade_catchup FROM PUBLIC;
+DO $$
+DECLARE t text; r text;
+BEGIN
+ FOREACH t IN ARRAY ARRAY['billing_pro_upgrade_setup','billing_pro_upgrade','billing_pro_upgrade_catchup'] LOOP
+  FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
+    EXECUTE format('REVOKE ALL ON %I FROM %I',t,r);
+   END IF;
+  END LOOP;
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+   EXECUTE format('GRANT SELECT,INSERT,UPDATE ON %I TO service_role',t);
+   EXECUTE format('CREATE POLICY %I ON %I TO service_role USING(true) WITH CHECK(true)',t||'_backend',t);
+  END IF;
+ END LOOP;
+END $$;
 
 CREATE FUNCTION end_pro_upgrade() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN

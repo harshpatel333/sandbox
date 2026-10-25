@@ -24,9 +24,20 @@ CREATE TABLE billing_pro_released_invoice (
 );
 CREATE INDEX billing_pro_released_invoice_due ON billing_pro_released_invoice(next_check_at) WHERE verified_revision<revision OR state<>'recorded' OR credit_state='pending';
 ALTER TABLE billing_pro_released_invoice ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON billing_pro_released_invoice FROM PUBLIC,anon,authenticated;
-GRANT SELECT,INSERT,UPDATE ON billing_pro_released_invoice TO service_role;
-CREATE POLICY pro_released_invoice_backend ON billing_pro_released_invoice TO service_role USING(true) WITH CHECK(true);
+REVOKE ALL ON billing_pro_released_invoice FROM PUBLIC;
+DO $$
+DECLARE r text;
+BEGIN
+ FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
+   EXECUTE format('REVOKE ALL ON billing_pro_released_invoice FROM %I',r);
+  END IF;
+ END LOOP;
+ IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+  GRANT SELECT,INSERT,UPDATE ON billing_pro_released_invoice TO service_role;
+  CREATE POLICY pro_released_invoice_backend ON billing_pro_released_invoice TO service_role USING(true) WITH CHECK(true);
+ END IF;
+END $$;
 
 CREATE FUNCTION guard_pro_released_invoice() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
