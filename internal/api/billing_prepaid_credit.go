@@ -79,9 +79,17 @@ func (h *Handlers) issuePrepaidCredit(ctx context.Context, client *stripeHTTPCli
 	defer release()
 	var payload []byte
 	var first *time.Time
-	err = h.Pool.QueryRow(ctx, `UPDATE billing_prepaid_purchase SET credit_state='uncertain',credit_first_attempt_at=COALESCE(credit_first_attempt_at,clock_timestamp())
- WHERE id=$1 AND credit_state IN ('pending','uncertain') RETURNING credit_request,credit_first_attempt_at`, id).Scan(&payload, &first)
+	err = h.Pool.QueryRow(ctx, `UPDATE billing_prepaid_purchase p SET credit_state='uncertain',credit_first_attempt_at=COALESCE(credit_first_attempt_at,clock_timestamp())
+ WHERE id=$1 AND (credit_state='uncertain' OR (credit_state='pending'
+  AND NOT EXISTS(SELECT 1 FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id AND r.resolution IS DISTINCT FROM 'keep')))
+ RETURNING credit_request,credit_first_attempt_at`, id).Scan(&payload, &first)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if withheld, werr := h.prepaidCreditWithheld(ctx, id); werr != nil || withheld {
+			if werr != nil {
+				return werr
+			}
+			return fmt.Errorf("%w: the purchase payment was reversed", errCreditIssuanceDeferred)
+		}
 		return nil
 	}
 	if err != nil {

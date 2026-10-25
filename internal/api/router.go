@@ -182,6 +182,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.POST("/yc/claims/decision", TeamCreationPrivacy(), h.DecideYCClaim)
 		// Billing recovery requires a credential unavailable to VMD hosts.
 		operator.POST("/teams/:team_id/billing/prepaid/auto-recharge/disable", h.DisablePlatformAutoRecharge)
+		operator.POST("/teams/:team_id/billing/prepaid/purchases/:purchase_id/reversal", h.ResolvePrepaidReversal)
 		operator.POST("/teams/:team_id/billing/matching", h.AttachTeamMatchingRule)
 		operator.POST("/teams/:team_id/billing/matching/revoke", h.RevokeTeamMatchingRule)
 		operator.POST("/teams/:team_id/billing/matching/credits/:credit_id/acknowledge", h.AcknowledgeMatchingCreditFlag)
@@ -276,6 +277,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/billing/matching/flags", h.ListMatchingCreditFlags)
 		internal.GET("/teams/:team_id/billing/prepaid", h.GetPlatformTeamPrepaid)
 		internal.GET("/billing/prepaid/purchases", h.ListPrepaidPurchases)
+		internal.GET("/billing/prepaid/reversals", h.ListPrepaidReversals)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)

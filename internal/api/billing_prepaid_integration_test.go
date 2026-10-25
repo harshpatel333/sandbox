@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -45,6 +46,8 @@ type prepaidFixture struct {
 	grantPosts          []url.Values
 	decline, loseIntent bool
 	aggregateReads      int
+	refunded            map[string]int64
+	disputed            map[string]bool
 	assigned            []uuid.UUID
 }
 
@@ -75,7 +78,7 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 		t.Fatal(err)
 	}
 	f := &prepaidFixture{t: t, h: h, team: team.ID, customer: "cus_" + uuid.NewString(), sub: "sub_" + uuid.NewString(),
-		intents: map[string]prepaidPaymentIntent{}, intentByKey: map[string]string{}, sessions: map[string]map[string]any{}, sessionByKey: map[string]string{},
+		intents: map[string]prepaidPaymentIntent{}, intentByKey: map[string]string{}, refunded: map[string]int64{}, disputed: map[string]bool{}, sessions: map[string]map[string]any{}, sessionByKey: map[string]string{},
 		invoices: map[string]StripeInvoiceAmounts{}, products: map[string]map[string]string{}, grants: map[string]entitlementGrant{}, grantByKey: map[string]string{}, balances: map[string]int64{}}
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
@@ -95,7 +98,7 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 		assignStarterAfterPurchase = assign
 		_, _ = pool.Exec(context.Background(), `UPDATE billing_funding_account SET observe=false,enforce=false,prepaid=false WHERE team_id=$1`, f.team)
 		_, _ = pool.Exec(context.Background(), `UPDATE billing_prepaid_auto_recharge SET enabled=false WHERE team_id=$1`, f.team)
-		_, _ = pool.Exec(context.Background(), `UPDATE billing_prepaid_purchase SET next_attempt_at='9999-01-01',credit_balance_checked_at='9999-01-01' WHERE team_id=$1`, f.team)
+		_, _ = pool.Exec(context.Background(), `UPDATE billing_prepaid_purchase SET next_attempt_at='9999-01-01',credit_balance_checked_at='9999-01-01',reversal_checked_at='9999-01-01' WHERE team_id=$1`, f.team)
 	})
 	return f
 }
@@ -145,7 +148,16 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewEncoder(w).Encode(f.intents[id])
 	case strings.HasPrefix(path, "/v1/payment_intents/"):
-		json.NewEncoder(w).Encode(f.intents[strings.TrimPrefix(path, "/v1/payment_intents/")])
+		pi := f.intents[strings.TrimPrefix(path, "/v1/payment_intents/")]
+		raw, _ := json.Marshal(pi)
+		var doc map[string]any
+		_ = json.Unmarshal(raw, &doc)
+		doc["latest_charge"] = "ch_" + pi.ID
+		json.NewEncoder(w).Encode(doc)
+	case strings.HasPrefix(path, "/v1/charges/ch_"):
+		id := strings.TrimPrefix(path, "/v1/charges/ch_")
+		pi := f.intents[id]
+		json.NewEncoder(w).Encode(map[string]any{"id": "ch_" + id, "customer": pi.Customer, "amount": pi.Amount, "amount_refunded": f.refunded[id], "disputed": f.disputed[id]})
 	case path == "/v1/payment_intents":
 		data := []prepaidPaymentIntent{}
 		for _, pi := range f.intents {
@@ -210,6 +222,8 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(g)
 	case strings.HasPrefix(path, "/v1/billing/credit_grants/"):
 		json.NewEncoder(w).Encode(f.grants[strings.TrimPrefix(path, "/v1/billing/credit_grants/")])
+	case path == "/v1/invoice_payments":
+		fmt.Fprint(w, `{"data":[]}`)
 	case path == "/v1/invoices":
 		fmt.Fprint(w, `{"data":[]}`)
 	case path == "/v1/billing/credit_balance_summary" && r.URL.Query().Get("filter[type]") == "applicability_scope":
@@ -999,5 +1013,124 @@ func TestPrepaidWorkerRetriesEnrolmentBeforeIssuingCredit(t *testing.T) {
 	}
 	if r := f.rows(); r[0].Credit != "issued" || len(f.grantPosts) != 1 {
 		t.Fatalf("retry did not issue the paid credit exactly once: %+v", r)
+	}
+}
+
+func (f *prepaidFixture) onlyPurchase() (uuid.UUID, string, string) {
+	f.t.Helper()
+	var id uuid.UUID
+	var intent, grant *string
+	if err := f.h.Pool.QueryRow(f.t.Context(), `SELECT id,payment_intent_id,stripe_credit_grant_id FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&id, &intent, &grant); err != nil {
+		f.t.Fatal(err)
+	}
+	return id, derefString(intent), derefString(grant)
+}
+
+func (f *prepaidFixture) reversal(id uuid.UUID) (kind string, resolution *string, revoked *int64) {
+	f.t.Helper()
+	if err := f.h.Pool.QueryRow(f.t.Context(), `SELECT kind,resolution,revoked_balance_cents FROM billing_prepaid_reversal WHERE purchase_id=$1`, id).Scan(&kind, &resolution, &revoked); err != nil {
+		f.t.Fatal(err)
+	}
+	return
+}
+
+func (f *prepaidFixture) reviewReversals() {
+	f.t.Helper()
+	f.exec(`UPDATE billing_prepaid_purchase SET reversal_checked_at=NULL WHERE team_id=$1`, f.team)
+	if err := f.h.reviewPrepaidReversals(f.t.Context(), f.client); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.h.revokeReversedPrepaidCredit(f.t.Context(), f.client); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func TestPrepaidFullRefundRevokesUnspentCredit(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(2000, 5000)
+	f.observe(0, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`UPDATE billing_prepaid_auto_recharge SET enabled=false WHERE team_id=$1`, f.team)
+	id, intent, grant := f.onlyPurchase()
+	f.mu.Lock()
+	f.balances[grant] = 300
+	f.refunded[intent] = 5000
+	f.mu.Unlock()
+	f.reviewReversals()
+	kind, resolution, revoked := f.reversal(id)
+	if kind != "refund" || resolution == nil || *resolution != "revoke" || revoked == nil || *revoked != 300 {
+		t.Fatalf("a full refund did not revoke the unspent credit: kind=%s resolution=%v revoked=%v", kind, resolution, revoked)
+	}
+	if f.grants[grant].VoidedAt == 0 {
+		t.Fatal("the refunded purchase's grant is still spendable")
+	}
+	var total, reversed int64
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT COALESCE(sum(p.amount_cents-COALESCE(r.reversed_cents,0)),0),COALESCE(sum(r.reversed_cents),0) FROM billing_prepaid_purchase p LEFT JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.team_id=$1`, f.team).Scan(&total, &reversed); err != nil || total != 0 || reversed != 5000 {
+		t.Fatal("refunded purchase still counted as revenue", total, reversed, err)
+	}
+	f.reviewReversals()
+	if _, _, again := f.reversal(id); again == nil || *again != 300 {
+		t.Fatal("a second review changed the recorded revocation")
+	}
+}
+
+func TestPrepaidDisputeIsHeldForStaffAndStopsAutoRecharge(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(2000, 5000)
+	f.observe(0, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	id, intent, grant := f.onlyPurchase()
+	f.mu.Lock()
+	f.disputed[intent] = true
+	f.mu.Unlock()
+	f.reviewReversals()
+	kind, resolution, _ := f.reversal(id)
+	if kind != "dispute" || resolution != nil || f.grants[grant].VoidedAt != 0 {
+		t.Fatalf("a dispute was resolved without staff: kind=%s resolution=%v", kind, resolution)
+	}
+	var enabled bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT enabled FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&enabled); err != nil || enabled {
+		t.Fatal("a disputed purchase left auto-recharge on", err)
+	}
+	f.exec(`UPDATE billing_prepaid_reversal SET resolution='revoke',resolved_at=clock_timestamp(),resolved_by=$2,resolution_reason='lost dispute' WHERE purchase_id=$1`, id, uuid.New())
+	f.reviewReversals()
+	if f.grants[grant].VoidedAt == 0 {
+		t.Fatal("staff revocation did not void the grant")
+	}
+	if _, err := f.h.Pool.Exec(t.Context(), `UPDATE billing_prepaid_reversal SET resolution='keep' WHERE purchase_id=$1`, id); err == nil {
+		t.Fatal("a reversal resolution was replaced")
+	}
+}
+
+func TestPrepaidReversedBeforeCreditIsWithheldUntilStaffKeepIt(t *testing.T) {
+	f := newPrepaidFixture(t)
+	s, err := f.h.startPrepaidPaymentCheckout(t.Context(), f.client, f.team, uuid.New(), f.customer, 2500, "https://console.example.com/ok", "https://console.example.com/cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _, _ := f.onlyPurchase()
+	f.mu.Lock()
+	pi := prepaidPaymentIntent{ID: "pi_" + uuid.NewString(), Status: "succeeded", Amount: 2500, AmountReceived: 2500, Currency: "usd", Customer: f.customer, Metadata: map[string]string{"prepaid_purchase_id": id.String()}}
+	f.intents[pi.ID] = pi
+	f.sessions[s.ID]["status"], f.sessions[s.ID]["payment_intent"] = "complete", pi.ID
+	f.refunded[pi.ID] = 1000
+	f.mu.Unlock()
+	if err = f.h.settleCheckoutPurchase(t.Context(), f.client, id); err != nil {
+		t.Fatal(err)
+	}
+	f.reviewReversals()
+	if err = f.h.issuePrepaidCredit(t.Context(), f.client, id); !errors.Is(err, errCreditIssuanceDeferred) {
+		t.Fatal("credit for a reversed purchase was not withheld", err)
+	}
+	if len(f.grantPosts) != 0 {
+		t.Fatal("a reversed purchase was credited before staff decided")
+	}
+	f.exec(`UPDATE billing_prepaid_reversal SET resolution='keep',resolved_at=clock_timestamp(),resolved_by=$2,resolution_reason='refund was a goodwill partial' WHERE purchase_id=$1`, id, uuid.New())
+	if err = f.h.issuePrepaidCredit(t.Context(), f.client, id); err != nil || len(f.grantPosts) != 1 {
+		t.Fatal("kept purchase was not credited", err, len(f.grantPosts))
 	}
 }

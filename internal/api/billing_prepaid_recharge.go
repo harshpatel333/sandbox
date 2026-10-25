@@ -67,6 +67,8 @@ func (h *Handlers) prepaidTick(ctx context.Context, client *stripeHTTPClient) er
 		h.retryPrepaidEnrolment,
 		h.startPrepaidEnforcement,
 		func(ctx context.Context) error { return h.voidSpentPrepaidGrants(ctx, client) },
+		func(ctx context.Context) error { return h.reviewPrepaidReversals(ctx, client) },
+		func(ctx context.Context) error { return h.revokeReversedPrepaidCredit(ctx, client) },
 		h.notifyDisabledAutoRecharges,
 	)
 }
@@ -118,6 +120,7 @@ func (h *Handlers) settleDuePrepaidPurchases(ctx context.Context, client *stripe
 	rows, err := h.Pool.Query(ctx, `SELECT id FROM billing_prepaid_purchase
  WHERE (payment_state IN ('pending','uncertain','processing') OR credit_state IN ('none','pending','uncertain')) AND payment_state<>'failed'
   AND NOT (payment_state='succeeded' AND credit_state='issued') AND next_attempt_at<=clock_timestamp()
+  AND NOT EXISTS(SELECT 1 FROM billing_prepaid_reversal r WHERE r.purchase_id=billing_prepaid_purchase.id AND r.resolution='revoke' AND r.revoked_at IS NOT NULL)
  ORDER BY next_attempt_at,id LIMIT 20`)
 	if err != nil {
 		return err

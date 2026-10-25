@@ -27,7 +27,10 @@ type prepaidAutoRechargeBody struct {
 
 const prepaidPurchaseJSON = `jsonb_build_object('id',p.id,'team_id',p.team_id,'source',p.source,'amount_cents',p.amount_cents,
  'state',CASE WHEN p.payment_state='failed' THEN 'failed' WHEN p.credit_state='issued' THEN 'credited' WHEN p.payment_state='succeeded' THEN 'paid' ELSE 'pending' END,
- 'failure_reason',p.failure_reason,'paid_at',p.paid_at,'credited_at',p.credited_at,'created_at',p.created_at)`
+ 'failure_reason',p.failure_reason,'paid_at',p.paid_at,'credited_at',p.credited_at,'created_at',p.created_at,
+ 'reversal',(SELECT jsonb_build_object('kind',r.kind,'reversed_cents',r.reversed_cents,'detected_at',r.detected_at,'resolution',r.resolution,
+   'resolved_at',r.resolved_at,'resolved_by',r.resolved_by,'resolution_reason',r.resolution_reason,'revoked_balance_cents',r.revoked_balance_cents,'revoked_at',r.revoked_at)
+  FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id))`
 
 const prepaidAutoRechargeJSON = `jsonb_build_object('enabled',COALESCE(a.enabled,false),'threshold_cents',a.threshold_cents,'amount_cents',a.amount_cents,
  'disabled_reason',a.disabled_reason,'disabled_at',a.disabled_at,
@@ -308,7 +311,9 @@ func (h *Handlers) ListPrepaidPurchases(c *gin.Context) {
 	}
 	var raw []byte
 	err := h.Pool.QueryRow(c.Request.Context(), `SELECT jsonb_build_object(
- 'total_cents',(SELECT COALESCE(sum(amount_cents),0) FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2),
+ 'gross_cents',(SELECT COALESCE(sum(amount_cents),0) FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2),
+ 'reversed_cents',(SELECT COALESCE(sum(r.reversed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2),
+ 'total_cents',(SELECT COALESCE(sum(p.amount_cents-COALESCE(r.reversed_cents,0)),0) FROM billing_prepaid_purchase p LEFT JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2),
  'count',(SELECT count(*) FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2),
  'purchases',(SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.paid_at,p.id),'[]') FROM
    (SELECT * FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2 ORDER BY paid_at,id LIMIT 1000) p))`, from, to).Scan(&raw)
@@ -317,4 +322,59 @@ func (h *Handlers) ListPrepaidPurchases(c *gin.Context) {
 		return
 	}
 	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
+}
+
+// Reversed purchases waiting for a staff decision, oldest first.
+func (h *Handlers) ListPrepaidReversals(c *gin.Context) {
+	if _, ok := h.requirePlatformBilling(c, platformBillingReadPermission); !ok {
+		return
+	}
+	var raw []byte
+	err := h.Pool.QueryRow(c.Request.Context(), `SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.reversal_detected_at),'[]') FROM
+ (SELECT p.*,r.detected_at reversal_detected_at FROM billing_prepaid_reversal r JOIN billing_prepaid_purchase p ON p.id=r.purchase_id
+  WHERE r.resolution IS NULL ORDER BY r.detected_at LIMIT 200) p`).Scan(&raw)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	c.Data(http.StatusOK, "application/json; charset=utf-8", []byte(`{"reversals":`+string(raw)+`}`))
+}
+
+type prepaidReversalBody struct {
+	Resolution string `json:"resolution"`
+	Reason     string `json:"reason"`
+}
+
+// Staff resolve a reversed purchase once: revoke voids its unspent credit,
+// keep leaves the credit in place (for example after a won dispute).
+func (h *Handlers) ResolvePrepaidReversal(c *gin.Context) {
+	actor, ok := h.requirePlatformBilling(c, platformBillingWritePermission)
+	if !ok {
+		return
+	}
+	team, err := internalTeamID(c)
+	if err != nil {
+		return
+	}
+	purchase, err := parseUUIDParam(c, "purchase_id")
+	if err != nil {
+		return
+	}
+	var req prepaidReversalBody
+	if err = c.ShouldBindJSON(&req); err != nil || (req.Resolution != "revoke" && req.Resolution != "keep") || strings.TrimSpace(req.Reason) == "" || len([]rune(req.Reason)) > 500 {
+		respondErrorMsg(c, "bad_request", "resolution must be revoke or keep, and a reason of at most 500 characters is required", http.StatusBadRequest)
+		return
+	}
+	var resolved time.Time
+	err = h.Pool.QueryRow(c.Request.Context(), `UPDATE billing_prepaid_reversal SET resolution=$3,resolved_at=clock_timestamp(),resolved_by=$4,resolution_reason=$5
+ WHERE purchase_id=$1 AND team_id=$2 AND resolution IS NULL RETURNING resolved_at`, purchase, team, req.Resolution, actor, strings.TrimSpace(req.Reason)).Scan(&resolved)
+	if errors.Is(err, pgx.ErrNoRows) {
+		respondErrorMsg(c, "conflict", "no unresolved reversal for this purchase", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"purchase_id": purchase, "resolution": req.Resolution, "resolved_at": resolved, "resolved_by": actor, "resolution_reason": strings.TrimSpace(req.Reason)})
 }
