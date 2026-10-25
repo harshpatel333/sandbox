@@ -541,6 +541,67 @@ func TestStaffPlanAssignmentWaitsForAdoptionAndReplaysCommitment(t *testing.T) {
 
 }
 
+func TestStaffPlanAssignmentRejectsOtherPricingVersion(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	ctx := t.Context()
+	schema := "staff_entry_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := h.Pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := h.Pool.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := h.Pool.Exec(ctx, "CREATE FUNCTION "+schema+`.billing_lock_pricing_public_state()
+RETURNS TABLE(entry_open boolean) LANGUAGE sql AS 'SELECT true'`); err != nil {
+		t.Fatal(err)
+	}
+	config := h.Pool.Config()
+	config.ConnConfig.RuntimeParams["search_path"] = schema + ",public"
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	staff := &Handlers{Pool: pool, DB: db.New(pool)}
+	versions := make(map[string]uuid.UUID)
+	for _, model := range []string{"legacy", "v2"} {
+		var id uuid.UUID
+		if err := h.Pool.QueryRow(ctx, `INSERT INTO billing_plan_version(pricing_version,family,version,kind,display_name,max_sandboxes)
+VALUES($1,'custom_'||substr(md5(random()::text),1,8),1,'custom','Example deal',250) RETURNING id`, model).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.Pool.Exec(ctx, `SELECT publish_billing_plan_version($1,$2)`, id, uuid.New()); err != nil {
+			t.Fatal(err)
+		}
+		versions[model] = id
+	}
+	setPricingVersion(t, h, "v2")
+	beforeMax, beforeCPU := limitsOf(t, h, team)
+	actor := uuid.New()
+	body := staffPlanAssignmentBody{Key: "custom-entry", VersionID: versions["legacy"], Reason: "custom approval"}
+	if _, err := staff.assignStaffPlan(ctx, team, actor, body); !errors.Is(err, errUnknownPlan) {
+		t.Fatalf("legacy custom entry under v2: %v", err)
+	}
+	history, err := teamPlanHistory(ctx, h.Pool, team, 10)
+	if err != nil || len(history) != 0 {
+		t.Fatalf("rejected entry changed history: %+v %v", history, err)
+	}
+	if max, cpu := limitsOf(t, h, team); max != beforeMax || !reflect.DeepEqual(cpu, beforeCPU) {
+		t.Fatalf("rejected entry changed limits: %d %v", max, cpu)
+	}
+	body.VersionID = versions["v2"]
+	plan, err := staff.assignStaffPlan(ctx, team, actor, body)
+	if err != nil || plan.VersionID == nil || *plan.VersionID != body.VersionID {
+		t.Fatalf("v2 custom entry: %+v %v", plan, err)
+	}
+	setPricingVersion(t, h, "legacy")
+	if replay, err := staff.assignStaffPlan(ctx, team, actor, body); err != nil || replay.ID != plan.ID {
+		t.Fatalf("persisted entry replay after pricing rollback: %+v %v", replay, err)
+	}
+}
+
 func TestPlanAssignmentHistorySurvivesTeamDeletion(t *testing.T) {
 	h, _ := newPlanAssignmentFixture(t)
 	setPricingVersion(t, h, "v2")
