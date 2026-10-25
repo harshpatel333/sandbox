@@ -325,10 +325,10 @@ func (h *Handlers) revokePrepaidGrant(ctx context.Context, client *stripeHTTPCli
 // One locked step of a revocation. The attempt is committed before the void,
 // and the void runs while the reversal row is locked at the decided version, so
 // a newer observation can never land between the check and the void. An
-// attempted revocation is always settled: a void is audited to the oldest
-// unsettled attempt on the purchase, at the amount Stripe's ledger shows voided,
-// and a superseded attempt is closed without voiding only while its grant is
-// confirmed live.
+// attempted revocation is always settled: once the grant is confirmed live,
+// every other attempt on the purchase is closed without voiding, so the one
+// unsettled attempt left is the one any void belongs to, and it is audited at
+// the amount Stripe's ledger shows voided.
 func (h *Handlers) revokePrepaidGrantStep(ctx context.Context, client *stripeHTTPClient, decision int64, id uuid.UUID, version int32, team uuid.UUID, customer, creditState string, grant *string, voided bool, current entitlementGrant) (bool, error) {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
@@ -362,6 +362,9 @@ func (h *Handlers) revokePrepaidGrantStep(ctx context.Context, client *stripeHTT
 		return true, tx.Commit(ctx)
 	}
 	if live && current.VoidedAt == 0 {
+		if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoke_retry_after='infinity' WHERE purchase_id=$1 AND id<>$2 AND decision='revoke' AND revoke_attempted_at IS NOT NULL AND revoked_at IS NULL`, id, decision); err != nil {
+			return true, err
+		}
 		if !attempted {
 			if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoke_attempted_at=clock_timestamp() WHERE id=$1`, decision); err != nil {
 				return true, err
