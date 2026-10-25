@@ -62,3 +62,40 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 
+
+CREATE OR REPLACE FUNCTION guard_free_template_policy_release() RETURNS trigger LANGUAGE plpgsql
+ SET search_path=pg_catalog,public,pg_temp SET row_security=off AS $$
+BEGIN
+ IF NEW.state='released' THEN
+  IF jsonb_array_length(public.billing_free_template_policy_pending_targets())<>0 THEN
+   RAISE EXCEPTION 'committed old-Free plan changes require owner reconciliation' USING ERRCODE='55000';
+  END IF;
+  IF NOT EXISTS(SELECT 1 FROM public.billing_plan_version WHERE family='free' AND pricing_version='v2' AND kind='free' AND state='published' AND max_templates=0)
+   OR EXISTS(SELECT 1 FROM public.team_plan_assignment a JOIN public.team t ON t.id=a.team_id
+    WHERE a.effective_to IS NULL AND a.kind='free' AND a.team_id<>NEW.system_team_id
+     AND a.limits->'max_templates' IS DISTINCT FROM '0'::jsonb) THEN
+   RAISE EXCEPTION 'Free0 catalog and fenced existing-assignment policy completion required' USING ERRCODE='55000';
+  END IF;
+  IF COALESCE(NEW.evidence->'free_template_policy'->'existing_assignments_verified','false'::jsonb)<>'true'::jsonb
+   OR COALESCE(btrim(NEW.evidence->'free_template_policy'->>'custom_policy_reference'),'')=''
+   OR COALESCE(btrim(NEW.evidence->'free_template_policy'->>'runtime_reference'),'')='' THEN
+   RAISE EXCEPTION 'explicit Free policy, runtime and current-assignment evidence required' USING ERRCODE='55000';
+  END IF;
+ END IF;
+ RETURN NEW;
+END $$;
+
+CREATE OR REPLACE FUNCTION billing_pricing_adoption_evidence_valid(p_region text,p_system uuid,p_epoch uuid,p_evidence jsonb)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
+ SELECT COALESCE(p_region IN ('use','usw') AND p_system<>'00000000-0000-0000-0000-000000000000' AND p_epoch IS NOT NULL
+  AND jsonb_typeof(p_evidence)='object'
+  AND p_evidence->>'region'=p_region AND p_evidence->>'system_team_id'=p_system::text AND p_evidence->>'epoch'=p_epoch::text
+  AND p_evidence->>'assembled_sha' ~ '^[0-9a-f]{40}$'
+  AND p_evidence->>'worker_sha'=p_evidence->>'assembled_sha' AND p_evidence->>'schema_sha'=p_evidence->>'assembled_sha'
+  AND btrim(p_evidence->>'deployment_reference')<>'' AND btrim(p_evidence->>'worker_reference')<>''
+  AND p_evidence->'verified_worker'='true'::jsonb
+  AND p_evidence->'free_template_policy'->'existing_assignments_verified'='true'::jsonb
+  AND btrim(p_evidence->'free_template_policy'->>'custom_policy_reference')<>''
+  AND btrim(p_evidence->'free_template_policy'->>'runtime_reference')<>'',false);
+$$;
+

@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -318,5 +320,44 @@ func TestIntegration_FreeTemplatePolicy_CLIContextAndReplay(t *testing.T) {
 	}
 	if err := json.Unmarshal(cli("use", testSystemTeamID.String(), false, args...), &replay); err != nil || replay.AssignmentID != result.AssignmentID {
 		t.Fatalf("OFF CLI replay=%s %v", replay.AssignmentID, err)
+	}
+}
+
+func TestIntegration_FreeTemplatePolicy_PartialMigrationCannotRelease(t *testing.T) {
+	isolatedFreeTemplatePolicy(t)
+	prepareFreeTemplatePolicy(t)
+	migration, err := os.ReadFile(filepath.Join("..", "..", "supabase", "migrations", "20261025010000_free_template_policy.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := testPool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	for _, name := range []string{"guard_free_template_policy_release", "billing_pricing_adoption_evidence_valid"} {
+		start := strings.Index(string(migration), "CREATE OR REPLACE FUNCTION "+name+"(")
+		if start < 0 {
+			t.Fatalf("missing migration function %s", name)
+		}
+		definition := string(migration)[start:]
+		end := strings.Index(definition, "$$;")
+		if end < 0 {
+			t.Fatalf("unterminated migration function %s", name)
+		}
+		if _, err := tx.Exec(t.Context(), definition[:end+3]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(t.Context(), `ALTER TABLE sandbox DROP COLUMN system_template; ALTER TABLE sandbox_snapshot DROP COLUMN system_template`); err != nil {
+		t.Fatal(err)
+	}
+	var valid bool
+	if err := tx.QueryRow(t.Context(), `SELECT billing_pricing_adoption_evidence_valid(region,system_team_id,epoch,'{}'::jsonb) FROM billing_pricing_adoption WHERE singleton`).Scan(&valid); err != nil || valid {
+		t.Fatalf("partial evidence valid=%v err=%v", valid, err)
+	}
+	_, err = tx.Exec(t.Context(), `UPDATE billing_pricing_adoption SET state='released' WHERE singleton`)
+	if err == nil || !strings.Contains(err.Error(), "Free template enforcement migration must complete before release") || !strings.Contains(err.Error(), "55000") {
+		t.Fatalf("partial migration release: %v", err)
 	}
 }
