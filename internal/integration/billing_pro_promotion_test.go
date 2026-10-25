@@ -213,6 +213,10 @@ func TestIntegration_ProPricingV2PurchaseSurvivesSwitchOff(t *testing.T) {
 	for range 2 {
 		assertProResponse(t, r, key, "/stripe/pro-checkout/recover", `{}`, 200, "active")
 	}
+	var kind, plan string
+	if err := testPool.QueryRow(t.Context(), `SELECT kind,plan_key FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, f.team).Scan(&kind, &plan); err != nil || kind != "subscription" || plan != "pro_monthly" {
+		t.Fatalf("purchase paid after switch-off was not assigned Pro: kind=%q plan=%q err=%v", kind, plan, err)
+	}
 	f.mu.Lock()
 	f.baseStart = f.baseEnd
 	f.baseEnd = time.Unix(f.baseStart, 0).UTC().AddDate(0, 1, 0).Unix()
