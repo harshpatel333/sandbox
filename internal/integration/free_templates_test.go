@@ -11,6 +11,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"strings"
 	"testing"
 	"time"
@@ -167,54 +170,83 @@ func TestIntegration_FreeTemplates_SnapshotForkPreservesProvenance(t *testing.T)
 
 func TestIntegration_FreeTemplates_MigrationBackfillsRetainedOrigins(t *testing.T) {
 	ctx := t.Context()
-	team, _ := seedTeamAndKey(t)
-	source := seedPausedSandbox(t, team)
-	custom, err := testQueries.CreateTemplate(ctx, db.CreateTemplateParams{TeamID: team, Name: "custom-" + uuid.NewString(), BuildSpec: []byte(`{"from":"example/image:stable"}`), Vcpu: 1, MemoryMib: 1024, DiskMib: 4096})
+	name := "free_origin_" + uuid.NewString()[:8] + "_test"
+	if _, err := testPool.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testPool.Config().Copy()
+	cfg.ConnConfig.Database = name
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	system, err := testQueries.CreateTemplate(ctx, db.CreateTemplateParams{TeamID: testSystemTeamID, Name: "system-" + uuid.NewString(), BuildSpec: []byte(`{"from":"example/image:stable"}`), Vcpu: 1, MemoryMib: 1024, DiskMib: 4096})
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = testPool.Exec(context.Background(), "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+	})
+	dir := filepath.Join("..", "..", "supabase", "migrations")
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx, err := testPool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback(context.Background())
-	if _, err := tx.Exec(ctx, `UPDATE billing_pricing_adoption SET region='use',system_team_id=$1 WHERE singleton`, testSystemTeamID); err != nil {
-		t.Fatal(err)
-	}
-	for _, statement := range []string{`ALTER TABLE sandbox DROP COLUMN system_template`, `ALTER TABLE sandbox_snapshot DROP COLUMN system_template`} {
-		if _, err := tx.Exec(ctx, statement); err != nil {
+	const forward = "20261025150000_free_template_policy.sql"
+	for _, entry := range entries {
+		if entry.Name() >= forward || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		source, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
 			t.Fatal(err)
 		}
+		if _, err = pool.Exec(ctx, string(source)); err != nil {
+			t.Fatalf("prefix %s: %v", entry.Name(), err)
+		}
+	}
+	q := db.New(pool)
+	team, err := q.CreateTeam(ctx, "origin-team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	systemTeam, err := q.CreateTeam(ctx, "origin-system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = q.CreateHost(ctx, db.CreateHostParams{ID: "origin-host", VmdAddr: "localhost:0", ProxyAddr: "localhost:0", Region: "test", CapacityMemoryMib: 1024, CapacityVcpus: 1}); err != nil {
+		t.Fatal(err)
+	}
+	custom, err := q.CreateTemplate(ctx, db.CreateTemplateParams{TeamID: team.ID, Name: "origin-custom", BuildSpec: []byte(`{"from":"example/image:stable"}`), Vcpu: 1, MemoryMib: 1024, DiskMib: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	system, err := q.CreateTemplate(ctx, db.CreateTemplateParams{TeamID: systemTeam.ID, Name: "origin-system", BuildSpec: []byte(`{"from":"example/image:stable"}`), Vcpu: 1, MemoryMib: 1024, DiskMib: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE billing_pricing_adoption SET region='use',system_team_id=$1 WHERE singleton`, systemTeam.ID); err != nil {
+		t.Fatal(err)
 	}
 	old := []struct {
 		id, template uuid.UUID
 		system       bool
-	}{{source, custom.ID, false}, {uuid.New(), system.ID, true}}
-	if _, err := tx.Exec(ctx, `UPDATE sandbox SET template_id=$2,base_path='/base.ext4' WHERE id=$1`, source, custom.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,template_id,base_path) VALUES($1,$2,'old-system','paused','default',1,1024,4096,$3,'/base.ext4')`, old[1].id, team, system.ID); err != nil {
-		t.Fatal(err)
-	}
+	}{{uuid.New(), custom.ID, false}, {uuid.New(), system.ID, true}}
 	for _, row := range old {
-		if _, err := tx.Exec(ctx, `INSERT INTO sandbox_snapshot(team_id,sandbox_id,template_id,kind,host_id,vcpu_count,memory_mib,disk_mib,base_path) VALUES($1,$2,$3,'fs','default',1,1024,4096,'/base.ext4')`, team, row.id, row.template); err != nil {
+		if _, err = pool.Exec(ctx, `INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,template_id,base_path) VALUES($1,$2,$3,'paused','origin-host',1,1024,4096,$4,'/base.ext4')`, row.id, team.ID, row.id.String(), row.template); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = pool.Exec(ctx, `INSERT INTO sandbox_snapshot(team_id,sandbox_id,template_id,kind,host_id,vcpu_count,memory_mib,disk_mib,base_path) VALUES($1,$2,$3,'fs','origin-host',1,1024,4096,'/base.ext4')`, team.ID, row.id, row.template); err != nil {
 			t.Fatal(err)
 		}
 	}
-	migration, err := os.ReadFile(filepath.Join("..", "..", "supabase", "migrations", "20261025140000_free_system_templates.sql"))
+	migration, err := os.ReadFile(filepath.Join(dir, forward))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, string(migration)); err != nil {
+	if _, err = pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
 	}
 	for _, row := range old {
 		var sandboxOrigin, snapshotOrigin bool
-		if err := tx.QueryRow(ctx, `SELECT s.system_template,ss.system_template FROM sandbox s JOIN sandbox_snapshot ss ON ss.sandbox_id=s.id WHERE s.id=$1`, row.id).Scan(&sandboxOrigin, &snapshotOrigin); err != nil {
+		if err = pool.QueryRow(ctx, `SELECT s.system_template,ss.system_template FROM sandbox s JOIN sandbox_snapshot ss ON ss.sandbox_id=s.id WHERE s.id=$1`, row.id).Scan(&sandboxOrigin, &snapshotOrigin); err != nil {
 			t.Fatal(err)
 		}
 		if sandboxOrigin != row.system || snapshotOrigin != row.system {

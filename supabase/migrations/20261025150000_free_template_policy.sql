@@ -67,14 +67,17 @@ BEGIN
 END $$;
 
 DO $$ BEGIN
- IF (SELECT count(*) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
-  JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
-  WHERE n.nspname='public' AND c.relname IN ('sandbox','sandbox_snapshot') AND a.attname='system_template'
-   AND NOT a.attisdropped AND a.atttypid='boolean'::regtype AND a.attnotnull AND pg_get_expr(d.adbin,d.adrelid)='false')<>2
-  OR NOT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('public.guard_free_sandbox_shape()') AND md5(prosrc)='78edcc79da0400927e5604b1d7e39b2e') THEN
-  RAISE EXCEPTION 'unsupported Free enforcement prefix; reconcile applied migration history' USING ERRCODE='55000';
+ IF EXISTS(SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+  WHERE n.nspname='public' AND c.relname IN ('sandbox','sandbox_snapshot') AND a.attname='system_template' AND NOT a.attisdropped)
+  OR EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='public.team_plan_assignment'::regclass
+   AND attname='free_allowance_origin_at' AND NOT attisdropped)
+  OR to_regclass('public.billing_free_template_policy_transition') IS NOT NULL THEN
+  RAISE EXCEPTION 'unsupported applied Free policy history; reconcile migration inventory' USING ERRCODE='55000';
  END IF;
 END $$;
+
+ALTER TABLE sandbox ADD COLUMN system_template boolean NOT NULL DEFAULT false;
+ALTER TABLE sandbox_snapshot ADD COLUMN system_template boolean NOT NULL DEFAULT false;
 
 DO $$ BEGIN
  IF EXISTS(SELECT 1 FROM sandbox s JOIN template t ON t.id=s.template_id
