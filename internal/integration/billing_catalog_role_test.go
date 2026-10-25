@@ -3,9 +3,12 @@
 package integration
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +54,72 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon,aut
 		w := operatorRequest(router, http.MethodPost, "/internal/billing/catalog/plans", actor.String(), body)
 		if w.Code != http.StatusCreated {
 			t.Fatalf("create=%d %s", w.Code, w.Body)
+		}
+	})
+	t.Run("zero custom templates", func(t *testing.T) {
+		var retained, unchanged, zero bool
+		if err := owner.QueryRow(t.Context(), `SELECT old.state='retired' AND old.max_templates=10,
+ (to_jsonb(old)-ARRAY['id','version','state','max_templates','created_by','created_at','updated_at','published_by','published_at','retired_by','retired_at']) =
+ (to_jsonb(current)-ARRAY['id','version','state','max_templates','created_by','created_at','updated_at','published_by','published_at','retired_by','retired_at']),
+ current.max_templates=0 AND current.id<>old.id
+ FROM billing_plan_version old JOIN billing_plan_version current ON current.family=old.family AND current.pricing_version=old.pricing_version AND current.state='published'
+ WHERE old.id=md5('billing-plan-version:v2:free:1')::uuid`).Scan(&retained, &unchanged, &zero); err != nil || !retained || !unchanged || !zero {
+			t.Fatalf("retained=%v unchanged=%v zero=%v err=%v", retained, unchanged, zero, err)
+		}
+		if w := doInternal(router, http.MethodGet, "/internal/billing/catalog", actor.String(), ""); w.Code != http.StatusOK {
+			t.Fatalf("catalog=%d %s", w.Code, w.Body)
+		} else {
+			var catalog struct {
+				Plans []struct {
+					PricingVersion string `json:"pricing_version"`
+					Family         string `json:"family"`
+					State          string `json:"state"`
+					Limits         struct {
+						MaxTemplates *int `json:"max_templates"`
+					} `json:"limits"`
+				} `json:"plans"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &catalog); err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, p := range catalog.Plans {
+				if p.PricingVersion == "v2" && p.Family == "free" && p.State == "published" {
+					found = p.Limits.MaxTemplates != nil && *p.Limits.MaxTemplates == 0
+				}
+			}
+			if !found {
+				t.Fatal("published Free lost zero custom templates in catalog response")
+			}
+		}
+		zeroBody := strings.Replace(body, `"family":"example"`, `"family":"examplezero"`, 1)
+		zeroBody = strings.Replace(zeroBody, `"max_concurrent":12`, `"max_concurrent":12,"max_templates":0`, 1)
+		if w := operatorRequest(router, http.MethodPost, "/internal/billing/catalog/plans", actor.String(), zeroBody); w.Code != http.StatusCreated {
+			t.Fatalf("create zero=%d %s", w.Code, w.Body)
+		}
+		if w := operatorRequest(router, http.MethodPost, "/internal/billing/catalog/plans", actor.String(), strings.Replace(zeroBody, `"max_templates":0`, `"max_templates":-1`, 1)); w.Code != http.StatusBadRequest {
+			t.Fatalf("negative templates=%d %s", w.Code, w.Body)
+		}
+		rolloutExec(t, owner, `INSERT INTO plan_limits(offer_key,max_sandboxes,max_templates) VALUES('example_zero',1,0)`)
+		if _, err := owner.Exec(t.Context(), `UPDATE plan_limits SET max_templates=-1 WHERE offer_key='example_zero'`); err == nil {
+			t.Fatal("negative plan template limit accepted")
+		}
+		var before, after string
+		readFree := `SELECT jsonb_agg(to_jsonb(v) ORDER BY version)::text FROM billing_plan_version v WHERE family='free' AND pricing_version='v2'`
+		if err := owner.QueryRow(t.Context(), readFree).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := findMigrationsDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		migration, err := os.ReadFile(filepath.Join(dir, "20261025060000_free_custom_template_limit.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rolloutExec(t, owner, string(migration))
+		if err := owner.QueryRow(t.Context(), readFree).Scan(&after); err != nil || before != after {
+			t.Fatalf("migration retry changed Free history: %v", err)
 		}
 	})
 	for _, action := range []string{"update", "delete", "publish", "retire"} {
@@ -103,7 +172,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon,aut
 			t.Fatal(err)
 		}
 		for range 2 {
-			if _, err = service.Exec(t.Context(), `INSERT INTO billing_contract_limits(contract_id,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates) VALUES($1,12,4,4096,8192,10) ON CONFLICT DO NOTHING`, c.ID); err != nil {
+			if _, err = service.Exec(t.Context(), `INSERT INTO billing_contract_limits(contract_id,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates) VALUES($1,12,4,4096,8192,0) ON CONFLICT DO NOTHING`, c.ID); err != nil {
 				t.Fatal(err)
 			}
 		}
