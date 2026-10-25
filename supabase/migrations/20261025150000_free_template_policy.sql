@@ -1,3 +1,5 @@
+BEGIN;
+
 SELECT pricing_version FROM billing_pricing_switch WHERE singleton FOR UPDATE;
 SELECT epoch FROM billing_pricing_adoption WHERE singleton FOR UPDATE;
 LOCK TABLE billing_plan_version, plan_limits, billing_contract_limits IN ACCESS EXCLUSIVE MODE NOWAIT;
@@ -60,9 +62,6 @@ BEGIN
     INSERT INTO billing_plan_version SELECT successor.*;
     PERFORM publish_billing_plan_version(successor.id, NULL);
 END $$;
-
-ALTER TABLE sandbox ADD COLUMN system_template boolean NOT NULL DEFAULT false;
-ALTER TABLE sandbox_snapshot ADD COLUMN system_template boolean NOT NULL DEFAULT false;
 
 DO $$ BEGIN
  IF EXISTS(SELECT 1 FROM sandbox s JOIN template t ON t.id=s.template_id
@@ -297,3 +296,4 @@ RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
   AND btrim(p_evidence->'free_template_policy'->>'runtime_reference')<>'',false);
 $$;
 
+COMMIT;

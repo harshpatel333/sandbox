@@ -1,6 +1,6 @@
 # Free template policy migration
 
-Migration `20261025150000_free_template_policy.sql` is the single policy migration. It includes the catalog constraints and Free0 version, template provenance and admission enforcement, the human assignment transition, and the additional release checks. Do not assemble the withdrawn `20261025060000` or the earlier `20261025140000` candidate alongside it. The unused `20261025010000` reservation stays retired.
+Migration `20261025150000_free_template_policy.sql` is the single policy migration. It includes the catalog constraints and Free0 version, the human assignment transition, and the additional release checks. Apply it after the retained, unchanged `20261025140000` provenance and admission migration. Do not assemble the withdrawn `20261025060000` alongside it. Historical `20261025010000` reservations do not select a final version.
 
 Before migration, bind the existing adoption schema to the canonical region/system team with the existing human prepare command. Unknown foreign template ownership causes migration to fail closed; it is never classified as system by exclusion.
 
