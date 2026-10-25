@@ -253,8 +253,8 @@ func (h *Handlers) recordPrepaidReversal(ctx context.Context, id, team uuid.UUID
 // (credit still in flight, fence held, provider errors) never block the rest.
 func (h *Handlers) revokeReversedPrepaidCredit(ctx context.Context, client *stripeHTTPClient) error {
 	rows, err := h.Pool.Query(ctx, `WITH due AS (
- SELECT d.id FROM billing_prepaid_reversal_decision d JOIN billing_prepaid_reversal r ON r.purchase_id=d.purchase_id AND r.version=d.version
- WHERE d.decision='revoke' AND d.revoked_at IS NULL AND COALESCE(d.revoke_retry_after,'-infinity'::timestamptz)<=clock_timestamp()
+ SELECT d.id FROM billing_prepaid_reversal_decision d JOIN billing_prepaid_reversal r ON r.purchase_id=d.purchase_id
+ WHERE d.decision='revoke' AND d.revoked_at IS NULL AND (r.version=d.version OR d.revoke_attempted_at IS NOT NULL) AND COALESCE(d.revoke_retry_after,'-infinity'::timestamptz)<=clock_timestamp()
  ORDER BY d.decided_at LIMIT 10 FOR UPDATE OF d SKIP LOCKED)
  UPDATE billing_prepaid_reversal_decision d SET revoke_retry_after=clock_timestamp()+interval '10 minutes' FROM due WHERE d.id=due.id
  RETURNING d.id,d.purchase_id,d.version,d.decided_at<clock_timestamp()-interval '1 day'`)
@@ -322,10 +322,12 @@ func (h *Handlers) revokePrepaidGrant(ctx context.Context, client *stripeHTTPCli
 	}
 }
 
-// One locked step of a revocation. The unspent balance is committed before the
-// void, and the void runs while the reversal row is locked at the decided
-// version, so a newer observation can never land between the check and the
-// void. A void already made with a recorded balance is always audited.
+// One locked step of a revocation. The attempt is committed before the void,
+// and the void runs while the reversal row is locked at the decided version, so
+// a newer observation can never land between the check and the void. An
+// attempted revocation is always settled: a voided grant is audited with the
+// amount Stripe's ledger shows voided, and a superseded attempt whose grant is
+// still live is closed without voiding.
 func (h *Handlers) revokePrepaidGrantStep(ctx context.Context, client *stripeHTTPClient, decision int64, id uuid.UUID, version int32, team uuid.UUID, customer, creditState string, grant *string, voided bool, current entitlementGrant) (bool, error) {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
@@ -333,37 +335,41 @@ func (h *Handlers) revokePrepaidGrantStep(ctx context.Context, client *stripeHTT
 	}
 	defer tx.Rollback(ctx)
 	var latest int32
-	var recorded *int64
-	if err = tx.QueryRow(ctx, `SELECT r.version,d.revoke_balance_cents FROM billing_prepaid_reversal r JOIN billing_prepaid_reversal_decision d ON d.purchase_id=r.purchase_id AND d.id=$2
- WHERE r.purchase_id=$1 FOR UPDATE OF r,d`, id, decision).Scan(&latest, &recorded); err != nil {
+	var attempted bool
+	if err = tx.QueryRow(ctx, `SELECT r.version,d.revoke_attempted_at IS NOT NULL FROM billing_prepaid_reversal r JOIN billing_prepaid_reversal_decision d ON d.purchase_id=r.purchase_id AND d.id=$2
+ WHERE r.purchase_id=$1 FOR UPDATE OF r,d`, id, decision).Scan(&latest, &attempted); err != nil {
 		return true, err
 	}
-	ownVoid := current.VoidedAt != 0 && recorded != nil
-	if latest != version && !ownVoid {
+	superseded := latest != version
+	live := creditState == "issued" && !voided
+	if superseded && (!attempted || !live || current.VoidedAt == 0) {
+		if attempted {
+			if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoke_retry_after='infinity' WHERE id=$1`, decision); err != nil {
+				return true, err
+			}
+		}
 		return true, tx.Commit(ctx)
 	}
-	balance := int64(0)
-	switch {
-	case creditState != "issued" || voided:
-	case ownVoid:
-		balance = *recorded
-	case current.VoidedAt != 0:
-	case recorded == nil:
-		if balance, err = client.grantLedgerBalance(ctx, customer, *grant); err != nil {
-			return true, err
+	amount := int64(0)
+	if live {
+		switch {
+		case current.VoidedAt != 0:
+		case !attempted:
+			if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoke_attempted_at=clock_timestamp() WHERE id=$1`, decision); err != nil {
+				return true, err
+			}
+			return false, tx.Commit(ctx)
+		default:
+			var g entitlementGrant
+			if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants/"+url.PathEscape(*grant)+"/void", url.Values{}, &g, "prepaid-credit-revoke:v1:"+id.String()); err != nil {
+				return true, err
+			}
+			if g.ID != *grant || g.VoidedAt == 0 {
+				return true, errors.New("credit grant revocation was not confirmed")
+			}
 		}
-		if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoke_balance_cents=$2 WHERE id=$1 AND revoke_balance_cents IS NULL`, decision, balance); err != nil {
+		if amount, err = client.grantVoidedAmount(ctx, customer, *grant); err != nil {
 			return true, err
-		}
-		return false, tx.Commit(ctx)
-	default:
-		balance = *recorded
-		var g entitlementGrant
-		if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants/"+url.PathEscape(*grant)+"/void", url.Values{}, &g, "prepaid-credit-revoke:v1:"+id.String()); err != nil {
-			return true, err
-		}
-		if g.ID != *grant || g.VoidedAt == 0 {
-			return true, errors.New("credit grant revocation was not confirmed")
 		}
 	}
 	if creditState == "issued" {
@@ -371,14 +377,62 @@ func (h *Handlers) revokePrepaidGrantStep(ctx context.Context, client *stripeHTT
 			return true, err
 		}
 	}
-	if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoked_at=clock_timestamp(),revoked_cents=$2 WHERE id=$1 AND revoked_at IS NULL`, decision, balance); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoked_at=clock_timestamp(),revoked_cents=$2 WHERE id=$1 AND revoked_at IS NULL`, decision, amount); err != nil {
 		return true, err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_funding_account SET next_check_at=LEAST(next_check_at,clock_timestamp()) WHERE team_id=$1 AND observe`, team); err != nil {
 		return true, err
 	}
-	log.Warn().Str("prepaid_purchase_id", id.String()).Int64("revoked_cents", balance).Msg("revoked unspent credit of a reversed prepaid purchase by staff decision")
+	log.Warn().Str("prepaid_purchase_id", id.String()).Int64("revoked_cents", amount).Msg("revoked unspent credit of a reversed prepaid purchase by staff decision")
 	return true, tx.Commit(ctx)
+}
+
+func (c *stripeHTTPClient) grantVoidedAmount(ctx context.Context, customer, grant string) (int64, error) {
+	var total int64
+	after := ""
+	for {
+		var page struct {
+			Data []struct {
+				ID    string `json:"id"`
+				Type  string `json:"type"`
+				Grant string `json:"credit_grant"`
+				Debit *struct {
+					Type   string `json:"type"`
+					Amount struct {
+						Monetary *struct {
+							Currency string `json:"currency"`
+							Value    int64  `json:"value"`
+						} `json:"monetary"`
+					} `json:"amount"`
+				} `json:"debit"`
+			} `json:"data"`
+			HasMore bool `json:"has_more"`
+		}
+		q := url.Values{"customer": {customer}, "credit_grant": {grant}, "limit": {"100"}}
+		if after != "" {
+			q.Set("starting_after", after)
+		}
+		if err := c.doForm(ctx, http.MethodGet, "/v1/billing/credit_balance_transactions?"+q.Encode(), nil, &page, ""); err != nil {
+			return 0, err
+		}
+		for _, tr := range page.Data {
+			if tr.Grant != grant {
+				return 0, errors.New("credit ledger returned another grant's transaction")
+			}
+			if tr.Type != "debit" || tr.Debit == nil || tr.Debit.Type != "credits_voided" {
+				continue
+			}
+			m := tr.Debit.Amount.Monetary
+			if m == nil || m.Currency != "usd" || m.Value < 0 {
+				return 0, errors.New("invalid voided credit amount")
+			}
+			total += m.Value
+		}
+		if !page.HasMore || len(page.Data) == 0 {
+			return total, nil
+		}
+		after = page.Data[len(page.Data)-1].ID
+	}
 }
 
 // A purchase reversed before its credit was issued is never credited by the

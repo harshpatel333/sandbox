@@ -262,7 +262,7 @@ CREATE TABLE billing_prepaid_reversal_decision (
     revoked_at timestamptz,
     -- The unspent balance read before the void, recorded first so a void that
     -- lands without its result being saved is still audited at its real value.
-    revoke_balance_cents bigint CHECK (revoke_balance_cents >= 0),
+    revoke_attempted_at timestamptz,
     revoke_retry_after timestamptz,
     UNIQUE (purchase_id, version),
     FOREIGN KEY (purchase_id, version) REFERENCES billing_prepaid_reversal_event(purchase_id, version),
@@ -304,11 +304,11 @@ BEGIN
             NEW.decided_at := clock_timestamp();
             NEW.revoked_at := NULL;
             NEW.revoked_cents := NULL;
-            NEW.revoke_balance_cents := NULL;
+            NEW.revoke_attempted_at := NULL;
             NEW.revoke_retry_after := NULL;
-        ELSIF (to_jsonb(NEW) - ARRAY['revoked_at','revoked_cents','revoke_balance_cents','revoke_retry_after']) IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['revoked_at','revoked_cents','revoke_balance_cents','revoke_retry_after'])
+        ELSIF (to_jsonb(NEW) - ARRAY['revoked_at','revoked_cents','revoke_attempted_at','revoke_retry_after']) IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['revoked_at','revoked_cents','revoke_attempted_at','revoke_retry_after'])
             OR OLD.revoked_at IS NOT NULL OR NEW.decision <> 'revoke'
-            OR (OLD.revoke_balance_cents IS NOT NULL AND NEW.revoke_balance_cents IS DISTINCT FROM OLD.revoke_balance_cents) THEN
+            OR (OLD.revoke_attempted_at IS NOT NULL AND NEW.revoke_attempted_at IS DISTINCT FROM OLD.revoke_attempted_at) THEN
             RAISE EXCEPTION 'a reversal decision is final; only its revocation result is recorded once';
         END IF;
     END IF;

@@ -49,7 +49,8 @@ type prepaidFixture struct {
 	refunded            map[string]int64
 	disputes            map[string]string
 	assigned            []uuid.UUID
-	onLedger            func()
+	onVoid              func()
+	voided              map[string]int64
 }
 
 func newPrepaidFixture(t *testing.T) *prepaidFixture {
@@ -79,7 +80,7 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 		t.Fatal(err)
 	}
 	f := &prepaidFixture{t: t, h: h, team: team.ID, customer: "cus_" + uuid.NewString(), sub: "sub_" + uuid.NewString(),
-		intents: map[string]prepaidPaymentIntent{}, intentByKey: map[string]string{}, refunded: map[string]int64{}, disputes: map[string]string{}, sessions: map[string]map[string]any{}, sessionByKey: map[string]string{},
+		intents: map[string]prepaidPaymentIntent{}, intentByKey: map[string]string{}, refunded: map[string]int64{}, disputes: map[string]string{}, voided: map[string]int64{}, sessions: map[string]map[string]any{}, sessionByKey: map[string]string{},
 		invoices: map[string]StripeInvoiceAmounts{}, products: map[string]map[string]string{}, grants: map[string]entitlementGrant{}, grantByKey: map[string]string{}, balances: map[string]int64{}}
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
@@ -226,10 +227,25 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"data": data})
 	case strings.HasSuffix(path, "/void"):
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/v1/billing/credit_grants/"), "/void")
+		if hook := f.onVoid; hook != nil {
+			f.onVoid = nil
+			hook()
+		}
 		g := f.grants[id]
-		g.VoidedAt = time.Now().Unix()
+		if g.VoidedAt == 0 {
+			g.VoidedAt = time.Now().Unix()
+			f.voided[id] = f.balances[id]
+		}
 		f.grants[id] = g
 		json.NewEncoder(w).Encode(g)
+	case path == "/v1/billing/credit_balance_transactions":
+		id := r.URL.Query().Get("credit_grant")
+		data := []map[string]any{{"id": "cbtxn_credit_" + id, "type": "credit", "credit_grant": id}}
+		if f.grants[id].VoidedAt != 0 {
+			data = append(data, map[string]any{"id": "cbtxn_void_" + id, "type": "debit", "credit_grant": id,
+				"debit": map[string]any{"type": "credits_voided", "amount": map[string]any{"type": "monetary", "monetary": map[string]any{"currency": "usd", "value": f.voided[id]}}}})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": data})
 	case strings.HasPrefix(path, "/v1/billing/credit_grants/"):
 		json.NewEncoder(w).Encode(f.grants[strings.TrimPrefix(path, "/v1/billing/credit_grants/")])
 	case path == "/v1/invoice_payments":
@@ -252,10 +268,6 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":%d}},"available_balance":{"monetary":{"currency":"usd","value":%d}}}]}`, total, total)
 	case path == "/v1/billing/credit_balance_summary":
 		id := r.URL.Query().Get("filter[credit_grant]")
-		if hook := f.onLedger; hook != nil {
-			f.onLedger = nil
-			hook()
-		}
 		fmt.Fprintf(w, `{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":%d}},"available_balance":{"monetary":{"currency":"usd","value":%d}}}]}`, f.balances[id], f.balances[id])
 	default:
 		f.t.Errorf("unexpected provider request %s %s", r.Method, r.URL)
@@ -1384,7 +1396,7 @@ func TestPrepaidSupersededRevokeIsNeverExecuted(t *testing.T) {
 	}
 }
 
-func TestPrepaidObservationDuringRevokeCancelsTheVoid(t *testing.T) {
+func TestPrepaidObservationDuringVoidWaitsAndReopensReview(t *testing.T) {
 	f := newPrepaidFixture(t)
 	id, intent, grant := f.rechargedPurchase()
 	f.mu.Lock()
@@ -1398,35 +1410,54 @@ func TestPrepaidObservationDuringRevokeCancelsTheVoid(t *testing.T) {
 	}
 	won := "won"
 	recorded := make(chan error, 1)
-	f.onLedger = func() {
+	f.onVoid = func() {
 		go func() {
 			recorded <- f.h.recordPrepaidReversal(context.Background(), id, f.team, 5000, prepaidReversalObservation{DisputeStatus: &won, Disputed: 5000, Evidence: []byte(`{}`)})
 		}()
 		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
 			var waiting bool
-			if err := f.h.Pool.QueryRow(context.Background(), `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock')`).Scan(&waiting); err == nil && waiting {
+			if err := f.h.Pool.QueryRow(context.Background(), `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%billing_prepaid_reversal%')`).Scan(&waiting); err == nil && waiting {
 				return
 			}
 		}
-		t.Error("the new observation never waited on the revocation")
+		t.Error("the new observation did not wait for the revocation in progress")
 	}
 	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-recorded; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-recorded:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the observation never ran during the void")
 	}
 	v2, _, status, state := f.reversalState(id)
-	var revoked bool
-	if err := f.h.Pool.QueryRow(t.Context(), `SELECT revoked_at IS NOT NULL FROM billing_prepaid_reversal_decision WHERE purchase_id=$1`, id).Scan(&revoked); err != nil {
-		t.Fatal(err)
-	}
-	if f.grants[grant].VoidedAt != 0 || revoked || v2 != v1+1 || *status != "won" || *state != "open" {
-		t.Fatal("an observation that arrived during a revocation did not stop the void", f.grants[grant].VoidedAt, revoked, v2, *status, *state)
+	if revoked, voided := f.revocation(id); revoked == nil || *revoked != 300 || !voided || v2 != v1+1 || *status != "won" || *state != "open" {
+		t.Fatal("a void and an observation that raced were not serialised into an audited void then a reopened review", revoked, voided, v2, *status, *state)
 	}
 }
 
-func TestPrepaidRevokeRetryAfterVoidRecordsTheUnspentBalance(t *testing.T) {
+func (f *prepaidFixture) voidAtProvider(grant string, unspent int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	g := f.grants[grant]
+	g.VoidedAt = time.Now().Unix()
+	f.grants[grant] = g
+	f.voided[grant] = unspent
+	f.balances[grant] = 0
+}
+
+func (f *prepaidFixture) revocation(id uuid.UUID) (revoked *int64, voided bool) {
+	f.t.Helper()
+	if err := f.h.Pool.QueryRow(f.t.Context(), `SELECT d.revoked_cents,p.credit_voided_at IS NOT NULL FROM billing_prepaid_reversal_decision d JOIN billing_prepaid_purchase p ON p.id=d.purchase_id WHERE d.purchase_id=$1 AND d.decision='revoke'`, id).Scan(&revoked, &voided); err != nil {
+		f.t.Fatal(err)
+	}
+	return
+}
+
+func TestPrepaidRevokeRetryAfterVoidRecordsTheAmountVoided(t *testing.T) {
 	f := newPrepaidFixture(t)
 	id, intent, grant := f.rechargedPurchase()
 	f.mu.Lock()
@@ -1438,22 +1469,72 @@ func TestPrepaidRevokeRetryAfterVoidRecordsTheUnspentBalance(t *testing.T) {
 	if err := f.decide(id, version, "revoke"); err != nil {
 		t.Fatal(err)
 	}
-	f.exec(`UPDATE billing_prepaid_reversal_decision SET revoke_balance_cents=300 WHERE purchase_id=$1`, id)
-	f.mu.Lock()
-	g := f.grants[grant]
-	g.VoidedAt = time.Now().Unix()
-	f.grants[grant] = g
-	f.balances[grant] = 0
-	f.mu.Unlock()
+	f.exec(`UPDATE billing_prepaid_reversal_decision SET revoke_attempted_at=clock_timestamp() WHERE purchase_id=$1`, id)
+	f.voidAtProvider(grant, 200)
 	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
 		t.Fatal(err)
 	}
-	var revoked *int64
-	var voided bool
-	if err := f.h.Pool.QueryRow(t.Context(), `SELECT d.revoked_cents,p.credit_voided_at IS NOT NULL FROM billing_prepaid_reversal_decision d JOIN billing_prepaid_purchase p ON p.id=d.purchase_id WHERE d.purchase_id=$1`, id).Scan(&revoked, &voided); err != nil {
+	if revoked, voided := f.revocation(id); revoked == nil || *revoked != 200 || !voided {
+		t.Fatal("a revocation retried after its void did not record the amount actually voided", revoked, voided)
+	}
+}
+
+func TestPrepaidAttemptedRevokeIsSettledAfterANewerObservation(t *testing.T) {
+	f := newPrepaidFixture(t)
+	id, intent, grant := f.rechargedPurchase()
+	f.mu.Lock()
+	f.balances[grant] = 300
+	f.disputes[intent] = "needs_response"
+	f.mu.Unlock()
+	f.reviewReversals()
+	v1, _, _, _ := f.reversalState(id)
+	if err := f.decide(id, v1, "revoke"); err != nil {
 		t.Fatal(err)
 	}
-	if revoked == nil || *revoked != 300 || !voided {
-		t.Fatal("a revocation retried after its void did not record the unspent balance taken", revoked, voided)
+	f.exec(`UPDATE billing_prepaid_reversal_decision SET revoke_attempted_at=clock_timestamp() WHERE purchase_id=$1`, id)
+	f.voidAtProvider(grant, 300)
+	f.mu.Lock()
+	f.disputes[intent] = "won"
+	f.mu.Unlock()
+	f.exec(`UPDATE billing_prepaid_purchase SET reversal_checked_at=NULL WHERE id=$1`, id)
+	if err := f.h.reviewPrepaidReversals(t.Context(), f.client); err != nil {
+		t.Fatal(err)
+	}
+	if v2, _, _, _ := f.reversalState(id); v2 != v1+1 {
+		t.Fatal("the newer observation was not recorded", v2)
+	}
+	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
+		t.Fatal(err)
+	}
+	if revoked, voided := f.revocation(id); revoked == nil || *revoked != 300 || !voided {
+		t.Fatal("a void made before a newer observation was never audited", revoked, voided)
+	}
+}
+
+func TestPrepaidSupersededAttemptWithLiveGrantIsClosedWithoutVoid(t *testing.T) {
+	f := newPrepaidFixture(t)
+	id, intent, grant := f.rechargedPurchase()
+	f.mu.Lock()
+	f.disputes[intent] = "needs_response"
+	f.mu.Unlock()
+	f.reviewReversals()
+	v1, _, _, _ := f.reversalState(id)
+	if err := f.decide(id, v1, "revoke"); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`UPDATE billing_prepaid_reversal_decision SET revoke_attempted_at=clock_timestamp() WHERE purchase_id=$1`, id)
+	f.mu.Lock()
+	f.disputes[intent] = "won"
+	f.mu.Unlock()
+	f.exec(`UPDATE billing_prepaid_purchase SET reversal_checked_at=NULL WHERE id=$1`, id)
+	if err := f.h.reviewPrepaidReversals(t.Context(), f.client); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
+		t.Fatal(err)
+	}
+	var closed bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT revoked_at IS NULL AND revoke_retry_after='infinity' FROM billing_prepaid_reversal_decision WHERE purchase_id=$1`, id).Scan(&closed); err != nil || !closed || f.grants[grant].VoidedAt != 0 {
+		t.Fatal("a superseded attempt with a live grant was voided or left to be claimed again", closed, err, f.grants[grant].VoidedAt)
 	}
 }
