@@ -3,17 +3,22 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
@@ -597,6 +602,41 @@ func TestIntegration_BillingCatalogWritesAreIdempotentPerVersionID(t *testing.T)
 	}
 }
 
+func TestIntegration_PlanCatalogRejectsOlderDraftAfterNewerRetirement(t *testing.T) {
+	ctx := t.Context()
+	previous := currentPlanVersion(t, "enterprise")
+	var older, newer uuid.UUID
+	for _, id := range []*uuid.UUID{&older, &newer} {
+		if err := testPool.QueryRow(ctx, `INSERT INTO billing_plan_version(family,version,kind,display_name,display_only)
+   SELECT 'enterprise',MAX(version)+1,'custom','Enterprise',true FROM billing_plan_version WHERE family='enterprise' RETURNING id`).Scan(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { publishPlanCopy(t, previous, "") })
+	if _, err := testPool.Exec(ctx, `SELECT publish_billing_plan_version($1,NULL);`, newer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `SELECT retire_billing_plan_version($1,NULL);`, newer); err != nil {
+		t.Fatal(err)
+	}
+	var before, after []byte
+	snapshot := `SELECT jsonb_agg(to_jsonb(v) ORDER BY id) FROM billing_plan_version v WHERE family='enterprise'`
+	if err := testPool.QueryRow(ctx, snapshot).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	_, err := testPool.Exec(ctx, `SELECT publish_billing_plan_version($1,NULL)`, older)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
+		t.Fatalf("older draft publication after newer retirement: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, snapshot).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected publication mutated catalog history")
+	}
+}
+
 func TestIntegration_PlanCatalogNeverPublishesOverANewerVersion(t *testing.T) {
 	ctx := t.Context()
 	previous := currentPlanVersion(t, "enterprise")
@@ -1024,50 +1064,70 @@ func TestIntegration_PricingEntryReaderUsesRestrictedRole(t *testing.T) {
 	}
 }
 
-func TestIntegration_PlanCatalogRetiredNewerBlocksOlderDraft(t *testing.T) {
+func TestIntegration_PlanCatalogMonotonicForwardPreservesFunctionAttributes(t *testing.T) {
 	tx, err := testPool.Begin(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
-	var older, newer uuid.UUID
-	family := "history_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	for i, id := range []*uuid.UUID{&older, &newer} {
-		if err := tx.QueryRow(t.Context(), `INSERT INTO billing_plan_version(family,version,kind,display_name,display_only) VALUES($1,$2,'custom','Example',true) RETURNING id`, family, i+1).Scan(id); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := tx.Exec(t.Context(), `SELECT publish_billing_plan_version($1,NULL);`, newer); err != nil {
+	var definition string
+	if err := tx.QueryRow(t.Context(), `SELECT pg_get_functiondef('public.publish_billing_plan_version(uuid,uuid)'::regprocedure)`).Scan(&definition); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(t.Context(), `SELECT retire_billing_plan_version($1,NULL);`, newer); err != nil {
+	newer := "n.state IN ('published', 'retired') AND n.version > d.version"
+	older := "n.state = 'published' AND n.version > d.version"
+	if !strings.Contains(definition, newer) {
+		t.Fatal("missing fixed publication predicate")
+	}
+	if _, err := tx.Exec(t.Context(), strings.Replace(definition, newer, older, 1)); err != nil {
 		t.Fatal(err)
 	}
-	var before, after []byte
-	if err := tx.QueryRow(t.Context(), `SELECT jsonb_agg(to_jsonb(v) ORDER BY version) FROM billing_plan_version v WHERE family=$1`, family).Scan(&before); err != nil {
+	if _, err := tx.Exec(t.Context(), `ALTER FUNCTION public.publish_billing_plan_version(uuid,uuid) SECURITY INVOKER SET search_path=pg_catalog,public,pg_temp; REVOKE ALL ON FUNCTION public.publish_billing_plan_version(uuid,uuid) FROM PUBLIC`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(t.Context(), `SAVEPOINT stale_publish`); err != nil {
+	metadata := `SELECT jsonb_build_object('oid',oid,'owner',proowner,'definer',prosecdef,'config',proconfig,'acl',proacl,'args',proargtypes::text,'return',prorettype)::text FROM pg_proc WHERE oid='public.publish_billing_plan_version(uuid,uuid)'::regprocedure`
+	var before, after string
+	if err := tx.QueryRow(t.Context(), metadata).Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	_, publishErr := tx.Exec(t.Context(), `SELECT publish_billing_plan_version($1,NULL)`, older)
-	if _, err := tx.Exec(t.Context(), `ROLLBACK TO SAVEPOINT stale_publish`); err != nil {
+	migration, err := os.ReadFile(filepath.Join("..", "..", "supabase", "migrations", "20261025150000_free_template_policy.sql"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if publishErr == nil || !strings.Contains(publishErr.Error(), "55000") || !strings.Contains(publishErr.Error(), "newer version") {
-		t.Fatalf("older draft after newer retirement: %v", publishErr)
+	start := strings.Index(string(migration), "DO $$\nDECLARE\n    definition text := pg_get_functiondef(")
+	if start < 0 {
+		t.Fatal("missing owning forward function patch")
 	}
-	if err := tx.QueryRow(t.Context(), `SELECT jsonb_agg(to_jsonb(v) ORDER BY version) FROM billing_plan_version v WHERE family=$1`, family).Scan(&after); err != nil {
+	body := string(migration)[start:]
+	end := strings.Index(body, "END $$;")
+	if end < 0 {
+		t.Fatal("missing forward block end")
+	}
+	patch := body[:end+len("END $$;")]
+	if _, err := tx.Exec(t.Context(), patch); err != nil {
 		t.Fatal(err)
 	}
-	if string(before) != string(after) {
-		t.Fatalf("rejected publication mutated history: before=%s after=%s", before, after)
+	if err := tx.QueryRow(t.Context(), metadata).Scan(&after); err != nil || after != before {
+		t.Fatalf("function attributes changed: before=%s after=%s err=%v", before, after, err)
 	}
-	var successor uuid.UUID
-	if err := tx.QueryRow(t.Context(), `INSERT INTO billing_plan_version(family,version,kind,display_name,display_only) VALUES($1,3,'custom','Example',true) RETURNING id`, family).Scan(&successor); err != nil {
+	if err := tx.QueryRow(t.Context(), `SELECT pg_get_functiondef('public.publish_billing_plan_version(uuid,uuid)'::regprocedure)`).Scan(&definition); err != nil || !strings.Contains(definition, newer) {
+		t.Fatalf("guard missing: %v", err)
+	}
+	if _, err := tx.Exec(t.Context(), patch); err != nil {
+		t.Fatalf("already fixed guard rejected: %v", err)
+	}
+	if _, err := tx.Exec(t.Context(), strings.Replace(definition, newer, "n.version > d.version AND n.state = 'published'", 1)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(t.Context(), `SELECT publish_billing_plan_version($1,NULL)`, successor); err != nil {
-		t.Fatalf("explicit rollback successor: %v", err)
+	if _, err := tx.Exec(t.Context(), `SAVEPOINT unknown_publication_guard`); err != nil {
+		t.Fatal(err)
+	}
+	_, unknownErr := tx.Exec(t.Context(), patch)
+	if _, err := tx.Exec(t.Context(), `ROLLBACK TO SAVEPOINT unknown_publication_guard`); err != nil {
+		t.Fatal(err)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(unknownErr, &pgErr) || pgErr.Code != "55000" {
+		t.Fatalf("unknown guard accepted: %v", unknownErr)
 	}
 }
