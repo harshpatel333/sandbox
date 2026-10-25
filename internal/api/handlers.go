@@ -1019,14 +1019,19 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		// A secret change may hold the sandbox, or have just let it go. While
-		// held, only the hold is read; the claim runs again once it clears,
-		// and waiting resumes if another change took the hold first.
+		// held, only the hold is read; the claim runs again once it clears.
+		// A claim that still finds no row lost to a change if the sandbox is
+		// paused, held again or not, since one can come and go between the
+		// claim and the probe; any other state is a real conflict.
 		werr := waitSecretWriteHold(c.Request.Context(), resumeSecretWriteWait, func() (bool, error) {
 			if h.secretWriteHeld(c, sandboxID) {
 				return false, nil
 			}
 			claimed, err = claim()
-			return !errors.Is(err, pgx.ErrNoRows) || !h.secretWriteHeld(c, sandboxID), nil
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return true, nil
+			}
+			return !h.secretWriteHeld(c, sandboxID) && !h.sandboxStillPaused(c, sandboxID, teamID), nil
 		})
 		if errors.Is(werr, errSecretChangeInFlight) {
 			respondSecretChangeInFlight(c)

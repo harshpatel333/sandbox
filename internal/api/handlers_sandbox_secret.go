@@ -159,6 +159,13 @@ func (h *Handlers) secretWriteHeld(c *gin.Context, sandboxID uuid.UUID) bool {
 	return err == nil && held
 }
 
+// sandboxStillPaused reports whether the sandbox is paused; a failed read
+// reports not, leaving the caller's answer as it was.
+func (h *Handlers) sandboxStillPaused(c *gin.Context, sandboxID, teamID uuid.UUID) bool {
+	sb, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+	return err == nil && sb.Status == db.SandboxStatusPaused
+}
+
 // takeSecretWriteHold takes the hold under the secret-write lock, so it
 // passes from a lapsed holder only between that holder's transactions.
 func (h *Handlers) takeSecretWriteHold(ctx context.Context, sandboxID, holder uuid.UUID) (bool, error) {
