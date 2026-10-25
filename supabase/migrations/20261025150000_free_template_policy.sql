@@ -132,13 +132,37 @@ REVOKE ALL ON billing_free_template_policy_transition FROM PUBLIC;
 CREATE TRIGGER billing_free_template_policy_transition_immutable BEFORE UPDATE OR DELETE OR TRUNCATE
  ON billing_free_template_policy_transition FOR EACH STATEMENT EXECUTE FUNCTION guard_billing_catalog_append_only();
 
+CREATE FUNCTION billing_free_template_policy_assignment_ready(p_assignment team_plan_assignment)
+RETURNS boolean LANGUAGE sql STABLE SET search_path=pg_catalog,public,pg_temp SET row_security=off AS $$
+ WITH previous AS (
+  SELECT a.* FROM public.team_plan_assignment a
+  WHERE a.team_id=(p_assignment).team_id AND a.effective_to<=(p_assignment).effective_from
+  ORDER BY a.effective_from DESC LIMIT 1
+ )
+ SELECT COALESCE((p_assignment).kind='free' AND (p_assignment).plan_key='free' AND (p_assignment).effective_to IS NULL
+  AND (p_assignment).contract_id IS NULL
+  AND (p_assignment).plan_version_id=md5('billing-plan-version:v2:free:no-custom-templates:1')::uuid
+  AND (p_assignment).limits->'max_templates'='0'::jsonb
+  AND CASE WHEN NOT EXISTS(SELECT 1 FROM previous WHERE kind='free') THEN
+   (p_assignment).free_allowance_origin_at IS NULL
+  ELSE EXISTS(
+   SELECT 1 FROM previous p JOIN public.billing_free_template_policy_transition r
+    ON r.predecessor_id=p.id AND r.successor_id=(p_assignment).id AND r.team_id=(p_assignment).team_id
+   WHERE p.plan_version_id=md5('billing-plan-version:v2:free:1')::uuid AND p.limits->'max_templates'='10'::jsonb
+    AND p.effective_to=(p_assignment).effective_from
+    AND (p_assignment).free_allowance_origin_at=COALESCE(p.free_allowance_origin_at,p.effective_from)
+    AND ((p_assignment).terms-'version_id'-'version')=(p.terms-'version_id'-'version')
+    AND ((p_assignment).limits-'max_templates')=(p.limits-'max_templates')
+  ) END,false);
+$$;
+
 CREATE OR REPLACE FUNCTION billing_free_template_policy_blocker(p_team uuid)
 RETURNS text LANGUAGE plpgsql STABLE SET search_path=pg_catalog,public,pg_temp SET row_security=off AS $$
 DECLARE blocked text; pending boolean;
 BEGIN
  blocked:=public.billing_pricing_adoption_blocker(p_team);
  IF blocked IS NOT NULL THEN RETURN blocked; END IF;
- IF EXISTS(SELECT 1 FROM public.billing_team_pause_target WHERE team_id=p_team AND done_at IS NULL) THEN RETURN 'unfinished_pause_target'; END IF;
+ IF EXISTS(SELECT 1 FROM public.billing_team_pause_target t WHERE t.team_id=p_team AND t.done_at IS NULL AND NOT public.billing_pause_target_settled(t)) THEN RETURN 'unfinished_pause_target'; END IF;
  IF EXISTS(SELECT 1 FROM public.billing_free_allowance_retry WHERE team_id=p_team) THEN RETURN 'allowance_retry'; END IF;
  IF to_regclass('public.team_plan_change') IS NOT NULL THEN
   EXECUTE 'SELECT EXISTS(SELECT 1 FROM public.team_plan_change WHERE team_id=$1)' INTO pending USING p_team;
@@ -253,10 +277,10 @@ BEGIN
   IF jsonb_array_length(public.billing_free_template_policy_pending_targets())<>0 THEN
    RAISE EXCEPTION 'committed old-Free plan changes require owner reconciliation' USING ERRCODE='55000';
   END IF;
-  IF NOT EXISTS(SELECT 1 FROM public.billing_plan_version WHERE family='free' AND pricing_version='v2' AND kind='free' AND state='published' AND max_templates=0)
+  IF NOT EXISTS(SELECT 1 FROM public.billing_plan_version WHERE id=md5('billing-plan-version:v2:free:no-custom-templates:1')::uuid AND family='free' AND pricing_version='v2' AND kind='free' AND state='published' AND max_templates=0)
    OR EXISTS(SELECT 1 FROM public.team_plan_assignment a JOIN public.team t ON t.id=a.team_id
     WHERE a.effective_to IS NULL AND a.kind='free' AND a.team_id<>NEW.system_team_id
-     AND a.limits->'max_templates' IS DISTINCT FROM '0'::jsonb) THEN
+     AND NOT public.billing_free_template_policy_assignment_ready(a)) THEN
    RAISE EXCEPTION 'Free0 catalog and fenced existing-assignment policy completion required' USING ERRCODE='55000';
   END IF;
   IF COALESCE(NEW.evidence->'free_template_policy'->'existing_assignments_verified','false'::jsonb)<>'true'::jsonb
@@ -278,11 +302,11 @@ INSERT INTO billing_pricing_adoption_event(epoch,region,action,actor,reason,deta
 SELECT epoch,region,'free_template_policy_reset','database','Free template policy requires fresh assembled evidence','{}'::jsonb FROM reset;
 
 DO $$ DECLARE r text; BEGIN
- REVOKE ALL ON FUNCTION billing_migrate_free_template_assignment(text,uuid,uuid,uuid,text,text),billing_free_template_policy_blocker(uuid),billing_free_template_policy_pending_targets(),guard_free_template_policy_release() FROM PUBLIC;
+ REVOKE ALL ON FUNCTION billing_migrate_free_template_assignment(text,uuid,uuid,uuid,text,text),billing_free_template_policy_blocker(uuid),billing_free_template_policy_pending_targets(),billing_free_template_policy_assignment_ready(team_plan_assignment),guard_free_template_policy_release() FROM PUBLIC;
  FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
    EXECUTE format('REVOKE ALL ON billing_free_template_policy_transition FROM %I',r);
-   EXECUTE format('REVOKE ALL ON FUNCTION billing_migrate_free_template_assignment(text,uuid,uuid,uuid,text,text),billing_free_template_policy_blocker(uuid),billing_free_template_policy_pending_targets(),guard_free_template_policy_release() FROM %I',r);
+   EXECUTE format('REVOKE ALL ON FUNCTION billing_migrate_free_template_assignment(text,uuid,uuid,uuid,text,text),billing_free_template_policy_blocker(uuid),billing_free_template_policy_pending_targets(),billing_free_template_policy_assignment_ready(team_plan_assignment),guard_free_template_policy_release() FROM %I',r);
   END IF;
  END LOOP;
 END $$;

@@ -3151,7 +3151,7 @@ func TestPlanAssignmentMigration(t *testing.T) {
 		team := uuid.New()
 		mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "released-import-"+team.String())
 		mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='v2'`)
-		mustExec(t, dstPool, `UPDATE billing_pricing_adoption SET region='usw',system_team_id=$1,state='released',evidence='{}',released_at=clock_timestamp()`, uuid.New())
+		mustExec(t, dstPool, `UPDATE billing_pricing_adoption SET region='usw',system_team_id=$1,state='released',evidence='{"free_template_policy":{"existing_assignments_verified":true,"custom_policy_reference":"local-fixture","runtime_reference":"local-fixture"}}',released_at=clock_timestamp()`, uuid.New())
 		t.Cleanup(func() { mustExec(t, dstPool, `UPDATE billing_pricing_switch SET pricing_version='legacy'`) })
 		spec, _ := tableByName("team")
 		if _, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err == nil || !strings.Contains(err.Error(), "regional team import is unavailable") {
@@ -3288,7 +3288,7 @@ func TestPlanAssignmentMigration(t *testing.T) {
 		}
 	})
 	for _, cell := range []string{"source", "destination"} {
-		for _, state := range []string{"allowance", "pause"} {
+		for _, state := range []string{"allowance", "pause", "policy"} {
 			t.Run(cell+" "+state+" authority refuses migration", func(t *testing.T) {
 				team := uuid.New()
 				mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "free-authority-"+team.String())
@@ -3299,6 +3299,19 @@ func TestPlanAssignmentMigration(t *testing.T) {
 				}
 				if state == "allowance" {
 					mustExec(t, pool, `INSERT INTO billing_free_allowance(team_id,window_started_at,resets_at,allowance_usd,used_usd,blocked_until,evaluated_at) VALUES($1,now(),now()+interval '24 hours',1,2,now()+interval '24 hours',now())`, team)
+				} else if state == "policy" {
+					predecessor, successor := uuid.New(), uuid.New()
+					start, boundary := time.Now().Add(-time.Hour), time.Now()
+					mustExec(t, pool, `INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,$2,'free','free','{}','{"max_concurrent":1,"max_templates":10}',$3,'migration','prior Free')`, predecessor, team, start)
+					mustExec(t, pool, `UPDATE team_plan_assignment SET effective_to=$2 WHERE id=$1`, predecessor, boundary)
+					mustExec(t, pool, `INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,terms,limits,effective_from,free_allowance_origin_at,source,reason) VALUES($1,$2,'free','free','{}','{"max_concurrent":1,"max_templates":0}',$3,$4,'migration','Free policy')`, successor, team, boundary, start)
+					if cell == "destination" {
+						spec, _ := tableByName("team")
+						if _, _, err := copyTable(ctx, dstPool, srcPool, spec, team, nil); err != nil {
+							t.Fatal(err)
+						}
+					}
+					mustExec(t, pool, `INSERT INTO billing_free_template_policy_transition(predecessor_id,successor_id,team_id,epoch,actor,reason) VALUES($1,$2,$3,$4,'operator@example.com','policy receipt')`, predecessor, successor, team, uuid.New())
 				} else {
 					mustExec(t, pool, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free','{}','{"max_concurrent":1}',clock_timestamp(),'plan_change','accepted exit')`, team)
 					mustExec(t, pool, `SELECT request_team_pause_all($1,'plan_switch_free')`, team)

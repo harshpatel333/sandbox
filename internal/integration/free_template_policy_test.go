@@ -195,9 +195,6 @@ func TestIntegration_FreeTemplatePolicy_FencesOwnershipAndRollsBackFaults(t *tes
 	if _, err := testPool.Exec(t.Context(), `UPDATE sandbox SET status='paused' WHERE id=$1`, sandbox); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testPool.Exec(t.Context(), `UPDATE billing_team_pause_target SET done_at=clock_timestamp() WHERE team_id=$1`, team); err != nil {
-		t.Fatal(err)
-	}
 	holder, err := testPool.Begin(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -238,6 +235,19 @@ func TestIntegration_FreeTemplatePolicy_FencesOwnershipAndRollsBackFaults(t *tes
 	}
 }
 
+func freePolicyReleaseEvidence(t *testing.T) (uuid.UUID, []byte) {
+	t.Helper()
+	var epoch uuid.UUID
+	if err := testPool.QueryRow(t.Context(), `SELECT epoch FROM billing_pricing_adoption WHERE singleton`).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := json.Marshal(map[string]any{"epoch": epoch.String(), "region": "use", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture", "free_template_policy": map[string]any{"existing_assignments_verified": true, "custom_policy_reference": "local-fixture", "runtime_reference": "local-fixture"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return epoch, evidence
+}
+
 func TestIntegration_FreeTemplatePolicy_ReleaseRejectsCommittedOldFreeTarget(t *testing.T) {
 	isolatedFreeTemplatePolicy(t)
 	team, _ := seedTeamAndKey(t)
@@ -247,14 +257,7 @@ func TestIntegration_FreeTemplatePolicy_ReleaseRejectsCommittedOldFreeTarget(t *
 		t.Fatal(err)
 	}
 	prepareFreeTemplatePolicy(t)
-	var epoch uuid.UUID
-	if err := testPool.QueryRow(t.Context(), `SELECT epoch FROM billing_pricing_adoption WHERE singleton`).Scan(&epoch); err != nil {
-		t.Fatal(err)
-	}
-	evidence, err := json.Marshal(map[string]any{"epoch": epoch.String(), "region": "use", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture", "free_template_policy": map[string]any{"existing_assignments_verified": true, "custom_policy_reference": "local-fixture", "runtime_reference": "local-fixture"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	epoch, evidence := freePolicyReleaseEvidence(t)
 	release := `SELECT billing_release_pricing_adoption('use',$1,$2,'operator@example.com','local fixture',$3::jsonb)`
 	if _, err := testPool.Exec(t.Context(), release, testSystemTeamID, epoch, evidence); pgCode(err) != "55000" {
 		t.Fatalf("all assigned concealed old Free10: %v", err)
@@ -431,5 +434,50 @@ func TestIntegration_FreeTemplatePolicy_PauseRequestSelectsCommittedSuccessor(t 
 	}
 	if target != successor {
 		t.Fatalf("pause target=%s predecessor=%s successor=%s", target, predecessor, successor)
+	}
+}
+
+func TestIntegration_FreeTemplatePolicy_ReleaseRequiresCanonicalAuditedHistory(t *testing.T) {
+	for _, scenario := range []string{"unknown_zero", "unreceipted_free", "new_free", "paid_exit"} {
+		t.Run(scenario, func(t *testing.T) {
+			isolatedFreeTemplatePolicy(t)
+			ctx := t.Context()
+			team, _ := seedTeamAndKey(t)
+			start := time.Now().Add(-time.Hour)
+			if scenario == "unreceipted_free" {
+				assignFreeTemplatePredecessor(t, team, start)
+			} else if scenario == "paid_exit" {
+				if _, err := testPool.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'enterprise','custom','{}','{"max_concurrent":1}',$2,'staff','prior paid authority')`, team, start); err != nil {
+					t.Fatal(err)
+				}
+			}
+			boundary := time.Now()
+			if scenario == "unreceipted_free" || scenario == "paid_exit" {
+				if _, err := testPool.Exec(ctx, `UPDATE team_plan_assignment SET effective_to=$2 WHERE team_id=$1 AND effective_to IS NULL`, team, boundary); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var version any = uuid.MustParse("4388348b-02ba-0306-4fc9-67bcc4c8fab4")
+			if scenario == "unknown_zero" {
+				version = nil
+			}
+			if _, err := testPool.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason) VALUES($1,'free','free',$2,'{"allowance":{"amount_cents":13,"period":"day_window","on_exhausted":"pause","compute":{"seconds":7200,"vcpu":1,"memory_gib":1}}}','{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096,"max_templates":0}',$3,'plan_change','committed free assignment')`, team, version, boundary); err != nil {
+				t.Fatal(err)
+			}
+			prepareFreeTemplatePolicy(t)
+			epoch, evidence := freePolicyReleaseEvidence(t)
+			_, err := testPool.Exec(ctx, `SELECT billing_release_pricing_adoption('use',$1,$2,'operator@example.com','local fixture',$3::jsonb)`, testSystemTeamID, epoch, evidence)
+			if scenario == "unknown_zero" || scenario == "unreceipted_free" {
+				if pgCode(err) != "55000" {
+					t.Fatalf("unverified history released: %v", err)
+				}
+				var state string
+				if err := testPool.QueryRow(ctx, `SELECT state FROM billing_pricing_adoption WHERE singleton`).Scan(&state); err != nil || state != "preparing" {
+					t.Fatalf("rejected release mutated state=%s: %v", state, err)
+				}
+			} else if err != nil {
+				t.Fatalf("legitimate new authority blocked: %v", err)
+			}
+		})
 	}
 }

@@ -112,9 +112,9 @@ func run(ctx context.Context, args []string, out io.Writer, getenv func(string) 
 		var report []byte
 		err := pool.QueryRow(ctx, `SELECT jsonb_build_object('pending_committed_targets',billing_free_template_policy_pending_targets(),'assignments',COALESCE(jsonb_agg(to_jsonb(r) ORDER BY r.team_id),'[]'::jsonb)) FROM (
    SELECT a.team_id,t.home_region,a.id AS assignment_id,a.plan_version_id,a.limits->'max_templates' AS frozen_max_templates,
-   a.limits->'max_templates' IS DISTINCT FROM '0'::jsonb AS needs_successor,
+   NOT billing_free_template_policy_assignment_ready(a) AS needs_successor,
    COALESCE(a.free_allowance_origin_at,a.effective_from) AS allowance_origin,
-   CASE WHEN a.limits->'max_templates' IS DISTINCT FROM '0'::jsonb THEN billing_free_template_policy_blocker(a.team_id) ELSE billing_pricing_adoption_blocker(a.team_id) END AS authority_blocker,
+   CASE WHEN billing_free_template_policy_assignment_ready(a) THEN billing_pricing_adoption_blocker(a.team_id) WHEN a.plan_version_id=md5('billing-plan-version:v2:free:1')::uuid AND a.limits->'max_templates'='10'::jsonb THEN billing_free_template_policy_blocker(a.team_id) ELSE 'unverified_free_policy_history' END AS authority_blocker,
    (SELECT count(*) FROM template t WHERE t.team_id=a.team_id AND t.deleted_at IS NULL) AS retained_custom_templates,
    (SELECT count(*) FROM sandbox s WHERE s.team_id=a.team_id AND NOT s.system_template AND s.destroyed_at IS NULL) AS retained_custom_sandboxes,
    (SELECT count(*) FROM sandbox_snapshot s WHERE s.team_id=a.team_id AND NOT s.system_template AND s.deleted_at IS NULL) AS retained_custom_snapshots
