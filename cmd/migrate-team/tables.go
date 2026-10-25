@@ -169,6 +169,7 @@ var skippedTables = []struct{ name, reason string }{
 	// away when the team row is purged.
 	{"team_sandbox_counter", "dest quota triggers rebuild it as sandboxes resume; copying would double-count"},
 	{"sandbox_snapshot", "a live row, or a deleted one a sandbox refers to, refuses the copy; deleted rows nothing refers to are purged with the team"},
+	{"sandbox_secret_write_hold", "a secret change in progress refuses the purge; lapsed rows are purged with their sandbox"},
 }
 
 // tableByName finds a migrated table's spec.
