@@ -440,6 +440,11 @@ func (h *Handlers) revertPauseWithTimeout(reqCtx context.Context, sandboxID, tea
 // vmdTimeout is the default deadline for VMD gRPC calls.
 const vmdTimeout = 30 * time.Second
 
+// resumeClaimTimeout bounds the resume claim, which waits only on other
+// short transactions holding the sandbox's secret-write lock. A client that
+// gives up does not reliably cancel the request.
+const resumeClaimTimeout = 10 * time.Second
+
 // vmdBootTimeout is the deadline for the boot (restore) call specifically.
 // It exceeds VMD's in-VM readiness cap (30s) so a guest that never becomes
 // ready yields VMD's definitive teardown error instead of a bare deadline —
@@ -986,7 +991,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 		claimParams.MachinePrincipalID = pgtype.UUID{Bytes: caller.PrincipalID, Valid: true}
 	}
-	claimed, err := h.DB.ClaimResume(c.Request.Context(), claimParams)
+	claim := func() (db.ClaimResumeRow, error) {
+		cctx, cancel := context.WithTimeout(c.Request.Context(), resumeClaimTimeout)
+		defer cancel()
+		return h.DB.ClaimResume(cctx, claimParams)
+	}
+	claimed, err := claim()
 	// Only a failed machine claim needs a second read to distinguish denied
 	// ownership from an owner's pause that is still settling. Do this before
 	// polling or exposing another principal's sandbox state.
@@ -1001,7 +1011,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		if !retry {
 			return "", false
 		}
-		claimed, err = h.DB.ClaimResume(c.Request.Context(), claimParams)
+		claimed, err = claim()
 	}
 	if err != nil {
 		if err == pgx.ErrNoRows {

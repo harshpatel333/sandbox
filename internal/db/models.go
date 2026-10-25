@@ -1598,6 +1598,12 @@ type SandboxSecretDetached struct {
 	DetachedAt time.Time `json:"detached_at"`
 }
 
+type SandboxSecretWriteHold struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Holder    uuid.UUID `json:"holder"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
 type SandboxSnapshot struct {
 	ID     uuid.UUID `json:"id"`
 	TeamID uuid.UUID `json:"team_id"`
