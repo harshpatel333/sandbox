@@ -260,8 +260,9 @@ CREATE TABLE billing_prepaid_reversal_decision (
     decided_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     revoked_cents bigint CHECK (revoked_cents >= 0),
     revoked_at timestamptz,
-    -- The unspent balance read before the void, recorded first so a void that
-    -- lands without its result being saved is still audited at its real value.
+    -- Recorded before the void, so a void that lands without its result being
+    -- saved is still found and audited; a superseded attempt whose grant stayed
+    -- live is closed with revoke_retry_after = 'infinity'.
     revoke_attempted_at timestamptz,
     revoke_retry_after timestamptz,
     UNIQUE (purchase_id, version),

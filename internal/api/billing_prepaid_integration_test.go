@@ -1538,3 +1538,29 @@ func TestPrepaidSupersededAttemptWithLiveGrantIsClosedWithoutVoid(t *testing.T) 
 		t.Fatal("a superseded attempt with a live grant was voided or left to be claimed again", closed, err, f.grants[grant].VoidedAt)
 	}
 }
+
+func TestPrepaidSpentVoidLeavesAnAttemptedRevokeToItsOwnAudit(t *testing.T) {
+	f := newPrepaidFixture(t)
+	id, intent, grant := f.rechargedPurchase()
+	f.mu.Lock()
+	f.balances[grant] = 300
+	f.refunded[intent] = 5000
+	f.mu.Unlock()
+	f.reviewReversals()
+	version, _, _, _ := f.reversalState(id)
+	if err := f.decide(id, version, "revoke"); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`UPDATE billing_prepaid_reversal_decision SET revoke_attempted_at=clock_timestamp() WHERE purchase_id=$1`, id)
+	f.voidAtProvider(grant, 300)
+	f.exec(`UPDATE billing_prepaid_purchase SET credit_balance_checked_at=NULL WHERE id=$1`, id)
+	if err := f.h.voidSpentPrepaidGrants(t.Context(), f.client); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
+		t.Fatal(err)
+	}
+	if revoked, voided := f.revocation(id); revoked == nil || *revoked != 300 || !voided {
+		t.Fatal("the spent-grant voider took over an attempted revocation and hid the amount it voided", revoked, voided)
+	}
+}

@@ -82,6 +82,8 @@ func (h *Handlers) startPrepaidEnforcement(ctx context.Context) error {
 
 // A fully consumed purchase grant is voided so it stops counting toward the
 // grant limits. Voiding changes the grant, so it waits for the same fence as issuance.
+// A staff revocation already attempted under that fence settles the grant itself,
+// so its void is audited at the amount Stripe voided.
 func (h *Handlers) voidSpentPrepaidGrants(ctx context.Context, client *stripeHTTPClient) error {
 	rows, err := h.Pool.Query(ctx, `SELECT id,team_id,customer_id,stripe_credit_grant_id FROM billing_prepaid_purchase
  WHERE credit_state='issued' AND credit_voided_at IS NULL AND COALESCE(credit_balance_checked_at,'-infinity'::timestamptz)<now()-interval '1 hour'
@@ -132,6 +134,10 @@ func (h *Handlers) voidSpentPrepaidGrant(ctx context.Context, client *stripeHTTP
 	}
 	defer release()
 	if balance, err = client.grantLedgerBalance(ctx, customer, grant); err != nil || balance != 0 {
+		return err
+	}
+	var revoking bool
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_prepaid_reversal_decision WHERE purchase_id=$1 AND revoke_attempted_at IS NOT NULL AND revoked_at IS NULL AND revoke_retry_after IS DISTINCT FROM 'infinity')`, id).Scan(&revoking); err != nil || revoking {
 		return err
 	}
 	var voided entitlementGrant
