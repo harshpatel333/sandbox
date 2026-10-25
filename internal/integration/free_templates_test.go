@@ -216,6 +216,7 @@ func TestIntegration_FreeTemplates_MigrationBackfillsRetainedOrigins(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	migration = []byte(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(string(migration)), "BEGIN;"), "COMMIT;"))
 	if _, err := tx.Exec(ctx, `SAVEPOINT unsupported_prefix; ALTER TABLE sandbox ALTER COLUMN system_template SET DEFAULT true`); err != nil {
 		t.Fatal(err)
 	}

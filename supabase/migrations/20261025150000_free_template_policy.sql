@@ -1,3 +1,5 @@
+BEGIN;
+
 SELECT pricing_version FROM billing_pricing_switch WHERE singleton FOR UPDATE;
 SELECT epoch FROM billing_pricing_adoption WHERE singleton FOR UPDATE;
 CREATE OR REPLACE FUNCTION publish_billing_plan_version(p_id uuid, p_actor uuid) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
@@ -337,3 +339,4 @@ RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
   AND btrim(p_evidence->'free_template_policy'->>'runtime_reference')<>'',false);
 $$;
 
+COMMIT;
