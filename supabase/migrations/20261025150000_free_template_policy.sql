@@ -66,8 +66,15 @@ BEGIN
     PERFORM publish_billing_plan_version(successor.id, NULL);
 END $$;
 
-ALTER TABLE sandbox ADD COLUMN system_template boolean NOT NULL DEFAULT false;
-ALTER TABLE sandbox_snapshot ADD COLUMN system_template boolean NOT NULL DEFAULT false;
+DO $$ BEGIN
+ IF (SELECT count(*) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+  JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+  WHERE n.nspname='public' AND c.relname IN ('sandbox','sandbox_snapshot') AND a.attname='system_template'
+   AND NOT a.attisdropped AND a.atttypid='boolean'::regtype AND a.attnotnull AND pg_get_expr(d.adbin,d.adrelid)='false')<>2
+  OR NOT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('public.guard_free_sandbox_shape()') AND md5(prosrc)='78edcc79da0400927e5604b1d7e39b2e') THEN
+  RAISE EXCEPTION 'unsupported Free enforcement prefix; reconcile applied migration history' USING ERRCODE='55000';
+ END IF;
+END $$;
 
 DO $$ BEGIN
  IF EXISTS(SELECT 1 FROM sandbox s JOIN template t ON t.id=s.template_id
@@ -76,8 +83,8 @@ DO $$ BEGIN
   RAISE EXCEPTION 'prepare the canonical system team and reconcile unknown foreign template owners before policy migration' USING ERRCODE='55000';
  END IF;
 END $$;
-UPDATE sandbox s SET system_template = true
-FROM template t,billing_pricing_adoption a WHERE a.singleton AND t.id=s.template_id AND t.team_id=a.system_team_id;
+UPDATE sandbox s SET system_template = (t.team_id=a.system_team_id)
+FROM template t,billing_pricing_adoption a WHERE a.singleton AND t.id=s.template_id;
 
 UPDATE sandbox_snapshot ss SET system_template = s.system_template
 FROM sandbox s WHERE s.id = ss.sandbox_id AND s.team_id = ss.team_id;

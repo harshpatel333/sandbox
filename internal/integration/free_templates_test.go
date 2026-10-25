@@ -205,8 +205,27 @@ func TestIntegration_FreeTemplates_MigrationBackfillsRetainedOrigins(t *testing.
 			t.Fatal(err)
 		}
 	}
+	prefix, err := os.ReadFile(filepath.Join("..", "..", "supabase", "migrations", "20261025140000_free_system_templates.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, string(prefix)); err != nil {
+		t.Fatal(err)
+	}
 	migration, err := os.ReadFile(filepath.Join("..", "..", "supabase", "migrations", "20261025150000_free_template_policy.sql"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SAVEPOINT unsupported_prefix; ALTER TABLE sandbox ALTER COLUMN system_template SET DEFAULT true`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, string(migration)); err == nil || !strings.Contains(err.Error(), "unsupported Free enforcement prefix") {
+		t.Fatalf("unsupported prefix: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT unsupported_prefix`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE sandbox SET system_template=true WHERE id=$1`, source); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, string(migration)); err != nil {

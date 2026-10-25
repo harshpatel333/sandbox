@@ -1,6 +1,8 @@
 # Free template policy migration
 
-Migration `20261025150000_free_template_policy.sql` is the single policy migration. It includes the catalog constraints and Free0 version, template provenance and admission enforcement, the human assignment transition, and the additional release checks. Do not assemble the withdrawn `20261025060000` or the earlier `20261025140000` candidate alongside it. The unused `20261025010000` reservation stays retired.
+The one new coordinated forward migration is `20261025150000_free_template_policy.sql`. It owns catalog constraints and immutable Free0 publication, allowance-origin preservation, the fenced human assignment successor, canonical provenance repair and release checks. It preserves the existing published `20261025140000_free_system_templates.sql` byte-for-byte (SHA256 `4b60836a4b1b139f44f3ae5b8da0e8c5d21d5fc9972311ffcaebe8f98f373f45`) as its required prefix. It neither recreates existing provenance columns nor rewrites that migration. The forward SQL checks the expected column shape and prior guard body and rejects unsupported prefixes with `55000`.
+
+Do not assemble old `010000`, withdrawn catalog `060000`, or superseded split-history `130000` candidates. Source absence does not prove any artifact was never applied. Reconcile each environment's migration ledger and SQL hashes before application. Different previously applied artifacts require separately reviewed forward reconciliation; never overwrite an applied migration. Global non-application on dev environments remains unverified.
 
 Before migration, bind the existing adoption schema to the canonical region/system team with the existing human prepare command. Unknown foreign template ownership causes migration to fail closed; it is never classified as system by exclusion.
 
