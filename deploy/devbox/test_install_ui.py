@@ -10,6 +10,7 @@ LOCAL_SECRETS = {
     'SERVICE_ROLE_KEY': 'service-role-secret',
     'INTERNAL_API_TOKEN': 'internal-secret',
     'OPERATOR_API_TOKEN': 'operator-secret',
+    'OPERATOR_API_TOKEN': 'operator-secret',
     'PROMOTION_CAPTURE_TOKEN': 'capture-secret',
     'PROMOTION_ACCOUNT_TOKEN': 'account-secret',
     'POSTGRES_PASSWORD': 'postgres-secret',
@@ -61,6 +62,34 @@ class InstallUiDryRunTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("build-arg NEXT_PUBLIC_SUPABASE_ANON_KEY=an$on key's", result.stdout.splitlines())
         self.assertEqual(result.stderr, '')
+
+    def test_calendly_values_are_runtime_only_and_not_printed(self):
+        values = {'CALENDLY_API_TOKEN': 'private-calendar-token', 'CALENDLY_ORGANIZATION_URI': 'https://api.calendly.com/organizations/example', 'CALENDLY_ENTERPRISE_EVENT_TYPE_URI': 'https://api.calendly.com/event_types/example'}
+        with (self.etc / 'secrets.env').open('a') as stream:
+            stream.write(''.join(f'{key}={value}\n' for key, value in values.items()))
+        result = self.run_script({'ANON_KEY': 'anon-key', **LOCAL_SECRETS})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for key, value in values.items():
+            self.assertIn('runtime ' + key + '=…', result.stdout)
+            self.assertNotIn(value, result.stdout + result.stderr)
+            self.assertNotIn('build-arg ' + key, result.stdout)
+
+    def test_configured_meeting_requires_existing_secret_before_mutation(self):
+        source = SCRIPT.read_text()
+        functions = source[source.index('die() {'):source.index('require_file "$DEVBOX_ENV"')]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'console-secrets.env'
+            original = b'GOOGLE_SIGNUP_PROOF_SECRET=' + b'x' * 32 + b'\n'
+            for content, success in ((None, False), (b'GOOGLE_SIGNUP_PROOF_SECRET=short\n', False), (original, True)):
+                if content is not None:
+                    path.write_bytes(content)
+                result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + functions + '\nCONSOLE_SECRETS="$1"\nRUNTIME_VARS=(CALENDLY_API_TOKEN=token CALENDLY_ORGANIZATION_URI=org CALENDLY_ENTERPRISE_EVENT_TYPE_URI=event)\nrequire_existing_meeting_secret', '_', str(path)], capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, success)
+                if content is not None:
+                    self.assertEqual(path.read_bytes(), content)
+                else:
+                    self.assertFalse(path.exists())
+            self.assertLess(source.index('\nrequire_existing_meeting_secret\n'), source.index('\nsystemctl start superserve-vmd\n'))
 
     def test_missing_shared_key_fails_with_its_name(self):
         local = {'ANON_KEY': 'anon-key', **LOCAL_SECRETS}

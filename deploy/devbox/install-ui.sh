@@ -91,6 +91,21 @@ shared() {
   printf '%s' "$value"
 }
 
+require_existing_meeting_secret() {
+  local configured=0 present=0 var proof
+  for var in "${RUNTIME_VARS[@]}"; do
+    case "${var%%=*}" in
+      CALENDLY_API_TOKEN|CALENDLY_ORGANIZATION_URI|CALENDLY_ENTERPRISE_EVENT_TYPE_URI)
+        if [[ -n "${var#*=}" ]]; then ((present+=1)); configured=1; fi ;;
+    esac
+  done
+  ((configured)) || return 0
+  ((present == 3)) || die "Calendly runtime configuration is incomplete"
+  [[ -r "$CONSOLE_SECRETS" ]] || die "existing meeting proof secret is unavailable"
+  proof="$(env_literal "$CONSOLE_SECRETS" GOOGLE_SIGNUP_PROOF_SECRET)"
+  ((${#proof} >= 32)) || die "existing meeting proof secret is invalid"
+}
+
 ensure_console_secrets() {
   local proxy="" proof=""
   if [[ -r "$CONSOLE_SECRETS" ]]; then
@@ -152,6 +167,9 @@ RUNTIME_VARS=(
   "RECAPTCHA_PROJECT_ID=$(env_get "$DEVBOX_ENV" RECAPTCHA_PROJECT_ID)"
   "RECAPTCHA_SCORE_THRESHOLD=$(env_get "$DEVBOX_ENV" RECAPTCHA_SCORE_THRESHOLD)"
   "RECAPTCHA_API_KEY=$(env_get "$CI_SECRETS" RECAPTCHA_API_KEY)"
+  "CALENDLY_API_TOKEN=$(env_get "$CI_SECRETS" CALENDLY_API_TOKEN)"
+  "CALENDLY_ORGANIZATION_URI=$(env_get "$CI_SECRETS" CALENDLY_ORGANIZATION_URI)"
+  "CALENDLY_ENTERPRISE_EVENT_TYPE_URI=$(env_get "$CI_SECRETS" CALENDLY_ENTERPRISE_EVENT_TYPE_URI)"
 )
 
 DOCKER="$(command -v docker || echo /usr/bin/docker)"
@@ -183,6 +201,8 @@ fi
 for tool in docker curl openssl; do
   command -v "$tool" >/dev/null || die "$tool is not installed"
 done
+
+require_existing_meeting_secret
 
 systemctl start superserve-vmd
 "$SCRIPT_DIR/seed-base.sh"
