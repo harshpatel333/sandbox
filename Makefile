@@ -100,7 +100,7 @@ seed-apikey:
 	go run ./cmd/seed-apikey
 
 migrate-local:
-	for f in $$(ls supabase/migrations/*.sql | sort); do psql "$(DATABASE_URL)" -f $$f; done
+	set -e; for f in $$(ls supabase/migrations/*.sql | sort); do psql -X -v ON_ERROR_STOP=1 "$(DATABASE_URL)" -f "$$f"; done
 
 ## Docker
 
