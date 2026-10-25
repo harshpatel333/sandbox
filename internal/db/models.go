@@ -941,37 +941,73 @@ type BillingPrepaidAutoRecharge struct {
 }
 
 type BillingPrepaidPurchase struct {
-	ID                     uuid.UUID          `json:"id"`
-	TeamID                 uuid.UUID          `json:"team_id"`
-	CustomerID             string             `json:"customer_id"`
-	Source                 string             `json:"source"`
-	AmountCents            int64              `json:"amount_cents"`
-	ActorID                pgtype.UUID        `json:"actor_id"`
-	PlanSnapshot           []byte             `json:"plan_snapshot"`
-	PaymentState           string             `json:"payment_state"`
-	PaymentIdempotencyKey  string             `json:"payment_idempotency_key"`
-	PaymentRequest         []byte             `json:"payment_request"`
-	PaymentFirstAttemptAt  pgtype.Timestamptz `json:"payment_first_attempt_at"`
-	CheckoutSessionID      *string            `json:"checkout_session_id"`
-	PaymentIntentID        *string            `json:"payment_intent_id"`
-	InvoiceID              *string            `json:"invoice_id"`
-	PaymentEvidence        []byte             `json:"payment_evidence"`
-	PaidAt                 pgtype.Timestamptz `json:"paid_at"`
-	FailureCode            *string            `json:"failure_code"`
-	FailureReason          *string            `json:"failure_reason"`
-	CreditState            string             `json:"credit_state"`
-	CreditIdempotencyKey   string             `json:"credit_idempotency_key"`
-	CreditRequest          []byte             `json:"credit_request"`
-	CreditFirstAttemptAt   pgtype.Timestamptz `json:"credit_first_attempt_at"`
-	StripeCreditGrantID    *string            `json:"stripe_credit_grant_id"`
-	CreditEvidence         []byte             `json:"credit_evidence"`
-	CreditedAt             pgtype.Timestamptz `json:"credited_at"`
-	CreditVoidedAt         pgtype.Timestamptz `json:"credit_voided_at"`
-	NextAttemptAt          time.Time          `json:"next_attempt_at"`
-	Failures               int32              `json:"failures"`
-	LastError              *string            `json:"last_error"`
-	CreatedAt              time.Time          `json:"created_at"`
-	CreditBalanceCheckedAt pgtype.Timestamptz `json:"credit_balance_checked_at"`
+	ID                       uuid.UUID          `json:"id"`
+	TeamID                   uuid.UUID          `json:"team_id"`
+	CustomerID               string             `json:"customer_id"`
+	Source                   string             `json:"source"`
+	AmountCents              int64              `json:"amount_cents"`
+	ActorID                  pgtype.UUID        `json:"actor_id"`
+	PlanSnapshot             []byte             `json:"plan_snapshot"`
+	PaymentState             string             `json:"payment_state"`
+	PaymentIdempotencyKey    string             `json:"payment_idempotency_key"`
+	PaymentRequest           []byte             `json:"payment_request"`
+	PaymentFirstAttemptAt    pgtype.Timestamptz `json:"payment_first_attempt_at"`
+	CheckoutSessionID        *string            `json:"checkout_session_id"`
+	PaymentIntentID          *string            `json:"payment_intent_id"`
+	InvoiceID                *string            `json:"invoice_id"`
+	PaymentEvidence          []byte             `json:"payment_evidence"`
+	PaidAt                   pgtype.Timestamptz `json:"paid_at"`
+	FailureCode              *string            `json:"failure_code"`
+	FailureReason            *string            `json:"failure_reason"`
+	CreditState              string             `json:"credit_state"`
+	CreditIdempotencyKey     string             `json:"credit_idempotency_key"`
+	CreditRequest            []byte             `json:"credit_request"`
+	CreditFirstAttemptAt     pgtype.Timestamptz `json:"credit_first_attempt_at"`
+	StripeCreditGrantID      *string            `json:"stripe_credit_grant_id"`
+	CreditEvidence           []byte             `json:"credit_evidence"`
+	CreditedAt               pgtype.Timestamptz `json:"credited_at"`
+	CreditVoidedAt           pgtype.Timestamptz `json:"credit_voided_at"`
+	NextAttemptAt            time.Time          `json:"next_attempt_at"`
+	Failures                 int32              `json:"failures"`
+	LastError                *string            `json:"last_error"`
+	CreatedAt                time.Time          `json:"created_at"`
+	CreditBalanceCheckedAt   pgtype.Timestamptz `json:"credit_balance_checked_at"`
+	ReversalCheckedAt        pgtype.Timestamptz `json:"reversal_checked_at"`
+	ReversalCheckRequestedAt pgtype.Timestamptz `json:"reversal_check_requested_at"`
+}
+
+type BillingPrepaidReversal struct {
+	PurchaseID    uuid.UUID `json:"purchase_id"`
+	TeamID        uuid.UUID `json:"team_id"`
+	RefundedCents int64     `json:"refunded_cents"`
+	DisputeStatus *string   `json:"dispute_status"`
+	DisputedCents int64     `json:"disputed_cents"`
+	Version       int32     `json:"version"`
+	DetectedAt    time.Time `json:"detected_at"`
+	ObservedAt    time.Time `json:"observed_at"`
+}
+
+type BillingPrepaidReversalDecision struct {
+	ID           int64              `json:"id"`
+	PurchaseID   uuid.UUID          `json:"purchase_id"`
+	Version      int32              `json:"version"`
+	Decision     string             `json:"decision"`
+	DecidedBy    uuid.UUID          `json:"decided_by"`
+	Reason       string             `json:"reason"`
+	DecidedAt    time.Time          `json:"decided_at"`
+	RevokedCents *int64             `json:"revoked_cents"`
+	RevokedAt    pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type BillingPrepaidReversalEvent struct {
+	ID            int64     `json:"id"`
+	PurchaseID    uuid.UUID `json:"purchase_id"`
+	Version       int32     `json:"version"`
+	RefundedCents int64     `json:"refunded_cents"`
+	DisputeStatus *string   `json:"dispute_status"`
+	DisputedCents int64     `json:"disputed_cents"`
+	Evidence      []byte    `json:"evidence"`
+	ObservedAt    time.Time `json:"observed_at"`
 }
 
 type BillingPricingSwitch struct {
