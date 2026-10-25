@@ -500,7 +500,7 @@ func TestIntegration_PlanCatalogPendingCheckoutResumesAfterRetire(t *testing.T) 
 	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody(f.offer), 200, f.session)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.priceCreates) != 0 || f.creates != 2 || f.keys[0] != f.keys[1] {
+	if len(f.priceCreates) != 0 || f.creates != 1 {
 		t.Fatalf("resume changed the frozen request: creates=%d keys=%v prices=%v", f.creates, f.keys, f.priceCreates)
 	}
 }

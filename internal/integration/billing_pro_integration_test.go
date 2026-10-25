@@ -228,7 +228,11 @@ func (f *proProviderFixture) serve(w http.ResponseWriter, r *http.Request) {
 		if f.paid {
 			paid = "paid"
 		}
-		write(map[string]any{"id": f.session, "customer": f.customer, "client_reference_id": f.team.String(), "mode": "subscription", "status": f.status, "payment_status": paid, "subscription": sub, "metadata": f.metadata})
+		url := ""
+		if f.status == "open" {
+			url = "https://checkout.stripe.test/example"
+		}
+		write(map[string]any{"id": f.session, "url": url, "customer": f.customer, "client_reference_id": f.team.String(), "mode": "subscription", "status": f.status, "payment_status": paid, "subscription": sub, "metadata": f.metadata})
 	case r.URL.Path == "/v1/subscriptions/"+f.sub:
 		items := []any{map[string]any{"id": "si_base", "quantity": 1, "price": basePrice, "current_period_start": f.baseStart, "current_period_end": f.baseEnd}}
 		var resourcePrices []string
