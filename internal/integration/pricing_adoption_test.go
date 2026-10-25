@@ -46,7 +46,7 @@ func TestIntegration_PricingAdoptionBarrier(t *testing.T) {
 		if _, err := testPool.Exec(ctx, `INSERT INTO team(id,name) VALUES($1::uuid,'concurrent-financial-'||$1::uuid::text);`, team); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := testPool.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free','{}','{"max_concurrent":1}',clock_timestamp(),'migration','local fixture')`, team); err != nil {
+		if _, err := testPool.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free','{}','{"max_concurrent":1,"max_templates":0}',clock_timestamp(),'migration','local fixture')`, team); err != nil {
 			t.Fatal(err)
 		}
 		if i == 0 {
@@ -112,9 +112,9 @@ func TestIntegration_PricingAdoptionBarrier(t *testing.T) {
 	}
 	denied.Rollback(ctx)
 	exec(`INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
- SELECT t.id,'free','free','{}','{"max_concurrent":1}',clock_timestamp(),'migration','local adoption test'
+ SELECT t.id,'free','free','{}','{"max_concurrent":1,"max_templates":0}',clock_timestamp(),'migration','local adoption test'
  FROM team t WHERE t.id NOT IN ($1,$2,$3) AND NOT EXISTS(SELECT 1 FROM team_plan_assignment a WHERE a.team_id=t.id AND a.effective_to IS NULL)`, testSystemTeamID, pending, foreign)
-	evidence, err := json.Marshal(map[string]any{"epoch": epoch.String(), "region": "usw", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture"})
+	evidence, err := json.Marshal(map[string]any{"epoch": epoch.String(), "region": "usw", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture", "free_template_policy": map[string]any{"existing_assignments_verified": true, "custom_policy_reference": "local-fixture", "runtime_reference": "local-fixture"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestIntegration_PricingAdoptionBarrier(t *testing.T) {
 		t.Fatalf("durable reason=%s %v", deferredReason, err)
 	}
 	exec(`INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
- SELECT id,'free','free','{}','{"max_concurrent":1}',clock_timestamp(),'migration','local adoption test' FROM team WHERE id IN ($1,$2)`, pending, foreign)
+ SELECT id,'free','free','{}','{"max_concurrent":1,"max_templates":0}',clock_timestamp(),'migration','local adoption test' FROM team WHERE id IN ($1,$2)`, pending, foreign)
 	if result := release(); result["released"] != false || result["unassigned"] != float64(0) || result["deferred"] != float64(1) {
 		t.Fatalf("assignment hid unresolved checkout: %v", result)
 	}
@@ -313,6 +313,7 @@ func TestIntegration_PricingAdoptionBarrier(t *testing.T) {
 }
 
 func TestIntegration_PricingAdoptionPublicStateFailsClosed(t *testing.T) {
+	isolatedFreeTemplatePolicy(t)
 	ctx := t.Context()
 	tx, err := testPool.Begin(ctx)
 	if err != nil {
@@ -384,7 +385,7 @@ func TestIntegration_PricingAdoptionPublicStateFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, broken := range []string{"region", "system_team_id", "epoch", "worker_sha", "verified_worker", "deployment_reference"} {
-		evidence := map[string]any{"epoch": epoch.String(), "region": "usw", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture"}
+		evidence := map[string]any{"epoch": epoch.String(), "region": "usw", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture", "free_template_policy": map[string]any{"existing_assignments_verified": true, "custom_policy_reference": "local-fixture", "runtime_reference": "local-fixture"}}
 		delete(evidence, broken)
 		raw, err := json.Marshal(evidence)
 		if err != nil {
@@ -465,7 +466,7 @@ func TestIntegration_PricingAdoptionCLIBlocksResidualRelease(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `SELECT reason FROM billing_pricing_adoption_inventory WHERE epoch=$1 AND team_id=$2 AND present`, snapshot.Epoch, team).Scan(&reason); err != nil || reason != "checkout_pending" {
 		t.Fatalf("CLI capture not durably visible: %s %v", reason, err)
 	}
-	evidence, err := json.Marshal(map[string]any{"epoch": snapshot.Epoch.String(), "region": "usw", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture"})
+	evidence, err := json.Marshal(map[string]any{"epoch": snapshot.Epoch.String(), "region": "usw", "system_team_id": testSystemTeamID.String(), "assembled_sha": "1111111111111111111111111111111111111111", "schema_sha": "1111111111111111111111111111111111111111", "worker_sha": "1111111111111111111111111111111111111111", "verified_worker": true, "deployment_reference": "local-fixture", "worker_reference": "local-fixture", "free_template_policy": map[string]any{"existing_assignments_verified": true, "custom_policy_reference": "local-fixture", "runtime_reference": "local-fixture"}})
 	if err != nil {
 		t.Fatal(err)
 	}

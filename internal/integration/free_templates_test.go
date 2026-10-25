@@ -182,7 +182,10 @@ func TestIntegration_FreeTemplates_MigrationBackfillsRetainedOrigins(t *testing.
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
-	for _, statement := range []string{`ALTER TABLE sandbox DROP COLUMN system_template`, `ALTER TABLE sandbox_snapshot DROP COLUMN system_template`} {
+	if _, err := tx.Exec(ctx, `UPDATE billing_pricing_adoption SET region='use',system_team_id=$1 WHERE singleton`, testSystemTeamID); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{`DROP TRIGGER billing_free_template_policy_release ON billing_pricing_adoption`, `DROP TABLE billing_free_template_policy_transition`, `ALTER TABLE team_plan_assignment DROP COLUMN free_allowance_origin_at`, `ALTER TABLE sandbox DROP COLUMN system_template`, `ALTER TABLE sandbox_snapshot DROP COLUMN system_template`} {
 		if _, err := tx.Exec(ctx, statement); err != nil {
 			t.Fatal(err)
 		}
@@ -202,7 +205,7 @@ func TestIntegration_FreeTemplates_MigrationBackfillsRetainedOrigins(t *testing.
 			t.Fatal(err)
 		}
 	}
-	migration, err := os.ReadFile(filepath.Join("..", "..", "supabase", "migrations", "20261025140000_free_system_templates.sql"))
+	migration, err := os.ReadFile(filepath.Join("..", "..", "supabase", "migrations", "20261025150000_free_template_policy.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}

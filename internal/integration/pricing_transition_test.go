@@ -162,7 +162,7 @@ func TestPricingOperatorTransition(t *testing.T) {
 		if e = tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM billing_pricing_switch_audit),(SELECT count(*) FROM billing_pricing_adoption_event WHERE action='switch_reset')`).Scan(&audit, &event); e != nil || audit != 1 || event != 1 {
 			t.Fatalf("audit/event=%d/%d err=%v", audit, event, e)
 		}
-		if _, e = tx.Exec(ctx, `UPDATE billing_pricing_adoption SET state='released',region='usw',system_team_id=$1,evidence='{}',released_at=clock_timestamp()`, team); e != nil {
+		if _, e = tx.Exec(ctx, `UPDATE billing_pricing_adoption SET state='released',region='usw',system_team_id=$1,evidence='{"free_template_policy":{"existing_assignments_verified":true,"custom_policy_reference":"local-fixture","runtime_reference":"local-fixture"}}',released_at=clock_timestamp()`, team); e != nil {
 			t.Fatal(e)
 		}
 		released := transitionSnapshot(t, tx)

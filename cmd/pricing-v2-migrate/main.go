@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/api"
@@ -24,6 +25,8 @@ const usage = `usage:
   pricing-v2-migrate [report] [--format text|json|csv]
   pricing-v2-migrate apply --confirm --actor <who> --reason <why> [--batch 500]
   pricing-v2-migrate prepare|capture --confirm --actor <who> --reason <why>
+  pricing-v2-migrate policy-report
+  pricing-v2-migrate policy-apply --confirm --actor <who> --reason <why> --team <uuid> --expected-assignment <uuid>
   pricing-v2-migrate release --confirm --actor <who> --reason <why> --epoch <uuid> --evidence-file <json>
 
 Environment: DATABASE_URL (the region's database), TEAM_CREATION_REGION (the
@@ -40,13 +43,14 @@ func main() {
 type options struct {
 	command, format, region, actor, reason string
 	epoch, evidenceFile                    string
+	team, expectedAssignment               string
 	confirm                                bool
 	batch                                  int
 }
 
 func parse(args []string, getenv func(string) string) (options, error) {
 	o := options{command: "report"}
-	if len(args) > 0 && (args[0] == "report" || args[0] == "apply" || args[0] == "prepare" || args[0] == "capture" || args[0] == "release") {
+	if len(args) > 0 && (args[0] == "report" || args[0] == "apply" || args[0] == "prepare" || args[0] == "capture" || args[0] == "release" || args[0] == "policy-report" || args[0] == "policy-apply") {
 		o.command, args = args[0], args[1:]
 	}
 	fs := flag.NewFlagSet("pricing-v2-migrate", flag.ContinueOnError)
@@ -55,6 +59,8 @@ func parse(args []string, getenv func(string) string) (options, error) {
 	fs.StringVar(&o.region, "region", getenv("TEAM_CREATION_REGION"), "")
 	fs.StringVar(&o.actor, "actor", "", "")
 	fs.StringVar(&o.reason, "reason", "", "")
+	fs.StringVar(&o.team, "team", "", "")
+	fs.StringVar(&o.expectedAssignment, "expected-assignment", "", "")
 	fs.StringVar(&o.epoch, "epoch", "", "")
 	fs.StringVar(&o.evidenceFile, "evidence-file", "", "")
 	fs.BoolVar(&o.confirm, "confirm", false, "")
@@ -68,12 +74,14 @@ func parse(args []string, getenv func(string) string) (options, error) {
 		return o, errors.New("set TEAM_CREATION_REGION or --region to the region whose database DATABASE_URL names")
 	case o.command == "report" && o.format != "text" && o.format != "json" && o.format != "csv":
 		return o, errors.New("--format must be text, json or csv")
-	case o.command != "report" && (!o.confirm || o.actor == "" || o.reason == ""):
+	case o.command != "report" && o.command != "policy-report" && (!o.confirm || o.actor == "" || o.reason == ""):
 		return o, errors.New("writes require --confirm, --actor and --reason")
 	case !validSystemTeam(getenv("SYSTEM_TEAM_ID")):
 		return o, errors.New("a valid nonzero SYSTEM_TEAM_ID is required")
 	case o.command == "release" && (!validSystemTeam(o.epoch) || o.evidenceFile == ""):
 		return o, errors.New("release requires current --epoch and --evidence-file")
+	case o.command == "policy-apply" && (!validSystemTeam(o.team) || !validSystemTeam(o.expectedAssignment)):
+		return o, errors.New("policy-apply requires --team and --expected-assignment")
 	case o.batch < 1 || o.batch > 5000:
 		return o, errors.New("--batch must be between 1 and 5000")
 	}
@@ -93,6 +101,46 @@ func run(ctx context.Context, args []string, out io.Writer, getenv func(string) 
 		return err
 	}
 	defer pool.Close()
+	if o.command == "policy-report" {
+		var bound bool
+		if err := pool.QueryRow(ctx, `SELECT COALESCE((SELECT region=$1 AND system_team_id=$2 FROM billing_pricing_adoption WHERE singleton),false)`, o.region, uuid.MustParse(getenv("SYSTEM_TEAM_ID"))).Scan(&bound); err != nil {
+			return err
+		}
+		if !bound {
+			return errors.New("policy-report requires matching prepared region and system team")
+		}
+		var report []byte
+		err := pool.QueryRow(ctx, `SELECT jsonb_build_object('pending_committed_targets',billing_free_template_policy_pending_targets(),'assignments',COALESCE(jsonb_agg(to_jsonb(r) ORDER BY r.team_id),'[]'::jsonb)) FROM (
+   SELECT a.team_id,t.home_region,a.id AS assignment_id,a.plan_version_id,a.limits->'max_templates' AS frozen_max_templates,
+   a.limits->'max_templates' IS DISTINCT FROM '0'::jsonb AS needs_successor,
+   COALESCE(a.free_allowance_origin_at,a.effective_from) AS allowance_origin,
+   CASE WHEN a.limits->'max_templates' IS DISTINCT FROM '0'::jsonb THEN billing_free_template_policy_blocker(a.team_id) ELSE billing_pricing_adoption_blocker(a.team_id) END AS authority_blocker,
+   (SELECT count(*) FROM template t WHERE t.team_id=a.team_id AND t.deleted_at IS NULL) AS retained_custom_templates,
+   (SELECT count(*) FROM sandbox s WHERE s.team_id=a.team_id AND NOT s.system_template AND s.destroyed_at IS NULL) AS retained_custom_sandboxes,
+   (SELECT count(*) FROM sandbox_snapshot s WHERE s.team_id=a.team_id AND NOT s.system_template AND s.deleted_at IS NULL) AS retained_custom_snapshots
+   FROM team_plan_assignment a JOIN team t ON t.id=a.team_id
+   WHERE a.kind='free' AND a.effective_to IS NULL AND a.team_id<>$1) r`, uuid.MustParse(getenv("SYSTEM_TEAM_ID"))).Scan(&report)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(out, string(report))
+		return err
+	}
+	if o.command == "policy-apply" {
+		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		var successor uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT billing_migrate_free_template_assignment($1,$2,$3,$4,$5,$6)`, o.region, uuid.MustParse(getenv("SYSTEM_TEAM_ID")), uuid.MustParse(o.team), uuid.MustParse(o.expectedAssignment), o.actor, o.reason).Scan(&successor); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		return json.NewEncoder(out).Encode(map[string]any{"team_id": o.team, "predecessor_id": o.expectedAssignment, "assignment_id": successor})
+	}
 	if o.command == "prepare" || o.command == "capture" || o.command == "release" {
 		activation := api.NewPricingV2Activation(pool, nil, o.region, getenv("SYSTEM_TEAM_ID"))
 		encoder := json.NewEncoder(out)
