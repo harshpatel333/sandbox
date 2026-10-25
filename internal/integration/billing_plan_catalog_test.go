@@ -1023,3 +1023,51 @@ func TestIntegration_PricingEntryReaderUsesRestrictedRole(t *testing.T) {
 		t.Fatalf("restricted reader=%s/%t/%v: %v", model, opened, epoch, err)
 	}
 }
+
+func TestIntegration_PlanCatalogRetiredNewerBlocksOlderDraft(t *testing.T) {
+	tx, err := testPool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	var older, newer uuid.UUID
+	family := "history_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	for i, id := range []*uuid.UUID{&older, &newer} {
+		if err := tx.QueryRow(t.Context(), `INSERT INTO billing_plan_version(family,version,kind,display_name,display_only) VALUES($1,$2,'custom','Example',true) RETURNING id`, family, i+1).Scan(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.Exec(t.Context(), `SELECT publish_billing_plan_version($1,NULL);`, newer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `SELECT retire_billing_plan_version($1,NULL);`, newer); err != nil {
+		t.Fatal(err)
+	}
+	var before, after []byte
+	if err := tx.QueryRow(t.Context(), `SELECT jsonb_agg(to_jsonb(v) ORDER BY version) FROM billing_plan_version v WHERE family=$1`, family).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `SAVEPOINT stale_publish`); err != nil {
+		t.Fatal(err)
+	}
+	_, publishErr := tx.Exec(t.Context(), `SELECT publish_billing_plan_version($1,NULL)`, older)
+	if _, err := tx.Exec(t.Context(), `ROLLBACK TO SAVEPOINT stale_publish`); err != nil {
+		t.Fatal(err)
+	}
+	if publishErr == nil || !strings.Contains(publishErr.Error(), "55000") || !strings.Contains(publishErr.Error(), "newer version") {
+		t.Fatalf("older draft after newer retirement: %v", publishErr)
+	}
+	if err := tx.QueryRow(t.Context(), `SELECT jsonb_agg(to_jsonb(v) ORDER BY version) FROM billing_plan_version v WHERE family=$1`, family).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("rejected publication mutated history: before=%s after=%s", before, after)
+	}
+	var successor uuid.UUID
+	if err := tx.QueryRow(t.Context(), `INSERT INTO billing_plan_version(family,version,kind,display_name,display_only) VALUES($1,3,'custom','Example',true) RETURNING id`, family).Scan(&successor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `SELECT publish_billing_plan_version($1,NULL)`, successor); err != nil {
+		t.Fatalf("explicit rollback successor: %v", err)
+	}
+}
