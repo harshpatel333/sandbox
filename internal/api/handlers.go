@@ -1017,8 +1017,14 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 		claimed, err = claim()
 	}
-	if errors.Is(err, pgx.ErrNoRows) && h.secretWriteHeld(c, sandboxID) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		// A secret change may hold the sandbox, or have just let it go. While
+		// held, only the hold is read; the claim runs again once it clears,
+		// and waiting resumes if another change took the hold first.
 		werr := waitSecretWriteHold(c.Request.Context(), resumeSecretWriteWait, func() (bool, error) {
+			if h.secretWriteHeld(c, sandboxID) {
+				return false, nil
+			}
 			claimed, err = claim()
 			return !errors.Is(err, pgx.ErrNoRows) || !h.secretWriteHeld(c, sandboxID), nil
 		})

@@ -80,13 +80,17 @@ const (
 	// secretWriteHoldWait bounds how long a change or a capture waits out
 	// another change before answering that one is in progress.
 	secretWriteHoldWait = 30 * time.Second
-	secretWriteHoldPoll = 50 * time.Millisecond
+	// A change usually finishes within a poll or two; backing off bounds the
+	// queries a long one costs each waiter.
+	secretWriteHoldPoll    = 50 * time.Millisecond
+	secretWriteHoldPollMax = time.Second
 )
 
 // waitSecretWriteHold runs try until it reports done, an error, or wait
 // passes.
 func waitSecretWriteHold(ctx context.Context, wait time.Duration, try func() (bool, error)) error {
 	deadline := time.Now().Add(wait)
+	poll := secretWriteHoldPoll
 	for {
 		done, err := try()
 		if err != nil || done {
@@ -98,8 +102,9 @@ func waitSecretWriteHold(ctx context.Context, wait time.Duration, try func() (bo
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(secretWriteHoldPoll):
+		case <-time.After(poll):
 		}
+		poll = min(2*poll, secretWriteHoldPollMax)
 	}
 }
 

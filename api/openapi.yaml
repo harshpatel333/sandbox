@@ -1722,10 +1722,10 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: "`sandbox_pausing` — the pause is still finishing after the wait; retry after `Retry-After` seconds. `conflict` — the sandbox is in a state that cannot be resumed (for example `failed`)."
+          description: "`sandbox_pausing` — the pause is still finishing after the wait; retry after `Retry-After` seconds. `secret_change_in_progress` — a secret change to the sandbox is still running after the wait; retry after `Retry-After` seconds. `conflict` — the sandbox is in a state that cannot be resumed (for example `failed`)."
           headers:
             Retry-After:
-              description: Seconds to wait before retrying; sent with `sandbox_pausing`.
+              description: Seconds to wait before retrying; sent with `sandbox_pausing` and `secret_change_in_progress`.
               schema:
                 type: integer
           content:
@@ -1768,10 +1768,10 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: "`sandbox_pausing` — the pause is still finishing after the wait; retry after `Retry-After` seconds. `conflict` — the sandbox is in a state that cannot be activated (for example `failed`)."
+          description: "`sandbox_pausing` — the pause is still finishing after the wait; retry after `Retry-After` seconds. `secret_change_in_progress` — a secret change to the sandbox is still running after the wait; retry after `Retry-After` seconds. `conflict` — the sandbox is in a state that cannot be activated (for example `failed`)."
           headers:
             Retry-After:
-              description: Seconds to wait before retrying; sent with `sandbox_pausing`.
+              description: Seconds to wait before retrying; sent with `sandbox_pausing` and `secret_change_in_progress`.
               schema:
                 type: integer
           content:
