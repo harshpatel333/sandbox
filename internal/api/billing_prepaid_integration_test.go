@@ -1568,3 +1568,53 @@ func TestPrepaidSpentVoidLeavesAnAttemptedRevokeToItsOwnAudit(t *testing.T) {
 		t.Fatal("the spent-grant voider took over an attempted revocation and hid the amount it voided", revoked, voided)
 	}
 }
+
+func TestPrepaidLostVoidIsAuditedToTheAttemptThatMadeItNotALaterRevoke(t *testing.T) {
+	f := newPrepaidFixture(t)
+	id, intent, grant := f.rechargedPurchase()
+	f.mu.Lock()
+	f.balances[grant] = 300
+	f.disputes[intent] = "needs_response"
+	f.mu.Unlock()
+	f.reviewReversals()
+	v1, _, _, _ := f.reversalState(id)
+	if err := f.decide(id, v1, "revoke"); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`UPDATE billing_prepaid_reversal_decision SET revoke_attempted_at=clock_timestamp(),revoke_retry_after=clock_timestamp()+interval '10 minutes' WHERE purchase_id=$1 AND version=$2`, id, v1)
+	f.voidAtProvider(grant, 300)
+	f.mu.Lock()
+	f.disputes[intent] = "lost"
+	f.mu.Unlock()
+	f.exec(`UPDATE billing_prepaid_purchase SET reversal_checked_at=NULL WHERE id=$1`, id)
+	if err := f.h.reviewPrepaidReversals(t.Context(), f.client); err != nil {
+		t.Fatal(err)
+	}
+	v2, _, _, _ := f.reversalState(id)
+	if err := f.decide(id, v2, "revoke"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`UPDATE billing_prepaid_reversal_decision SET revoke_retry_after=NULL WHERE purchase_id=$1 AND version=$2 AND revoked_at IS NULL`, id, v1)
+	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
+		t.Fatal(err)
+	}
+	audit := map[int32]*int64{}
+	rows, err := f.h.Pool.Query(t.Context(), `SELECT version,revoked_cents FROM billing_prepaid_reversal_decision WHERE purchase_id=$1`, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var v int32
+		var c *int64
+		if err = rows.Scan(&v, &c); err != nil {
+			t.Fatal(err)
+		}
+		audit[v] = c
+	}
+	if audit[v1] == nil || *audit[v1] != 300 || audit[v2] == nil || *audit[v2] != 0 {
+		t.Fatal("a void made by an earlier attempt was audited to a later decision", audit[v1], audit[v2])
+	}
+}

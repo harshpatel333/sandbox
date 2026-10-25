@@ -325,9 +325,10 @@ func (h *Handlers) revokePrepaidGrant(ctx context.Context, client *stripeHTTPCli
 // One locked step of a revocation. The attempt is committed before the void,
 // and the void runs while the reversal row is locked at the decided version, so
 // a newer observation can never land between the check and the void. An
-// attempted revocation is always settled: a voided grant is audited with the
-// amount Stripe's ledger shows voided, and a superseded attempt whose grant is
-// still live is closed without voiding.
+// attempted revocation is always settled: a void is audited to the oldest
+// unsettled attempt on the purchase, at the amount Stripe's ledger shows voided,
+// and a superseded attempt is closed without voiding only while its grant is
+// confirmed live.
 func (h *Handlers) revokePrepaidGrantStep(ctx context.Context, client *stripeHTTPClient, decision int64, id uuid.UUID, version int32, team uuid.UUID, customer, creditState string, grant *string, voided bool, current entitlementGrant) (bool, error) {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
@@ -352,7 +353,7 @@ func (h *Handlers) revokePrepaidGrantStep(ctx context.Context, client *stripeHTT
 	}
 	superseded := latest != version
 	live := creditState == "issued" && !voided
-	if superseded && (!attempted || !live || current.VoidedAt == 0) {
+	if superseded && (!attempted || (live && current.VoidedAt == 0)) {
 		if attempted {
 			if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoke_retry_after='infinity' WHERE id=$1`, decision); err != nil {
 				return true, err
@@ -360,26 +361,33 @@ func (h *Handlers) revokePrepaidGrantStep(ctx context.Context, client *stripeHTT
 		}
 		return true, tx.Commit(ctx)
 	}
-	amount := int64(0)
-	if live {
-		switch {
-		case current.VoidedAt != 0:
-		case !attempted:
+	if live && current.VoidedAt == 0 {
+		if !attempted {
 			if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoke_attempted_at=clock_timestamp() WHERE id=$1`, decision); err != nil {
 				return true, err
 			}
 			return false, tx.Commit(ctx)
-		default:
-			var g entitlementGrant
-			if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants/"+url.PathEscape(*grant)+"/void", url.Values{}, &g, "prepaid-credit-revoke:v1:"+id.String()); err != nil {
-				return true, err
-			}
-			if g.ID != *grant || g.VoidedAt == 0 {
-				return true, errors.New("credit grant revocation was not confirmed")
-			}
 		}
+		var g entitlementGrant
+		if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants/"+url.PathEscape(*grant)+"/void", url.Values{}, &g, "prepaid-credit-revoke:v1:"+id.String()); err != nil {
+			return true, err
+		}
+		if g.ID != *grant || g.VoidedAt == 0 {
+			return true, errors.New("credit grant revocation was not confirmed")
+		}
+	}
+	amount, target := int64(0), decision
+	if live {
 		if amount, err = client.grantVoidedAmount(ctx, customer, *grant); err != nil {
 			return true, err
+		}
+		var oldest *int64
+		if err = tx.QueryRow(ctx, `SELECT (SELECT id FROM billing_prepaid_reversal_decision WHERE purchase_id=$1 AND decision='revoke' AND revoke_attempted_at IS NOT NULL
+   AND revoked_at IS NULL AND revoke_retry_after IS DISTINCT FROM 'infinity' ORDER BY revoke_attempted_at,id LIMIT 1 FOR UPDATE)`, id).Scan(&oldest); err != nil {
+			return true, err
+		}
+		if oldest != nil {
+			target = *oldest
 		}
 	}
 	if creditState == "issued" {
@@ -387,7 +395,7 @@ func (h *Handlers) revokePrepaidGrantStep(ctx context.Context, client *stripeHTT
 			return true, err
 		}
 	}
-	if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoked_at=clock_timestamp(),revoked_cents=$2 WHERE id=$1 AND revoked_at IS NULL`, decision, amount); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_reversal_decision SET revoked_at=clock_timestamp(),revoked_cents=CASE WHEN id=$2 THEN $3 ELSE 0 END WHERE id IN ($1,$2) AND revoked_at IS NULL`, decision, target, amount); err != nil {
 		return true, err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_funding_account SET next_check_at=LEAST(next_check_at,clock_timestamp()) WHERE team_id=$1 AND observe`, team); err != nil {
