@@ -1,5 +1,12 @@
+BEGIN;
+
 SELECT * FROM billing_lock_pricing_public_state();
-SELECT pg_advisory_xact_lock(hashtext('billing-catalog:free:v2')::bigint);
+LOCK TABLE billing_plan_version, plan_limits, billing_contract_limits IN ACCESS EXCLUSIVE MODE NOWAIT;
+DO $$ BEGIN
+    IF NOT pg_try_advisory_xact_lock(hashtext('billing-catalog:free:v2')::bigint) THEN
+        RAISE EXCEPTION 'Free catalog is busy; retry the migration' USING ERRCODE = 'lock_not_available';
+    END IF;
+END $$;
 
 ALTER TABLE billing_plan_version
     DROP CONSTRAINT billing_plan_version_max_templates_check,
@@ -39,3 +46,5 @@ BEGIN
     INSERT INTO billing_plan_version SELECT successor.*;
     PERFORM publish_billing_plan_version(successor.id, NULL);
 END $$;
+
+COMMIT;

@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -121,6 +122,27 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon,aut
 		if err := owner.QueryRow(t.Context(), readFree).Scan(&after); err != nil || before != after {
 			t.Fatalf("migration retry changed Free history: %v", err)
 		}
+		for _, hold := range []string{
+			`SELECT 1 FROM billing_plan_version LIMIT 1`,
+			`SELECT pg_advisory_xact_lock(hashtext('billing-catalog:free:v2')::bigint)`,
+		} {
+			tx, err := owner.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(t.Context(), hold); err != nil {
+				_ = tx.Rollback(t.Context())
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			_, err = owner.Exec(ctx, string(migration))
+			cancel()
+			_ = tx.Rollback(t.Context())
+			var pgerr *pgconn.PgError
+			if !errors.As(err, &pgerr) || pgerr.Code != "55P03" {
+				t.Fatalf("migration must fail fast for %s: %v", hold, err)
+			}
+		}
 	})
 	for _, action := range []string{"update", "delete", "publish", "retire"} {
 		t.Run(action, func(t *testing.T) {
@@ -205,6 +227,47 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon,aut
 					t.Errorf("%s %s: %v", role, sql, err)
 				}
 			}
+		}
+	})
+	t.Run("successor failure rolls back constraints", func(t *testing.T) {
+		rolloutExec(t, owner, `ALTER TABLE plan_limits DROP CONSTRAINT plan_limits_max_templates_check,
+ ADD CONSTRAINT plan_limits_max_templates_check CHECK (max_templates BETWEEN 0 AND 99)`)
+		rolloutExec(t, owner, `SELECT retire_billing_plan_version(id,NULL) FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'`)
+		query := `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='plan_limits'::regclass AND conname='plan_limits_max_templates_check'`
+		var before, after string
+		if err := owner.QueryRow(t.Context(), query).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		dir, err := findMigrationsDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		migration, err := os.ReadFile(filepath.Join(dir, "20261025060000_free_custom_template_limit.sql"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		prelude, successor, ok := strings.Cut(string(migration), "DO $$\nDECLARE")
+		if !ok {
+			t.Fatal("successor statement not found")
+		}
+		conn, err := owner.Acquire(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		if _, err = conn.Exec(t.Context(), prelude); err != nil {
+			t.Fatal(err)
+		}
+		_, err = conn.Exec(t.Context(), "DO $$\nDECLARE"+successor)
+		var pgerr *pgconn.PgError
+		if !errors.As(err, &pgerr) || pgerr.Code != "P0002" {
+			t.Fatalf("missing Free must abort successor: %v", err)
+		}
+		if _, err = conn.Exec(t.Context(), "ROLLBACK"); err != nil {
+			t.Fatal(err)
+		}
+		if err = conn.QueryRow(t.Context(), query).Scan(&after); err != nil || before != after {
+			t.Fatalf("failed successor committed constraint changes: before=%s after=%s err=%v", before, after, err)
 		}
 	})
 }
