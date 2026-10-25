@@ -93,6 +93,13 @@ func TestPlanVersionValidate(t *testing.T) {
 	if err := free.validate(); err != nil {
 		t.Fatalf("Free with no custom templates: %v", err)
 	}
+	ceiling := valid
+	ceiling.Limits.MaxVCPU = int32p(absoluteMaxVcpu)
+	ceiling.Limits.MaxMemoryMiB = int32p(absoluteMaxMemoryMib)
+	ceiling.Limits.MaxDiskMiB = int32p(absoluteMaxDiskMib)
+	if err := ceiling.validate(); err != nil {
+		t.Fatalf("platform ceiling: %v", err)
+	}
 	for name, mutate := range map[string]func(*planVersion){
 		"family":               func(v *planVersion) { v.Family = "Pro_1" },
 		"pricing version":      func(v *planVersion) { v.PricingVersion = "v3" },
@@ -106,6 +113,9 @@ func TestPlanVersionValidate(t *testing.T) {
 		"negative templates":   func(v *planVersion) { v.Limits.MaxTemplates = int32p(-1) },
 		"memory below minimum": func(v *planVersion) { v.Limits.MaxMemoryMiB = int32p(255) },
 		"disk below minimum":   func(v *planVersion) { v.Limits.MaxDiskMiB = int32p(1023) },
+		"vcpu above ceiling":   func(v *planVersion) { v.Limits.MaxVCPU = int32p(absoluteMaxVcpu + 1) },
+		"memory above ceiling": func(v *planVersion) { v.Limits.MaxMemoryMiB = int32p(absoluteMaxMemoryMib + 1) },
+		"disk above ceiling":   func(v *planVersion) { v.Limits.MaxDiskMiB = int32p(absoluteMaxDiskMib + 1) },
 		"payg without caps": func(v *planVersion) {
 			v.Kind, v.Family, v.PricingVersion, v.MonthlyFeeCents, v.CreditSchedule, v.Allowance = "legacy_payg", "payg", "legacy", nil, nil, nil
 			v.Limits.MaxMemoryMiB = nil
