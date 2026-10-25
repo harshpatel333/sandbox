@@ -912,6 +912,25 @@ func (q *Queries) SandboxSecretWriteHeld(ctx context.Context, sandboxID uuid.UUI
 	return exists, err
 }
 
+const sandboxSecretWriteHeldBy = `-- name: SandboxSecretWriteHeldBy :one
+SELECT EXISTS (
+  SELECT 1 FROM sandbox_secret_write_hold
+  WHERE sandbox_id = $1 AND holder = $2 AND expires_at > now()
+)
+`
+
+type SandboxSecretWriteHeldByParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Holder    uuid.UUID `json:"holder"`
+}
+
+func (q *Queries) SandboxSecretWriteHeldBy(ctx context.Context, arg SandboxSecretWriteHeldByParams) (bool, error) {
+	row := q.db.QueryRow(ctx, sandboxSecretWriteHeldBy, arg.SandboxID, arg.Holder)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const softDeleteSecret = `-- name: SoftDeleteSecret :one
 UPDATE secret
 SET deleted_at = now(), updated_at = now()

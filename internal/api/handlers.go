@@ -445,6 +445,10 @@ const vmdTimeout = 30 * time.Second
 // gives up does not reliably cancel the request.
 const resumeClaimTimeout = 10 * time.Second
 
+// resumeSecretWriteWait bounds how long a resume waits out a secret change
+// in progress on the sandbox before answering that one is.
+const resumeSecretWriteWait = 10 * time.Second
+
 // vmdBootTimeout is the deadline for the boot (restore) call specifically.
 // It exceeds VMD's in-VM readiness cap (30s) so a guest that never becomes
 // ready yields VMD's definitive teardown error instead of a bare deadline —
@@ -1012,6 +1016,19 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			return "", false
 		}
 		claimed, err = claim()
+	}
+	if errors.Is(err, pgx.ErrNoRows) && h.secretWriteHeld(c, sandboxID) {
+		werr := waitSecretWriteHold(c.Request.Context(), resumeSecretWriteWait, func() (bool, error) {
+			claimed, err = claim()
+			return !errors.Is(err, pgx.ErrNoRows) || !h.secretWriteHeld(c, sandboxID), nil
+		})
+		if errors.Is(werr, errSecretChangeInFlight) {
+			respondSecretChangeInFlight(c)
+			return "", false
+		}
+		if werr != nil {
+			err = werr
+		}
 	}
 	if err != nil {
 		if err == pgx.ErrNoRows {

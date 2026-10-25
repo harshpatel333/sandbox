@@ -323,7 +323,7 @@ func (h *Handlers) insertSnapshotRow(ctx context.Context, p db.CreateSandboxSnap
 		return db.SandboxSnapshot(row), err
 	}
 	var row db.SandboxSnapshot
-	err := waitSecretWriteHold(ctx, func() (bool, error) {
+	err := waitSecretWriteHold(ctx, secretWriteHoldWait, func() (bool, error) {
 		tx, err := h.Pool.Begin(ctx)
 		if err != nil {
 			return false, err

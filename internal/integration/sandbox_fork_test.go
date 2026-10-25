@@ -463,6 +463,9 @@ func TestIntegration_SecretWriteHoldLapsesAndIsReleasedOnlyByItsHolder(t *testin
 	if take(second) != 1 {
 		t.Fatal("a lapsed hold was not taken over")
 	}
+	if owned, err := testQueries.SandboxSecretWriteHeldBy(ctx, db.SandboxSecretWriteHeldByParams{SandboxID: sandboxID, Holder: first}); err != nil || owned {
+		t.Fatalf("the lapsed holder still owns the hold: %v %v", owned, err)
+	}
 }
 
 // A key detached from a running sandbox is cleared in its guest and not

@@ -81,6 +81,12 @@ WHERE sandbox_secret_write_hold.expires_at <= now();
 DELETE FROM sandbox_secret_write_hold
 WHERE sandbox_id = sqlc.arg(sandbox_id) AND holder = sqlc.arg(holder);
 
+-- name: SandboxSecretWriteHeldBy :one
+SELECT EXISTS (
+  SELECT 1 FROM sandbox_secret_write_hold
+  WHERE sandbox_id = sqlc.arg(sandbox_id) AND holder = sqlc.arg(holder) AND expires_at > now()
+);
+
 -- name: SandboxSecretWriteHeld :one
 SELECT EXISTS (
   SELECT 1 FROM sandbox_secret_write_hold
