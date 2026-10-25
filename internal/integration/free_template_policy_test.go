@@ -58,7 +58,17 @@ func prepareFreeTemplatePolicy(t *testing.T) {
 func TestIntegration_FreeTemplatePolicy_PreservesFrozenUsageAndHistory(t *testing.T) {
 	isolatedFreeTemplatePolicy(t)
 	team, _ := seedTeamAndKey(t)
-	assignFreePlan(t, team, time.Now().Add(-5*time.Hour))
+	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_plan_assignment
+ (team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
+ VALUES($1,'free','free',md5('billing-plan-version:v2:free:1')::uuid,
+ '{"allowance":{"amount_cents":13,"period":"day_window","on_exhausted":"pause","compute":{"seconds":7200,"vcpu":1,"memory_gib":1}}}',
+ '{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096,"max_templates":10}',$2,'migration','retained predecessor')`, team, time.Now().Add(-5*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var effectiveTemplates int
+	if err := testPool.QueryRow(t.Context(), `SELECT max_templates FROM team_effective_limits($1)`, team).Scan(&effectiveTemplates); err != nil || effectiveTemplates != 10 {
+		t.Fatalf("pre-transition frozen template cap=%d: %v", effectiveTemplates, err)
+	}
 	var predecessor uuid.UUID
 	var frozen []byte
 	if err := testPool.QueryRow(t.Context(), `SELECT id,to_jsonb(a)-'effective_to' FROM team_plan_assignment a WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor, &frozen); err != nil {
@@ -97,6 +107,10 @@ func TestIntegration_FreeTemplatePolicy_PreservesFrozenUsageAndHistory(t *testin
 	if successor == predecessor {
 		t.Fatal("did not append a successor")
 	}
+	if err := testPool.QueryRow(t.Context(), `SELECT max_templates FROM team_effective_limits($1)`, team).Scan(&effectiveTemplates); err != nil || effectiveTemplates != 0 {
+		t.Fatalf("successor template cap=%d: %v", effectiveTemplates, err)
+	}
+
 	var oldAfter, allowanceAfter, creditAfter []byte
 	var origin, oldStart time.Time
 	var matching, paired bool

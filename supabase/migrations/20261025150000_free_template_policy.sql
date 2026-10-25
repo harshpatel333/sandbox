@@ -259,29 +259,6 @@ DO $$ DECLARE r text; BEGIN
  END LOOP;
 END $$;
 
-CREATE OR REPLACE FUNCTION team_effective_limits(p_team uuid)
-RETURNS TABLE(max_concurrent integer, max_vcpu integer, max_memory_mib integer, max_disk_mib integer, max_templates integer)
-LANGUAGE sql STABLE AS $$
-    WITH base AS (
-        SELECT max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates
-        FROM billing_plan_version WHERE family = 'payg' AND pricing_version = 'legacy' AND kind = 'legacy_payg' AND state <> 'draft'
-        ORDER BY state = 'published' DESC, version DESC LIMIT 1
-    ), assigned AS (
-        SELECT kind, (limits->>'max_templates')::integer AS max_templates FROM team_plan_assignment
-        WHERE team_id=p_team AND effective_to IS NULL
-    ), frozen AS (
-        SELECT l.max_templates FROM billing_commercial_contract c JOIN billing_contract_limits l ON l.contract_id = c.id
-        WHERE c.team_id = p_team AND c.status = 'active' ORDER BY c.starts_at DESC LIMIT 1
-    )
-    SELECT t.max_sandboxes,
-        COALESCE(t.max_template_vcpu, b.max_template_vcpu),
-        COALESCE(t.max_template_memory_mib, b.max_template_memory_mib),
-        COALESCE(t.max_template_disk_mib, b.max_template_disk_mib),
-        CASE WHEN (SELECT kind FROM assigned)='free' THEN 0 ELSE COALESCE(t.max_templates, (SELECT max_templates FROM assigned), (SELECT max_templates FROM frozen), b.max_templates) END
-    FROM team t LEFT JOIN base b ON true WHERE t.id = p_team;
-$$;
-
-
 CREATE OR REPLACE FUNCTION billing_pricing_adoption_evidence_valid(p_region text,p_system uuid,p_epoch uuid,p_evidence jsonb)
 RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
  SELECT COALESCE(p_region IN ('use','usw') AND p_system<>'00000000-0000-0000-0000-000000000000' AND p_epoch IS NOT NULL
