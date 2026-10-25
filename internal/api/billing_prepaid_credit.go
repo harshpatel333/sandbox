@@ -80,7 +80,7 @@ func (h *Handlers) issuePrepaidCredit(ctx context.Context, client *stripeHTTPCli
 	var payload []byte
 	var first *time.Time
 	err = h.Pool.QueryRow(ctx, `UPDATE billing_prepaid_purchase p SET credit_state='uncertain',credit_first_attempt_at=COALESCE(credit_first_attempt_at,clock_timestamp())
- WHERE id=$1 AND (credit_state='uncertain' OR (credit_state='pending' AND COALESCE(billing_prepaid_reversal_state(p.id),'keep')='keep'))
+ WHERE id=$1 AND (credit_state='uncertain' OR (credit_state='pending' AND NOT EXISTS(SELECT 1 FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id)))
  RETURNING credit_request,credit_first_attempt_at`, id).Scan(&payload, &first)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if withheld, werr := h.prepaidCreditWithheld(ctx, id); werr != nil || withheld {

@@ -216,6 +216,13 @@ CREATE INDEX billing_funding_account_prepaid_enrolment_due ON billing_funding_ac
 -- without a staff decision, and spent credit is never clawed back.
 ALTER TABLE billing_prepaid_purchase ADD COLUMN reversal_checked_at timestamptz;
 ALTER TABLE billing_prepaid_purchase ADD COLUMN reversal_check_requested_at timestamptz;
+-- Claim lease and failure backoff for the reversal check.
+ALTER TABLE billing_prepaid_purchase ADD COLUMN reversal_retry_after timestamptz;
+-- Payment intents behind an invoice-paid purchase, so dispute events (which
+-- carry no customer) can find it.
+ALTER TABLE billing_prepaid_purchase ADD COLUMN reversal_payment_intents text[] NOT NULL DEFAULT '{}';
+CREATE INDEX billing_prepaid_purchase_reversal_intents ON billing_prepaid_purchase USING gin(reversal_payment_intents) WHERE invoice_id IS NOT NULL;
+CREATE INDEX billing_prepaid_purchase_invoice_customer ON billing_prepaid_purchase(customer_id) WHERE invoice_id IS NOT NULL AND payment_state = 'succeeded';
 CREATE INDEX billing_prepaid_purchase_reversal_review ON billing_prepaid_purchase(COALESCE(reversal_checked_at, '-infinity'::timestamptz))
     WHERE payment_state = 'succeeded';
 CREATE INDEX billing_prepaid_purchase_reversal_requested ON billing_prepaid_purchase(reversal_check_requested_at)

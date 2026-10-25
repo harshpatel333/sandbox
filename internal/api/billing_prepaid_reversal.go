@@ -22,8 +22,11 @@ const prepaidReversalWindow = "120 days"
 
 var errPrepaidNoPaymentReference = errors.New("paid purchase has no payment reference")
 
-// Disputes in these states have neither been won nor lost yet.
+// Disputes in these states have neither been won nor lost yet. Inquiries
+// (warning_*) withdraw no funds and are reported apart from them.
 var prepaidOpenDisputeStates = []string{"warning_needs_response", "warning_under_review", "needs_response", "under_review"}
+
+var prepaidWithdrawnDisputeStates = []string{"needs_response", "under_review"}
 
 type prepaidChargeState struct {
 	ID             string `json:"id"`
@@ -54,19 +57,26 @@ type prepaidReversalObservation struct {
 	Evidence      []byte
 }
 
-// Rows are claimed by moving their check time before any provider call, so
-// instances never inspect the same purchase together. A failure leaves the
-// row due again in an hour instead of holding the head of the queue.
+// A row is claimed by pushing its retry time an hour ahead before any provider
+// call, so instances never inspect the same purchase together and a failing
+// row waits an hour instead of holding the head of the queue. Candidates come
+// from three bounded sets: purchases an event asked about, purchases paid in
+// the last 120 days, and purchases whose dispute is still open.
 func (h *Handlers) reviewPrepaidReversals(ctx context.Context, client *stripeHTTPClient) error {
-	rows, err := h.Pool.Query(ctx, `WITH due AS (
- SELECT p.id FROM billing_prepaid_purchase p LEFT JOIN billing_prepaid_reversal r ON r.purchase_id=p.id
- WHERE p.payment_state='succeeded' AND COALESCE(p.reversal_checked_at,'-infinity'::timestamptz)<clock_timestamp()-interval '1 minute'
-  AND (p.reversal_check_requested_at IS NOT NULL
-   OR (COALESCE(p.reversal_checked_at,'-infinity'::timestamptz)<clock_timestamp()-interval '1 day'
-    AND (p.paid_at>clock_timestamp()-$1::interval OR r.dispute_status=ANY($2))))
- ORDER BY p.reversal_check_requested_at NULLS LAST,COALESCE(p.reversal_checked_at,'-infinity'::timestamptz),p.id
- LIMIT 10 FOR UPDATE OF p SKIP LOCKED)
- UPDATE billing_prepaid_purchase p SET reversal_checked_at=clock_timestamp()-interval '23 hours' FROM due WHERE p.id=due.id
+	rows, err := h.Pool.Query(ctx, `WITH candidates AS (
+  (SELECT id FROM billing_prepaid_purchase WHERE reversal_check_requested_at IS NOT NULL ORDER BY reversal_check_requested_at LIMIT 50)
+  UNION
+  (SELECT id FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>clock_timestamp()-$1::interval
+    AND COALESCE(reversal_checked_at,'-infinity'::timestamptz)<clock_timestamp()-interval '1 day'
+   ORDER BY COALESCE(reversal_checked_at,'-infinity'::timestamptz) LIMIT 50)
+  UNION
+  (SELECT r.purchase_id FROM billing_prepaid_reversal r JOIN billing_prepaid_purchase p ON p.id=r.purchase_id
+   WHERE r.dispute_status=ANY($2) AND COALESCE(p.reversal_checked_at,'-infinity'::timestamptz)<clock_timestamp()-interval '1 day' LIMIT 50)),
+ due AS (SELECT p.id FROM billing_prepaid_purchase p JOIN candidates c ON c.id=p.id
+  WHERE p.payment_state='succeeded' AND COALESCE(p.reversal_retry_after,'-infinity'::timestamptz)<=clock_timestamp()
+  ORDER BY p.reversal_check_requested_at NULLS LAST,COALESCE(p.reversal_checked_at,'-infinity'::timestamptz),p.id
+  LIMIT 10 FOR UPDATE OF p SKIP LOCKED)
+ UPDATE billing_prepaid_purchase p SET reversal_retry_after=clock_timestamp()+interval '1 hour' FROM due WHERE p.id=due.id
  RETURNING p.id,p.team_id,p.customer_id,p.amount_cents,p.payment_intent_id,p.invoice_id,p.reversal_check_requested_at`, prepaidReversalWindow, prepaidOpenDisputeStates)
 	if err != nil {
 		return err
@@ -88,10 +98,13 @@ func (h *Handlers) reviewPrepaidReversals(ctx context.Context, client *stripeHTT
 	}
 	var errs []error
 	for _, p := range due {
-		observed, err := client.prepaidPaymentReversal(ctx, p.Customer, p.Amount, p.Intent, p.Invoice)
+		observed, intents, err := client.prepaidPaymentReversal(ctx, p.Customer, p.Amount, p.Intent, p.Invoice)
 		if errors.Is(err, errPrepaidNoPaymentReference) {
 			log.Error().Str("prepaid_purchase_id", p.ID.String()).Msg("paid prepaid purchase has no payment reference; reversals cannot be checked")
 			err = nil
+		}
+		if err == nil && p.Invoice != nil && len(intents) > 0 {
+			_, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET reversal_payment_intents=ARRAY(SELECT DISTINCT unnest(reversal_payment_intents||$2::text[]) ORDER BY 1) WHERE id=$1`, p.ID, intents)
 		}
 		if err == nil && observed != nil {
 			err = h.recordPrepaidReversal(ctx, p.ID, p.Team, *observed)
@@ -101,7 +114,7 @@ func (h *Handlers) reviewPrepaidReversals(ctx context.Context, client *stripeHTT
 			errs = append(errs, err)
 			continue
 		}
-		_, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET reversal_checked_at=clock_timestamp(),
+		_, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET reversal_checked_at=clock_timestamp(),reversal_retry_after=NULL,
  reversal_check_requested_at=CASE WHEN reversal_check_requested_at IS NOT DISTINCT FROM $2 THEN NULL ELSE reversal_check_requested_at END WHERE id=$1`, p.ID, p.Requested)
 		errs = append(errs, err)
 	}
@@ -113,7 +126,7 @@ func (h *Handlers) reviewPrepaidReversals(ctx context.Context, client *stripeHTT
 // charge also raises that charge's refunded amount, so for a first invoice the
 // larger of the two is the amount returned rather than their sum. Refunds and
 // disputes stay apart because only a refund is money known to be returned.
-func (c *stripeHTTPClient) prepaidPaymentReversal(ctx context.Context, customer string, amount int64, intent, invoice *string) (*prepaidReversalObservation, error) {
+func (c *stripeHTTPClient) prepaidPaymentReversal(ctx context.Context, customer string, amount int64, intent, invoice *string) (*prepaidReversalObservation, []string, error) {
 	var intents []string
 	var creditNotes int64
 	switch {
@@ -122,10 +135,10 @@ func (c *stripeHTTPClient) prepaidPaymentReversal(ctx context.Context, customer 
 	case invoice != nil:
 		inv, err := c.RetrieveBillingInvoice(ctx, *invoice)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if inv.Customer != customer {
-			return nil, errors.New("purchase invoice ownership changed")
+			return nil, nil, errors.New("purchase invoice ownership changed")
 		}
 		creditNotes = inv.PostPaymentCreditNotes
 		var payments struct {
@@ -140,10 +153,10 @@ func (c *stripeHTTPClient) prepaidPaymentReversal(ctx context.Context, customer 
 		}
 		q := url.Values{"invoice": {*invoice}, "status": {"paid"}, "limit": {"100"}}
 		if err = c.doForm(ctx, http.MethodGet, "/v1/invoice_payments?"+q.Encode(), nil, &payments, ""); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if payments.HasMore {
-			return nil, errors.New("purchase invoice payments exceed the supported bound")
+			return nil, nil, errors.New("purchase invoice payments exceed the supported bound")
 		}
 		for _, p := range payments.Data {
 			if p.Invoice == *invoice && p.Payment.Type == "payment_intent" && p.Payment.Intent != "" {
@@ -151,7 +164,7 @@ func (c *stripeHTTPClient) prepaidPaymentReversal(ctx context.Context, customer 
 			}
 		}
 	default:
-		return nil, errPrepaidNoPaymentReference
+		return nil, nil, errPrepaidNoPaymentReference
 	}
 	var refunded, disputed int64
 	var status *string
@@ -160,17 +173,17 @@ func (c *stripeHTTPClient) prepaidPaymentReversal(ctx context.Context, customer 
 	for _, id := range intents {
 		var pi prepaidIntentCharge
 		if err := c.doForm(ctx, http.MethodGet, "/v1/payment_intents/"+url.PathEscape(id), nil, &pi, ""); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if pi.ID != id || pi.Customer != customer || pi.LatestCharge == "" {
-			return nil, errors.New("purchase payment intent ownership or charge changed")
+			return nil, nil, errors.New("purchase payment intent ownership or charge changed")
 		}
 		var charge prepaidChargeState
 		if err := c.doForm(ctx, http.MethodGet, "/v1/charges/"+url.PathEscape(pi.LatestCharge), nil, &charge, ""); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if charge.ID != pi.LatestCharge || charge.Customer != customer {
-			return nil, errors.New("purchase charge ownership changed")
+			return nil, nil, errors.New("purchase charge ownership changed")
 		}
 		charges = append(charges, charge)
 		refunded += charge.AmountRefunded
@@ -183,15 +196,15 @@ func (c *stripeHTTPClient) prepaidPaymentReversal(ctx context.Context, customer 
 		}
 		q := url.Values{"charge": {charge.ID}, "limit": {"10"}}
 		if err := c.doForm(ctx, http.MethodGet, "/v1/disputes?"+q.Encode(), nil, &list, ""); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if list.HasMore || len(list.Data) == 0 {
-			return nil, errors.New("purchase dispute evidence is incomplete")
+			return nil, nil, errors.New("purchase dispute evidence is incomplete")
 		}
 		latest := list.Data[0]
 		for _, d := range list.Data {
 			if d.Charge != charge.ID {
-				return nil, errors.New("purchase dispute ownership changed")
+				return nil, nil, errors.New("purchase dispute ownership changed")
 			}
 			if d.Created > latest.Created {
 				latest = d
@@ -204,16 +217,15 @@ func (c *stripeHTTPClient) prepaidPaymentReversal(ctx context.Context, customer 
 	}
 	refunded = max(refunded, creditNotes)
 	if refunded == 0 && status == nil {
-		return nil, nil
+		return nil, intents, nil
 	}
 	evidence, _ := json.Marshal(map[string]any{"charges": charges, "disputes": disputes, "post_payment_credit_notes": creditNotes})
-	return &prepaidReversalObservation{Refunded: min(refunded, amount), DisputeStatus: status, Disputed: min(disputed, amount-min(refunded, amount)), Evidence: evidence}, nil
+	return &prepaidReversalObservation{Refunded: min(refunded, amount), DisputeStatus: status, Disputed: min(disputed, amount-min(refunded, amount)), Evidence: evidence}, intents, nil
 }
 
 // Each change the provider reports is appended as a new observation version,
-// which reopens the purchase for a staff decision. Nothing is revoked here.
-// Auto-recharge stops on any reversal so the card is never charged again on
-// the strength of money that was just returned or contested.
+// which reopens the purchase for a staff decision. Nothing about the credit or
+// the team's settings changes here.
 func (h *Handlers) recordPrepaidReversal(ctx context.Context, id, team uuid.UUID, o prepaidReversalObservation) error {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
@@ -244,20 +256,17 @@ func (h *Handlers) recordPrepaidReversal(ctx context.Context, id, team uuid.UUID
 		id, version, refundedNow, o.DisputeStatus, o.Disputed, o.Evidence); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_auto_recharge SET enabled=false,disabled_reason='a credit purchase was refunded or disputed',disabled_at=clock_timestamp(),notified_at=NULL
- WHERE team_id=$1 AND enabled`, team); err != nil {
-		return err
-	}
 	log.Warn().Str("prepaid_purchase_id", id.String()).Int32("version", version).Int64("refunded_cents", refundedNow).Str("dispute_status", derefString(o.DisputeStatus)).
 		Bool("dispute_open", o.DisputeStatus != nil && slices.Contains(prepaidOpenDisputeStates, *o.DisputeStatus)).Msg("prepaid purchase payment reversal observed; staff review required")
 	return tx.Commit(ctx)
 }
 
-// Revocation follows only a staff decision and voids only what the grant
-// still holds; spent credit and the issued grant's history are kept.
+// Revocation follows only a staff decision on the latest observation and voids
+// only what the grant still holds; spent credit and the issued grant's history
+// are kept. A decision a newer observation superseded is never executed.
 func (h *Handlers) revokeReversedPrepaidCredit(ctx context.Context, client *stripeHTTPClient) error {
 	rows, err := h.Pool.Query(ctx, `SELECT d.id,p.id,p.team_id,p.customer_id,p.credit_state,p.stripe_credit_grant_id,p.credit_voided_at IS NOT NULL,d.decided_at<clock_timestamp()-interval '1 day'
- FROM billing_prepaid_reversal_decision d JOIN billing_prepaid_purchase p ON p.id=d.purchase_id
+ FROM billing_prepaid_reversal_decision d JOIN billing_prepaid_purchase p ON p.id=d.purchase_id JOIN billing_prepaid_reversal r ON r.purchase_id=d.purchase_id AND r.version=d.version
  WHERE d.decision='revoke' AND d.revoked_at IS NULL ORDER BY d.decided_at LIMIT 10`)
 	if err != nil {
 		return err
@@ -341,12 +350,13 @@ func (h *Handlers) revokePrepaidGrant(ctx context.Context, client *stripeHTTPCli
 	return tx.Commit(ctx)
 }
 
-// prepaidCreditWithheld reports whether a reversed purchase must not be
-// credited: a reversal still open, or one staff decided to revoke.
+// A purchase reversed before its credit was issued is never credited by the
+// worker, whatever staff decide: keeping it records the decision, and any
+// credit for it is a separate, explicitly authorised staff grant.
 func (h *Handlers) prepaidCreditWithheld(ctx context.Context, id uuid.UUID) (bool, error) {
-	var state *string
-	err := h.Pool.QueryRow(ctx, `SELECT billing_prepaid_reversal_state($1)`, id).Scan(&state)
-	return state != nil && *state != "keep", err
+	var withheld bool
+	err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_prepaid_reversal WHERE purchase_id=$1)`, id).Scan(&withheld)
+	return withheld, err
 }
 
 // A refund, dispute or credit note event asks for the purchases it may concern
@@ -358,6 +368,7 @@ func requestPrepaidReversalCheck(ctx context.Context, q db.DBTX, customer, inten
 		return nil
 	}
 	_, err := q.Exec(ctx, `UPDATE billing_prepaid_purchase SET reversal_check_requested_at=clock_timestamp()
- WHERE payment_state='succeeded' AND ((NULLIF($2,'') IS NOT NULL AND payment_intent_id=$2) OR (customer_id=$1 AND invoice_id IS NOT NULL))`, customer, intent)
+ WHERE payment_state='succeeded' AND ((NULLIF($2,'') IS NOT NULL AND (payment_intent_id=$2 OR (invoice_id IS NOT NULL AND reversal_payment_intents @> ARRAY[$2::text])))
+  OR (NULLIF($1,'') IS NOT NULL AND customer_id=$1 AND invoice_id IS NOT NULL))`, customer, intent)
 	return err
 }

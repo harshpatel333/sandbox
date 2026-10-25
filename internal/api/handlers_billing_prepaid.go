@@ -318,11 +318,12 @@ func (h *Handlers) ListPrepaidPurchases(c *gin.Context) {
  'refunded_cents',(SELECT COALESCE(sum(r.refunded_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2),
  'dispute_lost_cents',(SELECT COALESCE(sum(r.disputed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2 AND r.dispute_status='lost'),
  'dispute_open_cents',(SELECT COALESCE(sum(r.disputed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2 AND r.dispute_status=ANY($3)),
- 'dispute_recovered_cents',(SELECT COALESCE(sum(r.disputed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2 AND r.dispute_status IN ('won','warning_closed','prevented')),
+ 'inquiry_cents',(SELECT COALESCE(sum(r.disputed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2 AND r.dispute_status LIKE 'warning_%'),
+ 'dispute_recovered_cents',(SELECT COALESCE(sum(r.disputed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2 AND r.dispute_status='won'),
  'total_cents',(SELECT COALESCE(sum(p.amount_cents-COALESCE(r.refunded_cents,0)-CASE WHEN r.dispute_status='lost' THEN r.disputed_cents ELSE 0 END),0) FROM billing_prepaid_purchase p LEFT JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2),
  'count',(SELECT count(*) FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2),
  'purchases',(SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.paid_at,p.id),'[]') FROM
-   (SELECT * FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2 ORDER BY paid_at,id LIMIT 1000) p))`, from, to, prepaidOpenDisputeStates).Scan(&raw)
+   (SELECT * FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2 ORDER BY paid_at,id LIMIT 1000) p))`, from, to, prepaidWithdrawnDisputeStates).Scan(&raw)
 	if err != nil {
 		respondError(c, ErrInternal)
 		return
