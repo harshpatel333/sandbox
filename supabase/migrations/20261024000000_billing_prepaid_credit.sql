@@ -209,74 +209,128 @@ CREATE INDEX billing_prepaid_purchase_customer_open ON billing_prepaid_purchase(
 ALTER TABLE billing_funding_account ADD COLUMN prepaid_enrolment_due_at timestamptz;
 CREATE INDEX billing_funding_account_prepaid_enrolment_due ON billing_funding_account(prepaid_enrolment_due_at) WHERE prepaid_enrolment_due_at IS NOT NULL;
 
--- A paid purchase can later be refunded or disputed. Each reversal is recorded
--- once and resolved once: a full refund revokes the unspent credit
--- automatically, anything else waits for staff to revoke or keep it.
+-- A paid purchase can later be refunded or disputed. Every change seen on the
+-- provider is appended as an observation; the summary row is the latest view
+-- and its version moves with every observation. Staff decide each version:
+-- keep the credit, or revoke what is still unspent. Nothing is revoked
+-- without a staff decision, and spent credit is never clawed back.
 ALTER TABLE billing_prepaid_purchase ADD COLUMN reversal_checked_at timestamptz;
+ALTER TABLE billing_prepaid_purchase ADD COLUMN reversal_check_requested_at timestamptz;
 CREATE INDEX billing_prepaid_purchase_reversal_review ON billing_prepaid_purchase(COALESCE(reversal_checked_at, '-infinity'::timestamptz))
     WHERE payment_state = 'succeeded';
+CREATE INDEX billing_prepaid_purchase_reversal_requested ON billing_prepaid_purchase(reversal_check_requested_at)
+    WHERE reversal_check_requested_at IS NOT NULL;
+
 CREATE TABLE billing_prepaid_reversal (
     purchase_id uuid PRIMARY KEY REFERENCES billing_prepaid_purchase(id),
     team_id uuid NOT NULL,
-    kind text NOT NULL CHECK (kind IN ('refund', 'dispute')),
-    reversed_cents bigint NOT NULL CHECK (reversed_cents > 0),
-    evidence jsonb NOT NULL CHECK (jsonb_typeof(evidence) = 'object'),
+    refunded_cents bigint NOT NULL CHECK (refunded_cents >= 0),
+    dispute_status text CHECK (dispute_status IN ('warning_needs_response', 'warning_under_review', 'warning_closed', 'needs_response', 'under_review', 'won', 'lost', 'prevented')),
+    disputed_cents bigint NOT NULL DEFAULT 0 CHECK (disputed_cents >= 0),
+    version integer NOT NULL DEFAULT 1 CHECK (version >= 1),
     detected_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    resolution text CHECK (resolution IN ('revoke', 'keep')),
-    resolved_at timestamptz,
-    resolved_by uuid,
-    resolution_reason text CHECK (btrim(resolution_reason) <> ''),
-    revoked_balance_cents bigint CHECK (revoked_balance_cents >= 0),
-    revoked_at timestamptz,
-    CHECK ((resolution IS NULL) = (resolved_at IS NULL) AND (resolution IS NULL) = (resolution_reason IS NULL)),
-    CHECK ((revoked_at IS NULL) = (revoked_balance_cents IS NULL)),
-    CHECK (revoked_at IS NULL OR resolution = 'revoke')
+    observed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (refunded_cents > 0 OR dispute_status IS NOT NULL)
 );
-CREATE INDEX billing_prepaid_reversal_open ON billing_prepaid_reversal(detected_at) WHERE resolution IS NULL;
-CREATE INDEX billing_prepaid_reversal_revoke ON billing_prepaid_reversal(resolved_at) WHERE resolution = 'revoke' AND revoked_at IS NULL;
+CREATE TABLE billing_prepaid_reversal_event (
+    id bigserial PRIMARY KEY,
+    purchase_id uuid NOT NULL REFERENCES billing_prepaid_reversal(purchase_id),
+    version integer NOT NULL,
+    refunded_cents bigint NOT NULL,
+    dispute_status text,
+    disputed_cents bigint NOT NULL,
+    evidence jsonb NOT NULL CHECK (jsonb_typeof(evidence) = 'object'),
+    observed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (purchase_id, version)
+);
+CREATE TABLE billing_prepaid_reversal_decision (
+    id bigserial PRIMARY KEY,
+    purchase_id uuid NOT NULL REFERENCES billing_prepaid_reversal(purchase_id),
+    version integer NOT NULL,
+    decision text NOT NULL CHECK (decision IN ('keep', 'revoke')),
+    decided_by uuid NOT NULL,
+    reason text NOT NULL CHECK (btrim(reason) <> '' AND char_length(reason) <= 500),
+    decided_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    revoked_cents bigint CHECK (revoked_cents >= 0),
+    revoked_at timestamptz,
+    UNIQUE (purchase_id, version),
+    FOREIGN KEY (purchase_id, version) REFERENCES billing_prepaid_reversal_event(purchase_id, version),
+    CHECK ((revoked_at IS NULL) = (revoked_cents IS NULL)),
+    CHECK (revoked_at IS NULL OR decision = 'revoke')
+);
+CREATE INDEX billing_prepaid_reversal_decision_revoke ON billing_prepaid_reversal_decision(decided_at) WHERE decision = 'revoke' AND revoked_at IS NULL;
 
 CREATE FUNCTION guard_billing_prepaid_reversal() RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE p billing_prepaid_purchase;
+DECLARE p billing_prepaid_purchase; latest integer;
 BEGIN
     IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'prepaid reversal history is immutable'; END IF;
-    IF TG_OP = 'INSERT' THEN
+    IF TG_TABLE_NAME = 'billing_prepaid_reversal' THEN
         SELECT * INTO p FROM billing_prepaid_purchase WHERE id = NEW.purchase_id;
-        IF NOT FOUND OR p.payment_state <> 'succeeded' OR p.team_id <> NEW.team_id OR NEW.reversed_cents > p.amount_cents THEN
+        IF NOT FOUND OR p.payment_state <> 'succeeded' OR p.team_id <> NEW.team_id
+            OR NEW.refunded_cents > p.amount_cents OR NEW.disputed_cents > p.amount_cents THEN
             RAISE EXCEPTION 'a reversal needs a paid purchase of this team and cannot exceed it';
         END IF;
-        NEW.detected_at := clock_timestamp();
-        NEW.revoked_at := NULL;
-        NEW.revoked_balance_cents := NULL;
+        IF TG_OP = 'INSERT' THEN
+            NEW.version := 1;
+            NEW.detected_at := clock_timestamp();
+        ELSIF (NEW.purchase_id, NEW.team_id, NEW.detected_at) IS DISTINCT FROM (OLD.purchase_id, OLD.team_id, OLD.detected_at)
+            OR NEW.refunded_cents < OLD.refunded_cents OR NEW.version <> OLD.version + 1 THEN
+            RAISE EXCEPTION 'a reversal only moves forward one observed version at a time';
+        END IF;
+        NEW.observed_at := clock_timestamp();
         RETURN NEW;
     END IF;
-    IF (NEW.purchase_id, NEW.team_id, NEW.detected_at) IS DISTINCT FROM (OLD.purchase_id, OLD.team_id, OLD.detected_at) THEN
-        RAISE EXCEPTION 'prepaid reversal identity is immutable';
+    IF TG_OP = 'UPDATE' AND TG_TABLE_NAME = 'billing_prepaid_reversal_event' THEN
+        RAISE EXCEPTION 'reversal observations are append-only';
     END IF;
-    IF (NEW.kind, NEW.reversed_cents, NEW.evidence) IS DISTINCT FROM (OLD.kind, OLD.reversed_cents, OLD.evidence)
-        AND (OLD.resolution IS NOT NULL OR NEW.reversed_cents < OLD.reversed_cents
-            OR NEW.reversed_cents > (SELECT amount_cents FROM billing_prepaid_purchase WHERE id = NEW.purchase_id)) THEN
-        RAISE EXCEPTION 'a reversal can only grow while unresolved';
-    END IF;
-    IF OLD.resolution IS NOT NULL AND (NEW.resolution, NEW.resolved_at, NEW.resolved_by, NEW.resolution_reason)
-        IS DISTINCT FROM (OLD.resolution, OLD.resolved_at, OLD.resolved_by, OLD.resolution_reason) THEN
-        RAISE EXCEPTION 'a reversal resolution cannot be replaced';
-    END IF;
-    IF OLD.revoked_at IS NOT NULL AND (NEW.revoked_at, NEW.revoked_balance_cents) IS DISTINCT FROM (OLD.revoked_at, OLD.revoked_balance_cents) THEN
-        RAISE EXCEPTION 'a revocation cannot be replaced';
+    IF TG_TABLE_NAME = 'billing_prepaid_reversal_decision' THEN
+        IF TG_OP = 'INSERT' THEN
+            SELECT version INTO latest FROM billing_prepaid_reversal WHERE purchase_id = NEW.purchase_id FOR UPDATE;
+            IF latest IS DISTINCT FROM NEW.version THEN
+                RAISE EXCEPTION 'a decision must answer the latest reversal observation';
+            END IF;
+            NEW.decided_at := clock_timestamp();
+            NEW.revoked_at := NULL;
+            NEW.revoked_cents := NULL;
+        ELSIF (to_jsonb(NEW) - ARRAY['revoked_at','revoked_cents']) IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['revoked_at','revoked_cents'])
+            OR OLD.revoked_at IS NOT NULL OR NEW.decision <> 'revoke' THEN
+            RAISE EXCEPTION 'a reversal decision is final; only its revocation result is recorded once';
+        END IF;
     END IF;
     RETURN NEW;
 END $$;
 CREATE TRIGGER billing_prepaid_reversal_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_prepaid_reversal
     FOR EACH ROW EXECUTE FUNCTION guard_billing_prepaid_reversal();
-ALTER TABLE billing_prepaid_reversal ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON billing_prepaid_reversal FROM PUBLIC;
-DO $$ DECLARE r text; BEGIN
-    FOREACH r IN ARRAY ARRAY['anon', 'authenticated'] LOOP
-        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN EXECUTE format('REVOKE ALL ON billing_prepaid_reversal FROM %I', r); END IF;
+CREATE TRIGGER billing_prepaid_reversal_event_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_prepaid_reversal_event
+    FOR EACH ROW EXECUTE FUNCTION guard_billing_prepaid_reversal();
+CREATE TRIGGER billing_prepaid_reversal_decision_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_prepaid_reversal_decision
+    FOR EACH ROW EXECUTE FUNCTION guard_billing_prepaid_reversal();
+
+-- The current staff state of a reversal: open while its latest observation
+-- has no decision yet.
+CREATE FUNCTION billing_prepaid_reversal_state(p_purchase uuid) RETURNS text LANGUAGE sql STABLE AS $$
+    SELECT CASE WHEN r.purchase_id IS NULL THEN NULL
+        WHEN d.decision IS NULL THEN 'open' ELSE d.decision END
+    FROM (SELECT p_purchase id) x
+    LEFT JOIN billing_prepaid_reversal r ON r.purchase_id = x.id
+    LEFT JOIN billing_prepaid_reversal_decision d ON d.purchase_id = r.purchase_id AND d.version = r.version;
+$$;
+
+DO $$ DECLARE t text; r text; BEGIN
+    FOREACH t IN ARRAY ARRAY['billing_prepaid_reversal', 'billing_prepaid_reversal_event', 'billing_prepaid_reversal_decision'] LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+        EXECUTE format('REVOKE ALL ON %I FROM PUBLIC', t);
+        FOREACH r IN ARRAY ARRAY['anon', 'authenticated'] LOOP
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN EXECUTE format('REVOKE ALL ON %I FROM %I', t, r); END IF;
+        END LOOP;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+            EXECUTE format('GRANT SELECT, INSERT, UPDATE ON %I TO service_role', t);
+            EXECUTE format('CREATE POLICY backend_access ON %I TO service_role USING (true) WITH CHECK (true)', t);
+        END IF;
     END LOOP;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
-        GRANT SELECT, INSERT, UPDATE ON billing_prepaid_reversal TO service_role;
-        CREATE POLICY backend_access ON billing_prepaid_reversal TO service_role USING (true) WITH CHECK (true);
+        GRANT USAGE ON SEQUENCE billing_prepaid_reversal_event_id_seq, billing_prepaid_reversal_decision_id_seq TO service_role;
+        GRANT EXECUTE ON FUNCTION billing_prepaid_reversal_state(uuid) TO service_role;
     END IF;
 END $$;
-REVOKE ALL ON FUNCTION guard_billing_prepaid_reversal() FROM PUBLIC;
+REVOKE ALL ON FUNCTION guard_billing_prepaid_reversal(), billing_prepaid_reversal_state(uuid) FROM PUBLIC;

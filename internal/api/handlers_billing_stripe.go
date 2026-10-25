@@ -3736,6 +3736,17 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 			StripeInvoiceStatus:  stringPtr(status),
 		})
 		return err
+	case "charge.refunded", "charge.refund.updated", "charge.dispute.created", "charge.dispute.updated", "charge.dispute.closed", "charge.dispute.funds_withdrawn", "charge.dispute.funds_reinstated", "credit_note.created", "credit_note.voided":
+		var obj struct {
+			Customer      string `json:"customer"`
+			PaymentIntent string `json:"payment_intent"`
+			Charge        string `json:"charge"`
+			Invoice       string `json:"invoice"`
+		}
+		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
+			return err
+		}
+		return requestPrepaidReversalCheck(ctx, tx, obj.Customer, obj.PaymentIntent)
 	case "billing.meter.error_report_triggered", "v1.billing.meter.error_report_triggered", "billing.meter.no_meter_found", "v1.billing.meter.no_meter_found":
 		if samples := stripeMeterErrorSamplePayloads(event.Data.Object); len(samples) > 1 {
 			for _, sample := range samples[1:] {

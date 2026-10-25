@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog/log"
 )
 
@@ -28,8 +29,10 @@ type prepaidAutoRechargeBody struct {
 const prepaidPurchaseJSON = `jsonb_build_object('id',p.id,'team_id',p.team_id,'source',p.source,'amount_cents',p.amount_cents,
  'state',CASE WHEN p.payment_state='failed' THEN 'failed' WHEN p.credit_state='issued' THEN 'credited' WHEN p.payment_state='succeeded' THEN 'paid' ELSE 'pending' END,
  'failure_reason',p.failure_reason,'paid_at',p.paid_at,'credited_at',p.credited_at,'created_at',p.created_at,
- 'reversal',(SELECT jsonb_build_object('kind',r.kind,'reversed_cents',r.reversed_cents,'detected_at',r.detected_at,'resolution',r.resolution,
-   'resolved_at',r.resolved_at,'resolved_by',r.resolved_by,'resolution_reason',r.resolution_reason,'revoked_balance_cents',r.revoked_balance_cents,'revoked_at',r.revoked_at)
+ 'reversal',(SELECT jsonb_build_object('version',r.version,'refunded_cents',r.refunded_cents,'dispute_status',r.dispute_status,'disputed_cents',r.disputed_cents,
+   'detected_at',r.detected_at,'observed_at',r.observed_at,'state',billing_prepaid_reversal_state(r.purchase_id),
+   'decisions',(SELECT COALESCE(jsonb_agg(jsonb_build_object('version',d.version,'decision',d.decision,'decided_by',d.decided_by,'reason',d.reason,'decided_at',d.decided_at,
+     'revoked_cents',d.revoked_cents,'revoked_at',d.revoked_at) ORDER BY d.version),'[]') FROM billing_prepaid_reversal_decision d WHERE d.purchase_id=r.purchase_id))
   FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id))`
 
 const prepaidAutoRechargeJSON = `jsonb_build_object('enabled',COALESCE(a.enabled,false),'threshold_cents',a.threshold_cents,'amount_cents',a.amount_cents,
@@ -312,11 +315,14 @@ func (h *Handlers) ListPrepaidPurchases(c *gin.Context) {
 	var raw []byte
 	err := h.Pool.QueryRow(c.Request.Context(), `SELECT jsonb_build_object(
  'gross_cents',(SELECT COALESCE(sum(amount_cents),0) FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2),
- 'reversed_cents',(SELECT COALESCE(sum(r.reversed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2),
- 'total_cents',(SELECT COALESCE(sum(p.amount_cents-COALESCE(r.reversed_cents,0)),0) FROM billing_prepaid_purchase p LEFT JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2),
+ 'refunded_cents',(SELECT COALESCE(sum(r.refunded_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2),
+ 'dispute_lost_cents',(SELECT COALESCE(sum(r.disputed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2 AND r.dispute_status='lost'),
+ 'dispute_open_cents',(SELECT COALESCE(sum(r.disputed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2 AND r.dispute_status=ANY($3)),
+ 'dispute_recovered_cents',(SELECT COALESCE(sum(r.disputed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2 AND r.dispute_status IN ('won','warning_closed','prevented')),
+ 'total_cents',(SELECT COALESCE(sum(p.amount_cents-COALESCE(r.refunded_cents,0)-CASE WHEN r.dispute_status='lost' THEN r.disputed_cents ELSE 0 END),0) FROM billing_prepaid_purchase p LEFT JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2),
  'count',(SELECT count(*) FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2),
  'purchases',(SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.paid_at,p.id),'[]') FROM
-   (SELECT * FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2 ORDER BY paid_at,id LIMIT 1000) p))`, from, to).Scan(&raw)
+   (SELECT * FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2 ORDER BY paid_at,id LIMIT 1000) p))`, from, to, prepaidOpenDisputeStates).Scan(&raw)
 	if err != nil {
 		respondError(c, ErrInternal)
 		return
@@ -324,15 +330,16 @@ func (h *Handlers) ListPrepaidPurchases(c *gin.Context) {
 	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
 }
 
-// Reversed purchases waiting for a staff decision, oldest first.
+// Reversed purchases whose latest observation has no staff decision yet.
 func (h *Handlers) ListPrepaidReversals(c *gin.Context) {
 	if _, ok := h.requirePlatformBilling(c, platformBillingReadPermission); !ok {
 		return
 	}
 	var raw []byte
-	err := h.Pool.QueryRow(c.Request.Context(), `SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.reversal_detected_at),'[]') FROM
- (SELECT p.*,r.detected_at reversal_detected_at FROM billing_prepaid_reversal r JOIN billing_prepaid_purchase p ON p.id=r.purchase_id
-  WHERE r.resolution IS NULL ORDER BY r.detected_at LIMIT 200) p`).Scan(&raw)
+	err := h.Pool.QueryRow(c.Request.Context(), `SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.reversal_observed_at),'[]') FROM
+ (SELECT p.*,r.observed_at reversal_observed_at FROM billing_prepaid_reversal r JOIN billing_prepaid_purchase p ON p.id=r.purchase_id
+  WHERE NOT EXISTS(SELECT 1 FROM billing_prepaid_reversal_decision d WHERE d.purchase_id=r.purchase_id AND d.version=r.version)
+  ORDER BY r.observed_at LIMIT 200) p`).Scan(&raw)
 	if err != nil {
 		respondError(c, ErrInternal)
 		return
@@ -341,12 +348,14 @@ func (h *Handlers) ListPrepaidReversals(c *gin.Context) {
 }
 
 type prepaidReversalBody struct {
-	Resolution string `json:"resolution"`
-	Reason     string `json:"reason"`
+	Decision string `json:"decision"`
+	Version  int32  `json:"version"`
+	Reason   string `json:"reason"`
 }
 
-// Staff resolve a reversed purchase once: revoke voids its unspent credit,
-// keep leaves the credit in place (for example after a won dispute).
+// Staff decide the latest observation of a reversed purchase: keep leaves the
+// credit (for example after a won dispute); revoke voids only what is still
+// unspent. A newer observation reopens the purchase for a fresh decision.
 func (h *Handlers) ResolvePrepaidReversal(c *gin.Context) {
 	actor, ok := h.requirePlatformBilling(c, platformBillingWritePermission)
 	if !ok {
@@ -361,20 +370,24 @@ func (h *Handlers) ResolvePrepaidReversal(c *gin.Context) {
 		return
 	}
 	var req prepaidReversalBody
-	if err = c.ShouldBindJSON(&req); err != nil || (req.Resolution != "revoke" && req.Resolution != "keep") || strings.TrimSpace(req.Reason) == "" || len([]rune(req.Reason)) > 500 {
-		respondErrorMsg(c, "bad_request", "resolution must be revoke or keep, and a reason of at most 500 characters is required", http.StatusBadRequest)
+	err = c.ShouldBindJSON(&req)
+	reason := strings.TrimSpace(req.Reason)
+	if err != nil || (req.Decision != "revoke" && req.Decision != "keep") || req.Version < 1 || reason == "" || len([]rune(reason)) > 500 {
+		respondErrorMsg(c, "bad_request", "decision must be revoke or keep, version is the reversal version decided, and a reason of at most 500 characters is required", http.StatusBadRequest)
 		return
 	}
-	var resolved time.Time
-	err = h.Pool.QueryRow(c.Request.Context(), `UPDATE billing_prepaid_reversal SET resolution=$3,resolved_at=clock_timestamp(),resolved_by=$4,resolution_reason=$5
- WHERE purchase_id=$1 AND team_id=$2 AND resolution IS NULL RETURNING resolved_at`, purchase, team, req.Resolution, actor, strings.TrimSpace(req.Reason)).Scan(&resolved)
-	if errors.Is(err, pgx.ErrNoRows) {
-		respondErrorMsg(c, "conflict", "no unresolved reversal for this purchase", http.StatusConflict)
+	var decided time.Time
+	err = h.Pool.QueryRow(c.Request.Context(), `INSERT INTO billing_prepaid_reversal_decision(purchase_id,version,decision,decided_by,reason)
+ SELECT r.purchase_id,$3,$4,$5,$6 FROM billing_prepaid_reversal r WHERE r.purchase_id=$1 AND r.team_id=$2 AND r.version=$3
+ ON CONFLICT(purchase_id,version) DO NOTHING RETURNING decided_at`, purchase, team, req.Version, req.Decision, actor, reason).Scan(&decided)
+	var pgErr *pgconn.PgError
+	if errors.Is(err, pgx.ErrNoRows) || (errors.As(err, &pgErr) && pgErr.Code == "P0001") {
+		respondErrorMsg(c, "conflict", "this reversal version is already decided or is not the latest observation", http.StatusConflict)
 		return
 	}
 	if err != nil {
 		respondError(c, ErrInternal)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"purchase_id": purchase, "resolution": req.Resolution, "resolved_at": resolved, "resolved_by": actor, "resolution_reason": strings.TrimSpace(req.Reason)})
+	c.JSON(http.StatusOK, gin.H{"purchase_id": purchase, "version": req.Version, "decision": req.Decision, "decided_at": decided, "decided_by": actor, "reason": reason})
 }
