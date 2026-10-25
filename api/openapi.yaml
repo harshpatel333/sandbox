@@ -1262,6 +1262,11 @@ paths:
             as it stands. With `error.code` `secret_change_in_progress`, a
             secret change to the sandbox is still running; retry after
             `Retry-After` seconds.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying; sent with `secret_change_in_progress`.
+              schema:
+                type: integer
           content:
             application/json:
               schema:
@@ -1843,6 +1848,11 @@ paths:
             finishes. With `error.code` `secret_change_in_progress`, another
             secret change to the sandbox is still running; retry after
             `Retry-After` seconds.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying; sent with `snapshot_in_progress` and `secret_change_in_progress`.
+              schema:
+                type: integer
           content:
             application/json:
               schema:
@@ -1886,6 +1896,11 @@ paths:
             finishes. With `error.code` `secret_change_in_progress`, another
             secret change to the sandbox is still running; retry after
             `Retry-After` seconds.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying; sent with `snapshot_in_progress` and `secret_change_in_progress`.
+              schema:
+                type: integer
           content:
             application/json:
               schema:
