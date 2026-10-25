@@ -19,6 +19,21 @@ ALTER TABLE billing_contract_limits
 
 DO $$
 DECLARE
+    definition text := pg_get_functiondef('public.publish_billing_plan_version(uuid,uuid)'::regprocedure);
+BEGIN
+    IF position('n.state IN (''published'', ''retired'') AND n.version > d.version' IN definition) > 0 THEN
+        RETURN;
+    END IF;
+    IF position('n.state = ''published'' AND n.version > d.version' IN definition) = 0 THEN
+        RAISE EXCEPTION 'unexpected catalog publication guard' USING ERRCODE = '55000';
+    END IF;
+    EXECUTE replace(definition,
+        'n.state = ''published'' AND n.version > d.version',
+        'n.state IN (''published'', ''retired'') AND n.version > d.version');
+END $$;
+
+DO $$
+DECLARE
     predecessor billing_plan_version;
     successor billing_plan_version;
 BEGIN

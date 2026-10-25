@@ -3,9 +3,12 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgconn"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -594,6 +597,41 @@ func TestIntegration_BillingCatalogWritesAreIdempotentPerVersionID(t *testing.T)
 	var actions string
 	if err := testPool.QueryRow(t.Context(), `SELECT string_agg(action, ',' ORDER BY created_at) FROM billing_catalog_audit WHERE version_id=$1`, id).Scan(&actions); err != nil || actions != "create_draft,publish,retire" {
 		t.Fatalf("audit actions=%q err=%v", actions, err)
+	}
+}
+
+func TestIntegration_PlanCatalogRejectsOlderDraftAfterNewerRetirement(t *testing.T) {
+	ctx := t.Context()
+	previous := currentPlanVersion(t, "enterprise")
+	var older, newer uuid.UUID
+	for _, id := range []*uuid.UUID{&older, &newer} {
+		if err := testPool.QueryRow(ctx, `INSERT INTO billing_plan_version(family,version,kind,display_name,display_only)
+   SELECT 'enterprise',MAX(version)+1,'custom','Enterprise',true FROM billing_plan_version WHERE family='enterprise' RETURNING id`).Scan(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { publishPlanCopy(t, previous, "") })
+	if _, err := testPool.Exec(ctx, `SELECT publish_billing_plan_version($1,NULL);`, newer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `SELECT retire_billing_plan_version($1,NULL);`, newer); err != nil {
+		t.Fatal(err)
+	}
+	var before, after []byte
+	snapshot := `SELECT jsonb_agg(to_jsonb(v) ORDER BY id) FROM billing_plan_version v WHERE family='enterprise'`
+	if err := testPool.QueryRow(ctx, snapshot).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	_, err := testPool.Exec(ctx, `SELECT publish_billing_plan_version($1,NULL)`, older)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
+		t.Fatalf("older draft publication after newer retirement: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, snapshot).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected publication mutated catalog history")
 	}
 }
 
