@@ -335,11 +335,14 @@ func (h *Handlers) revokePrepaidGrantStep(ctx context.Context, client *stripeHTT
 	}
 	defer tx.Rollback(ctx)
 	var latest int32
-	var attempted, nowVoided bool
+	var attempted, settled, nowVoided bool
 	var nowState string
-	if err = tx.QueryRow(ctx, `SELECT r.version,d.revoke_attempted_at IS NOT NULL FROM billing_prepaid_reversal r JOIN billing_prepaid_reversal_decision d ON d.purchase_id=r.purchase_id AND d.id=$2
- WHERE r.purchase_id=$1 FOR UPDATE OF r,d`, id, decision).Scan(&latest, &attempted); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT r.version,d.revoke_attempted_at IS NOT NULL,d.revoked_at IS NOT NULL OR d.revoke_retry_after IS NOT DISTINCT FROM 'infinity' FROM billing_prepaid_reversal r JOIN billing_prepaid_reversal_decision d ON d.purchase_id=r.purchase_id AND d.id=$2
+ WHERE r.purchase_id=$1 FOR UPDATE OF r,d`, id, decision).Scan(&latest, &attempted, &settled); err != nil {
 		return true, err
+	}
+	if settled {
+		return true, tx.Commit(ctx)
 	}
 	if err = tx.QueryRow(ctx, `SELECT credit_state,credit_voided_at IS NOT NULL FROM billing_prepaid_purchase WHERE id=$1 FOR UPDATE`, id).Scan(&nowState, &nowVoided); err != nil {
 		return true, err

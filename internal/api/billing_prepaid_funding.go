@@ -137,7 +137,11 @@ func (h *Handlers) voidSpentPrepaidGrant(ctx context.Context, client *stripeHTTP
 		return err
 	}
 	var revoking bool
-	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_prepaid_reversal_decision WHERE purchase_id=$1 AND revoke_attempted_at IS NOT NULL AND revoked_at IS NULL AND revoke_retry_after IS DISTINCT FROM 'infinity')`, id).Scan(&revoking); err != nil || revoking {
+	if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_prepaid_reversal_decision WHERE purchase_id=$1 AND revoke_attempted_at IS NOT NULL AND revoked_at IS NULL AND revoke_retry_after IS DISTINCT FROM 'infinity')`, id).Scan(&revoking); err != nil {
+		return err
+	}
+	if revoking {
+		_, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET credit_balance_checked_at=clock_timestamp()-interval '50 minutes' WHERE id=$1`, id)
 		return err
 	}
 	var voided entitlementGrant

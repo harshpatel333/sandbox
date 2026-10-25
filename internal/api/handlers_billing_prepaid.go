@@ -33,7 +33,7 @@ const prepaidPurchaseJSON = `jsonb_build_object('id',p.id,'team_id',p.team_id,'s
    'detected_at',r.detected_at,'observed_at',r.observed_at,'state',billing_prepaid_reversal_state(r.purchase_id),
    'decisions',(SELECT COALESCE(jsonb_agg(jsonb_build_object('version',d.version,'decision',d.decision,'decided_by',d.decided_by,'reason',d.reason,'decided_at',d.decided_at,
      'revoked_cents',d.revoked_cents,'revoked_at',d.revoked_at,'revoke_attempted_at',d.revoke_attempted_at,
-     'revoke_closed_unexecuted',d.revoked_at IS NULL AND d.revoke_retry_after='infinity') ORDER BY d.version),'[]') FROM billing_prepaid_reversal_decision d WHERE d.purchase_id=r.purchase_id))
+     'revoke_closed_unexecuted',d.revoked_at IS NULL AND d.revoke_retry_after IS NOT DISTINCT FROM 'infinity') ORDER BY d.version),'[]') FROM billing_prepaid_reversal_decision d WHERE d.purchase_id=r.purchase_id))
   FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id))`
 
 const prepaidAutoRechargeJSON = `jsonb_build_object('enabled',COALESCE(a.enabled,false),'threshold_cents',a.threshold_cents,'amount_cents',a.amount_cents,

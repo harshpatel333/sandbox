@@ -1557,6 +1557,10 @@ func TestPrepaidSpentVoidLeavesAnAttemptedRevokeToItsOwnAudit(t *testing.T) {
 	if err := f.h.voidSpentPrepaidGrants(t.Context(), f.client); err != nil {
 		t.Fatal(err)
 	}
+	var deferred bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT credit_balance_checked_at IS NOT NULL FROM billing_prepaid_purchase WHERE id=$1`, id).Scan(&deferred); err != nil || !deferred {
+		t.Fatal("a purchase left to its revocation is picked again by the spent-grant voider on every tick", err)
+	}
 	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
 		t.Fatal(err)
 	}
