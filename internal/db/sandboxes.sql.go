@@ -818,6 +818,10 @@ FROM (
 ) x
 WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
+  AND NOT EXISTS (
+    SELECT 1 FROM sandbox_secret_write_hold wh
+    WHERE wh.sandbox_id = sandbox.id AND wh.expires_at > now()
+  )
   AND ($1::uuid IS NULL
        OR (x.machine_owner_principal_id = $1
            AND x.machine_owner_team_id = sandbox.team_id))
@@ -867,7 +871,10 @@ type ClaimResumeRow struct {
 // only, a failed resume returns the row to paused with the deadline it had,
 // and activation clears it.
 // A machine caller supplies its principal so the claim itself enforces ownership.
-// 0 rows: owner mismatch, not paused, or another resume claimed it.
+// A secret change in progress holds the claim off (see
+// TakeSandboxSecretWriteHold), so a resume never overtakes its guest update.
+// 0 rows: owner mismatch, not paused, another resume claimed it, or a secret
+// change holds the sandbox.
 func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (ClaimResumeRow, error) {
 	row := q.db.QueryRow(ctx, claimResume,
 		arg.MachinePrincipalID,

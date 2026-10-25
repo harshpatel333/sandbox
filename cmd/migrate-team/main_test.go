@@ -1522,6 +1522,18 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("purge refuses while a secret change holds a sandbox", func(t *testing.T) {
+		mustExec(t, srcPool, `INSERT INTO sandbox_secret_write_hold (sandbox_id, holder, expires_at) VALUES ($1, $2, now() + interval '1 minute')`, f.sb1, uuid.New())
+		defer mustExec(t, srcPool, `DELETE FROM sandbox_secret_write_hold WHERE sandbox_id = $1`, f.sb1)
+
+		cfg := f.cfg(phasePurge)
+		cfg.confirmTeamName = "migration-drill"
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), f.sb1.String()) {
+			t.Fatalf("a secret change in progress must block purge, got: %v", err)
+		}
+	})
+
 	t.Run("purge refuses while a destroyed sandbox still owes its host reclaim", func(t *testing.T) {
 		mustExec(t, srcPool, `INSERT INTO sandbox_teardown (sandbox_id, host_id) VALUES ($1, $2)`, f.sb3, sourceHostID)
 		defer mustExec(t, srcPool, `DELETE FROM sandbox_teardown WHERE sandbox_id = $1`, f.sb3)

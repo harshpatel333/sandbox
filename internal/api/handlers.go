@@ -440,6 +440,15 @@ func (h *Handlers) revertPauseWithTimeout(reqCtx context.Context, sandboxID, tea
 // vmdTimeout is the default deadline for VMD gRPC calls.
 const vmdTimeout = 30 * time.Second
 
+// resumeClaimTimeout bounds the resume claim, which waits only on other
+// short transactions holding the sandbox's secret-write lock. A client that
+// gives up does not reliably cancel the request.
+const resumeClaimTimeout = 10 * time.Second
+
+// resumeSecretWriteWait bounds how long a resume waits out a secret change
+// in progress on the sandbox before answering that one is.
+const resumeSecretWriteWait = 10 * time.Second
+
 // vmdBootTimeout is the deadline for the boot (restore) call specifically.
 // It exceeds VMD's in-VM readiness cap (30s) so a guest that never becomes
 // ready yields VMD's definitive teardown error instead of a bare deadline —
@@ -986,7 +995,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 		claimParams.MachinePrincipalID = pgtype.UUID{Bytes: caller.PrincipalID, Valid: true}
 	}
-	claimed, err := h.DB.ClaimResume(c.Request.Context(), claimParams)
+	claim := func() (db.ClaimResumeRow, error) {
+		cctx, cancel := context.WithTimeout(c.Request.Context(), resumeClaimTimeout)
+		defer cancel()
+		return h.DB.ClaimResume(cctx, claimParams)
+	}
+	claimed, err := claim()
 	// Only a failed machine claim needs a second read to distinguish denied
 	// ownership from an owner's pause that is still settling. Do this before
 	// polling or exposing another principal's sandbox state.
@@ -1001,7 +1015,31 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		if !retry {
 			return "", false
 		}
-		claimed, err = h.DB.ClaimResume(c.Request.Context(), claimParams)
+		claimed, err = claim()
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		// A secret change may hold the sandbox, or have just let it go. While
+		// held, only the hold is read; the claim runs again once it clears.
+		// A claim that still finds no row lost to a change if the sandbox is
+		// paused, held again or not, since one can come and go between the
+		// claim and the probe; any other state is a real conflict.
+		werr := waitSecretWriteHold(c.Request.Context(), resumeSecretWriteWait, func() (bool, error) {
+			if h.secretWriteHeld(c, sandboxID) {
+				return false, nil
+			}
+			claimed, err = claim()
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return true, nil
+			}
+			return !h.secretWriteHeld(c, sandboxID) && !h.sandboxStillPaused(c, sandboxID, teamID), nil
+		})
+		if errors.Is(werr, errSecretChangeInFlight) {
+			respondSecretChangeInFlight(c)
+			return "", false
+		}
+		if werr != nil {
+			err = werr
+		}
 	}
 	if err != nil {
 		if err == pgx.ErrNoRows {

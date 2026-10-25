@@ -244,6 +244,8 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 		case errors.Is(err, pgx.ErrNoRows):
 			// The source moved on since it was read above.
 			respondErrorMsg(c, "conflict", "sandbox is no longer active or paused", http.StatusConflict)
+		case errors.Is(err, errSecretChangeInFlight):
+			respondSecretChangeInFlight(c)
 		case body.IdempotencyKey != nil && isUniqueViolation(err):
 			// Another request with the same key got in first.
 			existing, gerr := h.DB.GetSandboxSnapshotByIdempotencyKey(ctx, db.GetSandboxSnapshotByIdempotencyKeyParams{TeamID: teamID, SandboxID: sandboxID, IdempotencyKey: body.IdempotencyKey})
@@ -312,28 +314,36 @@ func respondSnapshotReplay(c *gin.Context, row db.SandboxSnapshot) {
 }
 
 // insertSnapshotRow writes the snapshot's row under the sandbox's
-// secret-write lock, which attach and detach take too: the bindings the row
-// records are the sandbox's at one moment, and a detach either lands before
-// it and is left out or waits for it.
+// secret-write lock, which attach and detach take too, and only while no
+// secret change holds the sandbox: the bindings the row records are the
+// sandbox's at one moment, never ones a change in progress may yet undo.
 func (h *Handlers) insertSnapshotRow(ctx context.Context, p db.CreateSandboxSnapshotParams) (db.SandboxSnapshot, error) {
 	if h.Pool == nil {
 		row, err := h.DB.CreateSandboxSnapshot(ctx, p)
 		return db.SandboxSnapshot(row), err
 	}
-	tx, err := h.Pool.Begin(ctx)
-	if err != nil {
-		return db.SandboxSnapshot{}, err
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	q := h.DB.WithTx(tx)
-	if err := q.LockSandboxForSecretWrites(ctx, p.SandboxID.String()); err != nil {
-		return db.SandboxSnapshot{}, err
-	}
-	row, err := q.CreateSandboxSnapshot(ctx, p)
-	if err != nil {
-		return db.SandboxSnapshot{}, err
-	}
-	return db.SandboxSnapshot(row), tx.Commit(ctx)
+	var row db.SandboxSnapshot
+	err := waitSecretWriteHold(ctx, secretWriteHoldWait, func() (bool, error) {
+		tx, err := h.Pool.Begin(ctx)
+		if err != nil {
+			return false, err
+		}
+		defer tx.Rollback(ctx) //nolint:errcheck
+		q := h.DB.WithTx(tx)
+		if err := q.LockSandboxForSecretWrites(ctx, p.SandboxID.String()); err != nil {
+			return false, err
+		}
+		if held, err := q.SandboxSecretWriteHeld(ctx, p.SandboxID); err != nil || held {
+			return false, err
+		}
+		created, err := q.CreateSandboxSnapshot(ctx, p)
+		if err != nil {
+			return false, err
+		}
+		row = db.SandboxSnapshot(created)
+		return true, tx.Commit(ctx)
+	})
+	return row, err
 }
 
 func (h *Handlers) markSnapshotReady(ctx context.Context, id uuid.UUID, snap vmdclient.SavedSnapshot) (db.SandboxSnapshot, error) {

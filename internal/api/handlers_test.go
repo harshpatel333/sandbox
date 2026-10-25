@@ -1785,6 +1785,61 @@ func TestResumeSandbox_SettlesPausingToPaused(t *testing.T) {
 	}
 }
 
+// A short secret change can take and release the hold around a retried
+// claim, between two probes that both see nothing held. The sandbox is still
+// paused, so a later pass claims it instead of answering a conflict.
+func TestResumeSandbox_RetriesAClaimLostToAShortSecretChange(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+
+	var claims int32
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) { return "10.0.0.5", nil },
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: SandboxSecretWriteHeld :one"):
+				return scalarBoolRow(false)
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				if atomic.AddInt32(&claims, 1) <= 3 {
+					return notFoundRow()
+				}
+				return claimResumeRow(sb, &snap, "", 0)
+			case strings.Contains(sql, "'resuming'"):
+				return claimResumeRow(sb, &snap, "", 0)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{
+		VMD:    vmd,
+		DB:     db.New(mock),
+		Config: &config.Config{SandboxAccessTokenSeed: []byte("test-seed-for-hmac-32-bytes-min!!")},
+	}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after the hold cleared; body: %s", w.Code, w.Body.String())
+	}
+	if got := atomic.LoadInt32(&claims); got != 4 {
+		t.Errorf("claims = %d, want 4", got)
+	}
+}
+
 // A sandbox stuck in 'pausing' past the settle window (finalize-pause lost
 // or genuinely stalled, not just racing) still 409s. This is also the
 // regression test for the settle poll's backoff: the pre-backoff code

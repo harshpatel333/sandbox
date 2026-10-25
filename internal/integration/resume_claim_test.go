@@ -4,10 +4,12 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -77,6 +79,29 @@ func TestIntegration_ClaimResume_WaitsForAttachLock(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("claim did not proceed after the attach lock was released")
+	}
+}
+
+// A secret change in progress holds the claim off until it releases, so a
+// resume never overtakes the change's guest update and is overwritten by it.
+func TestIntegration_ClaimResume_WaitsOutASecretChange(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := seedPausedSandbox(t, teamID)
+	holder := uuid.New()
+	if n, err := testQueries.TakeSandboxSecretWriteHold(ctx, db.TakeSandboxSecretWriteHoldParams{SandboxID: sandboxID, Holder: holder, LeaseSeconds: 60}); err != nil || n != 1 {
+		t.Fatalf("take the hold: %d %v", n, err)
+	}
+	params := db.ClaimResumeParams{ID: sandboxID, TeamID: teamID, LockKey: sandboxID.String()}
+	if _, err := testQueries.ClaimResume(ctx, params); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("claim under a held sandbox: %v; want no row", err)
+	}
+	if err := testQueries.ReleaseSandboxSecretWriteHold(ctx, db.ReleaseSandboxSecretWriteHoldParams{SandboxID: sandboxID, Holder: holder}); err != nil {
+		t.Fatal(err)
+	}
+	row, err := testQueries.ClaimResume(ctx, params)
+	if err != nil || row.Sandbox.Status != db.SandboxStatusResuming {
+		t.Fatalf("claim after the release: %q %v", row.Sandbox.Status, err)
 	}
 }
 

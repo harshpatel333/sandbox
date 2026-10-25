@@ -67,13 +67,34 @@ RETURNING *;
 -- check and insert serialize across API instances, not just the in-process lock.
 SELECT pg_advisory_xact_lock(hashtext($1)::bigint);
 
--- name: HoldSandboxSecretWrites :exec
--- The same lock, held by the session until released: an attach keeps it
--- through its guest update, which no transaction should stay open across.
-SELECT pg_advisory_lock(hashtext($1)::bigint);
+-- name: TakeSandboxSecretWriteHold :execrows
+-- 0 rows: another change holds it and has not expired. A row rather than a
+-- session lock, because a transaction pooler gives consecutive statements
+-- different server sessions and a session lock can outlive its unlock.
+-- clock_timestamp, not now(): the caller waits on the secret-write lock in
+-- this transaction, and the lease must not lose that wait.
+INSERT INTO sandbox_secret_write_hold (sandbox_id, holder, expires_at)
+VALUES (sqlc.arg(sandbox_id), sqlc.arg(holder), clock_timestamp() + make_interval(secs => sqlc.arg(lease_seconds)::int))
+ON CONFLICT (sandbox_id) DO UPDATE
+SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
+WHERE sandbox_secret_write_hold.expires_at <= clock_timestamp();
 
--- name: ReleaseSandboxSecretWrites :one
-SELECT pg_advisory_unlock(hashtext($1)::bigint);
+-- name: ReleaseSandboxSecretWriteHold :exec
+DELETE FROM sandbox_secret_write_hold
+WHERE sandbox_id = sqlc.arg(sandbox_id) AND holder = sqlc.arg(holder);
+
+-- name: SandboxSecretWriteHeldBy :one
+-- clock_timestamp for the same reason: it runs after a lock wait.
+SELECT EXISTS (
+  SELECT 1 FROM sandbox_secret_write_hold
+  WHERE sandbox_id = sqlc.arg(sandbox_id) AND holder = sqlc.arg(holder) AND expires_at > clock_timestamp()
+);
+
+-- name: SandboxSecretWriteHeld :one
+SELECT EXISTS (
+  SELECT 1 FROM sandbox_secret_write_hold
+  WHERE sandbox_id = $1 AND expires_at > now()
+);
 
 -- name: AddSandboxSecret :execrows
 -- FOR UPDATE on the sandbox row, taken before the insert because the insert

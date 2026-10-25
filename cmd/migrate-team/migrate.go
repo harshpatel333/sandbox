@@ -1036,6 +1036,23 @@ var retainedAfterPurgeTables = map[string]bool{
 	"stripe_checkout_publication_subscription": true,
 }
 
+// secretChangesInProgress lists the team's sandboxes a secret change holds.
+func secretChangesInProgress(ctx context.Context, tx pgx.Tx, teamID uuid.UUID) ([]string, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT h.sandbox_id::text FROM sandbox_secret_write_hold h
+		JOIN sandbox s ON s.id = h.sandbox_id
+		WHERE s.team_id = $1 AND h.expires_at > now()
+		ORDER BY 1`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list secret changes in progress: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("list secret changes in progress: %w", err)
+	}
+	return ids, nil
+}
+
 // allColumns lists a table's column names in attnum order.
 func allColumns(ctx context.Context, dst *pgxpool.Pool, table string) ([]string, error) {
 	rows, err := dst.Query(ctx, `
@@ -2001,6 +2018,14 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	// transaction rather than racing the deletes.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(id::text)::bigint) FROM sandbox WHERE team_id = $1`, cfg.teamID); err != nil {
 		return fmt.Errorf("advisory-lock sandboxes: %w", err)
+	}
+	// A secret change holds its sandbox beyond its locked transactions,
+	// through its guest update and any undo, so the lock alone does not
+	// exclude one in progress; none can start while it is held.
+	if held, err := secretChangesInProgress(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(held) > 0 {
+		return fmt.Errorf("aborting purge: secret change in progress on:\n  %s\nre-run once it finishes", strings.Join(held, "\n  "))
 	}
 	// Build admission serializes on the app's per-TEAM advisory lock
 	// (CountInFlightBuildsForTeam's caller contract) — take it so a

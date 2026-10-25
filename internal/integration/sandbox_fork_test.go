@@ -355,9 +355,9 @@ func TestIntegration_SecretAttachWaitsOutASnapshotCapture(t *testing.T) {
 	}
 }
 
-// An attach holds the sandbox's secret-write lock through its guest update:
-// a capture waits for it, so a binding the attach undoes is never recorded,
-// and the snapshot has only the key, for a fork to clear.
+// An attach holds the sandbox through its guest update: a capture waits it
+// out, so a binding the attach undoes is never recorded, and the snapshot has
+// only the key, for a fork to clear.
 func TestIntegration_CaptureWaitsOutAnAttachAndItsUndo(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedTeamAndKey(t)
@@ -370,67 +370,101 @@ func TestIntegration_CaptureWaitsOutAnAttachAndItsUndo(t *testing.T) {
 	}
 	secretID := seedSecret(t, teamID)
 
-	// The attach: held lock, binding committed, guest update pending.
-	conn, err := testPool.Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
+	// The attach: hold taken, binding committed, guest update pending.
+	holder := uuid.New()
+	if n, err := testQueries.TakeSandboxSecretWriteHold(ctx, db.TakeSandboxSecretWriteHoldParams{SandboxID: sourceID, Holder: holder, LeaseSeconds: 60}); err != nil || n != 1 {
+		t.Fatalf("take the hold: %d %v", n, err)
 	}
-	defer conn.Release()
-	aq := db.New(conn)
-	if err := aq.HoldSandboxSecretWrites(ctx, sourceID.String()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := aq.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: secretID, EnvKey: "TOKEN"}); err != nil {
+	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: secretID, EnvKey: "TOKEN"}); err != nil {
 		t.Fatal(err)
 	}
 
-	type result struct {
-		row db.SandboxSnapshot
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
+	// The capture, as the snapshot handler writes its row.
+	capture := func() (db.SandboxSnapshot, bool, error) {
 		tx, err := testPool.Begin(ctx)
 		if err != nil {
-			done <- result{err: err}
-			return
+			return db.SandboxSnapshot{}, false, err
 		}
 		defer tx.Rollback(ctx) //nolint:errcheck
 		q := db.New(tx)
 		if err := q.LockSandboxForSecretWrites(ctx, sourceID.String()); err != nil {
-			done <- result{err: err}
-			return
+			return db.SandboxSnapshot{}, false, err
+		}
+		if held, err := q.SandboxSecretWriteHeld(ctx, sourceID); err != nil || held {
+			return db.SandboxSnapshot{}, false, err
 		}
 		row, err := q.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
 			ID: uuid.New(), TeamID: teamID, SandboxID: sourceID, Kind: "mem+fs", SweepAfter: time.Now().Add(15 * time.Minute),
 		})
-		if err == nil {
-			err = tx.Commit(ctx)
+		if err != nil {
+			return db.SandboxSnapshot{}, false, err
 		}
-		done <- result{db.SandboxSnapshot(row), err}
-	}()
-	select {
-	case r := <-done:
-		t.Fatalf("the capture did not wait for the attach: %+v", r)
-	case <-time.After(300 * time.Millisecond):
+		return db.SandboxSnapshot(row), true, tx.Commit(ctx)
+	}
+	if r, ok, err := capture(); err != nil || ok {
+		t.Fatalf("the capture did not wait for the attach: %+v %v", r, err)
 	}
 
-	// The guest update failed: undone before the lock is let go.
-	if _, err := aq.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
+	// The guest update failed: undone before the hold is let go.
+	if _, err := testQueries.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := aq.RecordDetachedSecretKey(ctx, db.RecordDetachedSecretKeyParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
+	if err := testQueries.RecordDetachedSecretKey(ctx, db.RecordDetachedSecretKeyParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := aq.ReleaseSandboxSecretWrites(ctx, sourceID.String()); err != nil || !ok {
-		t.Fatalf("release: %v %v", ok, err)
+	if err := testQueries.ReleaseSandboxSecretWriteHold(ctx, db.ReleaseSandboxSecretWriteHoldParams{SandboxID: sourceID, Holder: holder}); err != nil {
+		t.Fatal(err)
 	}
-	r := <-done
-	if r.err != nil {
-		t.Fatal(r.err)
+	row, ok, err := capture()
+	if err != nil || !ok {
+		t.Fatalf("capture after the release: %v %v", ok, err)
 	}
-	if strings.Contains(string(r.row.SecretBindings), secretID.String()) || !strings.Contains(string(r.row.SecretBindings), `"TOKEN"`) {
-		t.Fatalf("snapshot recorded %s; want the undone attach's key without its secret", r.row.SecretBindings)
+	if strings.Contains(string(row.SecretBindings), secretID.String()) || !strings.Contains(string(row.SecretBindings), `"TOKEN"`) {
+		t.Fatalf("snapshot recorded %s; want the undone attach's key without its secret", row.SecretBindings)
+	}
+}
+
+// A hold whose holder died lapses at its lease instead of blocking the
+// sandbox's secret changes for good, and only its holder releases it.
+func TestIntegration_SecretWriteHoldLapsesAndIsReleasedOnlyByItsHolder(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID, err := insertSandboxRow(ctx, teamID, "hold-lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	take := func(holder uuid.UUID) int64 {
+		t.Helper()
+		n, err := testQueries.TakeSandboxSecretWriteHold(ctx, db.TakeSandboxSecretWriteHoldParams{SandboxID: sandboxID, Holder: holder, LeaseSeconds: 60})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	first, second := uuid.New(), uuid.New()
+	if take(first) != 1 {
+		t.Fatal("first take refused")
+	}
+	if take(second) != 0 {
+		t.Fatal("a second change took a live hold")
+	}
+	if err := testQueries.ReleaseSandboxSecretWriteHold(ctx, db.ReleaseSandboxSecretWriteHoldParams{SandboxID: sandboxID, Holder: second}); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := testQueries.SandboxSecretWriteHeld(ctx, sandboxID); err != nil || !held {
+		t.Fatalf("held after another change's release = %v %v; want held", held, err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_secret_write_hold SET expires_at = now() - interval '1 second' WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := testQueries.SandboxSecretWriteHeld(ctx, sandboxID); err != nil || held {
+		t.Fatalf("held past its lease = %v %v", held, err)
+	}
+	if take(second) != 1 {
+		t.Fatal("a lapsed hold was not taken over")
+	}
+	if owned, err := testQueries.SandboxSecretWriteHeldBy(ctx, db.SandboxSecretWriteHeldByParams{SandboxID: sandboxID, Holder: first}); err != nil || owned {
+		t.Fatalf("the lapsed holder still owns the hold: %v %v", owned, err)
 	}
 }
 
@@ -494,7 +528,7 @@ func TestIntegration_DetachedKeysAreBounded(t *testing.T) {
 	}
 }
 
-// A detach takes the sandbox's secret-write lock for its whole run, guest
+// A detach takes the sandbox's secret-write hold for its whole run, guest
 // update and cleanup included: while another change holds it, the detach
 // neither changes the binding nor finishes.
 func TestIntegration_DetachWaitsOutAnotherSecretChange(t *testing.T) {
@@ -513,14 +547,9 @@ func TestIntegration_DetachWaitsOutAnotherSecretChange(t *testing.T) {
 	}
 	r := newRouterWithSigner(t)
 
-	conn, err := testPool.Acquire(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Release()
-	hq := db.New(conn)
-	if err := hq.HoldSandboxSecretWrites(ctx, sourceID.String()); err != nil {
-		t.Fatal(err)
+	holder := uuid.New()
+	if n, err := testQueries.TakeSandboxSecretWriteHold(ctx, db.TakeSandboxSecretWriteHoldParams{SandboxID: sourceID, Holder: holder, LeaseSeconds: 60}); err != nil || n != 1 {
+		t.Fatalf("take the hold: %d %v", n, err)
 	}
 	done := make(chan int, 1)
 	go func() {
@@ -528,17 +557,17 @@ func TestIntegration_DetachWaitsOutAnotherSecretChange(t *testing.T) {
 	}()
 	select {
 	case code := <-done:
-		t.Fatalf("detach finished (%d) while another change held the lock", code)
+		t.Fatalf("detach finished (%d) while another change held the hold", code)
 	case <-time.After(300 * time.Millisecond):
 	}
 	if bound, err := testQueries.ListSandboxSecretBindingMeta(ctx, sourceID); err != nil || len(bound) != 1 || bound[0].Detached {
 		t.Fatalf("bindings while the detach waits: %+v %v; want TOKEN still bound", bound, err)
 	}
-	if ok, err := hq.ReleaseSandboxSecretWrites(ctx, sourceID.String()); err != nil || !ok {
-		t.Fatalf("release: %v %v", ok, err)
+	if err := testQueries.ReleaseSandboxSecretWriteHold(ctx, db.ReleaseSandboxSecretWriteHoldParams{SandboxID: sourceID, Holder: holder}); err != nil {
+		t.Fatal(err)
 	}
 	if code := <-done; code != http.StatusNoContent {
-		t.Fatalf("detach after the lock was released: %d", code)
+		t.Fatalf("detach after the hold was released: %d", code)
 	}
 	// Running: the guest dropped the key, so nothing is remembered.
 	var n int

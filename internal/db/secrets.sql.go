@@ -375,17 +375,6 @@ func (q *Queries) GetSecretsByNames(ctx context.Context, arg GetSecretsByNamesPa
 	return items, nil
 }
 
-const holdSandboxSecretWrites = `-- name: HoldSandboxSecretWrites :exec
-SELECT pg_advisory_lock(hashtext($1)::bigint)
-`
-
-// The same lock, held by the session until released: an attach keeps it
-// through its guest update, which no transaction should stay open across.
-func (q *Queries) HoldSandboxSecretWrites(ctx context.Context, hashtext string) error {
-	_, err := q.db.Exec(ctx, holdSandboxSecretWrites, hashtext)
-	return err
-}
-
 const insertProxyAudit = `-- name: InsertProxyAudit :exec
 INSERT INTO proxy_audit (
     team_id, sandbox_id, secret_id,
@@ -894,15 +883,53 @@ func (q *Queries) RecordDetachedSecretKey(ctx context.Context, arg RecordDetache
 	return err
 }
 
-const releaseSandboxSecretWrites = `-- name: ReleaseSandboxSecretWrites :one
-SELECT pg_advisory_unlock(hashtext($1)::bigint)
+const releaseSandboxSecretWriteHold = `-- name: ReleaseSandboxSecretWriteHold :exec
+DELETE FROM sandbox_secret_write_hold
+WHERE sandbox_id = $1 AND holder = $2
 `
 
-func (q *Queries) ReleaseSandboxSecretWrites(ctx context.Context, hashtext string) (bool, error) {
-	row := q.db.QueryRow(ctx, releaseSandboxSecretWrites, hashtext)
-	var pg_advisory_unlock bool
-	err := row.Scan(&pg_advisory_unlock)
-	return pg_advisory_unlock, err
+type ReleaseSandboxSecretWriteHoldParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Holder    uuid.UUID `json:"holder"`
+}
+
+func (q *Queries) ReleaseSandboxSecretWriteHold(ctx context.Context, arg ReleaseSandboxSecretWriteHoldParams) error {
+	_, err := q.db.Exec(ctx, releaseSandboxSecretWriteHold, arg.SandboxID, arg.Holder)
+	return err
+}
+
+const sandboxSecretWriteHeld = `-- name: SandboxSecretWriteHeld :one
+SELECT EXISTS (
+  SELECT 1 FROM sandbox_secret_write_hold
+  WHERE sandbox_id = $1 AND expires_at > now()
+)
+`
+
+func (q *Queries) SandboxSecretWriteHeld(ctx context.Context, sandboxID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, sandboxSecretWriteHeld, sandboxID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const sandboxSecretWriteHeldBy = `-- name: SandboxSecretWriteHeldBy :one
+SELECT EXISTS (
+  SELECT 1 FROM sandbox_secret_write_hold
+  WHERE sandbox_id = $1 AND holder = $2 AND expires_at > clock_timestamp()
+)
+`
+
+type SandboxSecretWriteHeldByParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Holder    uuid.UUID `json:"holder"`
+}
+
+// clock_timestamp for the same reason: it runs after a lock wait.
+func (q *Queries) SandboxSecretWriteHeldBy(ctx context.Context, arg SandboxSecretWriteHeldByParams) (bool, error) {
+	row := q.db.QueryRow(ctx, sandboxSecretWriteHeldBy, arg.SandboxID, arg.Holder)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const softDeleteSecret = `-- name: SoftDeleteSecret :one
@@ -972,6 +999,33 @@ func (q *Queries) SoftDeleteSecretByName(ctx context.Context, arg SoftDeleteSecr
 		&i.DeletedAt,
 	)
 	return i, err
+}
+
+const takeSandboxSecretWriteHold = `-- name: TakeSandboxSecretWriteHold :execrows
+INSERT INTO sandbox_secret_write_hold (sandbox_id, holder, expires_at)
+VALUES ($1, $2, clock_timestamp() + make_interval(secs => $3::int))
+ON CONFLICT (sandbox_id) DO UPDATE
+SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
+WHERE sandbox_secret_write_hold.expires_at <= clock_timestamp()
+`
+
+type TakeSandboxSecretWriteHoldParams struct {
+	SandboxID    uuid.UUID `json:"sandbox_id"`
+	Holder       uuid.UUID `json:"holder"`
+	LeaseSeconds int32     `json:"lease_seconds"`
+}
+
+// 0 rows: another change holds it and has not expired. A row rather than a
+// session lock, because a transaction pooler gives consecutive statements
+// different server sessions and a session lock can outlive its unlock.
+// clock_timestamp, not now(): the caller waits on the secret-write lock in
+// this transaction, and the lease must not lose that wait.
+func (q *Queries) TakeSandboxSecretWriteHold(ctx context.Context, arg TakeSandboxSecretWriteHoldParams) (int64, error) {
+	result, err := q.db.Exec(ctx, takeSandboxSecretWriteHold, arg.SandboxID, arg.Holder, arg.LeaseSeconds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const touchSecretLastUsed = `-- name: TouchSecretLastUsed :exec
