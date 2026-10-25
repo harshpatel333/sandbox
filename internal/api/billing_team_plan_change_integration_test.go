@@ -735,6 +735,93 @@ func TestTeamPlanChangeImmediateConsentAndReplay(t *testing.T) {
 	}
 }
 
+func TestTeamPlanChangeRejectsCatalogRetirementWhileWaitingForTeam(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(map[bool]string{false: "retire", true: "replace"}[replace], func(t *testing.T) {
+			f := newPlanChangeV2Fixture(t, planKindSubscription)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			family := "example_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+			publish := func(version int, max int32) planTerms {
+				t.Helper()
+				var id uuid.UUID
+				if err := f.h.Pool.QueryRow(ctx, `INSERT INTO billing_plan_version(pricing_version,family,version,kind,display_name,max_sandboxes)
+VALUES('v2',$1,$2,'prepaid','Example prepaid', $3) RETURNING id`, family, version, max).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.h.Pool.Exec(ctx, `SELECT publish_billing_plan_version($1,$2)`, id, f.actor); err != nil {
+					t.Fatal(err)
+				}
+				terms, err := f.h.planTermsForPricingVersion(ctx, family, "v2")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return terms
+			}
+			terms := publish(1, 7)
+			req := f.intent(t, family, "catalog-race", terms)
+			blocker, err := f.h.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer blocker.Rollback(context.Background())
+			var pid int32
+			if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid() FROM team WHERE id=$1 FOR NO KEY UPDATE`, f.team).Scan(&pid); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func(candidate planTerms) {
+				_, err := f.h.scheduleTeamPlanChangeTo(ctx, req, candidate)
+				done <- err
+			}(terms)
+			for {
+				var waiting bool
+				if err := f.h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))`, pid).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting {
+					break
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("schedule finished before team lock: %v", err)
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				case <-time.After(time.Millisecond):
+				}
+			}
+			if replace {
+				terms = publish(2, 9)
+			} else if _, err := f.h.Pool.Exec(ctx, `SELECT retire_billing_plan_version($1,$2)`, terms.VersionID, f.actor); err != nil {
+				t.Fatal(err)
+			}
+			if err := blocker.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-done; !errors.Is(err, errTeamPlanChangeConflict) {
+				t.Fatalf("stale catalog preview accepted: %v", err)
+			}
+			var count int
+			if err := f.h.Pool.QueryRow(ctx, `SELECT count(*) FROM team_plan_change WHERE team_id=$1`, f.team).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("stale catalog preview created work: %d %v", count, err)
+			}
+			if replace {
+				req = f.intent(t, family, req.Key, terms)
+				change, err := f.h.scheduleTeamPlanChangeTo(ctx, req, terms)
+				if err != nil || change.TargetTerms.VersionID != terms.VersionID || *change.TargetLimits.MaxConcurrent != 9 {
+					t.Fatalf("confirmed replacement not frozen: %+v %v", change, err)
+				}
+				if _, err := f.h.Pool.Exec(ctx, `SELECT retire_billing_plan_version($1,$2)`, terms.VersionID, f.actor); err != nil {
+					t.Fatal(err)
+				}
+				if replay, err := f.h.scheduleTeamPlanChangeTo(ctx, req, terms); err != nil || replay.ID != change.ID {
+					t.Fatalf("retirement blocked persisted OFF commitment: %+v %v", replay, err)
+				}
+			}
+		})
+	}
+}
+
 func TestTeamPlanChangeHistorySurvivesTeamDeletionWithoutRestoringRenewal(t *testing.T) {
 	for _, stage := range []string{"scheduled", "cancelled", "undone"} {
 		t.Run(stage, func(t *testing.T) {

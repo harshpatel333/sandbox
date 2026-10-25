@@ -203,9 +203,6 @@ func replayTeamPlanChange(ctx context.Context, q db.DBTX, req teamPlanChangeRequ
 }
 
 func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanChangeRequest, terms planTerms) (teamPlanChange, error) {
-	if terms.Limits.MaxConcurrent == nil {
-		return teamPlanChange{}, errors.New("target plan has no limits")
-	}
 	if prior, err := replayTeamPlanChange(ctx, h.Pool, req); !errors.Is(err, pgx.ErrNoRows) {
 		return prior, err
 	}
@@ -231,6 +228,26 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 	}
 	if prior, err := replayTeamPlanChange(ctx, tx, req); !errors.Is(err, pgx.ErrNoRows) {
 		return prior, err
+	}
+	if terms.VersionID != uuid.Nil {
+		version, err := scanPlanVersion(tx.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1 FOR SHARE`, terms.VersionID))
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && (version.State != "published" || version.PricingVersion != "v2") {
+			return teamPlanChange{}, teamPlanChangeConflict("this plan is no longer offered; reload the preview")
+		}
+		if err != nil {
+			return teamPlanChange{}, err
+		}
+		catalog := &Handlers{DB: db.New(tx)}
+		terms, err = catalog.termsOfVersion(ctx, version, terms.IntervalMonths)
+		if err != nil {
+			return teamPlanChange{}, err
+		}
+		if terms.OfferKey != req.Target {
+			return teamPlanChange{}, errUnknownPlan
+		}
+	}
+	if terms.Limits.MaxConcurrent == nil {
+		return teamPlanChange{}, errors.New("target plan has no limits")
 	}
 	if terms.Retired {
 		return teamPlanChange{}, teamPlanChangeConflict("this plan is no longer offered")
