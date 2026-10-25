@@ -44,7 +44,7 @@ func (h *Handlers) enrolPrepaidObservation(ctx context.Context, team uuid.UUID) 
 func prepaidUnspentPurchases(ctx context.Context, q db.DBTX, team uuid.UUID) (int, error) {
 	var live int
 	err := q.QueryRow(ctx, `SELECT count(*) FROM billing_prepaid_purchase p WHERE team_id=$1 AND payment_state<>'failed' AND credit_voided_at IS NULL
- AND NOT (credit_state IN ('none','pending') AND EXISTS(SELECT 1 FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id))`, team).Scan(&live)
+ AND NOT billing_prepaid_credit_withheld(p)`, team).Scan(&live)
 	return live, err
 }
 

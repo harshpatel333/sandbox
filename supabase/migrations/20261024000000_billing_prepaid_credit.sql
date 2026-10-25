@@ -260,12 +260,17 @@ CREATE TABLE billing_prepaid_reversal_decision (
     decided_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     revoked_cents bigint CHECK (revoked_cents >= 0),
     revoked_at timestamptz,
+    -- The unspent balance read before the void, recorded first so a void that
+    -- lands without its result being saved is still audited at its real value.
+    revoke_balance_cents bigint CHECK (revoke_balance_cents >= 0),
+    revoke_retry_after timestamptz,
     UNIQUE (purchase_id, version),
     FOREIGN KEY (purchase_id, version) REFERENCES billing_prepaid_reversal_event(purchase_id, version),
     CHECK ((revoked_at IS NULL) = (revoked_cents IS NULL)),
     CHECK (revoked_at IS NULL OR decision = 'revoke')
 );
 CREATE INDEX billing_prepaid_reversal_decision_revoke ON billing_prepaid_reversal_decision(decided_at) WHERE decision = 'revoke' AND revoked_at IS NULL;
+CREATE INDEX billing_prepaid_reversal_open_dispute ON billing_prepaid_reversal(purchase_id) WHERE dispute_status IN ('warning_needs_response', 'warning_under_review', 'needs_response', 'under_review');
 
 CREATE FUNCTION guard_billing_prepaid_reversal() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE p billing_prepaid_purchase; latest integer;
@@ -299,8 +304,11 @@ BEGIN
             NEW.decided_at := clock_timestamp();
             NEW.revoked_at := NULL;
             NEW.revoked_cents := NULL;
-        ELSIF (to_jsonb(NEW) - ARRAY['revoked_at','revoked_cents']) IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['revoked_at','revoked_cents'])
-            OR OLD.revoked_at IS NOT NULL OR NEW.decision <> 'revoke' THEN
+            NEW.revoke_balance_cents := NULL;
+            NEW.revoke_retry_after := NULL;
+        ELSIF (to_jsonb(NEW) - ARRAY['revoked_at','revoked_cents','revoke_balance_cents','revoke_retry_after']) IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['revoked_at','revoked_cents','revoke_balance_cents','revoke_retry_after'])
+            OR OLD.revoked_at IS NOT NULL OR NEW.decision <> 'revoke'
+            OR (OLD.revoke_balance_cents IS NOT NULL AND NEW.revoke_balance_cents IS DISTINCT FROM OLD.revoke_balance_cents) THEN
             RAISE EXCEPTION 'a reversal decision is final; only its revocation result is recorded once';
         END IF;
     END IF;
@@ -312,6 +320,12 @@ CREATE TRIGGER billing_prepaid_reversal_event_guard BEFORE INSERT OR UPDATE OR D
     FOR EACH ROW EXECUTE FUNCTION guard_billing_prepaid_reversal();
 CREATE TRIGGER billing_prepaid_reversal_decision_guard BEFORE INSERT OR UPDATE OR DELETE ON billing_prepaid_reversal_decision
     FOR EACH ROW EXECUTE FUNCTION guard_billing_prepaid_reversal();
+
+-- Credit for a purchase reversed before issuance is never released by the
+-- worker; every check of that rule goes through this one predicate.
+CREATE FUNCTION billing_prepaid_credit_withheld(p billing_prepaid_purchase) RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT p.credit_state IN ('none', 'pending') AND EXISTS (SELECT 1 FROM billing_prepaid_reversal r WHERE r.purchase_id = p.id);
+$$;
 
 -- The current staff state of a reversal: open while its latest observation
 -- has no decision yet.
@@ -337,7 +351,7 @@ DO $$ DECLARE t text; r text; BEGIN
     END LOOP;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
         GRANT USAGE ON SEQUENCE billing_prepaid_reversal_event_id_seq, billing_prepaid_reversal_decision_id_seq TO service_role;
-        GRANT EXECUTE ON FUNCTION billing_prepaid_reversal_state(uuid) TO service_role;
+        GRANT EXECUTE ON FUNCTION billing_prepaid_reversal_state(uuid), billing_prepaid_credit_withheld(billing_prepaid_purchase) TO service_role;
     END IF;
 END $$;
-REVOKE ALL ON FUNCTION guard_billing_prepaid_reversal(), billing_prepaid_reversal_state(uuid) FROM PUBLIC;
+REVOKE ALL ON FUNCTION guard_billing_prepaid_reversal(), billing_prepaid_reversal_state(uuid), billing_prepaid_credit_withheld(billing_prepaid_purchase) FROM PUBLIC;

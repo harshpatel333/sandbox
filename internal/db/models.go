@@ -990,15 +990,17 @@ type BillingPrepaidReversal struct {
 }
 
 type BillingPrepaidReversalDecision struct {
-	ID           int64              `json:"id"`
-	PurchaseID   uuid.UUID          `json:"purchase_id"`
-	Version      int32              `json:"version"`
-	Decision     string             `json:"decision"`
-	DecidedBy    uuid.UUID          `json:"decided_by"`
-	Reason       string             `json:"reason"`
-	DecidedAt    time.Time          `json:"decided_at"`
-	RevokedCents *int64             `json:"revoked_cents"`
-	RevokedAt    pgtype.Timestamptz `json:"revoked_at"`
+	ID                 int64              `json:"id"`
+	PurchaseID         uuid.UUID          `json:"purchase_id"`
+	Version            int32              `json:"version"`
+	Decision           string             `json:"decision"`
+	DecidedBy          uuid.UUID          `json:"decided_by"`
+	Reason             string             `json:"reason"`
+	DecidedAt          time.Time          `json:"decided_at"`
+	RevokedCents       *int64             `json:"revoked_cents"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+	RevokeBalanceCents *int64             `json:"revoke_balance_cents"`
+	RevokeRetryAfter   pgtype.Timestamptz `json:"revoke_retry_after"`
 }
 
 type BillingPrepaidReversalEvent struct {

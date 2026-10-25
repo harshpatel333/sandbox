@@ -312,8 +312,17 @@ func (h *Handlers) ListPrepaidPurchases(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "from and to must be RFC3339 times with to after from", http.StatusBadRequest)
 		return
 	}
+	raw, err := h.prepaidRevenue(c.Request.Context(), from, to)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
+}
+
+func (h *Handlers) prepaidRevenue(ctx context.Context, from, to time.Time) ([]byte, error) {
 	var raw []byte
-	err := h.Pool.QueryRow(c.Request.Context(), `SELECT jsonb_build_object(
+	err := h.Pool.QueryRow(ctx, `SELECT jsonb_build_object(
  'gross_cents',(SELECT COALESCE(sum(amount_cents),0) FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2),
  'refunded_cents',(SELECT COALESCE(sum(r.refunded_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2),
  'dispute_lost_cents',(SELECT COALESCE(sum(r.disputed_cents),0) FROM billing_prepaid_purchase p JOIN billing_prepaid_reversal r ON r.purchase_id=p.id WHERE p.payment_state='succeeded' AND p.paid_at>=$1 AND p.paid_at<$2 AND r.dispute_status='lost'),
@@ -324,11 +333,7 @@ func (h *Handlers) ListPrepaidPurchases(c *gin.Context) {
  'count',(SELECT count(*) FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2),
  'purchases',(SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.paid_at,p.id),'[]') FROM
    (SELECT * FROM billing_prepaid_purchase WHERE payment_state='succeeded' AND paid_at>=$1 AND paid_at<$2 ORDER BY paid_at,id LIMIT 1000) p))`, from, to, prepaidWithdrawnDisputeStates).Scan(&raw)
-	if err != nil {
-		respondError(c, ErrInternal)
-		return
-	}
-	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
+	return raw, err
 }
 
 // Reversed purchases whose latest observation has no staff decision yet.

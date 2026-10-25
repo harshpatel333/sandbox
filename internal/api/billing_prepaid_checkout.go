@@ -255,7 +255,12 @@ func (h *Handlers) settleCheckoutPurchase(ctx context.Context, client *stripeHTT
 			return errors.New("first invoice credit line differs from the purchase")
 		}
 		evidence, _ = json.Marshal(map[string]any{"amount_cents": line.Amount, "customer": inv.Customer, "checkout_session": s, "invoice": inv})
-		if _, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET invoice_id=$2 WHERE id=$1 AND invoice_id IS NULL`, id, inv.ID); err != nil {
+		intents, err := client.invoicePaymentIntents(ctx, inv.ID)
+		if err != nil {
+			return err
+		}
+		if _, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET invoice_id=COALESCE(invoice_id,$2),
+ reversal_payment_intents=ARRAY(SELECT DISTINCT unnest(reversal_payment_intents||$3::text[]) ORDER BY 1) WHERE id=$1`, id, inv.ID, intents); err != nil {
 			return err
 		}
 	default:

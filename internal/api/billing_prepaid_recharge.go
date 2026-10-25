@@ -97,9 +97,9 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
   AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id
    AND ((p.source='auto_recharge' AND p.payment_state IN ('pending','uncertain','processing'))
     OR (p.payment_state='succeeded' AND (p.credit_state<>'issued' OR p.credited_at>=f.credit_checked_at)
-     AND NOT (p.credit_state IN ('none','pending') AND EXISTS(SELECT 1 FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id)))))
+     AND NOT billing_prepaid_credit_withheld(p))))
   AND (SELECT count(*) FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id AND p.payment_state<>'failed' AND p.credit_voided_at IS NULL
-   AND NOT (p.credit_state IN ('none','pending') AND EXISTS(SELECT 1 FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id)))<$1`
+   AND NOT billing_prepaid_credit_withheld(p))<$1`
 	rows, err := tx.Query(ctx, `SELECT t.id`+selection+` ORDER BY t.id LIMIT 50 FOR NO KEY UPDATE OF t SKIP LOCKED`, prepaidLiveGrantLimit)
 	if err != nil {
 		return err
@@ -122,7 +122,7 @@ func (h *Handlers) settleDuePrepaidPurchases(ctx context.Context, client *stripe
 	rows, err := h.Pool.Query(ctx, `SELECT id FROM billing_prepaid_purchase
  WHERE (payment_state IN ('pending','uncertain','processing') OR credit_state IN ('none','pending','uncertain')) AND payment_state<>'failed'
   AND NOT (payment_state='succeeded' AND credit_state='issued') AND next_attempt_at<=clock_timestamp()
-  AND NOT (credit_state IN ('none','pending') AND EXISTS(SELECT 1 FROM billing_prepaid_reversal r WHERE r.purchase_id=billing_prepaid_purchase.id))
+  AND NOT billing_prepaid_credit_withheld(billing_prepaid_purchase)
  ORDER BY next_attempt_at,id LIMIT 20`)
 	if err != nil {
 		return err
