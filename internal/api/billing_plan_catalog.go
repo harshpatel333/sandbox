@@ -188,16 +188,22 @@ func (v planVersion) validate() error {
 			return errors.New("fees must be positive")
 		}
 	}
-	for _, limit := range []*int32{v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB, v.Limits.MaxTemplates} {
+	for _, limit := range []*int32{v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB} {
 		if limit != nil && *limit <= 0 {
 			return errors.New("limits must be positive")
 		}
 	}
-	if v.Limits.MaxMemoryMiB != nil && *v.Limits.MaxMemoryMiB < minimumTemplateMemoryMiB {
-		return errors.New("max_memory_mib must allow at least 256 MiB")
+	if v.Limits.MaxTemplates != nil && *v.Limits.MaxTemplates < 0 {
+		return errors.New("max_templates must be nonnegative")
 	}
-	if v.Limits.MaxDiskMiB != nil && *v.Limits.MaxDiskMiB < minimumTemplateDiskMiB {
-		return errors.New("max_disk_mib must allow at least 1024 MiB")
+	if v.Limits.MaxVCPU != nil && *v.Limits.MaxVCPU > absoluteMaxVcpu {
+		return fmt.Errorf("max_vcpu must not exceed %d", absoluteMaxVcpu)
+	}
+	if v.Limits.MaxMemoryMiB != nil && (*v.Limits.MaxMemoryMiB < minimumTemplateMemoryMiB || *v.Limits.MaxMemoryMiB > absoluteMaxMemoryMib) {
+		return fmt.Errorf("max_memory_mib must be between %d and %d", minimumTemplateMemoryMiB, absoluteMaxMemoryMib)
+	}
+	if v.Limits.MaxDiskMiB != nil && (*v.Limits.MaxDiskMiB < minimumTemplateDiskMiB || *v.Limits.MaxDiskMiB > absoluteMaxDiskMib) {
+		return fmt.Errorf("max_disk_mib must be between %d and %d", minimumTemplateDiskMiB, absoluteMaxDiskMib)
 	}
 	if v.Kind == "legacy_payg" && (v.Limits.MaxVCPU == nil || v.Limits.MaxMemoryMiB == nil || v.Limits.MaxDiskMiB == nil || v.Limits.MaxTemplates == nil) {
 		return errors.New("pay as you go needs every template limit: teams without their own limits use it")

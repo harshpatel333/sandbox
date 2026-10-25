@@ -1051,6 +1051,7 @@ func TestIntegration_PricingEntryReaderUsesRestrictedRole(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.Background())
+
 	if _, err := tx.Exec(t.Context(), `SET LOCAL ROLE service_role`); err != nil {
 		t.Fatal(err)
 	}

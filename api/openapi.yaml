@@ -5229,6 +5229,8 @@ components:
         max_templates:
           type: integer
           nullable: true
+          minimum: 0
+          description: Custom templates; zero allows only default and system templates.
     BillingPlanPrice:
       type: object
       nullable: true
