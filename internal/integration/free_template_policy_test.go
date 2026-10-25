@@ -326,7 +326,7 @@ func TestIntegration_FreeTemplatePolicy_CLIContextAndReplay(t *testing.T) {
 func TestIntegration_FreeTemplatePolicy_PartialMigrationCannotRelease(t *testing.T) {
 	isolatedFreeTemplatePolicy(t)
 	prepareFreeTemplatePolicy(t)
-	migration, err := os.ReadFile(filepath.Join("..", "..", "supabase", "migrations", "20261025010000_free_template_policy.sql"))
+	migration, err := os.ReadFile(filepath.Join("..", "..", "supabase", "migrations", "20261025130000_free_template_policy.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
