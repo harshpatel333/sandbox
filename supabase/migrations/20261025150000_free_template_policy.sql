@@ -42,8 +42,11 @@ BEGIN
     SELECT * INTO STRICT predecessor FROM billing_plan_version
     WHERE pricing_version = 'v2' AND family = 'free' AND kind = 'free' AND state = 'published'
     FOR UPDATE;
-    IF predecessor.max_templates = 0 THEN
+    IF predecessor.id = md5('billing-plan-version:v2:free:no-custom-templates:1')::uuid AND predecessor.max_templates = 0 THEN
         RETURN;
+    END IF;
+    IF predecessor.id IS DISTINCT FROM md5('billing-plan-version:v2:free:1')::uuid OR predecessor.max_templates IS DISTINCT FROM 10 THEN
+        RAISE EXCEPTION 'unexpected Free catalog predecessor' USING ERRCODE = '55000';
     END IF;
 
     successor := predecessor;
@@ -178,7 +181,7 @@ BEGIN
   RAISE EXCEPTION 'Free policy transition requires prepared raw v2' USING ERRCODE='55000';
  END IF;
  SELECT * INTO STRICT v FROM public.billing_plan_version
- WHERE family='free' AND pricing_version='v2' AND state='published' AND kind='free' AND max_templates=0 FOR SHARE;
+ WHERE id=md5('billing-plan-version:v2:free:no-custom-templates:1')::uuid AND family='free' AND pricing_version='v2' AND state='published' AND kind='free' AND max_templates=0 FOR SHARE;
  PERFORM 1 FROM public.team_billing_account WHERE team_id=p_team FOR UPDATE NOWAIT;
  PERFORM 1 FROM public.team WHERE id=p_team AND home_region=adoption.region FOR UPDATE NOWAIT;
  IF NOT FOUND THEN RAISE EXCEPTION 'team missing or outside prepared region' USING ERRCODE='55000'; END IF;
@@ -187,7 +190,10 @@ BEGIN
  IF NOT FOUND OR old_assignment.id<>p_expected_assignment OR old_assignment.kind<>'free' OR old_assignment.contract_id IS NOT NULL THEN
   RAISE EXCEPTION 'current Free assignment identity changed' USING ERRCODE='55000';
  END IF;
- IF old_assignment.limits->'max_templates'='0'::jsonb THEN RETURN old_assignment.id; END IF;
+ IF old_assignment.plan_version_id IS DISTINCT FROM md5('billing-plan-version:v2:free:1')::uuid
+  OR old_assignment.plan_key IS DISTINCT FROM 'free' OR old_assignment.limits->'max_templates' IS DISTINCT FROM '10'::jsonb THEN
+  RAISE EXCEPTION 'ineligible Free predecessor version' USING ERRCODE='55000';
+ END IF;
  blocked:=public.billing_free_template_policy_blocker(p_team);
  IF blocked IS NOT NULL THEN RAISE EXCEPTION 'unresolved authority: %',blocked USING ERRCODE='55000'; END IF;
  SELECT * INTO credit FROM public.billing_pricing_adoption_credit_resolution WHERE team_id=p_team FOR UPDATE;

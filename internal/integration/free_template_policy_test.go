@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"github.com/jackc/pgx/v5/pgconn"
 	"net/url"
 	"os"
 	"os/exec"
@@ -55,16 +57,21 @@ func prepareFreeTemplatePolicy(t *testing.T) {
 	}
 }
 
-func TestIntegration_FreeTemplatePolicy_PreservesFrozenUsageAndHistory(t *testing.T) {
-	isolatedFreeTemplatePolicy(t)
-	team, _ := seedTeamAndKey(t)
+func assignFreeTemplatePredecessor(t *testing.T, team uuid.UUID, since time.Time) {
+	t.Helper()
 	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_plan_assignment
  (team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
  VALUES($1,'free','free',md5('billing-plan-version:v2:free:1')::uuid,
  '{"allowance":{"amount_cents":13,"period":"day_window","on_exhausted":"pause","compute":{"seconds":7200,"vcpu":1,"memory_gib":1}}}',
- '{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096,"max_templates":10}',$2,'migration','retained predecessor')`, team, time.Now().Add(-5*time.Hour)); err != nil {
+ '{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096,"max_templates":10}',$2,'migration','retained predecessor')`, team, since); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestIntegration_FreeTemplatePolicy_PreservesFrozenUsageAndHistory(t *testing.T) {
+	isolatedFreeTemplatePolicy(t)
+	team, _ := seedTeamAndKey(t)
+	assignFreeTemplatePredecessor(t, team, time.Now().Add(-5*time.Hour))
 	var effectiveTemplates int
 	if err := testPool.QueryRow(t.Context(), `SELECT max_templates FROM team_effective_limits($1)`, team).Scan(&effectiveTemplates); err != nil || effectiveTemplates != 10 {
 		t.Fatalf("pre-transition frozen template cap=%d: %v", effectiveTemplates, err)
@@ -158,7 +165,7 @@ func TestIntegration_FreeTemplatePolicy_PreservesFrozenUsageAndHistory(t *testin
 func TestIntegration_FreeTemplatePolicy_FencesOwnershipAndRollsBackFaults(t *testing.T) {
 	isolatedFreeTemplatePolicy(t)
 	team, _ := seedTeamAndKey(t)
-	assignFreePlan(t, team, time.Now().Add(-time.Hour))
+	assignFreeTemplatePredecessor(t, team, time.Now().Add(-time.Hour))
 	var predecessor uuid.UUID
 	if err := testPool.QueryRow(t.Context(), `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor); err != nil {
 		t.Fatal(err)
@@ -234,7 +241,7 @@ func TestIntegration_FreeTemplatePolicy_FencesOwnershipAndRollsBackFaults(t *tes
 func TestIntegration_FreeTemplatePolicy_ReleaseRejectsCommittedOldFreeTarget(t *testing.T) {
 	isolatedFreeTemplatePolicy(t)
 	team, _ := seedTeamAndKey(t)
-	assignFreePlan(t, team, time.Now().Add(-time.Hour))
+	assignFreeTemplatePredecessor(t, team, time.Now().Add(-time.Hour))
 	var predecessor uuid.UUID
 	if err := testPool.QueryRow(t.Context(), `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor); err != nil {
 		t.Fatal(err)
@@ -275,7 +282,7 @@ func TestIntegration_FreeTemplatePolicy_ReleaseRejectsCommittedOldFreeTarget(t *
 func TestIntegration_FreeTemplatePolicy_CLIContextAndReplay(t *testing.T) {
 	isolatedFreeTemplatePolicy(t)
 	team, _ := seedTeamAndKey(t)
-	assignFreePlan(t, team, time.Now().Add(-time.Hour))
+	assignFreeTemplatePredecessor(t, team, time.Now().Add(-time.Hour))
 	var predecessor uuid.UUID
 	if err := testPool.QueryRow(t.Context(), `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor); err != nil {
 		t.Fatal(err)
@@ -332,5 +339,28 @@ func TestIntegration_FreeTemplatePolicy_CLIContextAndReplay(t *testing.T) {
 	}
 	if err := json.Unmarshal(cli("use", testSystemTeamID.String(), false, args...), &replay); err != nil || replay.AssignmentID != result.AssignmentID {
 		t.Fatalf("OFF CLI replay=%s %v", replay.AssignmentID, err)
+	}
+}
+
+func TestIntegration_FreeTemplatePolicy_RejectsUnknownPredecessorVersion(t *testing.T) {
+	isolatedFreeTemplatePolicy(t)
+	team, _ := seedTeamAndKey(t)
+	assignFreePlan(t, team, time.Now().Add(-time.Hour))
+	prepareFreeTemplatePolicy(t)
+	var id uuid.UUID
+	var before, after []byte
+	if err := testPool.QueryRow(t.Context(), `SELECT id,to_jsonb(a) FROM team_plan_assignment a WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&id, &before); err != nil {
+		t.Fatal(err)
+	}
+	_, err := testPool.Exec(t.Context(), `SELECT billing_migrate_free_template_assignment('use',$1,$2,$3,'operator@example.com','unknown version')`, testSystemTeamID, team, id)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
+		t.Fatalf("unknown predecessor version: %v", err)
+	}
+	if err := testPool.QueryRow(t.Context(), `SELECT to_jsonb(a) FROM team_plan_assignment a WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("unknown predecessor version mutated assignment")
 	}
 }
