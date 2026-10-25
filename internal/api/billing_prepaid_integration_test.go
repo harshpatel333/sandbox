@@ -51,6 +51,7 @@ type prepaidFixture struct {
 	assigned            []uuid.UUID
 	onVoid              func()
 	voided              map[string]int64
+	loseVoid            bool
 }
 
 func newPrepaidFixture(t *testing.T) *prepaidFixture {
@@ -237,6 +238,11 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 			f.voided[id] = f.balances[id]
 		}
 		f.grants[id] = g
+		if f.loseVoid {
+			f.loseVoid = false
+			http.Error(w, "lost", http.StatusServiceUnavailable)
+			return
+		}
 		json.NewEncoder(w).Encode(g)
 	case path == "/v1/billing/credit_balance_transactions":
 		id := r.URL.Query().Get("credit_grant")
@@ -1569,52 +1575,58 @@ func TestPrepaidSpentVoidLeavesAnAttemptedRevokeToItsOwnAudit(t *testing.T) {
 	}
 }
 
-func TestPrepaidLostVoidIsAuditedToTheAttemptThatMadeItNotALaterRevoke(t *testing.T) {
+func TestPrepaidNewRevokeRecoversOlderLostVoidBeforeSettling(t *testing.T) {
 	f := newPrepaidFixture(t)
 	id, intent, grant := f.rechargedPurchase()
 	f.mu.Lock()
 	f.balances[grant] = 300
 	f.disputes[intent] = "needs_response"
+	f.loseVoid = true
 	f.mu.Unlock()
 	f.reviewReversals()
 	v1, _, _, _ := f.reversalState(id)
-	if err := f.decide(id, v1, "revoke"); err != nil {
-		t.Fatal(err)
+	firstActor, secondActor := uuid.New(), uuid.New()
+	f.exec(`INSERT INTO billing_prepaid_reversal_decision(purchase_id,version,decision,decided_by,reason) VALUES($1,$2,'revoke',$3,'first decision')`, id, v1, firstActor)
+	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err == nil {
+		t.Fatal("expected an unavailable response after the provider voided the grant")
 	}
-	f.exec(`UPDATE billing_prepaid_reversal_decision SET revoke_attempted_at=clock_timestamp(),revoke_retry_after=clock_timestamp()+interval '10 minutes' WHERE purchase_id=$1 AND version=$2`, id, v1)
-	f.voidAtProvider(grant, 300)
+	var waiting bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT revoke_attempted_at IS NOT NULL AND revoked_at IS NULL AND revoke_retry_after>clock_timestamp() FROM billing_prepaid_reversal_decision WHERE purchase_id=$1 AND version=$2`, id, v1).Scan(&waiting); err != nil || !waiting {
+		t.Fatal("the first void attempt was not left durably awaiting recovery", waiting, err)
+	}
 	f.mu.Lock()
+	providerVoided := f.grants[grant].VoidedAt != 0
 	f.disputes[intent] = "lost"
 	f.mu.Unlock()
+	if !providerVoided {
+		t.Fatal("the provider did not accept the first void")
+	}
 	f.exec(`UPDATE billing_prepaid_purchase SET reversal_checked_at=NULL WHERE id=$1`, id)
 	if err := f.h.reviewPrepaidReversals(t.Context(), f.client); err != nil {
 		t.Fatal(err)
 	}
 	v2, _, _, _ := f.reversalState(id)
-	if err := f.decide(id, v2, "revoke"); err != nil {
-		t.Fatal(err)
+	if v2 != v1+1 {
+		t.Fatal("expected a new observation", v1, v2)
 	}
-	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
-		t.Fatal(err)
-	}
-	f.exec(`UPDATE billing_prepaid_reversal_decision SET revoke_retry_after=NULL WHERE purchase_id=$1 AND version=$2 AND revoked_at IS NULL`, id, v1)
-	if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
-		t.Fatal(err)
-	}
-	audit := map[int32]*int64{}
-	rows, err := f.h.Pool.Query(t.Context(), `SELECT version,revoked_cents FROM billing_prepaid_reversal_decision WHERE purchase_id=$1`, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for rows.Next() {
-		var v int32
-		var c *int64
-		if err = rows.Scan(&v, &c); err != nil {
+	f.exec(`INSERT INTO billing_prepaid_reversal_decision(purchase_id,version,decision,decided_by,reason) VALUES($1,$2,'revoke',$3,'second decision')`, id, v2, secondActor)
+	for range 2 {
+		if err := f.h.revokeReversedPrepaidCredit(t.Context(), f.client); err != nil {
 			t.Fatal(err)
 		}
-		audit[v] = c
 	}
-	if audit[v1] == nil || *audit[v1] != 300 || audit[v2] == nil || *audit[v2] != 0 {
-		t.Fatal("a void made by an earlier attempt was audited to a later decision", audit[v1], audit[v2])
+	var firstAmount, secondAmount *int64
+	var closed, voided bool
+	var actor uuid.UUID
+	var reason string
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT d.revoked_cents,d.revoke_retry_after='infinity',d.decided_by,d.reason,p.credit_voided_at IS NOT NULL
+ FROM billing_prepaid_reversal_decision d JOIN billing_prepaid_purchase p ON p.id=d.purchase_id WHERE d.purchase_id=$1 AND d.version=$2`, id, v1).Scan(&firstAmount, &closed, &actor, &reason, &voided); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT revoked_cents FROM billing_prepaid_reversal_decision WHERE purchase_id=$1 AND version=$2`, id, v2).Scan(&secondAmount); err != nil {
+		t.Fatal(err)
+	}
+	if firstAmount == nil || *firstAmount != 300 || closed || actor != firstActor || reason != "first decision" || !voided || secondAmount == nil || *secondAmount != 0 {
+		t.Fatal("the later decision took the earlier void's audit", firstAmount, secondAmount, closed, actor, reason, voided)
 	}
 }
