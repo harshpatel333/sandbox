@@ -124,18 +124,6 @@ func (q *Queries) GetTeam(ctx context.Context, id uuid.UUID) (Team, error) {
 	return i, err
 }
 
-const getTeamBuildConcurrency = `-- name: GetTeamBuildConcurrency :one
-SELECT build_concurrency FROM team WHERE id = $1
-`
-
-// Per-team max concurrent template builds. Used by the build supervisor.
-func (q *Queries) GetTeamBuildConcurrency(ctx context.Context, id uuid.UUID) (int32, error) {
-	row := q.db.QueryRow(ctx, getTeamBuildConcurrency, id)
-	var build_concurrency int32
-	err := row.Scan(&build_concurrency)
-	return build_concurrency, err
-}
-
 const getTeamByName = `-- name: GetTeamByName :one
 SELECT id, name, created_at, updated_at, build_concurrency, max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates, max_sandboxes, active_sandbox_count, credential_store_kind, credential_store_config, unmatched_host_policy, home_region, max_snapshots, max_snapshots_per_sandbox, max_snapshots_in_flight, limits_customized FROM team
 WHERE name = $1
@@ -165,6 +153,27 @@ func (q *Queries) GetTeamByName(ctx context.Context, name string) (Team, error) 
 		&i.MaxSnapshotsInFlight,
 		&i.LimitsCustomized,
 	)
+	return i, err
+}
+
+const getTeamTemplateBuildAdmission = `-- name: GetTeamTemplateBuildAdmission :one
+SELECT t.build_concurrency,
+       NOT EXISTS (
+         SELECT 1 FROM team_plan_assignment a
+         WHERE a.team_id = t.id AND a.effective_to IS NULL AND a.kind = 'free'
+       ) AS custom_templates_allowed
+FROM team t WHERE t.id = $1
+`
+
+type GetTeamTemplateBuildAdmissionRow struct {
+	BuildConcurrency       int32 `json:"build_concurrency"`
+	CustomTemplatesAllowed bool  `json:"custom_templates_allowed"`
+}
+
+func (q *Queries) GetTeamTemplateBuildAdmission(ctx context.Context, id uuid.UUID) (GetTeamTemplateBuildAdmissionRow, error) {
+	row := q.db.QueryRow(ctx, getTeamTemplateBuildAdmission, id)
+	var i GetTeamTemplateBuildAdmissionRow
+	err := row.Scan(&i.BuildConcurrency, &i.CustomTemplatesAllowed)
 	return i, err
 }
 

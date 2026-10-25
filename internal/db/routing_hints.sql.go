@@ -14,7 +14,7 @@ import (
 )
 
 const getSandboxWithPreviewPolicyForRouting = `-- name: GetSandboxWithPreviewPolicyForRouting :one
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.system_template, s.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
   (mo.sandbox_id IS NOT NULL)::boolean AS machine_ownership_present,
   mo.owner_principal_id AS machine_owner_principal_id,
@@ -84,6 +84,7 @@ func (q *Queries) GetSandboxWithPreviewPolicyForRouting(ctx context.Context, arg
 		&i.Sandbox.PauseOpTrigger,
 		&i.Sandbox.PauseOpActorID,
 		&i.Sandbox.RoutingVersion,
+		&i.Sandbox.SystemTemplate,
 		&i.Sandbox.SourceSnapshotID,
 		&i.RoutingObservedAt,
 		&i.Access,

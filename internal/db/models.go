@@ -1670,6 +1670,7 @@ type Sandbox struct {
 	// Who asked for the pause in flight; NULL for automatic pauses. Kept so a reconciled pause is attributed to them.
 	PauseOpActorID pgtype.UUID `json:"pause_op_actor_id"`
 	RoutingVersion int64       `json:"routing_version"`
+	SystemTemplate bool        `json:"system_template"`
 	// Snapshot this sandbox was created from; NULL when created from a template.
 	SourceSnapshotID pgtype.UUID `json:"source_snapshot_id"`
 }
@@ -1800,6 +1801,7 @@ type SandboxSnapshot struct {
 	// When the sweep next asks the host about a row creating or deleting; pushed out on every attempt, NULL once the host has confirmed.
 	SweepAfter       pgtype.Timestamptz `json:"sweep_after"`
 	RetentionEndedAt pgtype.Timestamptz `json:"retention_ended_at"`
+	SystemTemplate   bool               `json:"system_template"`
 }
 
 type SandboxStorageBaseline struct {

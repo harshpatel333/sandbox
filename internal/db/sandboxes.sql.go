@@ -164,7 +164,7 @@ WITH paused AS (
          OR EXISTS (SELECT 1 FROM sandbox_machine_owner mo
                     WHERE mo.sandbox_id = sandbox.id AND mo.team_id = sandbox.team_id
                       AND mo.owner_principal_id = $7::uuid))
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, system_template, source_snapshot_id
 ),
 closed_interval AS (
   UPDATE sandbox_active_interval
@@ -180,7 +180,7 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path, p.disk_mib, p.auto_delete_seconds, p.auto_delete_at, p.failed_at, p.had_secret_bindings, p.secret_env_fingerprint, p.secret_env_ip, p.secret_env_injected_at, p.secret_env_expires_at, p.pause_op_id, p.pause_op_started_at, p.pause_op_lease_until, p.pause_op_lease_version, p.pause_op_attention_at, p.pause_op_trigger, p.pause_op_actor_id, p.routing_version, p.source_snapshot_id
+SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path, p.disk_mib, p.auto_delete_seconds, p.auto_delete_at, p.failed_at, p.had_secret_bindings, p.secret_env_fingerprint, p.secret_env_ip, p.secret_env_injected_at, p.secret_env_expires_at, p.pause_op_id, p.pause_op_started_at, p.pause_op_lease_until, p.pause_op_lease_version, p.pause_op_attention_at, p.pause_op_trigger, p.pause_op_actor_id, p.routing_version, p.system_template, p.source_snapshot_id
 FROM paused p
 LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id
 `
@@ -234,6 +234,7 @@ type BeginPauseRow struct {
 	PauseOpTrigger       *string            `json:"pause_op_trigger"`
 	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 	RoutingVersion       int64              `json:"routing_version"`
+	SystemTemplate       bool               `json:"system_template"`
 	SourceSnapshotID     pgtype.UUID        `json:"source_snapshot_id"`
 }
 
@@ -297,6 +298,7 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPa
 		&i.PauseOpTrigger,
 		&i.PauseOpActorID,
 		&i.RoutingVersion,
+		&i.SystemTemplate,
 		&i.SourceSnapshotID,
 	)
 	return i, err
@@ -306,7 +308,7 @@ const beginResume = `-- name: BeginResume :one
 UPDATE sandbox
 SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, system_template, source_snapshot_id
 `
 
 type BeginResumeParams struct {
@@ -360,6 +362,7 @@ func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandb
 		&i.PauseOpTrigger,
 		&i.PauseOpActorID,
 		&i.RoutingVersion,
+		&i.SystemTemplate,
 		&i.SourceSnapshotID,
 	)
 	return i, err
@@ -827,7 +830,7 @@ WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND ($2::int IS NULL OR sandbox.vcpu_count <= $2::int)
   AND ($3::int IS NULL OR sandbox.memory_mib <= $3::int)
   AND ($4::int IS NULL OR sandbox.disk_mib <= $4::int)
-RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcpu_count, sandbox.memory_mib, sandbox.host_id, sandbox.ip_address, sandbox.pid, sandbox.snapshot_id, sandbox.created_at, sandbox.updated_at, sandbox.destroyed_at, sandbox.network_config, sandbox.timeout_seconds, sandbox.metadata, sandbox.template_id, sandbox.snapshot_path, sandbox.mem_path, sandbox.base_path, sandbox.delta_path, sandbox.disk_mib, sandbox.auto_delete_seconds, sandbox.auto_delete_at, sandbox.failed_at, sandbox.had_secret_bindings, sandbox.secret_env_fingerprint, sandbox.secret_env_ip, sandbox.secret_env_injected_at, sandbox.secret_env_expires_at, sandbox.pause_op_id, sandbox.pause_op_started_at, sandbox.pause_op_lease_until, sandbox.pause_op_lease_version, sandbox.pause_op_attention_at, sandbox.pause_op_trigger, sandbox.pause_op_actor_id, sandbox.routing_version, sandbox.source_snapshot_id,
+RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcpu_count, sandbox.memory_mib, sandbox.host_id, sandbox.ip_address, sandbox.pid, sandbox.snapshot_id, sandbox.created_at, sandbox.updated_at, sandbox.destroyed_at, sandbox.network_config, sandbox.timeout_seconds, sandbox.metadata, sandbox.template_id, sandbox.snapshot_path, sandbox.mem_path, sandbox.base_path, sandbox.delta_path, sandbox.disk_mib, sandbox.auto_delete_seconds, sandbox.auto_delete_at, sandbox.failed_at, sandbox.had_secret_bindings, sandbox.secret_env_fingerprint, sandbox.secret_env_ip, sandbox.secret_env_injected_at, sandbox.secret_env_expires_at, sandbox.pause_op_id, sandbox.pause_op_started_at, sandbox.pause_op_lease_until, sandbox.pause_op_lease_version, sandbox.pause_op_attention_at, sandbox.pause_op_trigger, sandbox.pause_op_actor_id, sandbox.routing_version, sandbox.system_template, sandbox.source_snapshot_id,
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
@@ -926,6 +929,7 @@ func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (Claim
 		&i.Sandbox.PauseOpTrigger,
 		&i.Sandbox.PauseOpActorID,
 		&i.Sandbox.RoutingVersion,
+		&i.Sandbox.SystemTemplate,
 		&i.Sandbox.SourceSnapshotID,
 		&i.SnapPath,
 		&i.SnapMemPath,
@@ -1055,13 +1059,13 @@ const createSandbox = `-- name: CreateSandbox :one
 WITH ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, false)
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, system_template, source_snapshot_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $19::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.routing_version, ins.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.routing_version, ins.system_template, ins.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -1126,6 +1130,7 @@ type CreateSandboxRow struct {
 	PauseOpTrigger       *string            `json:"pause_op_trigger"`
 	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 	RoutingVersion       int64              `json:"routing_version"`
+	SystemTemplate       bool               `json:"system_template"`
 	SourceSnapshotID     pgtype.UUID        `json:"source_snapshot_id"`
 	RoutingObservedAt    time.Time          `json:"routing_observed_at"`
 }
@@ -1202,6 +1207,7 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (C
 		&i.PauseOpTrigger,
 		&i.PauseOpActorID,
 		&i.RoutingVersion,
+		&i.SystemTemplate,
 		&i.SourceSnapshotID,
 		&i.RoutingObservedAt,
 	)
@@ -1210,16 +1216,16 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (C
 
 const createSandboxFromSnapshot = `-- name: CreateSandboxFromSnapshot :one
 WITH src AS (
-  SELECT s.id AS source_snapshot_id, s.host_id, s.template_id, s.vcpu_count, s.memory_mib, s.disk_mib,
+  SELECT s.id AS source_snapshot_id, s.host_id, s.template_id, s.system_template, s.vcpu_count, s.memory_mib, s.disk_mib,
          s.base_path, s.snapshot_path, s.mem_path
   FROM sandbox_snapshot s
   WHERE s.id = $1 AND s.team_id = $2
     AND s.status = 'ready' AND s.deleted_at IS NULL
   FOR SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id, network_config)
-  SELECT $3, $2, $4, $5, vcpu_count, memory_mib, host_id, $6, $7, template_id, snapshot_path, mem_path, base_path, disk_mib, $8, cardinality($9::uuid[]) > 0, source_snapshot_id, $10::jsonb FROM src
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id, network_config, system_template)
+  SELECT $3, $2, $4, $5, vcpu_count, memory_mib, host_id, $6, $7, template_id, snapshot_path, mem_path, base_path, disk_mib, $8, cardinality($9::uuid[]) > 0, source_snapshot_id, $10::jsonb, system_template FROM src
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, system_template, source_snapshot_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $11::text, 0 FROM ins
@@ -1229,7 +1235,7 @@ WITH src AS (
   SELECT ins.id, ($9::uuid[])[i], ($12::text[])[i], ($13::text[])[i]
   FROM ins, generate_subscripts($9::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.routing_version, ins.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.routing_version, ins.system_template, ins.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -1288,6 +1294,7 @@ type CreateSandboxFromSnapshotRow struct {
 	PauseOpTrigger       *string            `json:"pause_op_trigger"`
 	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 	RoutingVersion       int64              `json:"routing_version"`
+	SystemTemplate       bool               `json:"system_template"`
 	SourceSnapshotID     pgtype.UUID        `json:"source_snapshot_id"`
 	RoutingObservedAt    time.Time          `json:"routing_observed_at"`
 }
@@ -1358,6 +1365,7 @@ func (q *Queries) CreateSandboxFromSnapshot(ctx context.Context, arg CreateSandb
 		&i.PauseOpTrigger,
 		&i.PauseOpActorID,
 		&i.RoutingVersion,
+		&i.SystemTemplate,
 		&i.SourceSnapshotID,
 		&i.RoutingObservedAt,
 	)
@@ -1366,7 +1374,7 @@ func (q *Queries) CreateSandboxFromSnapshot(ctx context.Context, arg CreateSandb
 
 const createSandboxFromTemplate = `-- name: CreateSandboxFromTemplate :one
 WITH tpl AS (
-  SELECT t.id AS tpl_id, t.disk_mib FROM template t
+  SELECT t.id AS tpl_id, t.disk_mib, (t.team_id = $15)::boolean AS system_template FROM template t
   WHERE t.id = $13
     AND t.deleted_at IS NULL
     AND (t.team_id = $14 OR t.team_id = $15)
@@ -1376,15 +1384,15 @@ WITH tpl AS (
     AND t.delta_path IS NOT DISTINCT FROM $19
   FOR SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
-  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings, system_template)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false, system_template FROM tpl
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, system_template, source_snapshot_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $21::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.routing_version, ins.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.routing_version, ins.system_template, ins.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -1451,6 +1459,7 @@ type CreateSandboxFromTemplateRow struct {
 	PauseOpTrigger       *string            `json:"pause_op_trigger"`
 	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 	RoutingVersion       int64              `json:"routing_version"`
+	SystemTemplate       bool               `json:"system_template"`
 	SourceSnapshotID     pgtype.UUID        `json:"source_snapshot_id"`
 	RoutingObservedAt    time.Time          `json:"routing_observed_at"`
 }
@@ -1535,6 +1544,7 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 		&i.PauseOpTrigger,
 		&i.PauseOpActorID,
 		&i.RoutingVersion,
+		&i.SystemTemplate,
 		&i.SourceSnapshotID,
 		&i.RoutingObservedAt,
 	)
@@ -1543,19 +1553,19 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 
 const createSandboxFromTemplateWithSecrets = `-- name: CreateSandboxFromTemplateWithSecrets :one
 WITH tpl AS (
-  SELECT t.id AS tpl_id, t.disk_mib FROM template t
-  WHERE t.id = $1
+  SELECT t.id AS tpl_id, t.disk_mib, (t.team_id = $1)::boolean AS system_template FROM template t
+  WHERE t.id = $2
     AND t.deleted_at IS NULL
-    AND (t.team_id = $2 OR t.team_id = $3)
+    AND (t.team_id = $3 OR t.team_id = $1)
     AND t.snapshot_path IS NOT DISTINCT FROM $4
     AND t.mem_path IS NOT DISTINCT FROM $5
     AND t.base_path IS NOT DISTINCT FROM $6
     AND t.delta_path IS NOT DISTINCT FROM $7
   FOR SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
-  SELECT $8, $2, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, tpl_id, $4, $5, $6, $7, disk_mib, $19, true FROM tpl
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings, system_template)
+  SELECT $8, $3, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, tpl_id, $4, $5, $6, $7, disk_mib, $19, true, system_template FROM tpl
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, system_template, source_snapshot_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $20::text, 0 FROM ins
@@ -1565,15 +1575,15 @@ WITH tpl AS (
   SELECT ins.id, ($21::uuid[])[i], ($22::text[])[i], ($23::text[])[i]
   FROM ins, generate_subscripts($21::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.routing_version, ins.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.routing_version, ins.system_template, ins.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
 type CreateSandboxFromTemplateWithSecretsParams struct {
+	SystemTeamID      uuid.UUID     `json:"system_team_id"`
 	TemplateID        uuid.UUID     `json:"template_id"`
 	TeamID            uuid.UUID     `json:"team_id"`
-	SystemTeamID      uuid.UUID     `json:"system_team_id"`
 	SnapshotPath      *string       `json:"snapshot_path"`
 	MemPath           *string       `json:"mem_path"`
 	BasePath          *string       `json:"base_path"`
@@ -1635,6 +1645,7 @@ type CreateSandboxFromTemplateWithSecretsRow struct {
 	PauseOpTrigger       *string            `json:"pause_op_trigger"`
 	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 	RoutingVersion       int64              `json:"routing_version"`
+	SystemTemplate       bool               `json:"system_template"`
 	SourceSnapshotID     pgtype.UUID        `json:"source_snapshot_id"`
 	RoutingObservedAt    time.Time          `json:"routing_observed_at"`
 }
@@ -1645,9 +1656,9 @@ type CreateSandboxFromTemplateWithSecretsRow struct {
 // bindings are written either.
 func (q *Queries) CreateSandboxFromTemplateWithSecrets(ctx context.Context, arg CreateSandboxFromTemplateWithSecretsParams) (CreateSandboxFromTemplateWithSecretsRow, error) {
 	row := q.db.QueryRow(ctx, createSandboxFromTemplateWithSecrets,
+		arg.SystemTeamID,
 		arg.TemplateID,
 		arg.TeamID,
-		arg.SystemTeamID,
 		arg.SnapshotPath,
 		arg.MemPath,
 		arg.BasePath,
@@ -1709,6 +1720,7 @@ func (q *Queries) CreateSandboxFromTemplateWithSecrets(ctx context.Context, arg 
 		&i.PauseOpTrigger,
 		&i.PauseOpActorID,
 		&i.RoutingVersion,
+		&i.SystemTemplate,
 		&i.SourceSnapshotID,
 		&i.RoutingObservedAt,
 	)
@@ -1719,7 +1731,7 @@ const createSandboxWithSecrets = `-- name: CreateSandboxWithSecrets :one
 WITH ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, true)
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, system_template, source_snapshot_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $19::text, 0 FROM ins
@@ -1729,7 +1741,7 @@ WITH ins AS (
   SELECT ins.id, ($20::uuid[])[i], ($21::text[])[i], ($22::text[])[i]
   FROM ins, generate_subscripts($20::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.routing_version, ins.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.routing_version, ins.system_template, ins.source_snapshot_id, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -1797,6 +1809,7 @@ type CreateSandboxWithSecretsRow struct {
 	PauseOpTrigger       *string            `json:"pause_op_trigger"`
 	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 	RoutingVersion       int64              `json:"routing_version"`
+	SystemTemplate       bool               `json:"system_template"`
 	SourceSnapshotID     pgtype.UUID        `json:"source_snapshot_id"`
 	RoutingObservedAt    time.Time          `json:"routing_observed_at"`
 }
@@ -1871,6 +1884,7 @@ func (q *Queries) CreateSandboxWithSecrets(ctx context.Context, arg CreateSandbo
 		&i.PauseOpTrigger,
 		&i.PauseOpActorID,
 		&i.RoutingVersion,
+		&i.SystemTemplate,
 		&i.SourceSnapshotID,
 		&i.RoutingObservedAt,
 	)
@@ -2416,7 +2430,7 @@ func (q *Queries) GetPublishedPreviewPort(ctx context.Context, arg GetPublishedP
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, source_snapshot_id FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, routing_version, system_template, source_snapshot_id FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
@@ -2467,6 +2481,7 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 		&i.PauseOpTrigger,
 		&i.PauseOpActorID,
 		&i.RoutingVersion,
+		&i.SystemTemplate,
 		&i.SourceSnapshotID,
 	)
 	return i, err
@@ -2586,7 +2601,7 @@ func (q *Queries) GetSandboxStatusForPreviewMutation(ctx context.Context, arg Ge
 }
 
 const getSandboxWithPreviewPolicy = `-- name: GetSandboxWithPreviewPolicy :one
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.source_snapshot_id,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.system_template, s.source_snapshot_id,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -2647,6 +2662,7 @@ func (q *Queries) GetSandboxWithPreviewPolicy(ctx context.Context, arg GetSandbo
 		&i.Sandbox.PauseOpTrigger,
 		&i.Sandbox.PauseOpActorID,
 		&i.Sandbox.RoutingVersion,
+		&i.Sandbox.SystemTemplate,
 		&i.Sandbox.SourceSnapshotID,
 		&i.Access,
 	)
@@ -2973,7 +2989,7 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 }
 
 const listSandboxesByMachineOwner = `-- name: ListSandboxesByMachineOwner :many
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.source_snapshot_id,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.system_template, s.source_snapshot_id,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
 FROM sandbox s
 JOIN sandbox_machine_owner o ON o.sandbox_id = s.id AND o.team_id = s.team_id
@@ -3074,6 +3090,7 @@ func (q *Queries) ListSandboxesByMachineOwner(ctx context.Context, arg ListSandb
 			&i.Sandbox.PauseOpTrigger,
 			&i.Sandbox.PauseOpActorID,
 			&i.Sandbox.RoutingVersion,
+			&i.Sandbox.SystemTemplate,
 			&i.Sandbox.SourceSnapshotID,
 			&i.PreviewAccess,
 		); err != nil {
@@ -3088,7 +3105,7 @@ func (q *Queries) ListSandboxesByMachineOwner(ctx context.Context, arg ListSandb
 }
 
 const listSandboxesByTeamCreatedAsc = `-- name: ListSandboxesByTeamCreatedAsc :many
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.source_snapshot_id,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.system_template, s.source_snapshot_id,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -3172,6 +3189,7 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 			&i.Sandbox.PauseOpTrigger,
 			&i.Sandbox.PauseOpActorID,
 			&i.Sandbox.RoutingVersion,
+			&i.Sandbox.SystemTemplate,
 			&i.Sandbox.SourceSnapshotID,
 			&i.PreviewAccess,
 		); err != nil {
@@ -3187,7 +3205,7 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 
 const listSandboxesByTeamCreatedDesc = `-- name: ListSandboxesByTeamCreatedDesc :many
 
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.source_snapshot_id,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.system_template, s.source_snapshot_id,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -3284,6 +3302,7 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 			&i.Sandbox.PauseOpTrigger,
 			&i.Sandbox.PauseOpActorID,
 			&i.Sandbox.RoutingVersion,
+			&i.Sandbox.SystemTemplate,
 			&i.Sandbox.SourceSnapshotID,
 			&i.PreviewAccess,
 		); err != nil {
@@ -3298,7 +3317,7 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 }
 
 const listSandboxesByTeamPaged = `-- name: ListSandboxesByTeamPaged :many
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.source_snapshot_id,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id, s.routing_version, s.system_template, s.source_snapshot_id,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -3405,6 +3424,7 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 			&i.Sandbox.PauseOpTrigger,
 			&i.Sandbox.PauseOpActorID,
 			&i.Sandbox.RoutingVersion,
+			&i.Sandbox.SystemTemplate,
 			&i.Sandbox.SourceSnapshotID,
 			&i.PreviewAccess,
 		); err != nil {

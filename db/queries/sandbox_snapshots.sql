@@ -11,7 +11,7 @@
 -- caller that holds the sandbox's secret-write lock, so a detach is in the
 -- row or after it.
 WITH target AS (
-SELECT s.id, s.team_id, s.template_id, s.host_id, s.vcpu_count, s.memory_mib,
+SELECT s.id, s.team_id, s.template_id, s.system_template, s.host_id, s.vcpu_count, s.memory_mib,
        s.disk_mib, s.base_path, s.timeout_seconds, s.network_config,
        s.destroyed_at
 FROM sandbox s
@@ -26,13 +26,13 @@ FOR SHARE OF s
 INSERT INTO sandbox_snapshot (
     id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key,
     host_id, vcpu_count, memory_mib, disk_mib, base_path,
-    timeout_seconds, network_config, secret_bindings, sweep_after
+    timeout_seconds, network_config, secret_bindings, sweep_after, system_template
 )
 SELECT @id::uuid, t.team_id, t.id, t.template_id, @kind::text, 'creating', sqlc.narg('name')::text, sqlc.narg('idempotency_key')::text,
     t.host_id, t.vcpu_count, t.memory_mib, t.disk_mib, t.base_path,
     t.timeout_seconds, COALESCE(t.network_config, '{}'::jsonb),
     sandbox_secret_record(t.id),
-    @sweep_after::timestamptz
+    @sweep_after::timestamptz, t.system_template
 FROM target t
 RETURNING *
 ), opened_measurement_obligation AS (

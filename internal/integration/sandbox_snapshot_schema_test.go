@@ -293,7 +293,9 @@ func TestSandboxSnapshotInsertDoesNotBlockFreeAdmission(t *testing.T) {
 	if _, err := capture.Exec(ctx, `INSERT INTO sandbox_snapshot(team_id,sandbox_id,kind,host_id,vcpu_count,memory_mib,disk_mib,base_path) VALUES($1,$2,'fs','default',1,1024,4096,'/base.ext4')`, team, source); err != nil {
 		t.Fatal(err)
 	}
-	admitted, err := insertSandboxRow(ctx, team, "snapshot-free-admission")
+	var admitted uuid.UUID
+	err = testPool.QueryRow(ctx, `INSERT INTO sandbox(team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,system_template)
+     VALUES($1,'snapshot-free-admission','starting','default',1,1024,4096,true) RETURNING id`, team).Scan(&admitted)
 	if err != nil {
 		t.Fatalf("snapshot prevented allowed Free create: %v", err)
 	}

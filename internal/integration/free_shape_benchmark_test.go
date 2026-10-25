@@ -30,8 +30,8 @@ func BenchmarkFreeShapeAdmission(b *testing.B) {
 			b.Fatal(err)
 		}
 		var raw []byte
-		err = tx.QueryRow(ctx, `EXPLAIN(ANALYZE,FORMAT JSON) INSERT INTO sandbox(team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib)
-		 VALUES($1,$2,'starting',$3,1,1024,4096)`, team, "shape-benchmark-"+uuid.NewString(), testDefaultHostID).Scan(&raw)
+		err = tx.QueryRow(ctx, `EXPLAIN(ANALYZE,FORMAT JSON) INSERT INTO sandbox(team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,system_template)
+		 VALUES($1,$2,'starting',$3,1,1024,4096,true)`, team, "shape-benchmark-"+uuid.NewString(), testDefaultHostID).Scan(&raw)
 		_ = tx.Rollback(ctx)
 		if err != nil {
 			b.Fatal(err)

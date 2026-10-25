@@ -264,6 +264,11 @@ func (h *Handlers) acquireBuildSlot(c *gin.Context, teamID uuid.UUID, joinTempla
 		respondError(c, ErrInternal)
 		return nil, nil
 	}
+	if _, err := tx.Exec(ctx, "SELECT id FROM team WHERE id = $1 FOR SHARE", teamID); err != nil {
+		_ = tx.Rollback(ctx)
+		respondError(c, ErrInternal)
+		return nil, nil
+	}
 	q := h.DB.WithTx(tx)
 	if len(joinTemplate) != 0 {
 		// Serialize input selection with seed edits before testing the cap:
@@ -303,13 +308,19 @@ func (h *Handlers) acquireBuildSlot(c *gin.Context, teamID uuid.UUID, joinTempla
 			return nil, nil
 		}
 	}
-	limit, err := q.GetTeamBuildConcurrency(ctx, teamID)
+	admission, err := q.GetTeamTemplateBuildAdmission(ctx, teamID)
 	if err != nil {
 		_ = tx.Rollback(ctx)
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetTeamBuildConcurrency failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetTeamTemplateBuildAdmission failed")
 		respondError(c, ErrInternal)
 		return nil, nil
 	}
+	if teamID != h.systemTeamID() && !admission.CustomTemplatesAllowed {
+		_ = tx.Rollback(ctx)
+		respondErrorMsg(c, "custom_templates_unavailable", "The Free plan supports only default and system templates", http.StatusForbidden)
+		return nil, nil
+	}
+	limit := admission.BuildConcurrency
 	active, err := q.CountInFlightBuildsForTeam(ctx, teamID)
 	if err != nil {
 		_ = tx.Rollback(ctx)

@@ -1327,6 +1327,10 @@ func respondSandboxAdmissionError(c *gin.Context, err error) bool {
 	if !errors.As(err, &pgErr) {
 		return false
 	}
+	if pgErr.Code == "SS004" {
+		respondErrorMsg(c, "custom_templates_unavailable", "The Free plan supports only default and system templates", http.StatusForbidden)
+		return true
+	}
 	if pgErr.Code == "SS003" {
 		respondErrorMsg(c, "service_unavailable", "Team plan assignment is changing; retry the request", http.StatusServiceUnavailable)
 		return true

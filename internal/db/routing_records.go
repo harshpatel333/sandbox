@@ -32,6 +32,7 @@ func (r RoutingSandbox) Sandbox() Sandbox {
 		AutoDeleteAt:         r.AutoDeleteAt,
 		FailedAt:             r.FailedAt,
 		HadSecretBindings:    r.HadSecretBindings,
+		SystemTemplate:       r.SystemTemplate,
 		SecretEnvFingerprint: r.SecretEnvFingerprint,
 		SecretEnvIp:          r.SecretEnvIp,
 		SecretEnvInjectedAt:  r.SecretEnvInjectedAt,

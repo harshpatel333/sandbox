@@ -39,7 +39,7 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 -- a non-key UPDATE and takes FOR NO KEY UPDATE. That conflicts with FOR SHARE
 -- and not with FOR KEY SHARE.
 WITH tpl AS (
-  SELECT t.id AS tpl_id, t.disk_mib FROM template t
+  SELECT t.id AS tpl_id, t.disk_mib, (t.team_id = $15)::boolean AS system_template FROM template t
   WHERE t.id = $13
     AND t.deleted_at IS NULL
     AND (t.team_id = $14 OR t.team_id = $15)
@@ -49,8 +49,8 @@ WITH tpl AS (
     AND t.delta_path IS NOT DISTINCT FROM $19
   FOR SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
-  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings, system_template)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false, system_template FROM tpl
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -88,7 +88,7 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 -- 0 rows if the template is missing, deleted, or not visible — then no
 -- bindings are written either.
 WITH tpl AS (
-  SELECT t.id AS tpl_id, t.disk_mib FROM template t
+  SELECT t.id AS tpl_id, t.disk_mib, (t.team_id = @system_team_id)::boolean AS system_template FROM template t
   WHERE t.id = @template_id
     AND t.deleted_at IS NULL
     AND (t.team_id = @team_id OR t.team_id = @system_team_id)
@@ -98,8 +98,8 @@ WITH tpl AS (
     AND t.delta_path IS NOT DISTINCT FROM @delta_path
   FOR SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
-  SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds, true FROM tpl
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings, system_template)
+  SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds, true, system_template FROM tpl
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
@@ -126,15 +126,15 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 -- while nothing visible references the build both share; forks of one
 -- snapshot share the lock.
 WITH src AS (
-  SELECT s.id AS source_snapshot_id, s.host_id, s.template_id, s.vcpu_count, s.memory_mib, s.disk_mib,
+  SELECT s.id AS source_snapshot_id, s.host_id, s.template_id, s.system_template, s.vcpu_count, s.memory_mib, s.disk_mib,
          s.base_path, s.snapshot_path, s.mem_path
   FROM sandbox_snapshot s
   WHERE s.id = @snapshot_id AND s.team_id = @team_id
     AND s.status = 'ready' AND s.deleted_at IS NULL
   FOR SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id, network_config)
-  SELECT @id, @team_id, @name, @status, vcpu_count, memory_mib, host_id, @timeout_seconds, @metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, @auto_delete_seconds, cardinality(@secret_ids::uuid[]) > 0, source_snapshot_id, sqlc.narg('network_config')::jsonb FROM src
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id, network_config, system_template)
+  SELECT @id, @team_id, @name, @status, vcpu_count, memory_mib, host_id, @timeout_seconds, @metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, @auto_delete_seconds, cardinality(@secret_ids::uuid[]) > 0, source_snapshot_id, sqlc.narg('network_config')::jsonb, system_template FROM src
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)

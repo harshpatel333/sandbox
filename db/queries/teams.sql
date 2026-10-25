@@ -30,6 +30,10 @@ RETURNING *;
 DELETE FROM team
 WHERE id = $1;
 
--- name: GetTeamBuildConcurrency :one
--- Per-team max concurrent template builds. Used by the build supervisor.
-SELECT build_concurrency FROM team WHERE id = $1;
+-- name: GetTeamTemplateBuildAdmission :one
+SELECT t.build_concurrency,
+       NOT EXISTS (
+         SELECT 1 FROM team_plan_assignment a
+         WHERE a.team_id = t.id AND a.effective_to IS NULL AND a.kind = 'free'
+       ) AS custom_templates_allowed
+FROM team t WHERE t.id = $1;

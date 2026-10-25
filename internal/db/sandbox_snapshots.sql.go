@@ -17,7 +17,7 @@ const beginSandboxSnapshotDelete = `-- name: BeginSandboxSnapshotDelete :one
 UPDATE sandbox_snapshot SET status = 'deleting', sweep_after = now()
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
   AND (status <> 'creating' OR created_at < $3)
-RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at
+RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at, system_template
 `
 
 type BeginSandboxSnapshotDeleteParams struct {
@@ -63,6 +63,7 @@ func (q *Queries) BeginSandboxSnapshotDelete(ctx context.Context, arg BeginSandb
 		&i.DeletedAt,
 		&i.SweepAfter,
 		&i.RetentionEndedAt,
+		&i.SystemTemplate,
 	)
 	return i, err
 }
@@ -78,7 +79,7 @@ WHERE id IN (
     LIMIT $2::bigint
     FOR UPDATE SKIP LOCKED
 )
-RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at
+RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at, system_template
 `
 
 type ClaimStuckSandboxSnapshotsParams struct {
@@ -128,6 +129,7 @@ func (q *Queries) ClaimStuckSandboxSnapshots(ctx context.Context, arg ClaimStuck
 			&i.DeletedAt,
 			&i.SweepAfter,
 			&i.RetentionEndedAt,
+			&i.SystemTemplate,
 		); err != nil {
 			return nil, err
 		}
@@ -158,7 +160,7 @@ func (q *Queries) CountSandboxSnapshots(ctx context.Context, arg CountSandboxSna
 
 const createSandboxSnapshot = `-- name: CreateSandboxSnapshot :one
 WITH target AS (
-SELECT s.id, s.team_id, s.template_id, s.host_id, s.vcpu_count, s.memory_mib,
+SELECT s.id, s.team_id, s.template_id, s.system_template, s.host_id, s.vcpu_count, s.memory_mib,
        s.disk_mib, s.base_path, s.timeout_seconds, s.network_config,
        s.destroyed_at
 FROM sandbox s
@@ -173,15 +175,15 @@ FOR SHARE OF s
 INSERT INTO sandbox_snapshot (
     id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key,
     host_id, vcpu_count, memory_mib, disk_mib, base_path,
-    timeout_seconds, network_config, secret_bindings, sweep_after
+    timeout_seconds, network_config, secret_bindings, sweep_after, system_template
 )
 SELECT $3::uuid, t.team_id, t.id, t.template_id, $4::text, 'creating', $5::text, $6::text,
     t.host_id, t.vcpu_count, t.memory_mib, t.disk_mib, t.base_path,
     t.timeout_seconds, COALESCE(t.network_config, '{}'::jsonb),
     sandbox_secret_record(t.id),
-    $7::timestamptz
+    $7::timestamptz, t.system_template
 FROM target t
-RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at
+RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at, system_template
 ), opened_measurement_obligation AS (
 INSERT INTO retained_storage_measurement_obligation (
     team_id, owner_kind, owner_id, host_id, effective_at
@@ -196,7 +198,7 @@ WHERE feature_enabled('billing_metrics_write', i.team_id)
 ON CONFLICT (owner_kind, owner_id) WHERE resolved_at IS NULL AND ended_at IS NULL DO NOTHING
 RETURNING owner_id
 )
-SELECT i.id, i.team_id, i.sandbox_id, i.template_id, i.kind, i.status, i.name, i.idempotency_key, i.host_id, i.vcpu_count, i.memory_mib, i.disk_mib, i.base_path, i.base_mem_path, i.snapshot_path, i.mem_path, i.overlay_path, i.size_bytes, i.timeout_seconds, i.network_config, i.secret_bindings, i.fc_build_sha, i.guest_kernel, i.snapshot_format, i.created_at, i.ready_at, i.deleted_at, i.sweep_after, i.retention_ended_at FROM inserted i
+SELECT i.id, i.team_id, i.sandbox_id, i.template_id, i.kind, i.status, i.name, i.idempotency_key, i.host_id, i.vcpu_count, i.memory_mib, i.disk_mib, i.base_path, i.base_mem_path, i.snapshot_path, i.mem_path, i.overlay_path, i.size_bytes, i.timeout_seconds, i.network_config, i.secret_bindings, i.fc_build_sha, i.guest_kernel, i.snapshot_format, i.created_at, i.ready_at, i.deleted_at, i.sweep_after, i.retention_ended_at, i.system_template FROM inserted i
 CROSS JOIN (SELECT count(*) FROM retained_fence) retained_fence_guard
 CROSS JOIN (SELECT count(*) FROM opened_measurement_obligation) obligation_fence
 `
@@ -241,6 +243,7 @@ type CreateSandboxSnapshotRow struct {
 	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
 	SweepAfter       pgtype.Timestamptz `json:"sweep_after"`
 	RetentionEndedAt pgtype.Timestamptz `json:"retention_ended_at"`
+	SystemTemplate   bool               `json:"system_template"`
 }
 
 // The row exists as creating before the host is asked, under the id the
@@ -295,6 +298,7 @@ func (q *Queries) CreateSandboxSnapshot(ctx context.Context, arg CreateSandboxSn
 		&i.DeletedAt,
 		&i.SweepAfter,
 		&i.RetentionEndedAt,
+		&i.SystemTemplate,
 	)
 	return i, err
 }
@@ -326,7 +330,7 @@ func (q *Queries) DeletedSavedSnapshotIDs(ctx context.Context, ids []uuid.UUID) 
 }
 
 const getSandboxSnapshot = `-- name: GetSandboxSnapshot :one
-SELECT id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at FROM sandbox_snapshot
+SELECT id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at, system_template FROM sandbox_snapshot
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
 `
 
@@ -369,12 +373,13 @@ func (q *Queries) GetSandboxSnapshot(ctx context.Context, arg GetSandboxSnapshot
 		&i.DeletedAt,
 		&i.SweepAfter,
 		&i.RetentionEndedAt,
+		&i.SystemTemplate,
 	)
 	return i, err
 }
 
 const getSandboxSnapshotByIdempotencyKey = `-- name: GetSandboxSnapshotByIdempotencyKey :one
-SELECT id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at FROM sandbox_snapshot
+SELECT id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at, system_template FROM sandbox_snapshot
 WHERE team_id = $1 AND sandbox_id = $2 AND idempotency_key = $3
 `
 
@@ -419,12 +424,13 @@ func (q *Queries) GetSandboxSnapshotByIdempotencyKey(ctx context.Context, arg Ge
 		&i.DeletedAt,
 		&i.SweepAfter,
 		&i.RetentionEndedAt,
+		&i.SystemTemplate,
 	)
 	return i, err
 }
 
 const getSandboxSnapshotUnscoped = `-- name: GetSandboxSnapshotUnscoped :one
-SELECT id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at FROM sandbox_snapshot WHERE id = $1
+SELECT id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at, system_template FROM sandbox_snapshot WHERE id = $1
 `
 
 // Any team, any state: for settling a host's answer against the row.
@@ -461,12 +467,13 @@ func (q *Queries) GetSandboxSnapshotUnscoped(ctx context.Context, id uuid.UUID) 
 		&i.DeletedAt,
 		&i.SweepAfter,
 		&i.RetentionEndedAt,
+		&i.SystemTemplate,
 	)
 	return i, err
 }
 
 const listSandboxSnapshots = `-- name: ListSandboxSnapshots :many
-SELECT id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at FROM sandbox_snapshot
+SELECT id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at, system_template FROM sandbox_snapshot
 WHERE team_id = $1 AND sandbox_id = $2 AND deleted_at IS NULL
 ORDER BY created_at DESC, id DESC
 LIMIT $4::bigint OFFSET $3::bigint
@@ -523,6 +530,7 @@ func (q *Queries) ListSandboxSnapshots(ctx context.Context, arg ListSandboxSnaps
 			&i.DeletedAt,
 			&i.SweepAfter,
 			&i.RetentionEndedAt,
+			&i.SystemTemplate,
 		); err != nil {
 			return nil, err
 		}
@@ -569,7 +577,7 @@ SET status = 'ready', ready_at = now(),
     mem_path = $3, overlay_path = $4,
     size_bytes = $5, fc_build_sha = $6
 WHERE id = $7 AND status = 'creating'
-RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at
+RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at, system_template
 `
 
 type MarkSandboxSnapshotReadyParams struct {
@@ -625,6 +633,7 @@ func (q *Queries) MarkSandboxSnapshotReady(ctx context.Context, arg MarkSandboxS
 		&i.DeletedAt,
 		&i.SweepAfter,
 		&i.RetentionEndedAt,
+		&i.SystemTemplate,
 	)
 	return i, err
 }
@@ -632,7 +641,7 @@ func (q *Queries) MarkSandboxSnapshotReady(ctx context.Context, arg MarkSandboxS
 const renameSandboxSnapshot = `-- name: RenameSandboxSnapshot :one
 UPDATE sandbox_snapshot SET name = $3
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
-RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at
+RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after, retention_ended_at, system_template
 `
 
 type RenameSandboxSnapshotParams struct {
@@ -674,6 +683,7 @@ func (q *Queries) RenameSandboxSnapshot(ctx context.Context, arg RenameSandboxSn
 		&i.DeletedAt,
 		&i.SweepAfter,
 		&i.RetentionEndedAt,
+		&i.SystemTemplate,
 	)
 	return i, err
 }
