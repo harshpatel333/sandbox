@@ -974,6 +974,8 @@ type BillingPrepaidPurchase struct {
 	CreditBalanceCheckedAt   pgtype.Timestamptz `json:"credit_balance_checked_at"`
 	ReversalCheckedAt        pgtype.Timestamptz `json:"reversal_checked_at"`
 	ReversalCheckRequestedAt pgtype.Timestamptz `json:"reversal_check_requested_at"`
+	ReversalRetryAfter       pgtype.Timestamptz `json:"reversal_retry_after"`
+	ReversalPaymentIntents   []string           `json:"reversal_payment_intents"`
 }
 
 type BillingPrepaidReversal struct {
