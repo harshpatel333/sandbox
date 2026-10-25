@@ -1206,6 +1206,15 @@ func TestPrepaidReversedBeforeCreditStaysWithheldEvenWhenKept(t *testing.T) {
 	if err = f.tick(); err != nil || len(f.grantPosts) != 0 {
 		t.Fatal("the worker credited a reversed purchase", err)
 	}
+	f.enableAutoRecharge(2000, 5000)
+	f.observe(0, true)
+	if err = f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var auto int
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1 AND source='auto_recharge'`, f.team).Scan(&auto); err != nil || auto != 1 {
+		t.Fatal("a withheld reversed purchase suppressed the team's auto-recharge", auto, err)
+	}
 }
 
 func TestPrepaidRefundEventRechecksPurchasesPastTheSweepWindow(t *testing.T) {

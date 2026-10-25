@@ -96,8 +96,10 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
   AND f.credit_checked_at>clock_timestamp()-interval '2 minutes' AND f.credit_usd*100<a.threshold_cents
   AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id
    AND ((p.source='auto_recharge' AND p.payment_state IN ('pending','uncertain','processing'))
-    OR (p.payment_state='succeeded' AND (p.credit_state<>'issued' OR p.credited_at>=f.credit_checked_at))))
-  AND (SELECT count(*) FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id AND p.payment_state<>'failed' AND p.credit_voided_at IS NULL)<$1`
+    OR (p.payment_state='succeeded' AND (p.credit_state<>'issued' OR p.credited_at>=f.credit_checked_at)
+     AND NOT (p.credit_state IN ('none','pending') AND EXISTS(SELECT 1 FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id)))))
+  AND (SELECT count(*) FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id AND p.payment_state<>'failed' AND p.credit_voided_at IS NULL
+   AND NOT (p.credit_state IN ('none','pending') AND EXISTS(SELECT 1 FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id)))<$1`
 	rows, err := tx.Query(ctx, `SELECT t.id`+selection+` ORDER BY t.id LIMIT 50 FOR NO KEY UPDATE OF t SKIP LOCKED`, prepaidLiveGrantLimit)
 	if err != nil {
 		return err
