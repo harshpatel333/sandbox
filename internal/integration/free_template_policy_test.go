@@ -364,3 +364,72 @@ func TestIntegration_FreeTemplatePolicy_RejectsUnknownPredecessorVersion(t *test
 		t.Fatal("unknown predecessor version mutated assignment")
 	}
 }
+
+func TestIntegration_FreeTemplatePolicy_PauseRequestSelectsCommittedSuccessor(t *testing.T) {
+	isolatedFreeTemplatePolicy(t)
+	ctx := t.Context()
+	team, _ := seedTeamAndKey(t)
+	assignFreeTemplatePredecessor(t, team, time.Now().Add(-time.Hour))
+	sandbox := seedActiveSandbox(t, team, "pause-policy-boundary")
+	prepareFreeTemplatePolicy(t)
+	var predecessor uuid.UUID
+	if err := testPool.QueryRow(ctx, `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&predecessor); err != nil {
+		t.Fatal(err)
+	}
+	transition, err := testPool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transition.Rollback(context.Background())
+	var successor uuid.UUID
+	if err := transition.QueryRow(ctx, `SELECT billing_migrate_free_template_assignment('use',$1,$2,$3,'operator@example.com','policy race')`, testSystemTeamID, team, predecessor).Scan(&successor); err != nil {
+		t.Fatal(err)
+	}
+	pauseConn, err := testPool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pauseConn.Release()
+	pauseCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	finished := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		defer close(finished)
+		var count int
+		err := pauseConn.QueryRow(pauseCtx, `SELECT request_team_pause_all($1,'plan_switch_free')`, team).Scan(&count)
+		result <- err
+	}()
+	defer func() { cancel(); _ = transition.Rollback(context.Background()); <-finished }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		select {
+		case err := <-result:
+			t.Fatalf("pause request crossed uncommitted transition: %v", err)
+		default:
+		}
+		var waiting bool
+		if err := testPool.QueryRow(ctx, `SELECT COALESCE(wait_event_type='Lock',false) FROM pg_stat_activity WHERE pid=$1`, pauseConn.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pause request did not reach the transition lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := transition.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	var target uuid.UUID
+	if err := testPool.QueryRow(ctx, `SELECT assignment_id FROM billing_team_pause_target WHERE sandbox_id=$1 AND done_at IS NULL`, sandbox).Scan(&target); err != nil {
+		t.Fatal(err)
+	}
+	if target != successor {
+		t.Fatalf("pause target=%s predecessor=%s successor=%s", target, predecessor, successor)
+	}
+}
