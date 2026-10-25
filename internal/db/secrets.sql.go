@@ -915,7 +915,7 @@ func (q *Queries) SandboxSecretWriteHeld(ctx context.Context, sandboxID uuid.UUI
 const sandboxSecretWriteHeldBy = `-- name: SandboxSecretWriteHeldBy :one
 SELECT EXISTS (
   SELECT 1 FROM sandbox_secret_write_hold
-  WHERE sandbox_id = $1 AND holder = $2 AND expires_at > now()
+  WHERE sandbox_id = $1 AND holder = $2 AND expires_at > clock_timestamp()
 )
 `
 
@@ -924,6 +924,7 @@ type SandboxSecretWriteHeldByParams struct {
 	Holder    uuid.UUID `json:"holder"`
 }
 
+// clock_timestamp for the same reason: it runs after a lock wait.
 func (q *Queries) SandboxSecretWriteHeldBy(ctx context.Context, arg SandboxSecretWriteHeldByParams) (bool, error) {
 	row := q.db.QueryRow(ctx, sandboxSecretWriteHeldBy, arg.SandboxID, arg.Holder)
 	var exists bool
@@ -1002,10 +1003,10 @@ func (q *Queries) SoftDeleteSecretByName(ctx context.Context, arg SoftDeleteSecr
 
 const takeSandboxSecretWriteHold = `-- name: TakeSandboxSecretWriteHold :execrows
 INSERT INTO sandbox_secret_write_hold (sandbox_id, holder, expires_at)
-VALUES ($1, $2, now() + make_interval(secs => $3::int))
+VALUES ($1, $2, clock_timestamp() + make_interval(secs => $3::int))
 ON CONFLICT (sandbox_id) DO UPDATE
 SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
-WHERE sandbox_secret_write_hold.expires_at <= now()
+WHERE sandbox_secret_write_hold.expires_at <= clock_timestamp()
 `
 
 type TakeSandboxSecretWriteHoldParams struct {
@@ -1017,6 +1018,8 @@ type TakeSandboxSecretWriteHoldParams struct {
 // 0 rows: another change holds it and has not expired. A row rather than a
 // session lock, because a transaction pooler gives consecutive statements
 // different server sessions and a session lock can outlive its unlock.
+// clock_timestamp, not now(): the caller waits on the secret-write lock in
+// this transaction, and the lease must not lose that wait.
 func (q *Queries) TakeSandboxSecretWriteHold(ctx context.Context, arg TakeSandboxSecretWriteHoldParams) (int64, error) {
 	result, err := q.db.Exec(ctx, takeSandboxSecretWriteHold, arg.SandboxID, arg.Holder, arg.LeaseSeconds)
 	if err != nil {

@@ -71,20 +71,23 @@ SELECT pg_advisory_xact_lock(hashtext($1)::bigint);
 -- 0 rows: another change holds it and has not expired. A row rather than a
 -- session lock, because a transaction pooler gives consecutive statements
 -- different server sessions and a session lock can outlive its unlock.
+-- clock_timestamp, not now(): the caller waits on the secret-write lock in
+-- this transaction, and the lease must not lose that wait.
 INSERT INTO sandbox_secret_write_hold (sandbox_id, holder, expires_at)
-VALUES (sqlc.arg(sandbox_id), sqlc.arg(holder), now() + make_interval(secs => sqlc.arg(lease_seconds)::int))
+VALUES (sqlc.arg(sandbox_id), sqlc.arg(holder), clock_timestamp() + make_interval(secs => sqlc.arg(lease_seconds)::int))
 ON CONFLICT (sandbox_id) DO UPDATE
 SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
-WHERE sandbox_secret_write_hold.expires_at <= now();
+WHERE sandbox_secret_write_hold.expires_at <= clock_timestamp();
 
 -- name: ReleaseSandboxSecretWriteHold :exec
 DELETE FROM sandbox_secret_write_hold
 WHERE sandbox_id = sqlc.arg(sandbox_id) AND holder = sqlc.arg(holder);
 
 -- name: SandboxSecretWriteHeldBy :one
+-- clock_timestamp for the same reason: it runs after a lock wait.
 SELECT EXISTS (
   SELECT 1 FROM sandbox_secret_write_hold
-  WHERE sandbox_id = sqlc.arg(sandbox_id) AND holder = sqlc.arg(holder) AND expires_at > now()
+  WHERE sandbox_id = sqlc.arg(sandbox_id) AND holder = sqlc.arg(holder) AND expires_at > clock_timestamp()
 );
 
 -- name: SandboxSecretWriteHeld :one
