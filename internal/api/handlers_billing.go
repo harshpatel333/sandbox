@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/errgroup"
@@ -251,28 +253,17 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	}
 
 	now := h.nowUTC()
-	periodStart, periodEnd := billing.CurrentBillingPeriod(now)
 	account, accountErr := h.DB.GetTeamBillingAccount(c.Request.Context(), teamID)
 	if accountErr != nil && !errors.Is(accountErr, pgx.ErrNoRows) {
 		log.Error().Err(accountErr).Str("team_id", teamID.String()).Msg("load billing account failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	if accountErr == nil && account.CommercialBillingAnchor.Valid {
-		if start, end, anchored := billing.AnniversaryPeriod(account.CommercialBillingAnchor.Time, now); anchored {
-			periodStart, periodEnd = start, end
-		}
-	}
-	period, err := h.DB.GetActiveTeamBillingPeriod(c.Request.Context(), teamID)
+	periodStart, periodEnd, err := h.currentBillingPeriod(c.Request.Context(), teamID, account.CommercialBillingAnchor, now)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetActiveTeamBillingPeriod failed")
-			respondError(c, ErrInternal)
-			return
-		}
-	} else if !(accountErr == nil && account.CommercialBillingAnchor.Valid) {
-		periodStart = period.PeriodStart
-		periodEnd = period.PeriodEnd
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("DB GetActiveTeamBillingPeriod failed")
+		respondError(c, ErrInternal)
+		return
 	}
 
 	var (
@@ -621,11 +612,22 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	})
 }
 
-var commercialPlanNames = map[string]string{"pro_monthly": "Pro Monthly", "pro_annual": "Pro Annual", "yc_2026": "YC Pro Annual"}
+var commercialPlanNames = map[string]string{"yc_2026": "YC Pro Annual"}
+
+// catalogPlanName combines a catalog plan's display name with its interval,
+// e.g. "Pro Monthly".
+func catalogPlanName(displayName string, intervalMonths int32) string {
+	if intervalMonths == 12 {
+		return displayName + " Annual"
+	}
+	return displayName + " Monthly"
+}
 
 func billingPlanFromContract(row db.GetCurrentCommercialPlanRow) billingSummaryPlan {
 	name, ok := commercialPlanNames[row.OfferKey]
-	if !ok {
+	if !ok && row.PlanDisplayName != "" {
+		name = catalogPlanName(row.PlanDisplayName, row.ChargeIntervalMonths)
+	} else if !ok {
 		name = row.OfferKey
 	}
 	price := float64(row.ChargeAmountCents) / 100
@@ -821,6 +823,28 @@ func billingUsageSeriesTimezone(raw string) (*time.Location, error) {
 		return nil, errors.New("invalid timezone")
 	}
 	return time.LoadLocation(raw)
+}
+
+// currentBillingPeriod is the period a team's billing page reports: the
+// anniversary period once the team has a commercial anchor, else its open
+// billing period, else the calendar month.
+func (h *Handlers) currentBillingPeriod(ctx context.Context, team uuid.UUID, anchor pgtype.Timestamptz, now time.Time) (time.Time, time.Time, error) {
+	if anchor.Valid {
+		if start, end, anchored := billing.AnniversaryPeriod(anchor.Time, now); anchored {
+			return start, end, nil
+		}
+		start, end := billing.CurrentBillingPeriod(now)
+		return start, end, nil
+	}
+	period, err := h.DB.GetActiveTeamBillingPeriod(ctx, team)
+	if err == nil {
+		return period.PeriodStart, period.PeriodEnd, nil
+	}
+	start, end := billing.CurrentBillingPeriod(now)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = nil
+	}
+	return start, end, err
 }
 
 func (h *Handlers) requireBillingRead(c *gin.Context) (uuid.UUID, bool) {
@@ -1030,25 +1054,51 @@ func billingAccountHasEstablishedSubscription(account db.GetTeamBillingAccountRo
 	}
 }
 
-func (h *Handlers) requireBillingEligible(c *gin.Context, teamID uuid.UUID) bool {
+func (h *Handlers) requireSandboxAdmission(c *gin.Context, teamID uuid.UUID) bool {
 	// Lightweight handler tests use a query mock without the billing schema;
 	// production handlers always have a pool-backed database.
 	if h.Pool == nil {
 		return true
 	}
 	started := time.Now()
-	eligible, err := h.teamBillingEligibleCached(c.Request.Context(), teamID)
+	admission, err := h.teamSandboxAdmissionCached(c.Request.Context(), teamID)
 	log.Debug().Str("team_id", teamID.String()).Int64("billing_eligibility_ms", time.Since(started).Milliseconds()).Msg("billing eligibility check")
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read sandbox billing eligibility failed")
 		respondError(c, ErrInternal)
 		return false
 	}
-	if !eligible {
-		respondErrorMsg(c, "billing_ineligible", "Sandbox usage is unavailable until billing is active", http.StatusPaymentRequired)
+	if !admission.eligible {
+		if admission.allowanceResetsAt != nil {
+			respondFreeAllowanceExhausted(c, *admission.allowanceResetsAt)
+		} else {
+			respondErrorMsg(c, "billing_ineligible", "Sandbox usage is unavailable until billing is active", http.StatusPaymentRequired)
+		}
 		return false
 	}
 	return true
+}
+
+func respondSandboxExceedsPlan(c *gin.Context, limit *sandboxShapeLimit, vcpu, memoryMib, diskMib int32) {
+	limits := gin.H{}
+	var allowed []string
+	for _, d := range []struct {
+		key, unit string
+		cap       int32
+	}{{"max_vcpu", "vCPU", limit.vcpu}, {"max_memory_mib", "MiB memory", limit.memoryMib}, {"max_disk_mib", "MiB disk", limit.diskMib}} {
+		if d.cap > 0 {
+			limits[d.key] = d.cap
+			allowed = append(allowed, fmt.Sprintf("%d %s", d.cap, d.unit))
+		}
+	}
+	c.JSON(http.StatusPaymentRequired, gin.H{
+		"error": gin.H{
+			"code": "sandbox_exceeds_plan_limits",
+			"message": fmt.Sprintf("This sandbox (%d vCPU, %d MiB memory, %d MiB disk) is larger than your plan allows (%s). Upgrade your plan or use a smaller template.",
+				vcpu, memoryMib, diskMib, strings.Join(allowed, ", ")),
+			"limits": limits,
+		},
+	})
 }
 
 func currentBillingPeriod(now time.Time) (time.Time, time.Time) {
@@ -1270,4 +1320,31 @@ func billingTrialRunway(row db.GetTeamTrialRunwayRow, eligible bool, state strin
 	default:
 		return "unknown", &observed
 	}
+}
+
+func respondSandboxAdmissionError(c *gin.Context, err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	if pgErr.Code == "SS003" {
+		respondErrorMsg(c, "service_unavailable", "Team plan assignment is changing; retry the request", http.StatusServiceUnavailable)
+		return true
+	}
+	if pgErr.Code != "SS002" {
+		return false
+	}
+	var shape struct {
+		MaxVCPU   int32 `json:"max_vcpu"`
+		MaxMemory int32 `json:"max_memory_mib"`
+		MaxDisk   int32 `json:"max_disk_mib"`
+		VCPU      int32 `json:"vcpu"`
+		Memory    int32 `json:"memory_mib"`
+		Disk      int32 `json:"disk_mib"`
+	}
+	if json.Unmarshal([]byte(pgErr.Detail), &shape) != nil {
+		return false
+	}
+	respondSandboxExceedsPlan(c, &sandboxShapeLimit{vcpu: shape.MaxVCPU, memoryMib: shape.MaxMemory, diskMib: shape.MaxDisk}, shape.VCPU, shape.Memory, shape.Disk)
+	return true
 }
