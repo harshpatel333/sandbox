@@ -12,6 +12,10 @@ name: Deploy VMD
 on:
   workflow_dispatch:
     inputs:
+      diagnostic_only:
+        description: 'Read-only staging VM discovery; never installs or restarts hosts'
+        type: boolean
+        default: false
       environment:
         description: 'Target environment (staging always runs first)'
         required: false
@@ -121,10 +125,30 @@ env:
   DEPLOY_PRODUCTION_CELL: ${{ inputs.cell }}
 
 jobs:
+  diagnose-staging:
+    if: github.event_name == 'workflow_dispatch' && inputs.diagnostic_only && inputs.environment == 'staging'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      - name: Diagnose staging VM discovery without deployment
+        run: python3 .github/workflows/scripts/deploy-vmd.py --diagnose-staging-discovery
+
   # Failing CI must not reach production control-plane hosts. CI is a
   # separate workflow, so `needs:` can't reach it directly — poll the
   # same-SHA run instead, same pattern as Deploy API's wait-for-migrations.
   wait-for-ci:
+    if: ${{ !inputs.diagnostic_only }}
     runs-on: ubuntu-latest
     permissions:
       actions: read

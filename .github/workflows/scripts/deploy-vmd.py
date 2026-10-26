@@ -319,6 +319,38 @@ def legacy_vmd_enrollment():
     """)
 
 
+def discovery_error(stderr):
+    text = stderr or "(empty)"
+    for key, value in os.environ.items():
+        if value and len(value) >= 4 and re.search(r"TOKEN|PASSWORD|SECRET|DATABASE_URL|WEBHOOK|CREDENTIAL", key, re.I):
+            text = text.replace(value, "[redacted]")
+    text = re.sub(r"(?i)(bearer\s+)\S+", r"\1[redacted]", text)
+    text = re.sub(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s/@]+:[^\s/@]+@", r"\1[redacted]@", text)
+    text = re.sub(r'(?i)((?:access_token|refresh_token|id_token|password|private_key)\s*["\s]*[:=]\s*["\s]*)[^\s",]+', r'\1[redacted]', text)
+    return "".join(c for c in text if c in "\n\t" or c.isprintable())[:4000]
+
+
+def discover_vmd_instances(project, label):
+    try:
+        return subprocess.run(
+            ["gcloud", "compute", "instances", "list", f"--project={project}",
+             f"--filter=labels.{label} AND status=RUNNING",
+             "--format=csv[no-heading](name,zone)"],
+            capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError as error:
+        print(f"VMD instance discovery failed (exit={error.returncode}):\n"
+              f"{discovery_error(error.stderr)}", file=sys.stderr)
+        raise SystemExit(error.returncode or 1) from None
+
+
+def diagnose_staging_discovery():
+    result = discover_vmd_instances("rayai-dev", "component=vmd")
+    print("Staging VM discovery succeeded; no deployment or host access performed.")
+    print(result.stdout.strip() or "No RUNNING instances matched.")
+    return 0
+
+
 def run_or_die(cmd, context):
     """Run a subprocess, surface stderr on failure. Logs reach the
     GitHub Actions UI directly — no need to inspect the runner.
@@ -565,15 +597,7 @@ def main() -> int:
     if local:
         instances = [local]
     else:
-        result = subprocess.run(
-            [
-                "gcloud", "compute", "instances", "list",
-                f"--project={project}",
-                f"--filter=labels.{label} AND status=RUNNING",
-                "--format=csv[no-heading](name,zone)",
-            ],
-            capture_output=True, text=True, check=True,
-        )
+        result = discover_vmd_instances(project, label)
 
         instances = [
             {"name": r[0], "zone": r[1]}
@@ -1683,4 +1707,6 @@ def egress_capacity_update(env):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--diagnose-staging-discovery"]:
+        sys.exit(diagnose_staging_discovery())
     sys.exit(main())
