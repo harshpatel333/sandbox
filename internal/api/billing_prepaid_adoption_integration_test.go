@@ -33,10 +33,7 @@ func installPrepaidPublicStateFixture(t *testing.T, h *Handlers) {
 		if _, err := h.Pool.Exec(context.Background(), assertion); err != nil {
 			t.Error(err)
 		}
-		if _, err := h.Pool.Exec(context.Background(), `DELETE FROM billing_pricing_adoption`); err != nil {
-			t.Error(err)
-		}
-		if _, err := h.Pool.Exec(context.Background(), `INSERT INTO billing_pricing_adoption SELECT * FROM jsonb_populate_record(NULL::billing_pricing_adoption,$1)`, original); err != nil {
+		if _, err := h.Pool.Exec(context.Background(), `INSERT INTO billing_pricing_adoption SELECT * FROM jsonb_populate_record(NULL::billing_pricing_adoption,$1) ON CONFLICT(singleton) DO UPDATE SET region=excluded.region,system_team_id=excluded.system_team_id,epoch=excluded.epoch,state=excluded.state,evidence=excluded.evidence,released_at=excluded.released_at`, original); err != nil {
 			t.Error(err)
 		}
 	})
@@ -54,7 +51,8 @@ func TestPrepaidAdoptionGateReplaysAcceptedPurchaseButRejectsNewEntry(t *testing
 			case "preparing":
 				f.exec(`UPDATE billing_pricing_adoption SET state='preparing',released_at=NULL,evidence=NULL`)
 			case "missing-row":
-				f.exec(`DELETE FROM billing_pricing_adoption`)
+				// Simulate a physically absent row while retaining the production guard for the request.
+				f.exec(`ALTER TABLE billing_pricing_adoption DISABLE TRIGGER billing_pricing_adoption_retained; DELETE FROM billing_pricing_adoption; ALTER TABLE billing_pricing_adoption ENABLE TRIGGER billing_pricing_adoption_retained`)
 			case "missing":
 				f.exec(`ALTER TABLE billing_pricing_adoption RENAME TO prepaid_fixture_adoption`)
 				defer f.exec(`ALTER TABLE prepaid_fixture_adoption RENAME TO billing_pricing_adoption`)
