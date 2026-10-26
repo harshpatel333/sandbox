@@ -276,6 +276,33 @@ func TestPrepaidOperationFirstCheckoutLostReplyRestoresAssociation(t *testing.T)
 	f.sessions[session]["invoice"] = invoice
 	f.mu.Unlock()
 	completed := event("checkout.session.completed", map[string]any{"id": session, "customer": f.customer, "subscription": f.sub, "client_reference_id": f.team.String()})
+	assertSettledWithoutProvider := func(want string) {
+		t.Helper()
+		var requests atomic.Int32
+		unavailable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			http.Error(w, "provider unavailable", 503)
+		}))
+		defer unavailable.Close()
+		previousURL, previousClient := f.client.baseURL, f.client.httpClient
+		f.client.baseURL, f.client.httpClient = unavailable.URL, unavailable.Client()
+		defer func() { f.client.baseURL, f.client.httpClient = previousURL, previousClient }()
+		rec := prepaidOperationPost(r, req)
+		var got prepaidOperationResponse
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.State != want || got.PurchaseID != req.OperationID || got.URL != "" {
+			t.Fatalf("durable %s replay: %d %s", want, rec.Code, rec.Body)
+		}
+		if requests.Load() != 0 {
+			t.Fatalf("settled replay depended on provider: %d requests", requests.Load())
+		}
+	}
+	if err := f.h.processRecordedStripeWebhook(t.Context(), completed); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.settleCheckoutPurchase(t.Context(), f.client, req.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	assertSettledWithoutProvider("paid")
 	for range 2 {
 		if err := f.h.processRecordedStripeWebhook(t.Context(), completed); err != nil {
 			t.Fatal("checkout completed reconciliation", err)
@@ -301,10 +328,13 @@ func TestPrepaidOperationFirstCheckoutLostReplyRestoresAssociation(t *testing.T)
 	if err != nil || !ok || current.Kind != planKindPrepaid || current.Source != planSourceCreditPurchase {
 		t.Fatalf("verified first payment did not assign Starter: %+v %v", current, err)
 	}
-	rec := prepaidOperationPost(r, req)
-	var terminal prepaidOperationResponse
-	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &terminal) != nil || terminal.State != "credited" || terminal.URL != "" {
-		t.Fatalf("settled first-purchase replay: %d %s", rec.Code, rec.Body)
+	assertSettledWithoutProvider("credited")
+	replacement := "sub_later_" + uuid.NewString()
+	f.exec(`UPDATE team_billing_account SET stripe_subscription_id=$2,checkout_subscription_id=$2 WHERE team_id=$1`, f.team, replacement)
+	assertSettledWithoutProvider("credited")
+	var retained bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT stripe_subscription_id=$2 AND checkout_subscription_id=$2 AND checkout_initializing_at IS NULL FROM team_billing_account WHERE team_id=$1`, f.team, replacement).Scan(&retained); err != nil || !retained {
+		t.Fatalf("settled replay changed later valid association: %v %v", retained, err)
 	}
 }
 
@@ -349,12 +379,57 @@ func TestPrepaidOperationRecoveryDoesNotOverwriteChangedCheckout(t *testing.T) {
 			}
 			before := snapshot()
 			saved := prepaidCheckoutSession{ID: "cs_original", Mode: "subscription", Status: "open", Customer: f.customer, ClientReferenceID: f.team.String(), Metadata: map[string]string{"activation_user_id": actor.String(), "checkout_generation": generation.Format(time.RFC3339Nano), "prepaid_purchase_id": purchase.String()}}
-			if err := f.h.restorePrepaidSubscriptionCheckout(t.Context(), f.team, actor, purchase, f.customer, saved); err == nil {
+			if err := f.h.restorePrepaidSubscriptionCheckout(t.Context(), f.team, actor, purchase, f.customer, saved, false); err == nil {
 				t.Fatal("changed checkout accepted")
 			}
 			if after := snapshot(); after != before {
 				t.Fatal("recovery changed another checkout or partially published the association")
 			}
 		})
+	}
+}
+
+func TestPrepaidSettledOperationRepairsOnlyUnpublishedOriginalLease(t *testing.T) {
+	f := newPrepaidFixture(t)
+	actor := uuid.New()
+	r := prepaidOperationRouter(t, f, f.team, actor)
+	req := prepaidCheckoutBody{OperationID: uuid.New(), AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+	generation := time.Now().UTC().Truncate(time.Microsecond)
+	saved := prepaidCheckoutSession{ID: "cs_" + uuid.NewString(), Mode: "subscription", Status: "complete", Customer: f.customer, ClientReferenceID: f.team.String(), Subscription: f.sub, Metadata: map[string]string{"activation_user_id": actor.String(), "checkout_generation": generation.Format(time.RFC3339Nano), "prepaid_purchase_id": req.OperationID.String()}}
+	if err := f.h.recordCheckoutPurchase(t.Context(), req.OperationID, f.team, f.customer, actor, 500, saved.ID); err != nil {
+		t.Fatal(err)
+	}
+	proof, _ := json.Marshal(map[string]any{"amount_cents": 500, "customer": f.customer, "checkout_session": saved})
+	f.exec(`UPDATE billing_prepaid_purchase SET payment_state='succeeded',paid_at=clock_timestamp(),payment_evidence=$2 WHERE id=$1`, req.OperationID, proof)
+	f.exec(`UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL,checkout_initializing_at=$2,checkout_session_id=NULL,checkout_subscription_id=NULL,checkout_request_key=$3,stripe_checkout_actor_id=$4 WHERE team_id=$1`, f.team, generation, "checkout:original:prepaid-operation:"+req.OperationID.String(), actor)
+	var requests atomic.Int32
+	unavailable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "provider unavailable", 503)
+	}))
+	defer unavailable.Close()
+	f.client.baseURL, f.client.httpClient = unavailable.URL, unavailable.Client()
+	assertPaid := func() {
+		t.Helper()
+		rec := prepaidOperationPost(r, req)
+		var got prepaidOperationResponse
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.State != "paid" || got.PurchaseID != req.OperationID || got.URL != "" {
+			t.Fatalf("settled unpublished association: %d %s", rec.Code, rec.Body)
+		}
+	}
+	assertPaid()
+	var repaired bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT checkout_session_id=$2 AND checkout_initializing_at=$3 FROM team_billing_account WHERE team_id=$1`, f.team, saved.ID, generation).Scan(&repaired); err != nil || !repaired {
+		t.Fatalf("original unpublished lease was not repaired from durable proof: %v %v", repaired, err)
+	}
+	newerSession := "cs_newer_" + uuid.NewString()
+	f.exec(`UPDATE team_billing_account SET checkout_session_id=$2,checkout_initializing_at=$3,checkout_request_key=$4 WHERE team_id=$1`, f.team, newerSession, generation.Add(time.Minute), "checkout:newer:prepaid-operation:"+uuid.NewString())
+	assertPaid()
+	var retained bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT checkout_session_id=$2 AND checkout_initializing_at=$3 FROM team_billing_account WHERE team_id=$1`, f.team, newerSession, generation.Add(time.Minute)).Scan(&retained); err != nil || !retained {
+		t.Fatalf("settled replay overwrote newer lease: %v %v", retained, err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("settled association recovery called unavailable provider %d times", requests.Load())
 	}
 }

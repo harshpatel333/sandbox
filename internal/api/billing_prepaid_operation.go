@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/rs/zerolog/log"
 )
 
 var errPrepaidOperationConflict = errors.New("checkout operation is bound to another purchase request")
@@ -47,8 +49,8 @@ func (h *Handlers) resumePrepaidCheckoutOperation(c *gin.Context, client *stripe
 	ctx := c.Request.Context()
 	var customer, payment, credit string
 	var session *string
-	var raw []byte
-	err := h.Pool.QueryRow(ctx, `SELECT customer_id,payment_state,credit_state,checkout_session_id,payment_request FROM billing_prepaid_purchase WHERE id=$1 AND team_id=$2 AND actor_id=$3 AND amount_cents=$4 AND source='checkout'`, req.OperationID, team, actor, req.AmountCents).Scan(&customer, &payment, &credit, &session, &raw)
+	var raw, proof []byte
+	err := h.Pool.QueryRow(ctx, `SELECT customer_id,payment_state,credit_state,checkout_session_id,payment_request,payment_evidence->'checkout_session' FROM billing_prepaid_purchase WHERE id=$1 AND team_id=$2 AND actor_id=$3 AND amount_cents=$4 AND source='checkout'`, req.OperationID, team, actor, req.AmountCents).Scan(&customer, &payment, &credit, &session, &raw, &proof)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -66,10 +68,20 @@ func (h *Handlers) resumePrepaidCheckoutOperation(c *gin.Context, client *stripe
 		} else {
 			return false
 		}
+		if len(raw) == 0 && payment == "succeeded" {
+			var saved prepaidCheckoutSession
+			if json.Unmarshal(proof, &saved) == nil && saved.Mode == "subscription" {
+				// Settlement remains authoritative during provider outages or later plan
+				// changes. Repair only a still-unpublished original lease from its proof.
+				if err := h.restorePrepaidSubscriptionCheckout(ctx, team, actor, req.OperationID, customer, saved, true); err != nil {
+					log.Warn().Err(err).Str("team_id", team.String()).Str("purchase_id", req.OperationID.String()).Msg("settled prepaid checkout association awaits recovery")
+				}
+			}
+		}
 		c.JSON(http.StatusOK, response)
 		return true
 	}
-	if (len(raw) > 0 || payment == "failed") && terminal() {
+	if terminal() {
 		return true, nil
 	}
 	if session == nil {
@@ -97,13 +109,13 @@ func (h *Handlers) resumePrepaidCheckoutOperation(c *gin.Context, client *stripe
 			}
 		}
 		var recorded *string
-		if err = h.Pool.QueryRow(ctx, `SELECT payment_state,credit_state,checkout_session_id FROM billing_prepaid_purchase WHERE id=$1`, req.OperationID).Scan(&payment, &credit, &recorded); err != nil {
+		if err = h.Pool.QueryRow(ctx, `SELECT payment_state,credit_state,checkout_session_id,payment_evidence->'checkout_session' FROM billing_prepaid_purchase WHERE id=$1`, req.OperationID).Scan(&payment, &credit, &recorded, &proof); err != nil {
 			return true, err
 		}
 		if recorded != nil {
 			session = recorded
 		}
-		if (len(raw) > 0 || payment == "failed") && terminal() {
+		if terminal() {
 			return true, nil
 		}
 	}
@@ -119,7 +131,7 @@ func (h *Handlers) resumePrepaidCheckoutOperation(c *gin.Context, client *stripe
 		return true, errors.New("checkout session differs from the operation")
 	}
 	if len(raw) == 0 && saved.Status != "expired" {
-		if err = h.restorePrepaidSubscriptionCheckout(ctx, team, actor, req.OperationID, customer, saved); err != nil {
+		if err = h.restorePrepaidSubscriptionCheckout(ctx, team, actor, req.OperationID, customer, saved, false); err != nil {
 			return true, err
 		}
 	}
@@ -150,7 +162,7 @@ func (h *Handlers) resumePrepaidCheckoutOperation(c *gin.Context, client *stripe
 
 // A provider response can be lost before either local association is written.
 // Restore both under the original lease fence before exposing its Checkout URL.
-func (h *Handlers) restorePrepaidSubscriptionCheckout(ctx context.Context, team, actor, purchase uuid.UUID, customer string, saved prepaidCheckoutSession) error {
+func (h *Handlers) restorePrepaidSubscriptionCheckout(ctx context.Context, team, actor, purchase uuid.UUID, customer string, saved prepaidCheckoutSession, unresolvedOnly bool) error {
 	generation, err := time.Parse(time.RFC3339Nano, saved.Metadata["checkout_generation"])
 	if err != nil || saved.Mode != "subscription" || saved.ClientReferenceID != team.String() || saved.Metadata["activation_user_id"] != actor.String() || saved.Metadata["prepaid_purchase_id"] != purchase.String() || saved.Customer != customer || saved.ID == "" {
 		return errors.New("recovered subscription checkout identity differs")
@@ -170,11 +182,16 @@ func (h *Handlers) restorePrepaidSubscriptionCheckout(ctx context.Context, team,
 	if err != nil {
 		return err
 	}
-	if derefString(account.StripeCustomerID) != customer || !account.StripeCheckoutActorID.Valid || uuid.UUID(account.StripeCheckoutActorID.Bytes) != actor || (account.CheckoutSessionID != nil && *account.CheckoutSessionID != saved.ID) {
+	sameOwner := derefString(account.StripeCustomerID) == customer && account.StripeCheckoutActorID.Valid && uuid.UUID(account.StripeCheckoutActorID.Bytes) == actor
+	sameLease := account.CheckoutInitializingAt.Valid && account.CheckoutInitializingAt.Time.Equal(generation) && strings.HasSuffix(derefString(account.CheckoutRequestKey), ":prepaid-operation:"+purchase.String())
+	if unresolvedOnly && (!sameOwner || !sameLease || account.CheckoutSessionID != nil) {
+		return nil
+	}
+	if !sameOwner || (account.CheckoutSessionID != nil && *account.CheckoutSessionID != saved.ID) {
 		return errors.New("subscription checkout association changed during recovery")
 	}
 	if account.CheckoutInitializingAt.Valid {
-		if !account.CheckoutInitializingAt.Time.Equal(generation) || !strings.HasSuffix(derefString(account.CheckoutRequestKey), ":prepaid-operation:"+purchase.String()) {
+		if !sameLease {
 			return errors.New("subscription checkout lease changed during recovery")
 		}
 		expired, err := q.HasStripeCheckoutExpiration(ctx, team, customer, generation)
