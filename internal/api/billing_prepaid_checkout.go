@@ -67,13 +67,20 @@ func (h *Handlers) recordCheckoutPurchase(ctx context.Context, id, team uuid.UUI
 		return err
 	}
 	if session == "" {
+		var admissible bool
+		if err = tx.QueryRow(ctx, `SELECT payment_state NOT IN ('failed','succeeded') AND (checkout_session_id IS NOT NULL OR payment_first_attempt_at IS NULL OR payment_first_attempt_at>clock_timestamp()-interval '23 hours') FROM billing_prepaid_purchase WHERE id=$1 FOR UPDATE`, id).Scan(&admissible); err != nil {
+			return err
+		}
+		if !admissible {
+			return errPrepaidPaymentPending
+		}
 		if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_state='uncertain',payment_first_attempt_at=clock_timestamp(),next_attempt_at=clock_timestamp()+interval '2 minutes' WHERE id=$1 AND payment_state='pending'`, id); err != nil {
 			return err
 		}
 	} else {
 		var recorded *string
 		err = tx.QueryRow(ctx, `UPDATE billing_prepaid_purchase SET checkout_session_id=COALESCE(checkout_session_id,$2),payment_state=CASE WHEN payment_state IN ('pending','uncertain') THEN 'processing' ELSE payment_state END,
-   payment_first_attempt_at=COALESCE(payment_first_attempt_at,clock_timestamp()) WHERE id=$1 AND team_id=$3 AND customer_id=$4 AND amount_cents=$5 RETURNING checkout_session_id`, id, session, team, customer, amount).Scan(&recorded)
+   payment_first_attempt_at=COALESCE(payment_first_attempt_at,clock_timestamp()) WHERE id=$1 AND team_id=$3 AND customer_id=$4 AND amount_cents=$5 AND payment_state<>'failed' RETURNING checkout_session_id`, id, session, team, customer, amount).Scan(&recorded)
 		if err != nil {
 			return err
 		}
@@ -204,7 +211,7 @@ func (h *Handlers) settleCheckoutPurchase(ctx context.Context, client *stripeHTT
 	}
 	if session == nil {
 		if first == nil {
-			return h.failPrepaidPayment(ctx, id, "", "the checkout was never opened", false)
+			return h.failSessionlessPrepaidCheckout(ctx, id)
 		}
 		if request == nil || time.Since(*first) >= 23*time.Hour {
 			found, err := client.findPrepaidCheckout(ctx, customer, id)
@@ -215,7 +222,7 @@ func (h *Handlers) settleCheckoutPurchase(ctx context.Context, client *stripeHTT
 				if time.Since(*first) < 23*time.Hour {
 					return errPrepaidPaymentPending
 				}
-				return h.failPrepaidPayment(ctx, id, "", "the checkout was never opened", false)
+				return h.failSessionlessPrepaidCheckout(ctx, id)
 			}
 			if _, err = h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET checkout_session_id=$2,payment_state='processing' WHERE id=$1 AND checkout_session_id IS NULL AND payment_state='uncertain'`, id, found); err != nil {
 				return err
@@ -367,4 +374,24 @@ func (c *stripeHTTPClient) findPrepaidCheckout(ctx context.Context, customer str
 		cursor = list.Data[len(list.Data)-1].ID
 	}
 	return "", errors.New("checkout inventory exceeds the discovery bound")
+}
+
+// Recheck the row atomically after provider discovery. A session published while
+// discovery was in flight must not be converted to an immutable failed payment.
+func (h *Handlers) failSessionlessPrepaidCheckout(ctx context.Context, id uuid.UUID) error {
+	tag, err := h.Pool.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_state='failed',failure_reason='the checkout was never opened' WHERE id=$1 AND payment_state IN ('pending','uncertain','processing') AND checkout_session_id IS NULL AND (payment_first_attempt_at IS NULL OR payment_first_attempt_at<=clock_timestamp()-interval '23 hours')`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	var terminal bool
+	if err = h.Pool.QueryRow(ctx, `SELECT payment_state IN ('succeeded','failed') FROM billing_prepaid_purchase WHERE id=$1`, id).Scan(&terminal); err != nil {
+		return err
+	}
+	if terminal {
+		return nil
+	}
+	return errPrepaidPaymentPending
 }

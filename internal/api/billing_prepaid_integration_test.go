@@ -61,6 +61,8 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 	if err != nil || !strings.HasSuffix(cfg.ConnConfig.Database, "_test") {
 		t.Fatal("DATABASE_URL must name a migrated disposable test database", err)
 	}
+	// Match the small CI pool so concurrent checkout tests expose nested borrowing.
+	cfg.MaxConns = 4
 	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
 	if err != nil {
 		t.Fatal(err)
