@@ -31,6 +31,10 @@ CREATE OR REPLACE FUNCTION public.start_device_code(
     p_window           interval
 ) RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
+    -- A NULL in any of these would skip the lock and the count.
+    IF p_requester_hash IS NULL OR p_max_per_window IS NULL OR p_window IS NULL THEN
+        RAISE EXCEPTION 'invalid device code request' USING ERRCODE = '22023';
+    END IF;
     PERFORM pg_advisory_xact_lock(hashtext('device_code'), hashtext(p_requester_hash));
     IF (SELECT count(*) FROM public.device_code
         WHERE requester_hash = p_requester_hash
