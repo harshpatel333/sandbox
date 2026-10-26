@@ -107,9 +107,10 @@ func validatePlatform(img v1.Image, wantOS, wantArch string) error {
 }
 
 // extractTar reads a flattened image tarball and writes entries into destDir,
-// preserving mode, ownership (within process privileges), symlinks, and
-// hardlinks. Rejects path traversal (..) and symlinks pointing outside destDir.
-// Enforces maxBytes total across all regular files when >0.
+// preserving mode (setuid, setgid, and sticky included), symlinks, hardlinks,
+// and, when running as root, ownership. Rejects path traversal (..) and
+// symlinks pointing outside destDir. Enforces maxBytes total across all
+// regular files when >0.
 func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64) error {
 	absDest, err := filepath.Abs(destDir)
 	if err != nil {
@@ -123,6 +124,9 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 
 	tr := tar.NewReader(r)
 	var totalBytes int64
+	// Directory modes land after their contents, so a read-only directory
+	// does not block the entries extracted into it.
+	var dirModes []dirMode
 
 	for {
 		select {
@@ -133,6 +137,11 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 		hdr, err := tr.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				for i := len(dirModes) - 1; i >= 0; i-- {
+					if err := os.Chmod(dirModes[i].path, dirModes[i].mode); err != nil {
+						return fmt.Errorf("chmod %s: %w", dirModes[i].path, err)
+					}
+				}
 				return nil
 			}
 			return fmt.Errorf("read tar header: %w", err)
@@ -152,7 +161,9 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)&0o7777); err != nil {
+			// Writable while its contents are extracted; dirModes applies the
+			// entry's own mode at the end.
+			if err := os.MkdirAll(target, 0o755); err != nil {
 				return fmt.Errorf("mkdir %s: %w", target, err)
 			}
 
@@ -226,12 +237,54 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 			continue
 		}
 
+		// A hardlink shares its target's inode, which already has its owner
+		// and mode.
+		if hdr.Typeflag != tar.TypeLink {
+			if err := restoreOwner(target, hdr); err != nil {
+				return err
+			}
+		}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			dirModes = append(dirModes, dirMode{path: target, mode: tarEntryMode(hdr)})
+		case tar.TypeReg, tar.TypeRegA:
+			// After the owner: chown clears setuid and setgid.
+			if err := os.Chmod(target, tarEntryMode(hdr)); err != nil {
+				return fmt.Errorf("chmod %s: %w", target, err)
+			}
+		}
+
 		// Preserve mtime for files/symlinks where possible. Best-effort;
 		// ignore errors (not all filesystems support sub-second precision).
 		if hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeRegA {
 			_ = os.Chtimes(target, hdr.ModTime, hdr.ModTime)
 		}
 	}
+}
+
+type dirMode struct {
+	path string
+	mode os.FileMode
+}
+
+// restoreOwner gives an entry the owner its layer records, as a container
+// runtime does; a file owned by a service account must not become root's.
+// Only root can do this, so without it entries stay owned by the builder.
+func restoreOwner(target string, hdr *tar.Header) error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	if err := os.Lchown(target, hdr.Uid, hdr.Gid); err != nil {
+		return fmt.Errorf("chown %s: %w", target, err)
+	}
+	return nil
+}
+
+// tarEntryMode returns an entry's permission bits with setuid, setgid, and
+// sticky, which os.FileMode keeps as flags rather than as the 0o7000 bits a
+// raw conversion of the header's mode would carry.
+func tarEntryMode(hdr *tar.Header) os.FileMode {
+	return hdr.FileInfo().Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
 }
 
 // validateSymlink rejects symlinks whose target escapes absDest. Callers
