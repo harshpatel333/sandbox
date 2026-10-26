@@ -54,7 +54,7 @@ func validateFirstProCycleGrant(u proUpgrade, g entitlementGrant) error {
 	if err != nil {
 		return err
 	}
-	if g.ID != derefString(u.Grant) || g.Customer != u.Customer || g.Category != "paid" || g.Priority != 50 || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != u.bridgeCreditAmount() || g.ExpiresAt != expires || g.VoidedAt != 0 || g.EffectiveAt > u.End.Unix() || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Metadata["pro_upgrade_id"] != u.ID.String() {
+	if g.ID != derefString(u.Grant) || g.Customer != u.Customer || g.Category != "paid" || g.Priority != 50 || g.Amount.Type != "monetary" || g.Amount.Monetary.Currency != "usd" || g.Amount.Monetary.Value != u.bridgeCreditAmount() || g.ExpiresAt != expires || g.VoidedAt != 0 || (expires > 0 && g.EffectiveAt > u.End.Unix()) || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Metadata["pro_upgrade_id"] != u.ID.String() {
 		return errors.New("first Pro month allowance is missing or differs from paid terms")
 	}
 	return nil

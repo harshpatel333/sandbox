@@ -446,6 +446,18 @@ func testProUpgradeCreditRecovery(t *testing.T, credit *int64, firstCycle bool) 
 	if err = h.verifyOwnedEntitlementGrant(t.Context(), g); err != nil {
 		t.Fatalf("generic credit inventory rejected recognized upgrade terms: %v", err)
 	}
+	if !firstCycle {
+		// Historical bridge grants never expire and may be issued after the
+		// accepted stub ends when payment recovery or activation was delayed.
+		g.EffectiveAt = u.End.Add(time.Hour).Unix()
+		h.Now = func() time.Time { return u.End.Add(2 * time.Hour) }
+		if err = h.issueProUpgradeCredit(t.Context(), conn, &u, client); err != nil {
+			t.Fatalf("delayed legacy bridge recovery rejected: %v", err)
+		}
+		if err = h.verifyOwnedEntitlementGrant(t.Context(), g); err != nil {
+			t.Fatalf("generic credit inventory rejected delayed legacy bridge: %v", err)
+		}
+	}
 	orphan := g
 	orphan.ID = "cred_" + uuid.NewString()
 	orphan.Metadata = map[string]string{"pro_upgrade_id": uuid.NewString()}
