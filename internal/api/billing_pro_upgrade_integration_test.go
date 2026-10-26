@@ -194,10 +194,14 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 	if _, err = conn.Exec(t.Context(), `UPDATE team SET home_region='use' WHERE id=$1`, team); err != nil {
 		t.Fatal(err)
 	}
+	var reportAt time.Time
+	if err = conn.QueryRow(t.Context(), `SELECT clock_timestamp()`).Scan(&reportAt); err != nil {
+		t.Fatal(err)
+	}
 	bridgeTeams := func() int64 {
 		t.Helper()
 		var count int64
-		if err := conn.QueryRow(t.Context(), `SELECT COALESCE(sum(count),0)::bigint FROM (`+mrrContractGroupsQuery+`) groups WHERE offer_key='pro_monthly'`, now, "use", "").Scan(&count); err != nil {
+		if err := conn.QueryRow(t.Context(), `SELECT COALESCE(sum(count),0)::bigint FROM (`+mrrContractGroupsQuery+`) groups WHERE offer_key='pro_monthly'`, reportAt, "use", "").Scan(&count); err != nil {
 			t.Fatal(err)
 		}
 		return count
