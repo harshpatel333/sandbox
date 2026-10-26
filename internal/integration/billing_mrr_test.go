@@ -208,14 +208,23 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 	insert(newTeam("use"), notStarted)
 	// A paid bridge already runs Pro at the committed recurring fee, even when
 	// its first payment is completely covered by a coupon.
-	for _, scenario := range []string{"activated", "coupon", "unpaid", "ended-contract", "ended-assignment"} {
+	for _, scenario := range []string{"pending-positive", "pending-zero", "active-positive", "active-zero", "coupon", "unpaid", "unactivated-zero", "ended-contract", "ended-assignment"} {
 		team := newTeam("use")
 		c := contract{"pro_monthly", "pending", "subscription", 25000, 1, future, nil}
 		if scenario == "ended-contract" {
 			c.status = "ended"
+		} else if strings.HasPrefix(scenario, "active-") {
+			c.status = "active"
 		}
 		id := insert(team, c)
 		state, evidence, grant := "active", `{"amount_paid":12500}`, "grant_"+uuid.NewString()
+		bridge := int64(12500)
+		if strings.HasSuffix(scenario, "-zero") {
+			bridge, grant = 0, ""
+		}
+		if scenario == "unactivated-zero" {
+			state = "checkout"
+		}
 		if scenario == "coupon" {
 			evidence = `{"amount_paid":0,"discount":12500}`
 		}
@@ -223,8 +232,8 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 			state, evidence, grant = "checkout", "null", ""
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO billing_pro_upgrade
- (id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,grant_id,contract_id)
- VALUES(gen_random_uuid(),$1,gen_random_uuid(),'cus_'||$2::text,'sub_'||$2::text,'pro_monthly','{}',$3,$3,$4,$5,12500,$6,NULLIF($7::jsonb,'null'::jsonb),NULLIF($8,''),$2::uuid)`, team, id, past, future, now, state, evidence, grant); err != nil {
+ (id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,grant_id,contract_id,bridge_credit_cents)
+ VALUES(gen_random_uuid(),$1,gen_random_uuid(),'cus_'||$2::text,'sub_'||$2::text,'pro_monthly','{}',$3,$3,$4,$5,12500,$6,NULLIF($7::jsonb,'null'::jsonb),NULLIF($8,''),$2::uuid,$9)`, team, id, past, future, now, state, evidence, grant, bridge); err != nil {
 			t.Fatal(err)
 		}
 		var closed *time.Time
@@ -247,23 +256,23 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 	if after.Region != "use" {
 		t.Fatalf("region = %q", after.Region)
 	}
-	if d := after.MRRCents - before.MRRCents; d != 120000+100000+10000+100000+100000+25000+25000 {
+	if d := after.MRRCents - before.MRRCents; d != 120000+100000+10000+100000+100000+5*25000 {
 		t.Fatalf("mrr delta = %d", d)
 	}
-	if d := after.Teams - before.Teams; d != 16 {
+	if d := after.Teams - before.Teams; d != 20 {
 		t.Fatalf("team delta = %d", d)
 	}
-	if d := after.RevenueTeams - before.RevenueTeams; d != 7 {
+	if d := after.RevenueTeams - before.RevenueTeams; d != 10 {
 		t.Fatalf("revenue team delta = %d", d)
 	}
 	for _, want := range []mrrTestPlan{
-		{Key: "pro_monthly", Teams: 3, MRRCents: 170000},
+		{Key: "pro_monthly", Teams: 6, MRRCents: 245000},
 		{Key: "pro_annual", Teams: 1, MRRCents: 100000},
 		{Key: "starter_monthly", Teams: 1, MRRCents: 10000},
 		{Key: "yc_2026", Teams: 1, MRRCents: 100000},
 		{Key: "sponsored_annual_pro", Teams: 1, MRRCents: 100000},
 		{Key: "sponsored_usage", Teams: 2, MRRCents: 0},
-		{Key: "payg", Teams: 7, MRRCents: 0},
+		{Key: "payg", Teams: 8, MRRCents: 0},
 	} {
 		got, was := after.plan(want.Key), before.plan(want.Key)
 		if got.Teams-was.Teams != want.Teams || got.MRRCents-was.MRRCents != want.MRRCents {
