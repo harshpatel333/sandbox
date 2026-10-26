@@ -1461,6 +1461,7 @@ type DeviceCode struct {
 	TeamRegion    *string            `json:"team_region"`
 	ApprovedAt    pgtype.Timestamptz `json:"approved_at"`
 	ConsumedAt    pgtype.Timestamptz `json:"consumed_at"`
+	LastPolledAt  pgtype.Timestamptz `json:"last_polled_at"`
 }
 
 type EarlyAccessRequest struct {
