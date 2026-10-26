@@ -43,7 +43,7 @@ func TestPrepaidOperationRejectedCheckoutCannotOutlivePurchaseDeadline(t *testin
 	for _, tc := range []struct {
 		age        time.Duration
 		interleave bool
-	}{{24 * time.Hour, false}, {24 * time.Hour, true}, {time.Hour, false}} {
+	}{{24 * time.Hour, false}, {24 * time.Hour, true}, {time.Hour, false}, {22*time.Hour + 29*time.Minute, false}, {22*time.Hour + 30*time.Minute, false}, {22*time.Hour + 30*time.Minute + time.Second, false}, {22*time.Hour + 59*time.Minute, false}} {
 		interleave := tc.interleave
 		t.Run(tc.age.String()+strconv.FormatBool(interleave), func(t *testing.T) {
 			f := newPrepaidFixture(t)
@@ -85,6 +85,7 @@ func TestPrepaidOperationRejectedCheckoutCannotOutlivePurchaseDeadline(t *testin
 				t.Fatalf("4xx did not release lease: %v %v", released, err)
 			}
 			original := agePrepaidCheckoutAttempt(t, f, req.OperationID, tc.age)
+			f.h.Config.AppAllowedOrigins = []string{"https://replacement.example.com"}
 			var retry *httptest.ResponseRecorder
 			if interleave {
 				done := make(chan *httptest.ResponseRecorder, 1)
@@ -103,7 +104,7 @@ func TestPrepaidOperationRejectedCheckoutCannotOutlivePurchaseDeadline(t *testin
 			} else {
 				retry = prepaidOperationPost(r, req)
 			}
-			if tc.age < 23*time.Hour {
+			if tc.age < 22*time.Hour+30*time.Minute {
 				var got prepaidOperationResponse
 				if retry.Code != 200 || json.Unmarshal(retry.Body.Bytes(), &got) != nil || got.URL == "" || posts.Load() != 2 {
 					t.Fatalf("within-deadline retry: %d %s posts=%d", retry.Code, retry.Body, posts.Load())
@@ -119,6 +120,28 @@ func TestPrepaidOperationRejectedCheckoutCannotOutlivePurchaseDeadline(t *testin
 			}
 			if posts.Load() != 1 {
 				t.Fatalf("expired operation dispatched another session: posts=%d", posts.Load())
+			}
+			if tc.age < 23*time.Hour {
+				// This is not payment failure: the old purchase remains discoverable
+				// until its original deadline, but no new generation may dispatch.
+				var intact bool
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT p.payment_state='uncertain' AND p.checkout_session_id IS NULL AND p.payment_first_attempt_at=$2 AND a.checkout_initializing_at IS NULL FROM billing_prepaid_purchase p JOIN team_billing_account a USING(team_id) WHERE p.id=$1`, req.OperationID, original).Scan(&intact); err != nil || !intact {
+					t.Fatalf("late fresh generation changed original outcome: %v %v", intact, err)
+				}
+				done := make(chan *httptest.ResponseRecorder, 4)
+				for range 4 {
+					go func() { done <- prepaidOperationPost(r, req) }()
+				}
+				for range 4 {
+					rec := <-done
+					if rec.Code != 202 && rec.Code != 409 {
+						t.Fatalf("concurrent late retry: %d %s", rec.Code, rec.Body)
+					}
+				}
+				if posts.Load() != 1 {
+					t.Fatalf("concurrent late generation dispatched: %d", posts.Load())
+				}
+				return
 			}
 			if err := f.h.settleCheckoutPurchase(t.Context(), f.client, req.OperationID); err != nil {
 				t.Fatal(err)
@@ -171,5 +194,67 @@ func TestPrepaidSessionlessFailureRechecksPublishedSession(t *testing.T) {
 	var intact bool
 	if err = f.h.Pool.QueryRow(t.Context(), `SELECT checkout_session_id=$2 AND payment_state='processing' AND failure_reason IS NULL FROM billing_prepaid_purchase WHERE id=$1`, id, published).Scan(&intact); err != nil || !intact {
 		t.Fatalf("published session was permanently failed: %v %v", intact, err)
+	}
+}
+
+func TestPrepaidOperationLateAmbiguousGenerationKeepsReplay(t *testing.T) {
+	f := newPrepaidFixture(t)
+	actor := uuid.New()
+	r := prepaidOperationRouter(t, f, f.team, actor)
+	prices := []string{"price_cpu", "price_memory"}
+	f.h.Config.StripeCheckoutPriceIDs = prices
+	f.exec(`UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL WHERE team_id=$1`, f.team)
+	f.exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, f.team)
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/checkout/sessions" {
+			if request.Method == http.MethodGet {
+				_, _ = w.Write([]byte(`{"data":[],"has_more":false}`))
+				return
+			}
+			if request.Method == http.MethodPost && posts.Add(1) == 1 {
+				f.serve(httptest.NewRecorder(), request)
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				_ = conn.Close()
+				return
+			}
+		}
+		f.serve(w, request)
+	}))
+	defer srv.Close()
+	f.client.baseURL, f.client.httpClient = srv.URL, srv.Client()
+	req := prepaidCheckoutBody{OperationID: uuid.New(), AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+	if rec := prepaidOperationPost(r, req); rec.Code != 502 {
+		t.Fatalf("lost response: %d %s", rec.Code, rec.Body)
+	}
+	// Move both immutable fixture clocks and the provider's original replay key
+	// together, simulating a previously dispatched generation near its expiry.
+	generation := agePrepaidCheckoutAttempt(t, f, req.OperationID, 22*time.Hour+40*time.Minute)
+	f.exec(`UPDATE team_billing_account SET checkout_initializing_at=$2 WHERE team_id=$1`, f.team, generation)
+	keyParts := append(append([]string(nil), prices...), "prepaid:500")
+	key := checkoutSessionIdempotencyKeyForLease(f.team, f.customer, req.SuccessURL, req.CancelURL, keyParts, generation)
+	var originalSession string
+	f.mu.Lock()
+	for id, session := range f.sessions {
+		originalSession = id
+		session["metadata"].(map[string]string)["checkout_generation"] = generation.Format(time.RFC3339Nano)
+	}
+	f.sessionByKey[key] = originalSession
+	f.mu.Unlock()
+	f.h.Config.AppAllowedOrigins = nil
+	rec := prepaidOperationPost(r, req)
+	var got prepaidOperationResponse
+	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.ID != originalSession || got.URL == "" || posts.Load() != 2 {
+		t.Fatalf("ambiguous generation lost replay: %d %s posts=%d", rec.Code, rec.Body, posts.Load())
+	}
+	f.mu.Lock()
+	count := len(f.sessions)
+	f.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("replay duplicated session: %d", count)
 	}
 }
