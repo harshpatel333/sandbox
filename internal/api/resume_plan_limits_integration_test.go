@@ -77,7 +77,7 @@ func TestResumeUsesCurrentNonFreePlanShape(t *testing.T) {
 			if reachedBoot != tc.allowed {
 				t.Fatalf("boot=%v want=%v status=%d body=%s", reachedBoot, tc.allowed, w.Code, w.Body)
 			}
-			if !tc.allowed && w.Code != 409 {
+			if !tc.allowed && (w.Code != 402 || !strings.Contains(w.Body.String(), "sandbox_exceeds_plan_limits")) {
 				t.Fatalf("oversized resume=%d %s", w.Code, w.Body)
 			}
 			sb, err := db.New(pool).GetSandbox(t.Context(), db.GetSandboxParams{ID: id, TeamID: team})

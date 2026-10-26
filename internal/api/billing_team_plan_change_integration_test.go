@@ -1023,3 +1023,97 @@ func TestTeamPlanChangeRechecksCatalogAfterProviderBoundary(t *testing.T) {
 		t.Fatalf("accepted historical replay lost: %+v %v", replay, err)
 	}
 }
+
+func TestTeamPlanChangeContractBackedCustomRequiresReconciliation(t *testing.T) {
+	for _, via := range []string{"customer", "staff"} {
+		t.Run(via, func(t *testing.T) {
+			f := newPlanChangeV2Fixture(t, planKindCustom)
+			attachCustomContractForPlanChange(t, f)
+			before := customPlanChangeFinancialState(t, f)
+			req := teamPlanChangeRequest{Team: f.team, Target: "free", Key: "unsupported-custom-exit", Actor: f.actor, Via: via, Reason: "end agreement", ConfirmPausesRunning: true}
+			if _, err := f.h.scheduleTeamPlanChangeTo(t.Context(), req, testPlanTerms("free", planKindFree, 1, nil)); !errors.Is(err, errTeamPlanChangeConflict) || !strings.Contains(err.Error(), "manual reconciliation") {
+				t.Fatalf("custom contract exit=%v", err)
+			}
+			if after := customPlanChangeFinancialState(t, f); after != before {
+				t.Fatalf("rejected exit changed financial state: before=%s after=%s", before, after)
+			}
+			var journals int
+			if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM team_plan_change WHERE team_id=$1`, f.team).Scan(&journals); err != nil || journals != 0 {
+				t.Fatalf("journals=%d err=%v", journals, err)
+			}
+			if len(f.stripe.writes) != 0 || f.stripe.reads != 0 {
+				t.Fatalf("provider touched: reads=%d writes=%v", f.stripe.reads, f.stripe.writes)
+			}
+		})
+	}
+}
+
+func attachCustomContractForPlanChange(t *testing.T, f planChangeV2Fixture) {
+	t.Helper()
+	contract := uuid.New()
+	conn, err := f.h.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err = conn.Exec(t.Context(), `SET session_replication_role=replica`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, e := conn.Exec(context.WithoutCancel(t.Context()), `RESET session_replication_role`); e != nil {
+			t.Error(e)
+		}
+	}()
+	// An upfront contract has an external subscription identity, but is not
+	// subscription-billed and must not use subscription cancellation as exit.
+	start := time.Now().UTC().AddDate(0, -2, 0).Truncate(time.Second)
+	if _, err = conn.Exec(t.Context(), `INSERT INTO billing_commercial_contract(id,team_id,offer_key,status,starts_at,ends_at,customer_id,subscription_id,base_price_id,charge_kind,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor)
+ VALUES($1,$2,'custom_example','active',$3,billing_anniversary_boundary($3,12),$4,$5,'price_custom','upfront',1200000,12,1200000,$3)`, contract, f.team, start, f.stripe.customer, f.stripe.sub); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(t.Context(), `UPDATE team_plan_assignment SET contract_id=$1 WHERE team_id=$2 AND effective_to IS NULL`, contract, f.team); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func customPlanChangeFinancialState(t *testing.T, f planChangeV2Fixture) string {
+	t.Helper()
+	var state string
+	err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_object(
+ 'contracts',(SELECT jsonb_agg(to_jsonb(c) ORDER BY id) FROM billing_commercial_contract c WHERE team_id=$1),
+ 'assignments',(SELECT jsonb_agg(to_jsonb(p) ORDER BY id) FROM team_plan_assignment p WHERE team_id=$1),
+ 'account',(SELECT to_jsonb(a) FROM team_billing_account a WHERE team_id=$1),
+ 'grants',(SELECT jsonb_agg(to_jsonb(g) ORDER BY id) FROM team_credit_grant g WHERE team_id=$1))::text`, f.team).Scan(&state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
+func TestTeamPlanChangeCustomContractAcceptedReplayAndWorkerFailClosed(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindCustom)
+	c, err := f.request(t, "free", "historically-accepted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachCustomContractForPlanChange(t, f)
+	before := customPlanChangeFinancialState(t, f)
+	// Accepted idempotency keys still replay their original result, without
+	// creating a second intent or implicitly terminating the later linked contract.
+	replay, err := f.request(t, "free", "historically-accepted")
+	if err != nil || replay.ID != c.ID {
+		t.Fatalf("accepted replay=%+v err=%v", replay, err)
+	}
+	f.reachEffective(t, c.ID)
+	f.tick(t)
+	current := f.reload(t, c.ID)
+	if current.State != "scheduled" || current.AppliedPlan != nil || current.LastError == nil || !strings.Contains(*current.LastError, "manual reconciliation") {
+		t.Fatalf("unsupported historical intent applied: %+v", current)
+	}
+	if after := customPlanChangeFinancialState(t, f); after != before {
+		t.Fatalf("worker changed contract/credits/assignment: before=%s after=%s", before, after)
+	}
+	if f.stripe.reads != 0 || len(f.stripe.writes) != 0 {
+		t.Fatalf("provider touched: reads=%d writes=%v", f.stripe.reads, f.stripe.writes)
+	}
+}

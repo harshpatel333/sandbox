@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"time"
 
+	"errors"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ClaimResumeWithCurrentLimits holds the assignment mutex while reading shape
@@ -30,8 +32,12 @@ func (q *Queries) ClaimResumeWithCurrentLimits(ctx context.Context, arg ClaimRes
 		defer cancel()
 		_ = tx.Rollback(cleanup)
 	}()
-	locked, err := tx.Exec(ctx, `SELECT 1 FROM team WHERE id=$1 FOR SHARE`, arg.TeamID)
+	locked, err := tx.Exec(ctx, `SELECT 1 FROM team WHERE id=$1 FOR SHARE NOWAIT`, arg.TeamID)
 	if err != nil {
+		var pe *pgconn.PgError
+		if errors.As(err, &pe) && pe.Code == "55P03" {
+			return row, limits, &pgconn.PgError{Code: "SS003", Message: "team plan assignment is changing"}
+		}
 		return row, limits, err
 	}
 	if locked.RowsAffected() != 1 {

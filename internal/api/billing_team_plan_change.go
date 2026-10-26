@@ -313,6 +313,11 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 }
 
 func (h *Handlers) planChangeBoundary(ctx context.Context, team uuid.UUID, current teamPlan, now time.Time) (*string, time.Time, error) {
+	// Custom contracts can issue benefits independently of the plan assignment.
+	// Their exit needs explicit contract reconciliation before self-serve switching.
+	if current.Kind == planKindCustom && current.ContractID != nil {
+		return nil, time.Time{}, teamPlanChangeConflict("contract-backed custom plans require manual reconciliation before changing plans")
+	}
 	var err error
 	var subscription *string
 	var periodEnd time.Time
@@ -821,6 +826,9 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 		}
 		log.Warn().Str("plan_change_id", c.ID.String()).Str("team_id", c.Team.String()).Msg("plan change withdrawn: the team changed plans first")
 		return now, tx.Commit(ctx)
+	}
+	if current.Kind == planKindCustom && current.ContractID != nil {
+		return now, teamPlanChangeConflict("contract-backed custom plans require manual reconciliation before changing plans")
 	}
 	if c.Subscription != nil {
 		if err = h.releasePlanChangeSubscription(ctx, tx, c, current, terminal); err != nil {

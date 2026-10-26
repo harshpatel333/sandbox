@@ -83,7 +83,7 @@ func TestResumeReloadsLimitsBeforeRetriedClaim(t *testing.T) {
 			h := &Handlers{DB: db.New(mock)}
 			w := httptest.NewRecorder()
 			setupTestRouter(h, team.String()).ServeHTTP(w, resumeRequest(id.String()))
-			wantStatus, wantClaims := 409, tc.after+1
+			wantStatus, wantClaims := 402, tc.after+1
 			if tc.failure {
 				wantStatus, wantClaims = 500, 1
 			}
