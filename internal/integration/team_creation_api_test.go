@@ -1178,7 +1178,8 @@ func TestIntegration_TeamCreationServiceRoleV2Signup(t *testing.T) {
 	}
 	defer tx.Rollback(context.Background())
 	localIdentityError(t, tx, "42501", `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
-	localIdentityError(t, tx, "42501", `UPDATE billing_plan_version SET display_name='Changed' WHERE family='free' AND state='published'`)
+	// Signup needs catalog UPDATE for row locking; published terms remain trigger-immutable.
+	localIdentityError(t, tx, "P0001", `UPDATE billing_plan_version SET display_name='Changed' WHERE family='free' AND state='published'`)
 	if err := tx.Rollback(t.Context()); err != nil {
 		t.Fatal(err)
 	}

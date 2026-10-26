@@ -958,50 +958,6 @@ type BillingPlanVersion struct {
 	RetiredAt                 pgtype.Timestamptz `json:"retired_at"`
 }
 
-type BillingPricingAdoption struct {
-	Singleton    bool               `json:"singleton"`
-	Region       *string            `json:"region"`
-	SystemTeamID pgtype.UUID        `json:"system_team_id"`
-	Epoch        uuid.UUID          `json:"epoch"`
-	State        string             `json:"state"`
-	Evidence     []byte             `json:"evidence"`
-	ReleasedAt   pgtype.Timestamptz `json:"released_at"`
-}
-
-type BillingPricingAdoptionCreditHold struct {
-	TeamID     uuid.UUID `json:"team_id"`
-	Reason     string    `json:"reason"`
-	ObservedAt time.Time `json:"observed_at"`
-}
-
-type BillingPricingAdoptionCreditResolution struct {
-	TeamID       uuid.UUID `json:"team_id"`
-	AssignmentID uuid.UUID `json:"assignment_id"`
-	Source       []byte    `json:"source"`
-	VerifiedAt   time.Time `json:"verified_at"`
-}
-
-type BillingPricingAdoptionEvent struct {
-	ID        uuid.UUID `json:"id"`
-	Epoch     uuid.UUID `json:"epoch"`
-	Region    *string   `json:"region"`
-	Action    string    `json:"action"`
-	Actor     string    `json:"actor"`
-	Reason    string    `json:"reason"`
-	Details   []byte    `json:"details"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-type BillingPricingAdoptionInventory struct {
-	Epoch        uuid.UUID   `json:"epoch"`
-	TeamID       uuid.UUID   `json:"team_id"`
-	AssignmentID pgtype.UUID `json:"assignment_id"`
-	Bucket       string      `json:"bucket"`
-	Reason       string      `json:"reason"`
-	Present      bool        `json:"present"`
-	ObservedAt   time.Time   `json:"observed_at"`
-}
-
 type BillingPrepaidAutoRecharge struct {
 	TeamID         uuid.UUID          `json:"team_id"`
 	Enabled        bool               `json:"enabled"`
@@ -1013,6 +969,16 @@ type BillingPrepaidAutoRecharge struct {
 	DisabledAt     pgtype.Timestamptz `json:"disabled_at"`
 	DisabledBy     pgtype.UUID        `json:"disabled_by"`
 	NotifiedAt     pgtype.Timestamptz `json:"notified_at"`
+}
+
+type BillingPrepaidCheckoutOperation struct {
+	ID          uuid.UUID `json:"id"`
+	TeamID      uuid.UUID `json:"team_id"`
+	ActorID     uuid.UUID `json:"actor_id"`
+	AmountCents int64     `json:"amount_cents"`
+	SuccessUrl  string    `json:"success_url"`
+	CancelUrl   string    `json:"cancel_url"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type BillingPrepaidPurchase struct {
@@ -1087,6 +1053,50 @@ type BillingPrepaidReversalEvent struct {
 	DisputedCents int64     `json:"disputed_cents"`
 	Evidence      []byte    `json:"evidence"`
 	ObservedAt    time.Time `json:"observed_at"`
+}
+
+type BillingPricingAdoption struct {
+	Singleton    bool               `json:"singleton"`
+	Region       *string            `json:"region"`
+	SystemTeamID pgtype.UUID        `json:"system_team_id"`
+	Epoch        uuid.UUID          `json:"epoch"`
+	State        string             `json:"state"`
+	Evidence     []byte             `json:"evidence"`
+	ReleasedAt   pgtype.Timestamptz `json:"released_at"`
+}
+
+type BillingPricingAdoptionCreditHold struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Reason     string    `json:"reason"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+type BillingPricingAdoptionCreditResolution struct {
+	TeamID       uuid.UUID `json:"team_id"`
+	AssignmentID uuid.UUID `json:"assignment_id"`
+	Source       []byte    `json:"source"`
+	VerifiedAt   time.Time `json:"verified_at"`
+}
+
+type BillingPricingAdoptionEvent struct {
+	ID        uuid.UUID `json:"id"`
+	Epoch     uuid.UUID `json:"epoch"`
+	Region    *string   `json:"region"`
+	Action    string    `json:"action"`
+	Actor     string    `json:"actor"`
+	Reason    string    `json:"reason"`
+	Details   []byte    `json:"details"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type BillingPricingAdoptionInventory struct {
+	Epoch        uuid.UUID   `json:"epoch"`
+	TeamID       uuid.UUID   `json:"team_id"`
+	AssignmentID pgtype.UUID `json:"assignment_id"`
+	Bucket       string      `json:"bucket"`
+	Reason       string      `json:"reason"`
+	Present      bool        `json:"present"`
+	ObservedAt   time.Time   `json:"observed_at"`
 }
 
 type BillingPricingSwitch struct {
