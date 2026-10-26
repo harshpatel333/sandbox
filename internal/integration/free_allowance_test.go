@@ -26,11 +26,12 @@ import (
 
 func assignFreePlan(t *testing.T, teamID uuid.UUID, since time.Time) {
 	t.Helper()
+	// Fixtures create already-effective assignments even when host and database clocks differ.
 	if _, err := testPool.Exec(context.Background(), `
 		INSERT INTO team_plan_assignment (team_id, plan_key, kind, terms, limits, effective_from, source, reason)
 		VALUES ($1, 'free', 'free',
 		        '{"allowance":{"amount_cents":13,"period":"day_window","on_exhausted":"pause","compute":{"seconds":7200,"vcpu":1,"memory_gib":1}}}',
-		        '{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096}', $2, 'migration', 'test')`, teamID, since); err != nil {
+		        '{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096}', LEAST($2::timestamptz, clock_timestamp()), 'migration', 'test')`, teamID, since); err != nil {
 		t.Fatalf("assign free plan: %v", err)
 	}
 }
