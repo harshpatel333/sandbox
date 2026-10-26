@@ -41,7 +41,7 @@ END $$;
 CREATE FUNCTION pg_temp.transition_free_zero_templates(p_team uuid,p_assignment uuid,p_version uuid,p_actor uuid,p_reason text)
 RETURNS uuid LANGUAGE plpgsql AS $$
 DECLARE prior team_plan_assignment; v billing_plan_version; previous billing_plan_version; replay team_plan_assignment;
- at_time timestamptz; result uuid; expected_terms jsonb; expected_limits jsonb; key text:='free-zero-templates:'||p_assignment::text;
+ at_time timestamptz; result uuid; expected_terms jsonb; expected_go_terms jsonb; expected_limits jsonb; key text:='free-zero-templates:'||p_assignment::text;
 BEGIN
  IF p_actor IS NULL OR NOT EXISTS(SELECT 1 FROM profile WHERE id=p_actor) OR p_reason IS NULL OR length(btrim(p_reason)) NOT BETWEEN 1 AND 500 THEN
   RAISE EXCEPTION 'operator profile and audit reason required';
@@ -68,11 +68,19 @@ BEGIN
    'amount_cents',COALESCE(previous.allowance_cents,0),'period',previous.allowance_period,'on_exhausted',previous.allowance_on_exhausted,
    'compute',CASE WHEN previous.allowance_compute_seconds IS NULL THEN NULL ELSE jsonb_build_object(
     'seconds',previous.allowance_compute_seconds,'vcpu',previous.allowance_compute_vcpu,'memory_gib',previous.allowance_compute_memory_gib) END)) END);
+ -- Go retains the exact derived dollar display for fixed-cent allowances;
+ -- SQL signup omits it. Accept only these two complete representations.
+ expected_go_terms:=expected_terms;
+ IF previous.allowance_compute_seconds IS NULL AND previous.allowance_cents IS NOT NULL THEN
+  expected_go_terms:=jsonb_set(expected_terms,'{allowance,amount_usd}',to_jsonb(
+   rtrim(rtrim(((previous.allowance_cents::numeric/100)::numeric(21,2))::text,'0'),'.')));
+ END IF;
  expected_limits:=jsonb_build_object('max_concurrent',previous.max_sandboxes,'max_vcpu',previous.max_template_vcpu,
   'max_memory_mib',previous.max_template_memory_mib,'max_disk_mib',previous.max_template_disk_mib,'max_templates',previous.max_templates);
  IF prior.kind<>'free' OR prior.plan_key<>'free' OR prior.contract_id IS NOT NULL
   OR prior.source NOT IN ('signup','migration')
-  OR prior.terms IS DISTINCT FROM expected_terms OR prior.limits IS DISTINCT FROM expected_limits
+  OR (prior.terms IS DISTINCT FROM expected_terms AND prior.terms IS DISTINCT FROM expected_go_terms)
+  OR prior.limits IS DISTINCT FROM expected_limits
   OR previous.family<>'free' OR previous.pricing_version<>'v2'
   OR prior.terms->>'version_id' IS DISTINCT FROM previous.id::text
   OR prior.terms->>'kind' IS DISTINCT FROM 'free'
