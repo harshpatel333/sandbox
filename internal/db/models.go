@@ -1448,13 +1448,19 @@ type BillingYcOperation struct {
 }
 
 type DeviceCode struct {
-	ID         uuid.UUID   `json:"id"`
-	DeviceCode string      `json:"device_code"`
-	UserCode   string      `json:"user_code"`
-	UserID     pgtype.UUID `json:"user_id"`
-	Status     string      `json:"status"`
-	ExpiresAt  time.Time   `json:"expires_at"`
-	CreatedAt  time.Time   `json:"created_at"`
+	ID            uuid.UUID          `json:"id"`
+	DeviceCode    string             `json:"device_code"`
+	UserCode      string             `json:"user_code"`
+	UserID        pgtype.UUID        `json:"user_id"`
+	Status        string             `json:"status"`
+	ExpiresAt     time.Time          `json:"expires_at"`
+	CreatedAt     time.Time          `json:"created_at"`
+	ClientName    *string            `json:"client_name"`
+	RequesterHash *string            `json:"requester_hash"`
+	TeamID        pgtype.UUID        `json:"team_id"`
+	TeamRegion    *string            `json:"team_region"`
+	ApprovedAt    pgtype.Timestamptz `json:"approved_at"`
+	ConsumedAt    pgtype.Timestamptz `json:"consumed_at"`
 }
 
 type EarlyAccessRequest struct {
