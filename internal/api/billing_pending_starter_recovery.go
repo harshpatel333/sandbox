@@ -207,7 +207,7 @@ func (h *Handlers) reconcilePendingStarter(ctx context.Context, client *stripeHT
 		}
 		return "payment_confirmation_pending", "", nil
 	}
-	if !cancel && s.Status == "open" && s.PaymentStatus == "unpaid" && !current.CheckoutCompletedAt.Valid && current.CheckoutSubscriptionID == nil && payment != "failed" {
+	if !cancel && s.Status == "open" && s.PaymentStatus == "unpaid" && !current.CheckoutCompletedAt.Valid && current.CheckoutSubscriptionID == nil && !billingAccountHasEstablishedSubscription(db.GetTeamBillingAccountRow{StripeSubscriptionID: current.StripeSubscriptionID, StripeSubscriptionStatus: current.StripeSubscriptionStatus}) && payment != "failed" {
 		u, e := url.Parse(s.URL)
 		if e == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && !strings.ContainsAny(s.URL, "\r\n") {
 			return "recovered", s.URL, nil

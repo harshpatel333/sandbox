@@ -15,7 +15,7 @@ import (
 )
 
 func TestPrepaidPendingStarterRecovery(t *testing.T) {
-	for _, scenario := range []string{"resume", "cancel", "expired", "paid", "lost_ack", "timeout", "mismatch", "changed_generation", "wrong_actor", "wrong_request", "failed_fence", "closed_entry", "wrong_team", "expired_webhook_race", "paid_during_expire", "timeout_after_expire", "mismatch_after_expire", "wrong_generation", "legacy_resume", "legacy_cancel", "legacy_closed_entry", "expired_with_invoice", "expired_with_payment_intent", "expired_with_subscription"} {
+	for _, scenario := range []string{"resume", "cancel", "expired", "paid", "lost_ack", "timeout", "mismatch", "changed_generation", "wrong_actor", "wrong_request", "failed_fence", "closed_entry", "wrong_team", "expired_webhook_race", "paid_during_expire", "timeout_after_expire", "mismatch_after_expire", "wrong_generation", "legacy_resume", "legacy_cancel", "legacy_closed_entry", "expired_with_invoice", "expired_with_payment_intent", "expired_with_subscription", "established_subscription_resume"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newPrepaidFixture(t)
 			actor := uuid.New()
@@ -71,6 +71,9 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 						}
 					}
 					gets++
+					if scenario == "established_subscription_resume" {
+						f.exec(`UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status='active' WHERE team_id=$1`, f.team, f.sub)
+					}
 					if scenario == "timeout" || (scenario == "timeout_after_expire" && cancelCalls > 0) {
 						w.WriteHeader(504)
 						return
@@ -149,7 +152,7 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 			if discover.Code != 200 || !strings.Contains(discover.Body.String(), "pending_starter_checkout") || strings.Contains(discover.Body.String(), "https:") {
 				t.Fatalf("discovery %d %s", discover.Code, discover.Body)
 			}
-			input := pendingStarterRequest{PurchaseID: p.Purchase, Generation: &p.Account.CheckoutInitializingAt.Time, Cancel: scenario != "resume" && scenario != "closed_entry" && scenario != "expired" && scenario != "legacy_resume" && scenario != "legacy_closed_entry"}
+			input := pendingStarterRequest{PurchaseID: p.Purchase, Generation: &p.Account.CheckoutInitializingAt.Time, Cancel: scenario != "resume" && scenario != "closed_entry" && scenario != "expired" && scenario != "legacy_resume" && scenario != "legacy_closed_entry" && scenario != "established_subscription_resume"}
 			if scenario == "wrong_generation" {
 				g := input.Generation.Add(time.Second)
 				input.Generation = &g
@@ -181,6 +184,10 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 				var evidence bool
 				if err := f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM stripe_checkout_expiration_evidence WHERE team_id=$1)`, f.team).Scan(&evidence); err != nil || !evidence {
 					t.Fatalf("expiration %v %v", evidence, err)
+				}
+			case "established_subscription_resume":
+				if !fence || cancelCalls != 0 || strings.Contains(got.Body.String(), "https:") || !strings.Contains(got.Body.String(), "payment_confirmation_pending") {
+					t.Fatalf("payable session exposed for established subscription: %d %s", got.Code, got.Body)
 				}
 			case "wrong_request", "wrong_generation":
 				if got.Code != 409 || gets != 0 || !fence {
