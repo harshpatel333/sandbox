@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -137,9 +138,16 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 		hdr, err := tr.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				for i := len(dirModes) - 1; i >= 0; i-- {
-					if err := os.Chmod(dirModes[i].path, dirModes[i].mode); err != nil {
-						return fmt.Errorf("chmod %s: %w", dirModes[i].path, err)
+				// Deepest first: a parent can arrive after its children (an
+				// upper layer's entries come first), and once it drops owner
+				// execute nothing beneath it can be changed.
+				sort.SliceStable(dirModes, func(i, j int) bool {
+					return strings.Count(dirModes[i].path, string(filepath.Separator)) >
+						strings.Count(dirModes[j].path, string(filepath.Separator))
+				})
+				for _, d := range dirModes {
+					if err := os.Chmod(d.path, d.mode); err != nil {
+						return fmt.Errorf("chmod %s: %w", d.path, err)
 					}
 				}
 				return nil

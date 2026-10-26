@@ -142,3 +142,25 @@ func TestExtractTarKeepsDestinationPrivate(t *testing.T) {
 		t.Fatalf("destination mode %o, want 700", got)
 	}
 }
+
+func TestExtractTarAppliesDirectoryModesDeepestFirst(t *testing.T) {
+	t.Parallel()
+
+	// An upper layer's entry can precede the base layer's parent directory.
+	buf := writeTar(t,
+		&tar.Header{Typeflag: tar.TypeDir, Name: "locked/child/", Mode: 0o750},
+		&tar.Header{Typeflag: tar.TypeDir, Name: "locked/", Mode: 0o600},
+	)
+	dest := t.TempDir()
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(dest, "locked"), 0o755) })
+	if err := extractTar(context.Background(), buf, dest, 0); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(filepath.Join(dest, "locked"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("locked: mode %o, want 600", got)
+	}
+}
