@@ -1838,6 +1838,9 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 		keyParts = append(append([]string(nil), priceIDs...), "prepaid:"+strconv.FormatInt(prepaid.AmountCents, 10))
 	}
 	requestKey := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, keyParts)
+	if prepaid != nil && prepaid.OperationID != uuid.Nil {
+		requestKey += ":prepaid-operation:" + prepaid.OperationID.String()
+	}
 	attemptID := uuid.New()
 	var checkoutAccount db.TeamBillingAccount
 	if trusted {
@@ -1878,6 +1881,9 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 	var purchaseID uuid.UUID
 	if prepaid != nil {
 		purchaseID = prepaidCheckoutPurchaseID(teamID, leaseStartedAt, prepaid.AmountCents)
+		if prepaid.OperationID != uuid.Nil {
+			purchaseID = prepaid.OperationID
+		}
 		if err := h.recordCheckoutPurchase(c.Request.Context(), purchaseID, teamID, customerID, checkoutActor, prepaid.AmountCents, ""); err != nil {
 			h.finishFailedStripeCheckoutAttempt(teamID, attemptID, checkoutAccount.CheckoutInitializingAt, false)
 			if errors.Is(err, errPrepaidTooManyUnspent) {
@@ -1936,6 +1942,10 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 			respondError(c, ErrInternal)
 			return
 		}
+	}
+	if prepaid != nil && prepaid.OperationID != uuid.Nil {
+		c.JSON(http.StatusOK, prepaidOperationResponse{ID: session.ID, URL: session.URL, PurchaseID: purchaseID, State: "pending"})
+		return
 	}
 	c.JSON(http.StatusOK, billingSessionResponse{ID: session.ID, URL: session.URL})
 }

@@ -16,6 +16,7 @@ import (
 var prepaidCheckoutNamespace = uuid.MustParse("6f1c8f55-3c4e-4f62-9d55-6a8b0c1f2e47")
 
 type prepaidCheckoutLine struct {
+	OperationID uuid.UUID
 	AmountCents int64
 }
 
@@ -83,15 +84,35 @@ func (h *Handlers) recordCheckoutPurchase(ctx context.Context, id, team uuid.UUI
 }
 
 // Later purchases pay once in Checkout and save the card for auto-recharge.
-func (h *Handlers) startPrepaidPaymentCheckout(ctx context.Context, client *stripeHTTPClient, team, actor uuid.UUID, customer string, amount int64, successURL, cancelURL string) (prepaidCheckoutSession, error) {
+func (h *Handlers) startPrepaidPaymentCheckout(ctx context.Context, client *stripeHTTPClient, team, actor uuid.UUID, customer string, amount int64, successURL, cancelURL string, operation ...uuid.UUID) (prepaidCheckoutSession, error) {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return prepaidCheckoutSession{}, err
 	}
 	defer tx.Rollback(ctx)
 	id := uuid.New()
+	if len(operation) > 0 && operation[0] != uuid.Nil {
+		id = operation[0]
+	}
 	if err = h.preparePrepaidPurchase(ctx, tx, id, team, customer, actor, amount); err != nil {
 		return prepaidCheckoutSession{}, err
+	}
+	var existing []byte
+	if err = tx.QueryRow(ctx, `SELECT payment_request FROM billing_prepaid_purchase WHERE id=$1 FOR UPDATE`, id).Scan(&existing); err != nil {
+		return prepaidCheckoutSession{}, err
+	}
+	if len(existing) > 0 {
+		var accepted prepaidCheckoutRequest
+		if err = json.Unmarshal(existing, &accepted); err != nil {
+			return prepaidCheckoutSession{}, err
+		}
+		if accepted.Customer != customer || accepted.Team != team.String() || accepted.AmountCents != amount || accepted.SuccessURL != successURL || accepted.CancelURL != cancelURL {
+			return prepaidCheckoutSession{}, errPrepaidOperationConflict
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return prepaidCheckoutSession{}, err
+		}
+		return h.dispatchPrepaidPaymentCheckout(ctx, client, id)
 	}
 	request, err := json.Marshal(prepaidCheckoutRequest{Customer: customer, Team: team.String(), AmountCents: amount, SuccessURL: successURL, CancelURL: cancelURL, ExpiresAt: time.Now().Add(23 * time.Hour).Unix()})
 	if err != nil {
@@ -115,6 +136,23 @@ func (h *Handlers) dispatchPrepaidPaymentCheckout(ctx context.Context, client *s
 	var req prepaidCheckoutRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return prepaidCheckoutSession{}, err
+	}
+	var saved *string
+	if err := h.Pool.QueryRow(ctx, `SELECT checkout_session_id FROM billing_prepaid_purchase WHERE id=$1`, id).Scan(&saved); err != nil {
+		return prepaidCheckoutSession{}, err
+	}
+	if saved != nil {
+		return client.retrievePrepaidCheckout(ctx, *saved)
+	}
+	if time.Now().Unix() >= req.ExpiresAt {
+		found, err := client.findPrepaidCheckout(ctx, req.Customer, id)
+		if err != nil {
+			return prepaidCheckoutSession{}, err
+		}
+		if found == "" {
+			return prepaidCheckoutSession{}, errPrepaidPaymentPending
+		}
+		return client.retrievePrepaidCheckout(ctx, found)
 	}
 	form := url.Values{
 		"mode": {"payment"}, "customer": {req.Customer}, "client_reference_id": {req.Team},
