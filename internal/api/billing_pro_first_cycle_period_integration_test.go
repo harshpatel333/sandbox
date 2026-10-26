@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -114,5 +115,81 @@ func TestProFirstCycleReportingTransitionPreservesFreeUsage(t *testing.T) {
 				t.Fatalf("copied Free reporting usage into paid month: %v %v", priorCopied, err)
 			}
 		})
+	}
+}
+
+// Discovery may have already read an eligible Free bucket before retirement.
+// Its delayed insert must conflict with a completed sentinel, never queue work.
+func TestProFirstCycleRetirementFencesStaleCloseDiscovery(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second).AddDate(0, -1, 0)
+	h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
+	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+	u, err := h.proUpgrade(t.Context(), team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade SET state='credited',payment_evidence='{"verified":true}',grant_id=$2 WHERE id=$1`, u.ID, "cred_"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := h.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Release()
+	worker, err := h.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Release()
+	key := int64(worker.Conn().PgConn().PID())
+	if _, err = blocker.Exec(t.Context(), `SELECT pg_advisory_lock($1)`, key); err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key)
+	done := make(chan error, 1)
+	go func() {
+		_, e := worker.Exec(t.Context(), `WITH candidates AS MATERIALIZED (
+   SELECT team_id,period_start,period_end FROM team_billing_period WHERE team_id=$1 AND finalized_at IS NULL AND period_end<=now()
+  ), barrier AS MATERIALIZED (SELECT pg_advisory_xact_lock($2) FROM candidates)
+  INSERT INTO billing_period_close_work(team_id,period_start,period_end)
+  SELECT c.team_id,c.period_start,c.period_end FROM candidates c CROSS JOIN barrier ON CONFLICT DO NOTHING`, team, key)
+		done <- e
+	}()
+	waiting := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if err = blocker.QueryRow(t.Context(), `SELECT COALESCE(wait_event='advisory',false) FROM pg_stat_activity WHERE pid=$1`, worker.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waiting {
+		t.Fatal("discovery did not capture its pre-retirement candidate")
+	}
+	tx, err := blocker.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(t.Context())
+	if _, err = h.DB.WithTx(tx).LockTeamBillingAccount(t.Context(), team); err != nil {
+		t.Fatal(err)
+	}
+	if err = retireFirstProCycleReportingPeriods(t.Context(), tx, u); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = blocker.Exec(t.Context(), `SELECT pg_advisory_unlock($1)`, key); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+	var completed bool
+	if err = blocker.QueryRow(t.Context(), `SELECT count(*)=1 AND bool_and(completed_at IS NOT NULL AND stage='reporting_only_calendar_period' AND attempts=0 AND lease_token IS NULL) FROM billing_period_close_work WHERE team_id=$1`, team).Scan(&completed); err != nil || !completed {
+		t.Fatalf("stale discovery queued retired Free work: %v %v", completed, err)
 	}
 }

@@ -136,7 +136,7 @@ func retireFirstProCycleReportingPeriods(ctx context.Context, tx pgx.Tx, u proUp
 		if _, err = tx.Exec(ctx, `UPDATE team_billing_period SET status='finalized',blocked_reason='reporting_only_calendar_period',gross_charges_usd=0,credits_applied_usd=0,net_invoice_amount_usd=0,finalized_at=clock_timestamp(),updated_at=clock_timestamp() WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, u.Team, p.start, p.end); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, `UPDATE billing_period_close_work SET completed_at=clock_timestamp(),stage='reporting_only_calendar_period',last_progress_at=clock_timestamp() WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND completed_at IS NULL AND attempts=0 AND lease_token IS NULL`, u.Team, p.start, p.end); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO billing_period_close_work(team_id,period_start,period_end,completed_at,stage,last_progress_at) VALUES($1,$2,$3,clock_timestamp(),'reporting_only_calendar_period',clock_timestamp()) ON CONFLICT(team_id,period_start,period_end) DO UPDATE SET completed_at=EXCLUDED.completed_at,stage=EXCLUDED.stage,last_progress_at=EXCLUDED.last_progress_at WHERE billing_period_close_work.completed_at IS NULL AND billing_period_close_work.attempts=0 AND billing_period_close_work.lease_token IS NULL AND billing_period_close_work.stage='pending'`, u.Team, p.start, p.end); err != nil {
 			return err
 		}
 	}
