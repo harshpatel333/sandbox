@@ -23,7 +23,22 @@ func lockSourceAssignments(ctx context.Context, tx pgx.Tx, team uuid.UUID) error
 	if _, err := tx.Exec(ctx, `SELECT id FROM team_plan_assignment WHERE team_id=$1 FOR UPDATE`, team); err != nil {
 		return err
 	}
-	return checkFreePauseTransfer(ctx, tx, team)
+	if err := checkFreePauseTransfer(ctx, tx, team); err != nil {
+		return err
+	}
+	return refusePlanChangeMigration(ctx, tx, team)
+}
+
+func refusePlanChangeMigration(ctx context.Context, q querier, team uuid.UUID) error {
+	var unsupported bool
+	if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1)
+        OR EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=$1)`, team).Scan(&unsupported); err != nil {
+		return fmt.Errorf("check plan change migration authority: %w", err)
+	}
+	if unsupported {
+		return fmt.Errorf("assigned teams and plan change history cannot migrate until scheduling, replay and provider authority can transfer together")
+	}
+	return nil
 }
 
 func checkFreePauseTransfer(ctx context.Context, q querier, team uuid.UUID) error {
@@ -153,6 +168,9 @@ func assignmentSnapshot(ctx context.Context, src querier, team uuid.UUID) ([]byt
 func checkAssignmentReferences(ctx context.Context, src querier, dst pgx.Tx, team uuid.UUID) error {
 	for _, q := range []querier{src, dst} {
 		if err := checkFreePauseTransfer(ctx, q, team); err != nil {
+			return err
+		}
+		if err := checkProUpgradeMigration(ctx, q, team); err != nil {
 			return err
 		}
 	}
