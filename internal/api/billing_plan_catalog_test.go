@@ -177,7 +177,7 @@ func TestDecimalString(t *testing.T) {
 }
 
 func TestPlanPricedNeedsStripe(t *testing.T) {
-	terms := planTerms{PricingVersion: "v2", Version: 1}
+	terms := planTerms{PricingVersion: "v2", Version: 1, IntervalMonths: 1}
 	h := &Handlers{}
 	if h.planPriced(terms) {
 		t.Fatal("v2 plan advertised without Stripe")
@@ -208,6 +208,36 @@ func TestPlanCatalogTextLimitsCountUnicodeCharacters(t *testing.T) {
 			field.set(&v, strings.Repeat("界", field.limit+1))
 			if err := v.validate(); err == nil {
 				t.Fatal("overlong Unicode text accepted")
+			}
+		})
+	}
+}
+
+func TestPublicPlanAvailabilityPreservesLegacyAnnualAndHidesV2Annual(t *testing.T) {
+	h := &Handlers{Stripe: &stripeHTTPClient{}}
+	for _, model := range []string{"v2", "legacy"} {
+		t.Run(model, func(t *testing.T) {
+			v := planVersion{PricingVersion: model, Family: "pro", Version: 2, Kind: "subscription", DisplayName: "Pro", Public: true, SelfServe: true,
+				MonthlyFeeCents: int64p(25000), AnnualFeeCents: int64p(250000),
+				CreditSchedule: []planGrant{{EveryMonths: 1, AmountCents: 25000, ExpiresAfterMonths: 1}},
+				Limits:         planLimits{MaxConcurrent: int32p(1000), MaxVCPU: int32p(8), MaxMemoryMiB: int32p(32768), MaxDiskMiB: int32p(102400), MaxTemplates: int32p(1000)}}
+			if err := v.validate(); err != nil {
+				t.Fatalf("invalid published plan fixture: %v", err)
+			}
+			card := h.planCard(v, nil)
+			if card.Monthly == nil || !card.Monthly.Available || card.Annual == nil || card.Annual.Available != (model == "legacy") {
+				t.Fatalf("card availability = %+v monthly=%+v annual=%+v", card, card.Monthly, card.Annual)
+			}
+			plans := purchasablePlans([]billingPlanCard{card})
+			want := 1
+			if model == "legacy" {
+				want = 2
+			}
+			if len(plans) != want || plans[0].Key != "pro_monthly" || plans[0].PriceCents != 25000 {
+				t.Fatalf("purchasable plans = %+v", plans)
+			}
+			if model == "legacy" && (plans[1].Key != "pro_annual" || plans[1].IntervalMonths != 12 || plans[1].PriceCents != 250000) {
+				t.Fatalf("legacy annual plan = %+v", plans)
 			}
 		})
 	}

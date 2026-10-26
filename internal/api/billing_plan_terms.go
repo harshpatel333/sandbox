@@ -285,6 +285,9 @@ func (t planTerms) ownsPrice() bool {
 
 // planPriced reports whether checkout may sell t in this environment.
 func (h *Handlers) planPriced(t planTerms) bool {
+	if t.PricingVersion == "v2" && t.IntervalMonths != 1 {
+		return false
+	}
 	stripe, ok := h.Stripe.(*stripeHTTPClient)
 	return ok && stripe != nil && (t.ownsPrice() || (h.Config != nil && h.Config.PlanPriceID(t.OfferKey) != ""))
 }
