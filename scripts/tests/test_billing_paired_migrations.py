@@ -25,6 +25,11 @@ class PairedMigrations(unittest.TestCase):
         self.url = urlunsplit(url._replace(path='/' + self.name))
         self.sql('CREATE DATABASE ' + self.name, admin=True)
         self.addCleanup(lambda: self.sql('DROP DATABASE ' + self.name + ' WITH (FORCE)', admin=True))
+        self.sql("""DO $$ BEGIN
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role NOLOGIN; END IF;
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='anon') THEN CREATE ROLE anon NOLOGIN; END IF;
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN CREATE ROLE authenticated NOLOGIN; END IF;
+        END $$;""")
         for migration in MIGRATIONS:
             if migration.name.startswith('20261026'):
                 break
@@ -68,6 +73,21 @@ class PairedMigrations(unittest.TestCase):
                 self.assertEqual(self.sql("SELECT md5(pg_get_functiondef('billing_contract_eligible(billing_commercial_contract,timestamptz,timestamptz)'::regprocedure))"), before)
                 self.sql(cleanup)
 
+    def test_unknown_helper_body_fails_at_each_replacement(self):
+        self.pair_schema()
+        for migration in MIGRATIONS:
+            if not migration.name.startswith('20261026'):
+                continue
+            if '45510_' in migration.name or '45538_' in migration.name:
+                body = self.sql("SELECT quote_literal(prosrc) FROM pg_proc WHERE oid='billing_provider_pair_covered(billing_commercial_contract,timestamptz,timestamptz,boolean)'::regprocedure")
+                self.sql("CREATE OR REPLACE FUNCTION billing_provider_pair_covered(c billing_commercial_contract,s timestamptz,e timestamptz,issuing boolean) RETURNS boolean LANGUAGE sql VOLATILE AS 'SELECT true'")
+                self.sql('BEGIN;\n' + migration.read_text() + '\nCOMMIT;', succeeds=False)
+                self.sql('CREATE OR REPLACE FUNCTION billing_provider_pair_covered(c billing_commercial_contract,s timestamptz,e timestamptz,issuing boolean) RETURNS boolean LANGUAGE sql VOLATILE AS ' + body)
+                self.sql('ALTER FUNCTION billing_provider_pair_covered(billing_commercial_contract,timestamptz,timestamptz,boolean) SET search_path=public')
+                self.sql('BEGIN;\n' + migration.read_text() + '\nCOMMIT;', succeeds=False)
+                self.sql('ALTER FUNCTION billing_provider_pair_covered(billing_commercial_contract,timestamptz,timestamptz,boolean) RESET ALL')
+            self.sql(migration.read_text())
+
     def test_partial_pair_fails_at_payment_replacement(self):
         self.pair_schema()
         for migration in MIGRATIONS:
@@ -83,6 +103,12 @@ class PairedMigrations(unittest.TestCase):
     def test_ahead_schema_each_replacement(self):
         self.pair_schema()
         self.sql((FIXTURE / 'authority_cases.sql').read_text())
+        # Minimal core read access matches the real backend integration boundary;
+        # paired objects and eligibility EXECUTE retain their migration ACLs.
+        self.sql('GRANT SELECT ON team_billing_account, billing_commercial_contract, billing_contract_payment, billing_pro_payment_verification TO service_role')
+        # Supabase service_role bypasses RLS. Keep the local shared role unchanged:
+        # a SELECT-only policy supplies that one core-table read in this fixture.
+        self.sql('CREATE POLICY pair_fixture_account_read ON team_billing_account FOR SELECT TO service_role USING (true)')
         def check(name):
             if '45510_' in name or '45538_' in name:
                 self.assertEqual(self.sql((FIXTURE / 'assert_authority.sql').read_text()), 'paired authority preserved')

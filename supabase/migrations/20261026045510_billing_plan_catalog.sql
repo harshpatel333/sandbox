@@ -164,9 +164,11 @@ BEGIN
   WHERE NOT EXISTS(SELECT 1 FROM pg_attribute a
     WHERE a.attrelid=to_regclass('public.' || required.relation) AND a.attname=required.col
       AND NOT a.attisdropped AND a.atttypid=to_regtype(required.typ));
+  -- Supported paired helper bodies match the installed staging contract;
+  -- signature-compatible unknown behavior must not silently acquire authority.
   IF missing IS NOT NULL
-   OR NOT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('public.billing_provider_pair_covered(public.billing_commercial_contract,timestamptz,timestamptz,boolean)') AND prorettype='boolean'::regtype AND NOT prosecdef)
-   OR NOT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('public.billing_payment_authorizes_entitlement(public.billing_commercial_contract,public.billing_contract_payment,timestamptz,timestamptz)') AND prorettype='boolean'::regtype AND NOT prosecdef) THEN
+   OR NOT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('public.billing_provider_pair_covered(public.billing_commercial_contract,timestamptz,timestamptz,boolean)') AND prorettype='boolean'::regtype AND NOT prosecdef AND proconfig IS NULL AND prolang=(SELECT oid FROM pg_language WHERE lanname='sql') AND provolatile='v' AND md5(prosrc)='c474ef32696470299b77cc657763cfdd')
+   OR NOT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('public.billing_payment_authorizes_entitlement(public.billing_commercial_contract,public.billing_contract_payment,timestamptz,timestamptz)') AND prorettype='boolean'::regtype AND NOT prosecdef AND proconfig IS NULL AND prolang=(SELECT oid FROM pg_language WHERE lanname='sql') AND provolatile='s' AND md5(prosrc)='a74f299dc0b9ecfb90bb3e70aebdc0b2') THEN
    RAISE EXCEPTION 'incomplete provider-pair authority schema: %', COALESCE(missing,'helper contract');
   END IF;
  END IF;

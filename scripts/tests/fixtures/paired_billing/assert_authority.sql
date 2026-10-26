@@ -31,6 +31,22 @@ BEGIN
  INSERT INTO billing_provider_pair_monthly_payment(payment_id,team_id,contract_id,invoice_id,fee_item_id,fee_period_start,fee_period_end,period_start,period_end,amount_cents)
  VALUES(p.id,c.team_id,c.id,p.invoice_id,b.fee_item_id,s,'2025-03-28',s,e,100000);
  IF billing_contract_eligible(c,s,e) IS NOT TRUE THEN RAISE EXCEPTION 'mapped receipt lost allowance authority'; END IF;
+ SET LOCAL ROLE service_role;
+ IF billing_contract_eligible(c,s,e) IS NOT TRUE THEN RAISE EXCEPTION 'backend role lost mapped authority'; END IF;
+ RESET ROLE;
+ SET LOCAL ROLE anon;
+ BEGIN
+  PERFORM billing_contract_eligible(c,s,e);
+  RAISE EXCEPTION 'anon acquired financial authority' USING ERRCODE='assert_failure';
+ EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+ RESET ROLE;
+ SET LOCAL ROLE authenticated;
+ BEGIN
+  PERFORM billing_contract_eligible(c,s,e);
+  RAISE EXCEPTION 'authenticated acquired financial authority' USING ERRCODE='assert_failure';
+ EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+ RESET ROLE;
+
  IF billing_contract_eligible(c,e,'2025-04-30') THEN RAISE EXCEPTION 'receipt reused outside mapped allowance'; END IF;
  INSERT INTO billing_provider_pair_revocation(contract_id,team_id,identity) VALUES(c.id,c.team_id,b.binding->'identity');
  IF billing_contract_eligible(c,s,e) THEN RAISE EXCEPTION 'revoked pair authorized allowance'; END IF;
