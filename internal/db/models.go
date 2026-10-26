@@ -2114,6 +2114,15 @@ type Secret struct {
 	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
 }
 
+type SignupReviewDecision struct {
+	UserID        uuid.UUID   `json:"user_id"`
+	Decision      string      `json:"decision"`
+	StaffID       uuid.UUID   `json:"staff_id"`
+	PlanVersionID pgtype.UUID `json:"plan_version_id"`
+	Region        *string     `json:"region"`
+	CreatedAt     time.Time   `json:"created_at"`
+}
+
 type Snapshot struct {
 	ID         uuid.UUID `json:"id"`
 	SandboxID  uuid.UUID `json:"sandbox_id"`
