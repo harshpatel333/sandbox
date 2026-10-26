@@ -24,11 +24,14 @@ func TestIntegration_PricingSwitchHTTPRestrictedRole(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+	})
 	exec(`DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role NOLOGIN; END IF; END $$;
  CREATE ROLE pricing_switch_http_test NOLOGIN BYPASSRLS IN ROLE service_role;
  GRANT USAGE ON SCHEMA public TO pricing_switch_http_test;
  GRANT SELECT ON ALL TABLES IN SCHEMA public TO pricing_switch_http_test;
- GRANT EXECUTE ON FUNCTION billing_transition_pricing_version(text,uuid,text) TO service_role;
+ GRANT EXECUTE ON FUNCTION billing_transition_pricing_version(text,uuid,text),billing_pricing_public_state() TO service_role;
  UPDATE billing_pricing_switch SET pricing_version='legacy',changed_by=NULL,reason=NULL;`)
 	t.Cleanup(func() {
 		_, _ = testPool.Exec(context.Background(), `DROP OWNED BY pricing_switch_http_test; DROP ROLE pricing_switch_http_test`)
@@ -97,9 +100,6 @@ func TestIntegration_PricingSwitchHTTPRestrictedRole(t *testing.T) {
 		t.Fatalf("switch released entry: %+v", public)
 	}
 	call("legacy", "restore", http.StatusOK)
-	t.Cleanup(func() {
-		_, _ = testPool.Exec(context.Background(), `UPDATE billing_pricing_switch SET pricing_version='legacy'`)
-	})
 	stable := snapshot()
 	t.Cleanup(func() {
 		_, _ = testPool.Exec(context.Background(), `ALTER TABLE billing_pricing_switch ENABLE TRIGGER billing_pricing_adoption_reset`)
