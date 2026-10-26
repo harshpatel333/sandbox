@@ -16,8 +16,15 @@ import (
 var prepaidCheckoutNamespace = uuid.MustParse("6f1c8f55-3c4e-4f62-9d55-6a8b0c1f2e47")
 
 type prepaidCheckoutLine struct {
-	OperationID uuid.UUID
-	AmountCents int64
+	OperationID       uuid.UUID
+	AmountCents       int64
+	acceptedRedirects bool
+}
+
+// Stripe requires at least 30 minutes at creation; equality leaves no dispatch
+// margin. Compare at the provider's whole-second precision without extending expiry.
+func prepaidCheckoutGenerationCanCreate(generation, expires time.Time) bool {
+	return expires.Unix() > generation.Add(30*time.Minute).Unix()
 }
 
 type prepaidCheckoutRequest struct {

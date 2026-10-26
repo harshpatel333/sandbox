@@ -23,6 +23,24 @@ type prepaidOperationResponse struct {
 	State      string    `json:"state"`
 }
 
+// Existing accepted terms remain recoverable after redirect policy changes.
+func (h *Handlers) acceptedPrepaidCheckoutOperation(ctx context.Context, team, actor uuid.UUID, req prepaidCheckoutBody) (bool, error) {
+	var matches, accepted bool
+	err := h.Pool.QueryRow(ctx, `SELECT o.team_id=$2 AND o.actor_id=$3 AND o.amount_cents=$4 AND o.success_url=$5 AND o.cancel_url=$6,
+		EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.id=o.id AND p.team_id=o.team_id AND p.actor_id=o.actor_id AND p.amount_cents=o.amount_cents AND p.source='checkout')
+		FROM billing_prepaid_checkout_operation o WHERE o.id=$1`, req.OperationID, team, actor, req.AmountCents, req.SuccessURL, req.CancelURL).Scan(&matches, &accepted)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !matches {
+		return false, errPrepaidOperationConflict
+	}
+	return accepted, nil
+}
+
 func (h *Handlers) bindPrepaidCheckoutOperation(ctx context.Context, team, actor uuid.UUID, req prepaidCheckoutBody) error {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {

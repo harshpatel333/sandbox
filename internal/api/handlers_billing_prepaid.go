@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -103,24 +104,41 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		respondErrorMsg(c, "service_unavailable", "Stripe billing is not configured", http.StatusServiceUnavailable)
 		return
 	}
+	acceptedRedirects := false
 	if req.OperationID != uuid.Nil {
-		req.SuccessURL, err = h.validateBillingRedirectURL(req.SuccessURL)
-		if err != nil {
-			respondErrorMsg(c, "bad_request", "invalid success_url", 400)
-			return
+		for _, raw := range []*string{&req.SuccessURL, &req.CancelURL} {
+			if parsed, parseErr := url.Parse(strings.TrimSpace(*raw)); parseErr == nil {
+				*raw = parsed.String()
+			}
 		}
-		req.CancelURL, err = h.validateBillingRedirectURL(req.CancelURL)
+		acceptedRedirects, err = h.acceptedPrepaidCheckoutOperation(ctx, team, actor, req)
 		if err != nil {
-			respondErrorMsg(c, "bad_request", "invalid cancel_url", 400)
-			return
-		}
-		if err = h.bindPrepaidCheckoutOperation(ctx, team, actor, req); err != nil {
 			if errors.Is(err, errPrepaidOperationConflict) {
 				respondErrorMsg(c, "operation_conflict", err.Error(), 409)
 			} else {
 				respondError(c, ErrInternal)
 			}
 			return
+		}
+		if !acceptedRedirects {
+			req.SuccessURL, err = h.validateBillingRedirectURL(req.SuccessURL)
+			if err != nil {
+				respondErrorMsg(c, "bad_request", "invalid success_url", 400)
+				return
+			}
+			req.CancelURL, err = h.validateBillingRedirectURL(req.CancelURL)
+			if err != nil {
+				respondErrorMsg(c, "bad_request", "invalid cancel_url", 400)
+				return
+			}
+			if err = h.bindPrepaidCheckoutOperation(ctx, team, actor, req); err != nil {
+				if errors.Is(err, errPrepaidOperationConflict) {
+					respondErrorMsg(c, "operation_conflict", err.Error(), 409)
+				} else {
+					respondError(c, ErrInternal)
+				}
+				return
+			}
 		}
 		if handled, resumeErr := h.resumePrepaidCheckoutOperation(c, client, team, actor, req); handled || resumeErr != nil {
 			if resumeErr != nil {
@@ -154,18 +172,21 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		return
 	}
 	if !billingAccountHasEstablishedSubscription(account) {
-		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, OperationID: req.OperationID})
+		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, OperationID: req.OperationID, acceptedRedirects: acceptedRedirects})
 		return
 	}
-	successURL, err := h.validateBillingRedirectURL(req.SuccessURL)
-	if err != nil {
-		respondErrorMsg(c, "bad_request", "invalid success_url", http.StatusBadRequest)
-		return
-	}
-	cancelURL, err := h.validateBillingRedirectURL(req.CancelURL)
-	if err != nil {
-		respondErrorMsg(c, "bad_request", "invalid cancel_url", http.StatusBadRequest)
-		return
+	successURL, cancelURL := req.SuccessURL, req.CancelURL
+	if !acceptedRedirects {
+		successURL, err = h.validateBillingRedirectURL(req.SuccessURL)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "invalid success_url", http.StatusBadRequest)
+			return
+		}
+		cancelURL, err = h.validateBillingRedirectURL(req.CancelURL)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "invalid cancel_url", http.StatusBadRequest)
+			return
+		}
 	}
 	session, err := h.startPrepaidPaymentCheckout(ctx, client, team, actor, derefString(account.StripeCustomerID), req.AmountCents, successURL, cancelURL, req.OperationID)
 	if err != nil {

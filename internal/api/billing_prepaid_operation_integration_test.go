@@ -95,6 +95,23 @@ func TestPrepaidOperationConcurrentRetryAndBinding(t *testing.T) {
 			t.Fatalf("mismatch accepted: %d %s", rec.Code, rec.Body)
 		}
 	}
+	f.h.Config.AppAllowedOrigins = []string{"https://replacement.example.com"}
+	fresh := req
+	fresh.OperationID = uuid.New()
+	if rec := prepaidOperationPost(r, fresh); rec.Code != 400 {
+		t.Fatalf("fresh removed origin accepted: %d %s", rec.Code, rec.Body)
+	}
+	if err := f.h.bindPrepaidCheckoutOperation(t.Context(), f.team, actor, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if rec := prepaidOperationPost(r, fresh); rec.Code != 400 {
+		t.Fatalf("unused binding bypassed policy: %d %s", rec.Code, rec.Body)
+	}
+	changed := req
+	changed.SuccessURL = "https://replacement.example.com/ok"
+	if rec := prepaidOperationPost(r, changed); rec.Code != 409 {
+		t.Fatalf("accepted binding changed returns: %d %s", rec.Code, rec.Body)
+	}
 	other, err := f.h.DB.CreateTeam(t.Context(), "operation-other-"+uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
@@ -107,6 +124,7 @@ func TestPrepaidOperationConcurrentRetryAndBinding(t *testing.T) {
 	if rec := prepaidOperationPost(otherActorRouter, req); rec.Code != 409 {
 		t.Fatalf("cross-actor operation accepted: %d %s", rec.Code, rec.Body)
 	}
+	f.h.Config.AppAllowedOrigins = []string{"https://replacement.example.com"}
 	setPricingVersion(t, f.h, "legacy")
 	if rec := prepaidOperationPost(r, req); rec.Code != 200 {
 		t.Fatalf("accepted checkout lost after switch: %d %s", rec.Code, rec.Body)
@@ -221,6 +239,7 @@ func TestPrepaidOperationFirstCheckoutLostReplyRestoresAssociation(t *testing.T)
 	if err := f.h.Pool.QueryRow(t.Context(), `SELECT a.checkout_session_id IS NULL AND p.checkout_session_id IS NULL AND a.checkout_initializing_at IS NOT NULL FROM team_billing_account a JOIN billing_prepaid_purchase p USING(team_id) WHERE p.id=$1`, req.OperationID).Scan(&initial); err != nil || !initial {
 		t.Fatalf("lost-response precondition: %v %v", initial, err)
 	}
+	f.h.Config.AppAllowedOrigins = []string{"https://replacement.example.com"}
 	done := make(chan *httptest.ResponseRecorder, 2)
 	for range 2 {
 		go func() { done <- prepaidOperationPost(r, req) }()
