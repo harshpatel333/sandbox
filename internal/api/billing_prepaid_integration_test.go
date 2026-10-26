@@ -54,7 +54,7 @@ type prepaidFixture struct {
 	loseVoid, dropVoid  bool
 }
 
-func newPrepaidFixture(t *testing.T) *prepaidFixture {
+func newPrepaidFixture(t *testing.T, initialCredit ...int64) *prepaidFixture {
 	t.Helper()
 	dsn := os.Getenv("DATABASE_URL")
 	cfg, err := pgxpool.ParseConfig(dsn)
@@ -91,7 +91,11 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 	h.Stripe = f.client
 	f.exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status) VALUES($1,$2,$3,'active')`, f.team, f.customer, f.sub)
 	f.exec(`INSERT INTO billing_funding_account(team_id,observe) VALUES($1,true) ON CONFLICT(team_id) DO UPDATE SET observe=true`, f.team)
-	f.observe(1000, true)
+	credit := int64(1000)
+	if len(initialCredit) > 0 {
+		credit = initialCredit[0]
+	}
+	f.observe(credit, true)
 	assign := assignStarterAfterPurchase
 	assignStarterAfterPurchase = func(_ context.Context, _ *Handlers, _ uuid.UUID, purchase uuid.UUID) error {
 		f.mu.Lock()
@@ -1687,5 +1691,95 @@ func TestPrepaidVoidByALaterRevokeIsNotCreditedToAnEarlierFailedAttempt(t *testi
 	}
 	if firstAmount != nil || !firstClosed || secondAmount == nil || *secondAmount != 300 || actor != secondActor || f.grants[grant].VoidedAt == 0 {
 		t.Fatal("a void made by a later revoke was credited to an earlier attempt that voided nothing", firstAmount, firstClosed, secondAmount, actor)
+	}
+}
+
+func TestPrepaidEnforcementStartsWithFirstPostGrantZero(t *testing.T) {
+	for _, scenario := range []string{"usage exhausted credit", "provider lag"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newPrepaidFixture(t, 0)
+			f.enableAutoRecharge(500, 500)
+			if err := f.tick(); err != nil {
+				t.Fatal(err)
+			}
+			f.exec(`UPDATE billing_prepaid_auto_recharge SET enabled=false WHERE team_id=$1`, f.team)
+			purchase := f.rows()
+			if len(purchase) != 1 || purchase[0].Amount != 500 || purchase[0].Payment != "succeeded" || purchase[0].Credit != "issued" {
+				t.Fatalf("purchase not issued: %+v", purchase)
+			}
+			publish := func(available, unsettled string) {
+				t.Helper()
+				j, s := claimFundingTestJob(t, f.h, f.team)
+				spendable, err := fundingNetSpendableUSD(available, unsettled)
+				if err != nil {
+					t.Fatal(err)
+				}
+				credit := &fundingCreditObservation{SpendableUSD: spendable, ValidUntil: s.At.Add(time.Minute), Evidence: json.RawMessage(fmt.Sprintf(`{"available_usd":%q,"unsettled_usd":%q}`, available, unsettled))}
+				provider := &fundingProviderObservation{PaymentMethodID: "pm_saved", PaymentMethodReusable: true, CollectionReady: true, ValidUntil: s.At.Add(time.Minute), Evidence: json.RawMessage(`{"subscription_status":"active"}`)}
+				if err = f.h.publishFundingObservation(t.Context(), j, s, credit, provider, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			available, unsettled := "5", "5"
+			if scenario == "provider lag" {
+				available, unsettled = "0", "0"
+			}
+			publish(available, unsettled)
+			var postGrant bool
+			if err := f.h.Pool.QueryRow(t.Context(), `SELECT f.credit_usd=0 AND f.credit_checked_at>p.credited_at AND NOT f.prepaid AND NOT f.enforce AND f.payment_method_ready AND a.stripe_subscription_status='active' FROM billing_funding_account f JOIN billing_prepaid_purchase p USING(team_id) JOIN team_billing_account a USING(team_id) WHERE f.team_id=$1`, f.team).Scan(&postGrant); err != nil || !postGrant {
+				t.Fatalf("first fresh zero fixture: %v %v", postGrant, err)
+			}
+			assertEligibility := func(want bool) {
+				t.Helper()
+				var prepaid, enforce, eligible bool
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT prepaid,enforce,team_sandbox_billing_eligible(team_id) FROM billing_funding_account WHERE team_id=$1`, f.team).Scan(&prepaid, &enforce, &eligible); err != nil || !prepaid || !enforce || eligible != want {
+					t.Fatalf("prepaid=%v enforce=%v eligible=%v want%v: %v", prepaid, enforce, eligible, want, err)
+				}
+			}
+			for range 2 {
+				if err := f.h.startPrepaidEnforcement(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				assertEligibility(false)
+			}
+			if scenario == "provider lag" {
+				publish("5", "0")
+				if err := f.h.startPrepaidEnforcement(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				assertEligibility(true)
+			}
+			if after := f.rows(); !reflect.DeepEqual(after, purchase) || len(f.intentPosts) != 1 || len(f.grantPosts) != 1 {
+				t.Fatalf("enforcement changed purchase/grant identity: %+v", after)
+			}
+		})
+	}
+}
+
+func TestPrepaidEnforcementRejectsUnboundPostGrantZero(t *testing.T) {
+	for name, mutate := range map[string]string{
+		"pre-grant":    `UPDATE billing_funding_account SET credit_checked_at=(SELECT credited_at FROM billing_prepaid_purchase WHERE team_id=$1 LIMIT 1) WHERE team_id=$1`,
+		"expired":      `UPDATE billing_funding_account SET credit_valid_until=clock_timestamp()-interval '1 second' WHERE team_id=$1`,
+		"generation":   `UPDATE billing_funding_account SET observed_generation=generation-1 WHERE team_id=$1`,
+		"customer":     `UPDATE billing_funding_account SET customer_id='cus_other' WHERE team_id=$1`,
+		"subscription": `UPDATE billing_funding_account SET subscription_id='sub_other' WHERE team_id=$1`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newPrepaidFixture(t, 0)
+			f.enableAutoRecharge(500, 500)
+			if err := f.tick(); err != nil {
+				t.Fatal(err)
+			}
+			f.exec(`UPDATE billing_prepaid_auto_recharge SET enabled=false WHERE team_id=$1`, f.team)
+			f.observe(0, true)
+			f.exec(mutate, f.team)
+			if err := f.h.startPrepaidEnforcement(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			var enforced bool
+			if err := f.h.Pool.QueryRow(t.Context(), `SELECT prepaid OR enforce FROM billing_funding_account WHERE team_id=$1`, f.team).Scan(&enforced); err != nil || enforced {
+				t.Fatalf("unbound evidence activated enforcement: %v %v", enforced, err)
+			}
+		})
 	}
 }
