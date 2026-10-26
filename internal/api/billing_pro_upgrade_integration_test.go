@@ -443,6 +443,19 @@ func testProUpgradeCreditRecovery(t *testing.T, credit *int64, firstCycle bool) 
 	if err = conn.QueryRow(t.Context(), `SELECT expires_at FROM billing_provider_credit WHERE customer_id=$1 AND grant_id=$2`, u.Customer, g.ID).Scan(&expires); err != nil || expires != expectedExpiry {
 		t.Fatalf("accepted credit expiry: %d %v", expires, err)
 	}
+	if err = h.verifyOwnedEntitlementGrant(t.Context(), g); err != nil {
+		t.Fatalf("generic credit inventory rejected recognized upgrade terms: %v", err)
+	}
+	orphan := g
+	orphan.ID = "cred_" + uuid.NewString()
+	orphan.Metadata = map[string]string{"pro_upgrade_id": uuid.NewString()}
+	if err = h.verifyOwnedEntitlementGrant(t.Context(), orphan); err == nil {
+		t.Fatal("generic credit inventory accepted unbound reserved upgrade marker")
+	}
+	orphan.Metadata = nil
+	if err = h.verifyOwnedEntitlementGrant(t.Context(), orphan); err != nil {
+		t.Fatalf("unmarked external credit rejected: %v", err)
+	}
 	g.ExpiresAt++
 	if err = h.issueProUpgradeCredit(t.Context(), conn, &u, client); err == nil {
 		t.Fatal("replay accepted a provider credit with changed expiry")

@@ -56,7 +56,7 @@ func retireFirstProCycleReportingPeriods(ctx context.Context, tx pgx.Tx, u proUp
 	if err != nil {
 		return err
 	}
-	rows, err = tx.Query(ctx, `SELECT lease_token IS NOT NULL OR attempts>0 FROM billing_period_close_work WHERE team_id=$1 AND period_start<$3 AND period_end>$2 FOR UPDATE`, u.Team, u.Start, u.End)
+	rows, err = tx.Query(ctx, `SELECT lease_token IS NOT NULL OR attempts>0 OR stage<>'pending' OR last_attempt_at IS NOT NULL OR last_progress_at IS NOT NULL OR last_error IS NOT NULL FROM billing_period_close_work WHERE team_id=$1 AND period_start<$3 AND period_end>$2 AND completed_at IS NULL FOR UPDATE`, u.Team, u.Start, u.End)
 	if err != nil {
 		return err
 	}
@@ -134,6 +134,9 @@ func retireFirstProCycleReportingPeriods(ctx context.Context, tx pgx.Tx, u proUp
 	}
 	for _, p := range periods {
 		if _, err = tx.Exec(ctx, `UPDATE team_billing_period SET status='finalized',blocked_reason='reporting_only_calendar_period',gross_charges_usd=0,credits_applied_usd=0,net_invoice_amount_usd=0,finalized_at=clock_timestamp(),updated_at=clock_timestamp() WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, u.Team, p.start, p.end); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `UPDATE billing_period_close_work SET completed_at=clock_timestamp(),stage='reporting_only_calendar_period',last_progress_at=clock_timestamp() WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND completed_at IS NULL AND attempts=0 AND lease_token IS NULL`, u.Team, p.start, p.end); err != nil {
 			return err
 		}
 	}

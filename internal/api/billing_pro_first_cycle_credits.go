@@ -69,13 +69,18 @@ func verifyFirstProCycleGrant(ctx context.Context, u proUpgrade, client *stripeH
 }
 
 func (h *Handlers) verifyOwnedFirstProCycleGrant(ctx context.Context, g entitlementGrant) error {
-	u, err := scanProUpgrade(h.Pool.QueryRow(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE customer_id=$1 AND (grant_id=$2 OR id::text=$3) AND request_payload->>'FirstPaidProCycle'='true'`, g.Customer, g.ID, g.Metadata["pro_upgrade_id"]))
+	u, err := scanProUpgrade(h.Pool.QueryRow(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE customer_id=$1 AND (grant_id=$2 OR id::text=$3)`, g.Customer, g.ID, g.Metadata["pro_upgrade_id"]))
 	if errors.Is(err, pgx.ErrNoRows) {
+		if g.Metadata["pro_upgrade_id"] != "" {
+			return errors.New("Pro upgrade allowance lacks frozen local authority")
+		}
 		return nil
 	}
 	if err != nil {
 		return err
 	}
+	// Locally recognized unmarked upgrades retain their original non-expiring
+	// bridge terms; the same frozen amount and grant identity still apply.
 	return validateFirstProCycleGrant(u, g)
 }
 
