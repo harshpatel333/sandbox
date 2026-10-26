@@ -108,3 +108,26 @@ func freeZeroGoSnapshot(t *testing.T, fixed bool) {
 		exec(`SELECT pg_temp.transition_free_zero_templates($1,$2,$3,$4,'Go snapshot acceptance')`, sqlTeam, sqlAssignment, replacement, actor)
 	}
 }
+
+// freezePlanTerms represents an absent allowance as JSON null. Normal staff
+// assignment and delayed prepaid settlement must remain compatible with it.
+func TestPlanAssignmentFreeZeroTemplatesAbsentAllowance(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	terms := testPlanTerms("free", planKindFree, 2, nil)
+	first, err := assignInTx(t, h, planAssignment{Team: team, Terms: terms, Source: planSourceStaff, Reason: "ordinary Free with nil allowance"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := assignInTx(t, h, planAssignment{Team: team, Terms: terms, Source: planSourceStaff, Reason: "unchanged nil allowance"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var since time.Time
+	var allowance string
+	if err = h.Pool.QueryRow(t.Context(), `SELECT free_since,allowance::text FROM billing_free_plan($1)`, team).Scan(&since, &allowance); err != nil || !since.Equal(first.EffectiveFrom) || allowance != "{}" {
+		t.Fatalf("nil allowance continuity since=%s allowance=%s err=%v", since, allowance, err)
+	}
+	if next.ID == first.ID {
+		t.Fatal("assignment transition did not occur")
+	}
+}

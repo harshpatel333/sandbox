@@ -368,3 +368,52 @@ func TestIntegration_FreeZeroTemplatesAdmissionReadsCurrentRowOnly(t *testing.T)
 	}
 	t.Logf("1001-assignment admission plan: %s", encoded)
 }
+
+func TestIntegration_FreeZeroTemplatesNullAndMissingAllowance(t *testing.T) {
+	for _, tc := range []struct {
+		name, prior, next string
+		carry             bool
+	}{
+		{"JSON null", `{"allowance":null}`, `{"allowance":null}`, true},
+		{"missing to null", `{}`, `{"allowance":null}`, false},
+		{"null to missing", `{"allowance":null}`, `{}`, false},
+		{"scalar to object", `{"allowance":"invalid"}`, `{"allowance":{"amount_cents":5}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			tx, err := testPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			exec := func(q string, args ...any) {
+				t.Helper()
+				if _, e := tx.Exec(ctx, q, args...); e != nil {
+					t.Fatal(e)
+				}
+			}
+			exec(`UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+			team := uuid.New()
+			exec(`INSERT INTO team(id,name) VALUES($1,'Non-object allowance boundary')`, team)
+			var start time.Time
+			if err = tx.QueryRow(ctx, `SELECT clock_timestamp()-interval '2 hours'`).Scan(&start); err != nil {
+				t.Fatal(err)
+			}
+			exec(`INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free',$2::jsonb,'{"max_concurrent":2}',$3,'staff','initial non-object allowance')`, team, tc.prior, start)
+			next := start.Add(time.Hour)
+			exec(`UPDATE team_plan_assignment SET effective_to=$2 WHERE team_id=$1 AND effective_to IS NULL`, team, next)
+			exec(`INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free',$2::jsonb,'{"max_concurrent":2}',$3,'staff','next non-object allowance')`, team, tc.next, next)
+			var since time.Time
+			if err = tx.QueryRow(ctx, `SELECT free_since FROM billing_free_plan($1)`, team).Scan(&since); err != nil {
+				t.Fatal(err)
+			}
+			expected := next
+			if tc.carry {
+				expected = start
+			}
+			if !since.Equal(expected) {
+				t.Fatalf("floor=%s expected=%s", since, expected)
+			}
+		})
+	}
+}

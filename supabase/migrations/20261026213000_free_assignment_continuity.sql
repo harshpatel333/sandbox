@@ -21,7 +21,11 @@ BEGIN
   ORDER BY effective_from DESC,created_at DESC,id LIMIT 1;
   IF FOUND AND previous.kind='free' AND previous.effective_from<NEW.effective_from
    -- amount_usd is a derived display string, never allowance authority.
-   AND ((previous.terms->'allowance')-'amount_usd') IS NOT DISTINCT FROM ((NEW.terms->'allowance')-'amount_usd') THEN
+   AND (CASE WHEN jsonb_typeof(previous.terms->'allowance')='object'
+     THEN (previous.terms->'allowance')-'amount_usd' ELSE previous.terms->'allowance' END)
+    IS NOT DISTINCT FROM
+    (CASE WHEN jsonb_typeof(NEW.terms->'allowance')='object'
+     THEN (NEW.terms->'allowance')-'amount_usd' ELSE NEW.terms->'allowance' END) THEN
    expected:=COALESCE(previous.free_allowance_since,previous.effective_from);
   END IF;
  END IF;
