@@ -441,6 +441,10 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 	if err = h.enrollInvoiceAccount(ctx, u.Team, nil); err != nil {
 		return "", err
 	}
+	return h.activateProUpgrade(ctx, u, params)
+}
+
+func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params StripeCreateCheckoutSessionParams) (string, error) {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return "", err
