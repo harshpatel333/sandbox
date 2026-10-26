@@ -113,7 +113,7 @@ on:
 # leave a host stopped or on a half-written env file. A queued run always
 # starts from the finished state of the one before it.
 concurrency:
-  group: deploy-vmd
+  group: ${{ inputs.diagnostic_only && format('vmd-discovery-diagnostics-{0}', github.ref) || 'deploy-vmd' }}
   cancel-in-progress: false
   queue: max
 
