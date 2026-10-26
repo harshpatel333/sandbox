@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -169,11 +170,11 @@ func (v planVersion) validate() error {
 	if strings.ContainsRune(v.DisplayName+v.PriceLabel+v.Tagline+strings.Join(v.Features, ""), 0) {
 		return errors.New("text may not contain NUL characters")
 	}
-	if strings.TrimSpace(v.DisplayName) == "" || len(v.DisplayName) > 80 || len(v.PriceLabel) > 80 || len(v.Tagline) > 200 || len(v.Features) > 20 {
+	if strings.TrimSpace(v.DisplayName) == "" || utf8.RuneCountInString(v.DisplayName) > 80 || utf8.RuneCountInString(v.PriceLabel) > 80 || utf8.RuneCountInString(v.Tagline) > 200 || len(v.Features) > 20 {
 		return errors.New("display name is required; name, price label, tagline and features have length limits")
 	}
 	for _, f := range v.Features {
-		if strings.TrimSpace(f) == "" || len(f) > 200 {
+		if strings.TrimSpace(f) == "" || utf8.RuneCountInString(f) > 200 {
 			return errors.New("feature bullets must be non-empty and at most 200 characters")
 		}
 	}

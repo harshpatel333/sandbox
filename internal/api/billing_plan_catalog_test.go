@@ -2,6 +2,7 @@ package api
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 )
 
@@ -184,5 +185,30 @@ func TestPlanPricedNeedsStripe(t *testing.T) {
 	h.Stripe = &stripeHTTPClient{}
 	if !h.planPriced(terms) {
 		t.Fatal("v2 plan not available with Stripe")
+	}
+}
+
+func TestPlanCatalogTextLimitsCountUnicodeCharacters(t *testing.T) {
+	for _, field := range []struct {
+		name  string
+		limit int
+		set   func(*planVersion, string)
+	}{
+		{"display name", 80, func(v *planVersion, s string) { v.DisplayName = s }},
+		{"price label", 80, func(v *planVersion, s string) { v.PriceLabel = s }},
+		{"tagline", 200, func(v *planVersion, s string) { v.Tagline = s }},
+		{"feature", 200, func(v *planVersion, s string) { v.Features = []string{s} }},
+	} {
+		t.Run(field.name, func(t *testing.T) {
+			v := planVersion{PricingVersion: "v2", Family: "custom_example", Kind: "custom", DisplayName: "Example", Limits: planLimits{MaxConcurrent: int32p(5)}}
+			field.set(&v, strings.Repeat("界", field.limit))
+			if err := v.validate(); err != nil {
+				t.Fatalf("valid Unicode boundary: %v", err)
+			}
+			field.set(&v, strings.Repeat("界", field.limit+1))
+			if err := v.validate(); err == nil {
+				t.Fatal("overlong Unicode text accepted")
+			}
+		})
 	}
 }

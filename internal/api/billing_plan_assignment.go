@@ -512,7 +512,8 @@ type staffPlanAssignmentBody struct {
 
 // AssignTeamPlan lets staff put a team on a custom plan version, such as an
 // Enterprise arrangement. The team needs no billing account or Stripe
-// customer; the plan applies at once and replaces the team's current plan.
+// customer. Fresh assignments wait until any paid authority or billing
+// transition has been resolved; accepted requests remain replayable.
 func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 	team, ok := ycTeam(c)
 	if !ok {
@@ -538,6 +539,8 @@ func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 	plan, err := h.assignStaffPlan(ctx, team, actor, body)
 	var pgErr *pgconn.PgError
 	switch {
+	case errors.Is(err, errStaffPlanAuthority):
+		respondErrorMsg(c, "conflict", "resolve the existing paid plan or billing transition before assigning a custom plan", http.StatusConflict)
 	case errors.Is(err, errPricingV2Off):
 		respondErrorMsg(c, "conflict", "plan assignment is not available yet", http.StatusConflict)
 	case errors.Is(err, errUnknownPlan):
@@ -557,6 +560,7 @@ func (h *Handlers) AssignTeamPlan(c *gin.Context) {
 }
 
 var errPricingV2Off = errors.New("pricing v2 is off")
+var errStaffPlanAuthority = errors.New("existing commercial authority or unresolved billing transition")
 
 func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, body staffPlanAssignmentBody) (teamPlan, error) {
 	tx, err := h.Pool.Begin(ctx)
@@ -583,6 +587,25 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 	}
 	if version != "v2" || !entryOpen {
 		return teamPlan{}, errPricingV2Off
+	}
+	// The team lock also fences checkout activation and plan-change workers.
+	// Replay above remains valid even after later commercial commitments.
+	var blocked bool
+	if err = tx.QueryRow(ctx, `SELECT
+ EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND status<>'ended')
+ OR EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL AND kind='subscription')
+ OR EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state NOT IN ('expired','ended'))
+ OR EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND state='pending' AND offer_key<>'free')
+ OR EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$1 AND (checkout_initializing_at IS NOT NULL OR checkout_may_exist))
+ OR EXISTS(SELECT 1 FROM billing_yc_operation WHERE team_id=$1 AND state<>'ended')
+ OR EXISTS(SELECT 1 FROM yc_claim_team_intent WHERE team_id=$1 AND released_at IS NULL)
+ OR EXISTS(SELECT 1 FROM billing_sponsored_operation WHERE team_id=$1 AND state NOT IN ('revoked','expired'))
+ OR EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE team_id=$1 AND (payment_state IN ('pending','uncertain','processing') OR credit_state IN ('pending','uncertain')))
+ OR EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=$1 AND (state IN ('scheduled','applied') OR (state='undone' AND subscription_id IS NOT NULL AND provider_renewed_at IS NULL)))`, team).Scan(&blocked); err != nil {
+		return teamPlan{}, err
+	}
+	if blocked {
+		return teamPlan{}, errStaffPlanAuthority
 	}
 	catalogVersion, err := scanPlanVersion(tx.QueryRow(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE id=$1 AND state<>'draft' FOR SHARE`, body.VersionID))
 	if errors.Is(err, pgx.ErrNoRows) {

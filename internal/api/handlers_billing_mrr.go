@@ -17,7 +17,7 @@ import (
 const (
 	mrrPAYGKey            = "payg"
 	mrrSponsoredAnnualKey = "sponsored_annual_pro"
-	// Fee-waived deals are valued at what the same team would pay for Pro.
+	// Historical fee-waived deals retain the legacy Pro annual list reference.
 	mrrWaivedReferenceOffer = "pro_annual"
 )
 
@@ -70,9 +70,9 @@ func mrrValuesAtProList(g mrrContractGroup) bool {
 }
 
 // mrrPerTeamCents normalises one contract's recurring fee to a month. Paid
-// contracts use their frozen fee; YC and sponsored annual Pro use the Pro
-// annual list price; credit-only sponsorship has no recurring fee. Usage is
-// never recurring revenue.
+// contracts use their frozen fee; YC and sponsored annual Pro use the legacy
+// Pro annual list price; credit-only sponsorship has no recurring fee. Usage
+// is never recurring revenue.
 func mrrPerTeamCents(g mrrContractGroup, proAnnual planTerms) int64 {
 	switch {
 	case mrrValuesAtProList(g):
@@ -169,7 +169,7 @@ func (h *Handlers) loadMRROverview(ctx context.Context, q db.DBTX, now time.Time
 		key := mrrPlanKey(g)
 		if _, ok := names[key]; ok {
 			if mrrValuesAtProList(g) && proAnnual.OfferKey == "" {
-				if proAnnual, err = h.planTerms(ctx, mrrWaivedReferenceOffer); err != nil {
+				if proAnnual, err = h.planTermsForPricingVersion(ctx, mrrWaivedReferenceOffer, "legacy", q); err != nil {
 					return mrrOverview{}, err
 				}
 			}

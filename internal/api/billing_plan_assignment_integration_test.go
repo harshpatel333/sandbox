@@ -585,3 +585,165 @@ func TestPlanAssignmentMigrationBypassCannotEnterV2(t *testing.T) {
 		t.Fatalf("refused import persisted: %t %v", published, err)
 	}
 }
+
+func publishStaffAssignmentTestVersion(t *testing.T, h *Handlers) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := h.Pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version(pricing_version,family,version,kind,display_name,max_sandboxes) VALUES('v2','custom_'||substr(md5(random()::text),1,8),1,'custom','Example custom',250) RETURNING id`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `SELECT publish_billing_plan_version($1,$2)`, id, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestStaffPlanAssignmentPreservesCommercialAuthority(t *testing.T) {
+	for _, state := range []string{"active contract", "pending contract", "orphan subscription", "pending checkout", "prepared upgrade", "scheduled change", "safe Free", "safe Starter"} {
+		t.Run(state, func(t *testing.T) {
+			h, team := newPlanAssignmentFixture(t)
+			setPricingVersion(t, h, "v2")
+			installPrepaidPublicStateFixture(t, h)
+			version := publishStaffAssignmentTestVersion(t, h)
+			actor := uuid.New()
+			body := staffPlanAssignmentBody{Key: "accepted-custom", VersionID: version, Reason: "approved custom terms"}
+			accepted, err := h.assignStaffPlan(t.Context(), team, actor, body)
+			if err != nil {
+				t.Fatal("initial custom commitment", err)
+			}
+			kind, key := planKindFree, "free"
+			if state == "orphan subscription" || state == "active contract" || state == "pending contract" {
+				kind, key = planKindSubscription, "pro_monthly"
+			}
+			if state == "safe Starter" {
+				kind, key = planKindPrepaid, "starter"
+			}
+			if _, err = assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms(key, kind, 2, nil), Source: planSourceCheckout, Reason: "later commitment"}); err != nil {
+				t.Fatal(err)
+			}
+			// Describe lifecycle states directly; activation itself is covered by Pro tests.
+			tx, err := h.Pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := tx.Exec(t.Context(), sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exec(`SET LOCAL session_replication_role=replica`)
+			switch state {
+			case "active contract", "pending contract":
+				status := "active"
+				if state == "pending contract" {
+					status = "pending"
+				}
+				exec(`INSERT INTO billing_commercial_contract(team_id,offer_key,status,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor) VALUES($1::uuid,'pro_monthly',$2,clock_timestamp(),'cus_'||$1::text,'sub_'||$1::text,'price_example',25000,1,25000,clock_timestamp()-interval '1 second')`, team, status)
+				exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,commercial_billing_anchor) VALUES($1::uuid,'cus_'||$1::text,'sub_'||$1::text,clock_timestamp())`, team)
+			case "pending checkout":
+				exec(`INSERT INTO billing_signup_choice(team_id,offer_key,state,generation,actor_id,base_price_id,request_payload) VALUES($1,'pro_monthly','pending',clock_timestamp(),gen_random_uuid(),'price_example','{}') ON CONFLICT(team_id) DO UPDATE SET offer_key=excluded.offer_key,state=excluded.state,generation=excluded.generation,actor_id=excluded.actor_id,base_price_id=excluded.base_price_id,request_payload=excluded.request_payload`, team)
+			case "prepared upgrade":
+				exec(`INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents) VALUES($1,$2,$3,'cus_example','pro_monthly','{}',clock_timestamp()-interval '1 minute',clock_timestamp()-interval '1 minute',clock_timestamp()+interval '1 day',clock_timestamp(),100)`, uuid.New(), team, actor)
+			case "scheduled change":
+				exec(`INSERT INTO team_plan_change(team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,requested_by,requested_via,reason,idempotency_key) SELECT team_id,id,'free','free','{}','{"max_concurrent":1}',clock_timestamp()+interval '1 day',true,$2,'customer','end paid plan','change' FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team, actor)
+			}
+			if err = tx.Commit(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			snapshot := func() string {
+				t.Helper()
+				var raw string
+				err := h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_object('contracts',(SELECT jsonb_agg(to_jsonb(c)) FROM billing_commercial_contract c WHERE team_id=$1),'account',(SELECT to_jsonb(a) FROM team_billing_account a WHERE team_id=$1),'assignments',(SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM team_plan_assignment a WHERE team_id=$1),'limits',(SELECT jsonb_build_array(max_sandboxes,max_template_vcpu) FROM team WHERE id=$1),'grants',(SELECT jsonb_agg(to_jsonb(e)) FROM billing_usage_entitlement e WHERE team_id=$1))::text`, team).Scan(&raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return raw
+			}
+			before := snapshot()
+			fresh := body
+			fresh.Key = "fresh-custom"
+			_, err = h.assignStaffPlan(t.Context(), team, actor, fresh)
+			if strings.HasPrefix(state, "safe") {
+				if err != nil {
+					t.Fatal("safe custom assignment", err)
+				}
+				return
+			}
+			if !errors.Is(err, errStaffPlanAuthority) {
+				t.Fatalf("fresh assignment accepted existing authority: %v", err)
+			}
+			if after := snapshot(); after != before {
+				t.Fatal("rejected custom assignment changed financial state")
+			}
+			if replay, err := h.assignStaffPlan(t.Context(), team, actor, body); err != nil || replay.ID != accepted.ID {
+				t.Fatalf("accepted replay lost: %+v %v", replay, err)
+			}
+			if after := snapshot(); after != before {
+				t.Fatal("accepted replay changed later financial state")
+			}
+		})
+	}
+}
+
+func TestStaffPlanAssignmentRechecksAfterConcurrentCommercialCommit(t *testing.T) {
+	h, team := newPlanAssignmentFixture(t)
+	setPricingVersion(t, h, "v2")
+	installPrepaidPublicStateFixture(t, h)
+	version := publishStaffAssignmentTestVersion(t, h)
+	initial, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourceSignup, Reason: "initial"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activation, err := h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer activation.Rollback(context.Background())
+	var blocker int32
+	if err = activation.QueryRow(t.Context(), `SELECT pg_backend_pid() FROM team WHERE id=$1 FOR NO KEY UPDATE`, team).Scan(&blocker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = activation.Exec(t.Context(), `SET LOCAL session_replication_role=replica`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = activation.Exec(t.Context(), `INSERT INTO billing_commercial_contract(team_id,offer_key,status,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor) VALUES($1::uuid,'pro_monthly','pending',clock_timestamp(),'cus_'||$1::text,'sub_'||$1::text,'price_example',25000,1,25000,clock_timestamp()-interval '1 second')`, team); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := h.assignStaffPlan(ctx, team, uuid.New(), staffPlanAssignmentBody{Key: "racing-custom", VersionID: version, Reason: "custom terms"})
+		result <- err
+	}()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var blocked bool
+		if err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, blocker).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("assignment did not wait for activation lock: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	if err = activation.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-result; !errors.Is(err, errStaffPlanAuthority) {
+		t.Fatalf("committed paid authority bypassed: %v", err)
+	}
+	current, ok, err := currentTeamPlan(t.Context(), h.Pool, team)
+	if err != nil || !ok || current.ID != initial.ID {
+		t.Fatalf("racing custom assignment replaced predecessor: %+v %v", current, err)
+	}
+}
