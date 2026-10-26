@@ -15,7 +15,7 @@ CREATE TABLE billing_invoice_cash_authority (
  FOREIGN KEY(team_id,period_start,period_end) REFERENCES team_billing_period(team_id,period_start,period_end)
 );
 ALTER TABLE billing_invoice_cash_authority ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON billing_invoice_cash_authority FROM PUBLIC,anon,authenticated;
+REVOKE ALL ON billing_invoice_cash_authority FROM PUBLIC;
 
 CREATE FUNCTION guard_invoice_cash_authority() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -148,7 +148,21 @@ END $$;
 CREATE TRIGGER frozen_invoice_plan_history BEFORE INSERT OR UPDATE ON team_plan_assignment
  FOR EACH ROW EXECUTE FUNCTION guard_frozen_invoice_plan_history();
 
-REVOKE ALL ON FUNCTION guard_invoice_cash_authority(),resolve_invoice_cash_authority(text),guard_invoice_cash_intent(),guard_frozen_invoice_plan_history() FROM PUBLIC,anon,authenticated;
-GRANT SELECT,INSERT ON billing_invoice_cash_authority TO service_role;
-CREATE POLICY invoice_cash_authority_backend ON billing_invoice_cash_authority TO service_role USING(true) WITH CHECK(true);
-GRANT EXECUTE ON FUNCTION resolve_invoice_cash_authority(text) TO service_role;
+REVOKE ALL ON FUNCTION guard_invoice_cash_authority(),resolve_invoice_cash_authority(text),guard_invoice_cash_intent(),guard_frozen_invoice_plan_history() FROM PUBLIC;
+DO $$
+DECLARE r text;
+BEGIN
+ FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
+   -- Default ACLs may grant ALL to the backend. Reset only these new objects
+   -- before granting their deliberately smaller backend surface.
+   EXECUTE format('REVOKE ALL ON billing_invoice_cash_authority FROM %I',r);
+   EXECUTE format('REVOKE ALL ON FUNCTION guard_invoice_cash_authority(),resolve_invoice_cash_authority(text),guard_invoice_cash_intent(),guard_frozen_invoice_plan_history() FROM %I',r);
+   IF r='service_role' THEN
+    GRANT SELECT,INSERT ON billing_invoice_cash_authority TO service_role;
+    CREATE POLICY invoice_cash_authority_backend ON billing_invoice_cash_authority TO service_role USING(true) WITH CHECK(true);
+    GRANT EXECUTE ON FUNCTION resolve_invoice_cash_authority(text) TO service_role;
+   END IF;
+  END IF;
+ END LOOP;
+END $$;
