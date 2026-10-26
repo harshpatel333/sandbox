@@ -1894,9 +1894,26 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 				respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 				return
 			}
+			if errors.Is(err, errPrepaidPaymentPending) {
+				if prepaid.OperationID != uuid.Nil {
+					c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: purchaseID, State: "pending"})
+				} else {
+					respondErrorMsg(c, "payment_confirmation_pending", "checkout outcome requires recovery", http.StatusAccepted)
+				}
+				return
+			}
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("freeze prepaid checkout terms failed")
 			respondError(c, ErrInternal)
 			return
+		}
+		if prepaid.OperationID != uuid.Nil {
+			// A fresh subscription lease must not extend the original purchase's
+			// settlement deadline. Stripe cannot open a payable session after expiry.
+			if err := h.Pool.QueryRow(c.Request.Context(), `SELECT payment_first_attempt_at+interval '23 hours' FROM billing_prepaid_purchase WHERE id=$1`, purchaseID).Scan(&expiresAt); err != nil {
+				h.finishFailedStripeCheckoutAttempt(teamID, attemptID, checkoutAccount.CheckoutInitializingAt, false)
+				respondError(c, ErrInternal)
+				return
+			}
 		}
 		oneTime = []StripeCheckoutOneTimeLine{prepaidCheckoutOneTimeLine(purchaseID, prepaid.AmountCents)}
 	}
