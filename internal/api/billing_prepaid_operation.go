@@ -152,6 +152,14 @@ func (h *Handlers) resumePrepaidCheckoutOperation(c *gin.Context, client *stripe
 		return true, errors.New("checkout session differs from the operation")
 	}
 	if len(raw) == 0 && saved.Status != "expired" {
+		var managed bool
+		if err = h.Pool.QueryRow(ctx, `SELECT qm_team_managed_billing($1)`, team).Scan(&managed); err != nil {
+			return true, err
+		}
+		if managed {
+			c.JSON(http.StatusAccepted, response)
+			return true, nil
+		}
 		if err = h.restorePrepaidSubscriptionCheckout(ctx, team, actor, req.OperationID, customer, saved, false); err != nil {
 			return true, err
 		}
@@ -222,10 +230,8 @@ func (h *Handlers) restorePrepaidSubscriptionCheckout(ctx context.Context, team,
 		if expired {
 			return errors.New("subscription checkout generation already expired")
 		}
-		if account.CheckoutSessionID == nil || !account.CheckoutMayExist {
-			if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET checkout_session_id=$2,checkout_may_exist=true,updated_at=clock_timestamp() WHERE team_id=$1`, team, saved.ID); err != nil {
-				return err
-			}
+		if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET checkout_session_id=$2,checkout_may_exist=true,updated_at=clock_timestamp() WHERE team_id=$1`, team, saved.ID); err != nil {
+			return err
 		}
 	} else if saved.Subscription == "" || derefString(account.StripeSubscriptionID) != saved.Subscription || derefString(account.CheckoutSubscriptionID) != saved.Subscription {
 		return errors.New("subscription checkout lease is no longer current")
