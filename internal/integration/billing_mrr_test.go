@@ -210,7 +210,7 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 	// its first payment is completely covered by a coupon.
 	for _, scenario := range []string{"activated", "coupon", "unpaid", "ended-contract", "ended-assignment"} {
 		team := newTeam("use")
-		c := contract{"pro_monthly", "active", "subscription", 25000, 1, future, nil}
+		c := contract{"pro_monthly", "pending", "subscription", 25000, 1, future, nil}
 		if scenario == "ended-contract" {
 			c.status = "ended"
 		}
@@ -232,7 +232,7 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 			closed = &now
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,effective_to,contract_id,source,reason)
- VALUES($1,'pro','subscription','{}','{"max_concurrent":100}',$2,$3,$4,'checkout','accepted Pro bridge')`, team, past, closed, id); err != nil {
+ VALUES($1,'pro_monthly','subscription','{}','{"max_concurrent":100}',$2,$3,$4,'checkout','accepted Pro bridge')`, team, past, closed, id); err != nil {
 			t.Fatal(err)
 		}
 	}

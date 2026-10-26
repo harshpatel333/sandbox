@@ -122,20 +122,21 @@ func buildMRROverview(groups []mrrContractGroup, totalTeams int64, proAnnual pla
 
 // Activated prorated Pro includes its committed recurring fee during the paid
 // bridge, before recurring billing starts. The current assignment and active
-// paid upgrade must both identify that contract. Pending, ended and lapsed
-// contracts are excluded; each team has at most one non-ended contract.
+// paid upgrade must both identify that contract. Its recurring contract remains
+// pending until the first renewal; unrelated pending, ended and lapsed contracts
+// are excluded. Each team has at most one non-ended contract.
 const mrrContractGroupsQuery = `SELECT c.offer_key,c.charge_kind,c.charge_amount_cents,c.charge_interval_months,
  c.charge_kind='sponsored_entitlement' AND EXISTS(SELECT 1 FROM billing_sponsored_annual_authority a
   WHERE a.contract_id=c.id AND a.team_id=c.team_id AND a.state<>'ended') AS sponsored_annual,
  count(*)
 FROM billing_commercial_contract c JOIN team t ON t.id=c.team_id
-WHERE c.status='active' AND (c.starts_at<=$1 OR EXISTS(
+WHERE ((c.status='active' AND c.starts_at<=$1) OR (c.status IN('pending','active') AND EXISTS(
  SELECT 1 FROM billing_pro_upgrade u JOIN team_plan_assignment p ON p.team_id=u.team_id AND p.contract_id=u.contract_id
  WHERE u.contract_id=c.id AND u.team_id=c.team_id AND u.customer_id=c.customer_id AND u.subscription_id=c.subscription_id
   AND u.offer_key=c.offer_key AND u.period_end=c.starts_at AND u.quoted_at<=$1 AND u.state='active'
   AND u.payment_evidence IS NOT NULL AND u.grant_id IS NOT NULL
-  AND p.plan_key='pro' AND p.kind='subscription' AND p.effective_from<=$1 AND p.effective_to IS NULL
- )) AND (c.ends_at IS NULL OR c.ends_at>$1) AND t.home_region=$2
+  AND p.plan_key=u.offer_key AND p.kind='subscription' AND p.effective_from<=$1 AND p.effective_to IS NULL
+ ))) AND (c.ends_at IS NULL OR c.ends_at>$1) AND t.home_region=$2
  AND t.id IS DISTINCT FROM NULLIF($3,'')::uuid
 GROUP BY 1,2,3,4,5`
 

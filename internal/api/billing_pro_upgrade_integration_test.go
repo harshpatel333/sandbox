@@ -191,6 +191,26 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 	if !starts.Equal(end) || !storedAnchor.Equal(anchor) || state != "pending" {
 		t.Fatalf("premature or moved contract: %s %s %s", starts, storedAnchor, state)
 	}
+	if _, err = conn.Exec(t.Context(), `UPDATE team SET home_region='use' WHERE id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	bridgeTeams := func() int64 {
+		t.Helper()
+		var count int64
+		if err := conn.QueryRow(t.Context(), `SELECT COALESCE(sum(count),0)::bigint FROM (`+mrrContractGroupsQuery+`) groups WHERE offer_key='pro_monthly'`, now, "use", "").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	beforeActivation := bridgeTeams()
+	// The reconciliation completion records the paid upgrade as active while
+	// its producer-created recurring contract stays pending until renewal.
+	if _, err = conn.Exec(t.Context(), `UPDATE billing_pro_upgrade SET state='active' WHERE id=$1 AND state='credited'`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := bridgeTeams(); got != beforeActivation+1 {
+		t.Fatalf("producer-created pending contract and pro_monthly assignment omitted from MRR: before=%d after=%d", beforeActivation, got)
+	}
 	if err = conn.QueryRow(t.Context(), `SELECT count(*) FROM team_plan_assignment WHERE team_id=$1`, team).Scan(&assignments); err != nil {
 		t.Fatal(err)
 	}
