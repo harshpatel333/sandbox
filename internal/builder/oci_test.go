@@ -123,23 +123,38 @@ func TestExtractTarKeepsOwnership(t *testing.T) {
 func TestExtractTarKeepsDestinationPrivate(t *testing.T) {
 	t.Parallel()
 
-	buf := writeTar(t,
-		&tar.Header{Typeflag: tar.TypeDir, Name: "./", Mode: 0o755},
-		&tar.Header{Typeflag: tar.TypeReg, Name: "./usr/bin/tool", Mode: 0o4755},
-	)
-	dest := t.TempDir()
-	if err := os.Chmod(dest, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := extractTar(context.Background(), buf, dest, 0); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(dest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := info.Mode().Perm(); got != 0o700 {
-		t.Fatalf("destination mode %o, want 700", got)
+	for name, entries := range map[string][]*tar.Header{
+		"archive root": {
+			{Typeflag: tar.TypeDir, Name: "./", Mode: 0o755},
+		},
+		"symlink alias of the root": {
+			{Typeflag: tar.TypeSymlink, Name: "alias", Linkname: "."},
+			{Typeflag: tar.TypeDir, Name: "alias/", Mode: 0o755},
+		},
+		"directory replaced by a root alias": {
+			{Typeflag: tar.TypeDir, Name: "x/", Mode: 0o777},
+			{Typeflag: tar.TypeSymlink, Name: "x", Linkname: "."},
+			{Typeflag: tar.TypeReg, Name: "x/tool", Mode: 0o4755},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			dest := t.TempDir()
+			if err := os.Chmod(dest, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			entries = append(entries, &tar.Header{Typeflag: tar.TypeReg, Name: "usr/bin/tool", Mode: 0o4755})
+			if err := extractTar(context.Background(), writeTar(t, entries...), dest, 0); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(dest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != 0o700 {
+				t.Fatalf("destination mode %o, want 700", got)
+			}
+		})
 	}
 }
 

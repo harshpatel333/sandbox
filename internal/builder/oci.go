@@ -123,6 +123,11 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 		return fmt.Errorf("destDir is not a directory: %s", absDest)
 	}
 
+	rootInfo, err := os.Stat(absDest)
+	if err != nil {
+		return fmt.Errorf("stat destDir: %w", err)
+	}
+
 	tr := tar.NewReader(r)
 	var totalBytes int64
 	// Directory modes land after their contents, so a read-only directory
@@ -146,8 +151,8 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 						strings.Count(dirModes[j].path, string(filepath.Separator))
 				})
 				for _, d := range dirModes {
-					if err := os.Chmod(d.path, d.mode); err != nil {
-						return fmt.Errorf("chmod %s: %w", d.path, err)
+					if err := chmodDir(d.path, d.mode, rootInfo); err != nil {
+						return err
 					}
 				}
 				return nil
@@ -279,6 +284,33 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 type dirMode struct {
 	path string
 	mode os.FileMode
+}
+
+// chmodDir sets a directory entry's mode without following a symlink in its
+// final component, and never on the extraction root however the path reaches
+// it: an image can make an entry's path an alias of the root (alias -> .),
+// and the root's private mode is what keeps host users from its setuid files.
+func chmodDir(path string, mode os.FileMode, root os.FileInfo) error {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.ENOTDIR) {
+		// A later entry replaced the directory; its header no longer applies.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if os.SameFile(info, root) {
+		return nil
+	}
+	if err := f.Chmod(mode); err != nil {
+		return fmt.Errorf("chmod %s: %w", path, err)
+	}
+	return nil
 }
 
 // restoreOwner gives an entry the owner its layer records, as a container
