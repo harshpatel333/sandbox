@@ -232,6 +232,20 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 	if prior, err := replayTeamPlanChange(ctx, tx, req); !errors.Is(err, pgx.ErrNoRows) {
 		return prior, err
 	}
+	// Published terms are immutable, but withdrawal can commit during the
+	// provider boundary lookup. Hold the catalog row through acceptance.
+	if terms.VersionID != uuid.Nil {
+		var state string
+		if err := tx.QueryRow(ctx, `SELECT state FROM billing_plan_version WHERE id=$1 FOR SHARE`, terms.VersionID).Scan(&state); err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return teamPlanChange{}, err
+			}
+			return teamPlanChange{}, teamPlanChangeConflict("this plan is no longer offered")
+		}
+		if state != "published" {
+			return teamPlanChange{}, teamPlanChangeConflict("this plan is no longer offered")
+		}
+	}
 	if terms.Retired {
 		return teamPlanChange{}, teamPlanChangeConflict("this plan is no longer offered")
 	}

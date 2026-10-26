@@ -953,3 +953,73 @@ func TestTeamPlanChangeCustomerCannotUndoStaffCancellation(t *testing.T) {
 		t.Fatalf("customer replay accessed undone staff change: %v", err)
 	}
 }
+
+func TestTeamPlanChangeRechecksCatalogAfterProviderBoundary(t *testing.T) {
+	accepted := newPlanChangeV2Fixture(t, planKindSubscription)
+	stale := newPlanChangeV2Fixture(t, planKindSubscription)
+	terms, err := stale.h.planTermsForPricingVersion(t.Context(), "starter", "v2")
+	if err != nil || terms.VersionID == uuid.Nil || terms.Retired {
+		t.Fatalf("published Starter: %+v %v", terms, err)
+	}
+	// Restore the catalog through a new immutable version, not by editing history.
+	t.Cleanup(func() {
+		var replacement uuid.UUID
+		err := stale.h.Pool.QueryRow(context.WithoutCancel(t.Context()), `INSERT INTO billing_plan_version
+   SELECT (jsonb_populate_record(NULL::billing_plan_version,to_jsonb(v)||jsonb_build_object(
+    'id',gen_random_uuid(),'version',(SELECT max(version)+1 FROM billing_plan_version WHERE family=v.family),
+    'state','draft','published_at',NULL,'published_by',NULL,'retired_at',NULL,'retired_by',NULL))).*
+   FROM billing_plan_version v WHERE id=$1 RETURNING id`, terms.VersionID).Scan(&replacement)
+		if err == nil {
+			_, err = stale.h.Pool.Exec(context.WithoutCancel(t.Context()), `SELECT publish_billing_plan_version($1,NULL)`, replacement)
+		}
+		if err != nil {
+			t.Error(err)
+		}
+	})
+	acceptedReq := accepted.intent(t, "starter", "accepted-before-withdrawal", terms)
+	prior, err := accepted.h.scheduleTeamPlanChangeTo(t.Context(), acceptedReq, terms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := stale.intent(t, "starter", "withdrawn-during-boundary", terms)
+	before := stale.plan(t)
+	var once sync.Once
+	withdrawal := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/subscriptions/"+stale.stripe.sub {
+			once.Do(func() {
+				_, err := stale.h.Pool.Exec(r.Context(), `SELECT retire_billing_plan_version($1,NULL)`, terms.VersionID)
+				withdrawal <- err
+			})
+		}
+		stale.stripe.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	stale.h.Stripe = &stripeHTTPClient{baseURL: server.URL, apiVersion: "2026-07-29.dahlia", httpClient: server.Client()}
+	_, err = stale.h.scheduleTeamPlanChangeTo(t.Context(), req, terms)
+	select {
+	case withdrawalErr := <-withdrawal:
+		if withdrawalErr != nil {
+			t.Fatal(withdrawalErr)
+		}
+	default:
+		t.Fatal("provider-boundary withdrawal did not run")
+	}
+	if !errors.Is(err, errTeamPlanChangeConflict) || !strings.Contains(err.Error(), "no longer offered") {
+		t.Fatalf("withdrawn version scheduled: %v", err)
+	}
+	var state string
+	var count int
+	if err = stale.h.Pool.QueryRow(t.Context(), `SELECT state FROM billing_plan_version WHERE id=$1`, terms.VersionID).Scan(&state); err != nil || state != "retired" {
+		t.Fatalf("withdrawal did not commit: %s %v", state, err)
+	}
+	if err = stale.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM team_plan_change WHERE team_id=$1`, stale.team).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rejected request persisted: %d %v", count, err)
+	}
+	if after := stale.plan(t); after.ID != before.ID || len(stale.stripe.writes) != 0 {
+		t.Fatalf("rejection changed assignment/provider: %+v %v", after, stale.stripe.writes)
+	}
+	if replay, err := accepted.h.scheduleTeamPlanChangeTo(t.Context(), acceptedReq, terms); err != nil || replay.ID != prior.ID {
+		t.Fatalf("accepted historical replay lost: %+v %v", replay, err)
+	}
+}
