@@ -192,6 +192,28 @@ func TestPrepaidOperationRecoversLostProviderReply(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("recovery duplicated provider session: %d", count)
 	}
+	f.mu.Lock()
+	pi := prepaidPaymentIntent{ID: "pi_" + uuid.NewString(), Status: "succeeded", Amount: 500, AmountReceived: 500, Currency: "usd", Customer: f.customer, Metadata: map[string]string{"prepaid_purchase_id": req.OperationID.String()}}
+	f.intents[pi.ID] = pi
+	f.sessions[got.ID]["status"], f.sessions[got.ID]["payment_intent"] = "complete", pi.ID
+	f.mu.Unlock()
+	for range 2 {
+		if err := f.h.settlePrepaidPurchase(t.Context(), f.client, req.OperationID); err != nil {
+			t.Fatalf("managed accepted later purchase fulfillment: %v", err)
+		}
+	}
+	rec := prepaidOperationPost(r, req)
+	var credited prepaidOperationResponse
+	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &credited) != nil || credited.State != "credited" || credited.URL != "" {
+		t.Fatalf("managed later credit replay: %d %s", rec.Code, rec.Body)
+	}
+	f.mu.Lock()
+	grants := len(f.grantPosts)
+	f.mu.Unlock()
+	if grants != 1 {
+		t.Fatalf("managed later purchase grant count: %d", grants)
+	}
+
 }
 
 func TestPrepaidOperationFirstCheckoutUsesCallerPurchaseIdentity(t *testing.T) {
@@ -524,7 +546,7 @@ func TestPrepaidOperationManagedAdmissionPreservesAcceptedRecovery(t *testing.T)
 			defer managePrepaidFixtureTeam(t, f)()
 			f.h.Config.AppAllowedOrigins = nil
 			expected := 200
-			if tc.unpublished {
+			if tc.first {
 				expected = 202
 			}
 			if rec := prepaidOperationPost(r, req); rec.Code != expected {
@@ -592,5 +614,99 @@ func TestPrepaidOperationManagedAdmissionPreservesAcceptedRecovery(t *testing.T)
 				t.Fatalf("replay bypassed permission: %d %s", rec.Code, rec.Body)
 			}
 		})
+	}
+}
+
+func TestPrepaidManagedFirstSubscriptionPreservesPaidHoldingBoundary(t *testing.T) {
+	f, _ := prepaidPlanFixture(t)
+	actor := uuid.New()
+	r := prepaidOperationRouter(t, f, f.team, actor)
+	f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
+	f.exec(`UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL WHERE team_id=$1`, f.team)
+	f.exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, f.team)
+	req := prepaidCheckoutBody{OperationID: uuid.New(), AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+	opened := prepaidOperationPost(r, req)
+	var original prepaidOperationResponse
+	if opened.Code != 200 || json.Unmarshal(opened.Body.Bytes(), &original) != nil || original.URL == "" {
+		t.Fatalf("initial checkout: %d %s", opened.Code, opened.Body)
+	}
+	snapshot := func() string {
+		t.Helper()
+		var state []byte
+		if err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_object('account',to_jsonb(a),'assignments',(SELECT jsonb_agg(to_jsonb(p) ORDER BY p.id) FROM team_plan_assignment p WHERE p.team_id=a.team_id)) FROM team_billing_account a WHERE a.team_id=$1`, f.team).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		return string(state)
+	}
+	before := snapshot()
+	defer managePrepaidFixtureTeam(t, f)()
+	replay := prepaidOperationPost(r, req)
+	var pending prepaidOperationResponse
+	if replay.Code != 202 || json.Unmarshal(replay.Body.Bytes(), &pending) != nil || pending.State != "pending" || pending.URL != "" || pending.ID != "" {
+		t.Fatalf("managed first checkout exposed payment: %d %s", replay.Code, replay.Body)
+	}
+	f.mu.Lock()
+	generation := f.sessions[original.ID]["metadata"].(map[string]string)["checkout_generation"]
+	f.mu.Unlock()
+	now := time.Now().UTC().Truncate(time.Second)
+	event := func(kind string, obj any) stripeEventEnvelope {
+		raw, _ := json.Marshal(obj)
+		e := stripeEventEnvelope{ID: "evt_" + uuid.NewString(), Type: kind, Created: stripeEventTimestamp(now.Unix()), Data: stripeEventEnvelopeData{Object: raw}}
+		payload, _ := json.Marshal(e)
+		f.exec(`INSERT INTO stripe_webhook_event(event_id,event_type,payload) VALUES($1,$2,$3)`, e.ID, e.Type, payload)
+		return e
+	}
+	sub := event("customer.subscription.created", map[string]any{"id": f.sub, "customer": f.customer, "status": "active", "current_period_start": now.Unix(), "current_period_end": now.AddDate(0, 1, 0).Unix(), "metadata": map[string]string{"activation_user_id": actor.String(), "checkout_generation": generation}})
+	invoice := "in_" + uuid.NewString()
+	zero := int64(0)
+	inv := StripeInvoiceAmounts{ID: invoice, Customer: f.customer, Status: "paid", AmountRemaining: &zero, Currency: "usd"}
+	inv.Lines.Data = []StripeInvoiceAmountLine{usageLine("price_cpu", 0), usageLine("price_credit", 500)}
+	inv.Lines.Data[0].Parent.SubscriptionItemDetails = &struct {
+		Subscription     string `json:"subscription"`
+		SubscriptionItem string `json:"subscription_item"`
+		Proration        bool   `json:"proration"`
+	}{Subscription: f.sub}
+	inv.Lines.Data[0].Pricing.PriceDetails.Product = "prod_cpu"
+	inv.Lines.Data[1].Pricing.PriceDetails.Product = "prod_credit"
+	f.mu.Lock()
+	f.invoices[invoice] = inv
+	f.products["prod_credit"] = map[string]string{"prepaid_purchase_id": req.OperationID.String()}
+	f.sessions[original.ID]["status"] = "complete"
+	f.sessions[original.ID]["subscription"] = f.sub
+	f.sessions[original.ID]["invoice"] = invoice
+	f.mu.Unlock()
+	completed := event("checkout.session.completed", map[string]any{"id": original.ID, "customer": f.customer, "subscription": f.sub, "client_reference_id": f.team.String()})
+	for range 2 {
+		if err := f.h.processRecordedStripeWebhook(t.Context(), sub); !errors.Is(err, errStripeCheckoutAssociationPending) {
+			t.Fatalf("subscription must remain retryable before association: %v", err)
+		}
+		if err := f.h.processRecordedStripeWebhook(t.Context(), completed); err == nil || !strings.Contains(err.Error(), "managed teams do not enroll individual subscriptions") {
+			t.Fatalf("completion did not retain production managed fence: %v", err)
+		}
+		if err := f.h.settlePrepaidPurchase(t.Context(), f.client, req.OperationID); !errors.Is(err, errPrepaidPaymentPending) {
+			t.Fatalf("paid first purchase did not hold before fulfillment: %v", err)
+		}
+		var retained bool
+		if err := f.h.Pool.QueryRow(t.Context(), `SELECT payment_state='succeeded' AND credit_state='none' AND failure_reason IS NULL AND invoice_id=$2 AND paid_at IS NOT NULL AND payment_evidence->'checkout_session'->>'id'=$3 AND payment_evidence->'invoice'->>'status'='paid' AND plan_snapshot IS NOT NULL FROM billing_prepaid_purchase WHERE id=$1`, req.OperationID, invoice, original.ID).Scan(&retained); err != nil || !retained {
+			t.Fatalf("verified cash proof not retained at holding boundary: %v %v", retained, err)
+		}
+		var events int
+		if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM stripe_webhook_event WHERE event_id=ANY($1::text[]) AND processed_at IS NULL AND payload IS NOT NULL`, []string{sub.ID, completed.ID}).Scan(&events); err != nil || events != 2 {
+			t.Fatalf("association events lost retryable evidence: %d %v", events, err)
+		}
+		if after := snapshot(); before != after {
+			t.Fatalf("managed paid recovery changed account/lease/assignment: before%s after%s", before, after)
+		}
+		rec := prepaidOperationPost(r, req)
+		var paid prepaidOperationResponse
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &paid) != nil || paid.State != "paid" || paid.URL != "" {
+			t.Fatalf("durable cash proof not reportable: %d %s", rec.Code, rec.Body)
+		}
+	}
+	f.mu.Lock()
+	sessions, grants := len(f.sessions), len(f.grantPosts)
+	f.mu.Unlock()
+	if sessions != 1 || grants != 0 {
+		t.Fatalf("held checkout produced new effects: sessions=%d grants=%d", sessions, grants)
 	}
 }
