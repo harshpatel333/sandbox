@@ -258,6 +258,18 @@ func (h *Handlers) acquireBuildSlot(c *gin.Context, teamID uuid.UUID, joinTempla
 		respondError(c, ErrInternal)
 		return nil, nil
 	}
+	// Match plan assignment's team-first lock order. Never wait behind a
+	// changing plan while holding a build slot or template row.
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM team WHERE id=$1 FOR SHARE NOWAIT", teamID); err != nil {
+		_ = tx.Rollback(ctx)
+		var pe *pgconn.PgError
+		if errors.As(err, &pe) && pe.Code == "55P03" {
+			respondErrorMsg(c, "service_unavailable", "team plan assignment is changing; retry shortly", http.StatusServiceUnavailable)
+		} else {
+			respondError(c, ErrInternal)
+		}
+		return nil, nil
+	}
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", teamID.String()); err != nil {
 		_ = tx.Rollback(ctx)
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("pg_advisory_xact_lock failed")
@@ -325,6 +337,14 @@ func (h *Handlers) acquireBuildSlot(c *gin.Context, teamID uuid.UUID, joinTempla
 		return nil, nil
 	}
 	return q, tx
+}
+
+func templateLimits(ctx context.Context, q *db.Queries, teamID uuid.UUID) (teamLimits, error) {
+	l, err := q.GetTeamEffectiveLimits(ctx, teamID)
+	if err == nil && (l.MaxVcpu <= 0 || l.MaxMemoryMib <= 0 || l.MaxDiskMib <= 0 || l.MaxTemplates < 0) {
+		err = fmt.Errorf("invalid team plan limits")
+	}
+	return teamLimits{MaxConcurrent: l.MaxConcurrent, MaxVCPU: l.MaxVcpu, MaxMemoryMiB: l.MaxMemoryMib, MaxDiskMiB: l.MaxDiskMib, MaxTemplates: l.MaxTemplates}, err
 }
 
 func parseTemplateID(c *gin.Context) (uuid.UUID, error) {
@@ -452,17 +472,6 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 			http.StatusBadRequest)
 		return
 	}
-	limits, err := h.teamEffectiveLimits(c.Request.Context(), teamID)
-	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read team limits failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	vcpu, memMib, diskMib := templateShape(teamID, h.systemTeamID(), limits, req.Vcpu, req.MemoryMib, req.DiskMib)
-	if msg := validateTemplateShape(teamID, h.systemTeamID(), limits, vcpu, memMib, diskMib); msg != "" {
-		respondErrorMsg(c, "bad_request", msg, http.StatusBadRequest)
-		return
-	}
 	if err := validateBuildSpec(req.BuildSpec); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
@@ -475,6 +484,27 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 		return
 	}
 
+	// Gate on per-team concurrency and do the insert under the same tx,
+	// so concurrent submits serialize cleanly.
+	ctx := c.Request.Context()
+	q, tx := h.acquireBuildSlot(c, teamID)
+	if q == nil {
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	limits, err := templateLimits(ctx, q, teamID)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read team limits failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	vcpu, memMib, diskMib := templateShape(teamID, h.systemTeamID(), limits, req.Vcpu, req.MemoryMib, req.DiskMib)
+	if msg := validateTemplateShape(teamID, h.systemTeamID(), limits, vcpu, memMib, diskMib); msg != "" {
+		respondErrorMsg(c, "bad_request", msg, http.StatusBadRequest)
+		return
+	}
+
 	// Compute the canonical hash before the DB call so template_build's
 	// idempotency index can do its job on insert. The hash covers the
 	// canonical spec and resource shape — same hash → same build inputs.
@@ -484,15 +514,6 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-
-	// Gate on per-team concurrency and do the insert under the same tx,
-	// so concurrent submits serialize cleanly.
-	ctx := c.Request.Context()
-	q, tx := h.acquireBuildSlot(c, teamID)
-	if q == nil {
-		return
-	}
-	defer tx.Rollback(ctx)
 
 	// Per-team template count cap. Inside the advisory lock so concurrent
 	// submits at limit-1 don't both pass. System team is exempt.
@@ -827,6 +848,20 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	limits, err := templateLimits(ctx, q, teamID)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if msg := validateTemplateShape(teamID, h.systemTeamID(), limits, tpl.Vcpu, tpl.MemoryMib, tpl.DiskMib); msg != "" {
+		respondErrorMsg(c, "bad_request", msg, http.StatusBadRequest)
+		return
+	}
+	if teamID != h.systemTeamID() && limits.MaxTemplates <= 0 {
+		respondErrorMsg(c, "too_many_templates", "this plan does not allow template builds", http.StatusTooManyRequests)
+		return
+	}
+
 	specHash, err := builder.InputHash(tpl.BuildSpec, tpl.Vcpu, tpl.MemoryMib, tpl.DiskMib)
 	if err != nil {
 		respondError(c, ErrInternal)
