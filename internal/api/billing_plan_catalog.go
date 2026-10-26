@@ -189,10 +189,13 @@ func (v planVersion) validate() error {
 			return errors.New("fees must be positive")
 		}
 	}
-	for _, limit := range []*int32{v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB, v.Limits.MaxTemplates} {
+	for _, limit := range []*int32{v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB} {
 		if limit != nil && *limit <= 0 {
 			return errors.New("limits must be positive")
 		}
+	}
+	if v.Limits.MaxTemplates != nil && (*v.Limits.MaxTemplates < 0 || (*v.Limits.MaxTemplates == 0 && !(v.PricingVersion == "v2" && v.Family == "free" && v.Kind == "free"))) {
+		return errors.New("template limits must be positive, or zero for v2 Free")
 	}
 	if v.Limits.MaxMemoryMiB != nil && *v.Limits.MaxMemoryMiB < minimumTemplateMemoryMiB {
 		return errors.New("max_memory_mib must allow at least 256 MiB")
@@ -212,6 +215,13 @@ func (v planVersion) validate() error {
 		}
 		if a.AmountCents < 0 || (a.Compute != nil && (a.Compute.Seconds <= 0 || a.Compute.VCPU <= 0 || a.Compute.MemoryGiB <= 0)) {
 			return errors.New("allowance amounts must be positive")
+		}
+	}
+	if v.PricingVersion == "v2" && v.Family == "free" {
+		if v.Kind != "free" || v.DisplayOnly || v.SelfServe || v.hasFee() || v.Allowance == nil ||
+			v.Allowance.Period != "day_window" || v.Allowance.OnExhausted != "pause" ||
+			v.Limits.MaxConcurrent == nil || v.Limits.MaxVCPU == nil || v.Limits.MaxMemoryMiB == nil || v.Limits.MaxDiskMiB == nil {
+			return errors.New("v2 Free requires a daily allowance that pauses on exhaustion and every sandbox shape limit")
 		}
 	}
 	if v.DisplayOnly {

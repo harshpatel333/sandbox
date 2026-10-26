@@ -130,7 +130,7 @@ func TestPlanVersionValidate(t *testing.T) {
 	}
 	for name, v := range map[string]planVersion{
 		"enterprise": {PricingVersion: "v2", Family: "enterprise", Kind: "custom", DisplayName: "Enterprise", DisplayOnly: true},
-		"free": {PricingVersion: "v2", Family: "free", Kind: "free", Public: true, DisplayName: "Free", Limits: planLimits{MaxConcurrent: int32p(1)},
+		"free": {PricingVersion: "v2", Family: "free", Kind: "free", Public: true, DisplayName: "Free", Limits: planLimits{MaxConcurrent: int32p(1), MaxVCPU: int32p(1), MaxMemoryMiB: int32p(1024), MaxDiskMiB: int32p(1024), MaxTemplates: int32p(0)},
 			Allowance: &planAllowance{Period: "day_window", OnExhausted: "pause", Compute: &planCompute{Seconds: 7200, VCPU: 1, MemoryGiB: 1}}},
 		"starter":       {PricingVersion: "v2", Family: "starter", Kind: "prepaid", Public: true, DisplayName: "Starter", Limits: planLimits{MaxConcurrent: int32p(100)}},
 		"matching deal": {PricingVersion: "v2", Family: "custom_example", Kind: "custom", DisplayName: "Example", Matching: &planMatching{MatchingBps: 10000, CapCents: 8000000}},
@@ -238,6 +238,33 @@ func TestPublicPlanAvailabilityPreservesLegacyAnnualAndHidesV2Annual(t *testing.
 			}
 			if model == "legacy" && (plans[1].Key != "pro_annual" || plans[1].IntervalMonths != 12 || plans[1].PriceCents != 250000) {
 				t.Fatalf("legacy annual plan = %+v", plans)
+			}
+		})
+	}
+}
+
+func TestPlanVersionUsableFreeValidation(t *testing.T) {
+	valid := planVersion{PricingVersion: "v2", Family: "free", Kind: "free", DisplayName: "Free",
+		Limits:    planLimits{MaxConcurrent: int32p(1), MaxVCPU: int32p(1), MaxMemoryMiB: int32p(1024), MaxDiskMiB: int32p(1024), MaxTemplates: int32p(0)},
+		Allowance: &planAllowance{AmountCents: 1, Period: "day_window", OnExhausted: "pause"}}
+	if err := valid.validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*planVersion){
+		"missing allowance":  func(v *planVersion) { v.Allowance = nil },
+		"wrong kind":         func(v *planVersion) { v.Kind = "prepaid" },
+		"wrong period":       func(v *planVersion) { v.Allowance.Period = "month" },
+		"wrong exhaustion":   func(v *planVersion) { v.Allowance.OnExhausted = "payg" },
+		"missing shape":      func(v *planVersion) { v.Limits.MaxVCPU = nil },
+		"negative templates": func(v *planVersion) { v.Limits.MaxTemplates = int32p(-1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := valid
+			a := *valid.Allowance
+			v.Allowance = &a
+			mutate(&v)
+			if v.validate() == nil {
+				t.Fatal("accepted unusable Free")
 			}
 		})
 	}

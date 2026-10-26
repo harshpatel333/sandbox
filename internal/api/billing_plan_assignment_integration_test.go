@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -342,7 +343,15 @@ func TestPlanAssignmentSignupRequiresPublishedFree(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(context.WithoutCancel(t.Context()))
+	// Construct the missing-catalog fixture before activating v2 inside this
+	// rolled-back transaction; an active Free version cannot be retired.
+	if _, err := tx.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version='legacy'`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := tx.Exec(t.Context(), `SELECT retire_billing_plan_version(id,NULL) FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version='v2'`); err != nil {
 		t.Fatal(err)
 	}
 	name := "unpublished-free-" + uuid.NewString()
@@ -400,7 +409,13 @@ func TestPlanAssignmentSignupLocksAcceptanceRows(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer released.Rollback(context.WithoutCancel(t.Context()))
-			if _, err := released.Exec(t.Context(), mutation); err != nil {
+			_, err = released.Exec(t.Context(), mutation)
+			if name == "Free retirement" {
+				var pgErr *pgconn.PgError
+				if !errors.As(err, &pgErr) || pgErr.Code != "55000" || !strings.Contains(pgErr.Message, "active v2 Free must be replaced") {
+					t.Fatalf("active Free retirement was not rejected after locks released: %v", err)
+				}
+			} else if err != nil {
 				t.Fatalf("%s failed after signup released locks: %v", name, err)
 			}
 		})
