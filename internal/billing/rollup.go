@@ -251,7 +251,7 @@ func storageBillableForHour(ctx context.Context, pool *pgxpool.Pool, teamID uuid
 // reports or the storage calculation, which can exceed the rollup budget for
 // large teams. Storage is display-only here and is measured best-effort.
 func upsertUnbilledStorageRollupUsage(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, job rollupJob) error {
-	row, err := q.UpsertTeamBillingUsageHourCompute(ctx, db.UpsertTeamBillingUsageHourComputeParams{
+	_, err := q.UpsertTeamBillingUsageHourCompute(ctx, db.UpsertTeamBillingUsageHourComputeParams{
 		TeamID:    job.TeamID,
 		HourStart: job.HourStart,
 		HourEnd:   job.HourEnd,
@@ -262,9 +262,7 @@ func upsertUnbilledStorageRollupUsage(ctx context.Context, pool *pgxpool.Pool, q
 	if err != nil {
 		return err
 	}
-	// Storage is measured only once the hour's reports are complete, so a
-	// measured value is final; the scheduler's refreshes need not repeat it.
-	if row.StorageMibSeconds.Valid || unbilledStorageBackoff.active(job.TeamID, time.Now()) {
+	if unbilledStorageBackoff.active(job.TeamID, time.Now()) {
 		return nil
 	}
 	err = measureUnbilledRollupStorage(ctx, pool, job)
@@ -289,7 +287,7 @@ func upsertUnbilledStorageRollupUsage(ctx context.Context, pool *pgxpool.Pool, q
 // unbilledStorageBackoffFor is how long a team whose storage calculation ran
 // out of budget goes unmeasured. The scheduler refreshes every team's lookback
 // window each tick, so without it a team too large for the budget re-runs the
-// calculation, and is cancelled, for each unmeasured hour on every tick.
+// calculation, and is cancelled, for each hour of the window on every tick.
 const unbilledStorageBackoffFor = 6 * time.Hour
 
 // unbilledStorageBackoff is per process: each instance learns a slow team on
