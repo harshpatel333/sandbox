@@ -132,6 +132,9 @@ func run(ctx context.Context, cfg config) error {
 		}
 	}
 
+	if err := checkPrepaidCells(ctx, src, dst, cfg.teamID); err != nil {
+		return err
+	}
 	if err := checkYCClaimMigration(ctx, src, cfg.teamID); err != nil {
 		return err
 	}
@@ -189,23 +192,42 @@ func refuseQMManagedTeam(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UU
 // the source's actual flag state — its value when a row exists there,
 // absence when none does.
 func runReleaseRollups(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
+	if err := checkPrepaidCells(ctx, src, dst, cfg.teamID); err != nil {
+		return err
+	}
 	if err := checkRetainedAccountingReady(ctx, src, cfg.teamID); err != nil {
 		return err
 	}
+	sourceTx, err := src.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer sourceTx.Rollback(ctx)
+	if err := lockSourceAssignments(ctx, sourceTx, cfg.teamID); err != nil {
+		return err
+	}
+	destinationTx, err := lockPrepaidDestination(ctx, dst, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	defer destinationTx.Rollback(ctx)
 	var srcEnabled *bool
-	if err := src.QueryRow(ctx, `
+	if err := sourceTx.QueryRow(ctx, `
 		SELECT enabled FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`,
 		cfg.teamID).Scan(&srcEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("check source rollup flag: %w", err)
 	}
-	return restoreRollupFlag(ctx, dst, cfg.teamID, srcEnabled)
+	if err := restoreRollupFlag(ctx, destinationTx, cfg.teamID, srcEnabled); err != nil {
+		return err
+	}
+	return destinationTx.Commit(ctx)
 }
 
 // restoreRollupFlag writes the source's rollup-flag state into the dest: the
 // source's value when a row existed, absence when none did. Shared by the
 // standalone release-rollups phase (source still present) and purge
 // (which captures the state before deleting the source).
-func restoreRollupFlag(ctx context.Context, dst *pgxpool.Pool, teamID uuid.UUID, srcEnabled *bool) error {
+func restoreRollupFlag(ctx context.Context, dst migrationDestination, teamID uuid.UUID, srcEnabled *bool) error {
 	if srcEnabled == nil {
 		if _, err := dst.Exec(ctx, `
 			DELETE FROM team_feature_flag WHERE team_id = $1 AND key = 'billing_hourly_rollups'`, teamID); err != nil {
@@ -228,6 +250,9 @@ func restoreRollupFlag(ctx context.Context, dst *pgxpool.Pool, teamID uuid.UUID,
 // plan
 
 func runPlan(ctx context.Context, src *pgxpool.Pool, cfg config) error {
+	if err := checkPrepaidCells(ctx, src, nil, cfg.teamID); err != nil {
+		return err
+	}
 	for _, t := range migratedTables {
 		var n int64
 		q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, t.name, t.effectiveCopyScope())
@@ -541,6 +566,9 @@ func retainedAccountingWindow(ctx context.Context, src querier, teamID uuid.UUID
 type rowTransform func(row map[string]any) error
 
 func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
+	if err := checkPrepaidCells(ctx, src, dst, cfg.teamID); err != nil {
+		return err
+	}
 	// The window requires everything paused or destroyed. Hard-stop otherwise.
 	blockers, err := activeSandboxes(ctx, src, cfg.teamID)
 	if err != nil {
@@ -1425,6 +1453,9 @@ func runValidate(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error 
 // validateTeam runs every read-only parity check and returns the list of
 // mismatches (empty = pass). Query errors are returned as err.
 func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]string, error) {
+	if err := checkPrepaidCells(ctx, src, dst, cfg.teamID); err != nil {
+		return nil, err
+	}
 	var mismatches []string
 	teamID := cfg.teamID
 
@@ -1757,6 +1788,9 @@ func validateDetachedDest(ctx context.Context, dst *pgxpool.Pool, cfg config) ([
 // stays as a cold fallback for the soak period before purge. Rollback is
 // re-inserting the membership rows, or running the tool in reverse.
 func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName string) error {
+	if err := checkPrepaidCells(ctx, src, dst, cfg.teamID); err != nil {
+		return err
+	}
 	if cfg.confirmTeamName != teamName {
 		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
 	}
@@ -1847,6 +1881,11 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	if err := lockSourceAssignments(ctx, tx, cfg.teamID); err != nil {
 		return err
 	}
+	destinationTx, err := lockPrepaidDestination(ctx, dst, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	defer destinationTx.Rollback(ctx)
 	if err := checkRetainedAccountingReady(ctx, tx, cfg.teamID); err != nil {
 		return err
 	}
@@ -1927,6 +1966,9 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
+	if err := destinationTx.Rollback(ctx); err != nil {
+		return err
+	}
 	log.Info().Int64("deleted", total).Msg("detach: source membership rows removed; everything else stays as a cold fallback until purge")
 
 	// Detach is the cutover moment, so it lifts the copy's rollup hold
@@ -1945,6 +1987,9 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 // purge
 
 func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName string) error {
+	if err := checkPrepaidCells(ctx, src, dst, cfg.teamID); err != nil {
+		return err
+	}
 	if cfg.confirmTeamName != teamName {
 		return fmt.Errorf("--confirm-team-name %q does not match team name %q; refusing to delete", cfg.confirmTeamName, teamName)
 	}
@@ -2031,6 +2076,11 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	if err := lockSourceAssignments(ctx, tx, cfg.teamID); err != nil {
 		return err
 	}
+	destinationTx, err := lockPrepaidDestination(ctx, dst, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	defer destinationTx.Rollback(ctx)
 	if err := checkRetainedAccountingReady(ctx, tx, cfg.teamID); err != nil {
 		return err
 	}
@@ -2198,6 +2248,9 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit: %w", err)
+	}
+	if err := destinationTx.Rollback(ctx); err != nil {
+		return err
 	}
 	// Detached: the dest's flag has been live-owned since detach released
 	// the hold at cutover — restoring the frozen source's value now would

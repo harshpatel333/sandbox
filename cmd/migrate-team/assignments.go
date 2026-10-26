@@ -23,6 +23,9 @@ func lockSourceAssignments(ctx context.Context, tx pgx.Tx, team uuid.UUID) error
 	if _, err := tx.Exec(ctx, `SELECT id FROM team_plan_assignment WHERE team_id=$1 FOR UPDATE`, team); err != nil {
 		return err
 	}
+	if err := checkPrepaidMigration(ctx, tx, team); err != nil {
+		return err
+	}
 	if err := checkFreePauseTransfer(ctx, tx, team); err != nil {
 		return err
 	}
@@ -81,6 +84,12 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, spec tableSp
 		return 0, 0, err
 	}
 	if _, err := tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR UPDATE`, team); err != nil {
+		return 0, 0, err
+	}
+	if err := checkPrepaidMigration(ctx, src, team); err != nil {
+		return 0, 0, err
+	}
+	if err := checkPrepaidMigration(ctx, tx, team); err != nil {
 		return 0, 0, err
 	}
 	if err := checkAssignmentReferences(ctx, src, tx, team); err != nil {

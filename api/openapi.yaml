@@ -935,6 +935,102 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /billing/prepaid:
+    get:
+      operationId: getPrepaidCredit
+      tags: [Billing]
+      summary: Get prepaid credit balance, auto-recharge settings and recent purchases
+      description: Requires `billing:read`. Available whether or not prepaid plans are active, so existing balances stay visible.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Prepaid credit summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PrepaidCreditSummary"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /billing/prepaid/checkout:
+    post:
+      operationId: createPrepaidCheckout
+      tags: [Billing]
+      summary: Buy prepaid credit
+      description: Requires `billing:write`. The first purchase opens the subscription checkout with the credit as a one-time charge; later purchases open a one-time payment checkout that saves the card. Credit is issued after the payment is verified.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount_cents, success_url, cancel_url]
+              properties:
+                amount_cents:
+                  type: integer
+                  format: int64
+                  minimum: 500
+                  multipleOf: 500
+                success_url:
+                  type: string
+                  format: uri
+                cancel_url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Checkout session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Prepaid plans are not active, the plan cannot buy credit, or too many purchases are unspent.
+        "503":
+          description: Prepaid credit is temporarily at capacity.
+  /billing/prepaid/auto-recharge:
+    put:
+      operationId: putPrepaidAutoRecharge
+      tags: [Billing]
+      summary: Configure prepaid auto-recharge
+      description: Requires `billing:write`. Turning auto-recharge off always succeeds. Turning it on needs active prepaid plans and a card saved by an earlier purchase.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+                threshold_cents:
+                  type: integer
+                  format: int64
+                  minimum: 500
+                  multipleOf: 500
+                amount_cents:
+                  type: integer
+                  format: int64
+                  minimum: 500
+                  multipleOf: 500
+      responses:
+        "200":
+          description: Updated prepaid credit summary without purchases
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PrepaidCreditSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Prepaid plans are not active, the plan cannot buy credit, or no card is saved.
   /stripe/customer-portal-session:
     post:
       operationId: createStripeCustomerPortalSession
@@ -3313,6 +3409,76 @@ components:
         string; the tagged form routes the request to the sandbox's home
         region. Endpoints accept both forms interchangeably.
 
+    PrepaidCreditSummary:
+      type: object
+      required: [balance_cents, low_balance, auto_recharge, has_saved_card, purchases]
+      properties:
+        balance_cents:
+          type: integer
+          format: int64
+        low_balance:
+          type: boolean
+          description: Balance is below $5 and auto-recharge is off.
+        has_saved_card:
+          type: boolean
+        auto_recharge:
+          type: object
+          required: [enabled, in_flight]
+          properties:
+            enabled:
+              type: boolean
+            threshold_cents:
+              type: integer
+              format: int64
+              nullable: true
+            amount_cents:
+              type: integer
+              format: int64
+              nullable: true
+            disabled_reason:
+              type: string
+              nullable: true
+            disabled_at:
+              type: string
+              format: date-time
+              nullable: true
+            in_flight:
+              type: boolean
+        purchases:
+          type: array
+          items:
+            type: object
+            required: [id, source, amount_cents, state, created_at]
+            properties:
+              id:
+                type: string
+                format: uuid
+              team_id:
+                type: string
+                format: uuid
+              source:
+                type: string
+                enum: [checkout, auto_recharge]
+              amount_cents:
+                type: integer
+                format: int64
+              state:
+                type: string
+                enum: [pending, paid, credited, failed]
+              failure_reason:
+                type: string
+                nullable: true
+              paid_at:
+                type: string
+                format: date-time
+                nullable: true
+              credited_at:
+                type: string
+                format: date-time
+                nullable: true
+              created_at:
+                type: string
+                format: date-time
     BillingSessionResponse:
       type: object
       required: [url]

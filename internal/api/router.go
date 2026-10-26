@@ -120,6 +120,9 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/stripe/plan-choice", h.CommitFreeSignupPlan)
 		api.POST("/stripe/pro-checkout/recover", h.RecoverProCheckout)
 		api.POST("/stripe/customer-portal-session", h.CreateStripeCustomerPortalSession)
+		api.GET("/billing/prepaid", h.GetPrepaidCredit)
+		api.POST("/billing/prepaid/checkout", h.CreatePrepaidCheckout)
+		api.PUT("/billing/prepaid/auto-recharge", h.PutPrepaidAutoRecharge)
 
 		// RBAC Phase 2b customer-facing team management.
 		api.GET("/teams/:team_id/management", h.GetTeamManagement)
@@ -181,6 +184,11 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		operator.GET("/yc/claims", TeamCreationPrivacy(), h.PendingYCClaims)
 		operator.POST("/yc/claims/decision", TeamCreationPrivacy(), h.DecideYCClaim)
 		// Billing recovery requires a credential unavailable to VMD hosts.
+		operator.POST("/teams/:team_id/billing/prepaid/auto-recharge/disable", h.DisablePlatformAutoRecharge)
+		operator.POST("/teams/:team_id/billing/prepaid/purchases/:purchase_id/reversal", h.ResolvePrepaidReversal)
+		operator.POST("/teams/:team_id/billing/matching", h.AttachTeamMatchingRule)
+		operator.POST("/teams/:team_id/billing/matching/revoke", h.RevokeTeamMatchingRule)
+		operator.POST("/teams/:team_id/billing/matching/credits/:credit_id/acknowledge", h.AcknowledgeMatchingCreditFlag)
 		operator.POST("/teams/:team_id/billing/plan-assignments", h.AssignTeamPlan)
 		operator.POST("/teams/:team_id/billing/plan-changes", h.RequestTeamPlanChange)
 		operator.POST("/teams/:team_id/billing/plan-changes/:change_id/undo", h.UndoTeamPlanChange)
@@ -270,6 +278,11 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.POST("/teams/:team_id/billing/periods/:period_id/approve", h.ApproveTeamBillingPeriod)
 		internal.POST("/teams/:team_id/billing/periods/:period_id/export", h.ExportTeamBillingPeriod)
 		internal.GET("/teams/:team_id/billing/periods/:period_id/export-accounting", h.GetBillingExportAccounting)
+		internal.GET("/teams/:team_id/billing/matching", h.GetTeamMatchingCredit)
+		internal.GET("/billing/matching/flags", h.ListMatchingCreditFlags)
+		internal.GET("/teams/:team_id/billing/prepaid", h.GetPlatformTeamPrepaid)
+		internal.GET("/billing/prepaid/purchases", h.ListPrepaidPurchases)
+		internal.GET("/billing/prepaid/reversals", h.ListPrepaidReversals)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)

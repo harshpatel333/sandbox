@@ -3211,7 +3211,7 @@ func TestPlanAssignmentMigration(t *testing.T) {
 			mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "assignment-"+team.String())
 			first, second := uuid.New(), uuid.New()
 			mustExec(t, srcPool, `INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
-    VALUES($1,$2,'starter','prepaid',(SELECT id FROM billing_plan_version WHERE pricing_version='v2' AND family='starter' AND state='published'),'{"display_name":"Frozen Starter"}','{"max_concurrent":20,"max_memory_mib":4096}',clock_timestamp(),'credit_purchase','accepted purchase')`, first, team)
+    VALUES($1,$2,'payg','legacy_payg',NULL,'{"display_name":"Frozen Legacy"}','{"max_concurrent":20,"max_memory_mib":4096}',clock_timestamp(),'credit_purchase','accepted purchase')`, first, team)
 			mustExec(t, srcPool, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE id=$1`, first)
 			mustExec(t, srcPool, `INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,terms,limits,effective_from,source,reason,idempotency_key)
     VALUES($1,$2,'custom_example','custom','{"display_name":"Frozen Custom"}','{"max_concurrent":30,"max_memory_mib":8192}',clock_timestamp(),'staff','agreement','request-one')`, second, team)
@@ -3247,7 +3247,7 @@ func TestPlanAssignmentMigration(t *testing.T) {
 			mustExec(t, srcPool, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE id=$1`, second)
 			third := uuid.New()
 			mustExec(t, srcPool, `INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,terms,limits,effective_from,source,reason)
-    VALUES($1,$2,'free','free','{"display_name":"Frozen Free"}','{"max_concurrent":1}',clock_timestamp(),'plan_change','accepted exit')`, third, team)
+    VALUES($1,$2,'payg','legacy_payg','{"display_name":"Frozen Legacy Exit"}','{"max_concurrent":1}',clock_timestamp(),'plan_change','accepted exit')`, third, team)
 			if err := requireAssignmentParity(ctx, srcPool, dstPool, team); err == nil {
 				t.Fatal("cutover allowed uncopied assignment")
 			}
@@ -3259,7 +3259,7 @@ func TestPlanAssignmentMigration(t *testing.T) {
 			}
 			mustExec(t, dstPool, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE id=$1`, third)
 			mustExec(t, dstPool, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
-    VALUES($1,'starter','prepaid','{"display_name":"Destination Starter"}','{"max_concurrent":100}',clock_timestamp(),'credit_purchase','destination purchase')`, team)
+    VALUES($1,'custom_destination','custom','{"display_name":"Destination Custom"}','{"max_concurrent":100}',clock_timestamp(),'credit_purchase','destination purchase')`, team)
 			if err := validateRetainedAssignments(ctx, srcPool, dstPool, team); err != nil {
 				t.Fatalf("destination progression rejected: %v", err)
 			}
