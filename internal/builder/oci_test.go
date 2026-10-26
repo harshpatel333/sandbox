@@ -119,3 +119,26 @@ func TestExtractTarKeepsOwnership(t *testing.T) {
 		t.Errorf("spool/tool lost setgid after chown: %v", info.Mode())
 	}
 }
+
+func TestExtractTarKeepsDestinationPrivate(t *testing.T) {
+	t.Parallel()
+
+	buf := writeTar(t,
+		&tar.Header{Typeflag: tar.TypeDir, Name: "./", Mode: 0o755},
+		&tar.Header{Typeflag: tar.TypeReg, Name: "./usr/bin/tool", Mode: 0o4755},
+	)
+	dest := t.TempDir()
+	if err := os.Chmod(dest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := extractTar(context.Background(), buf, dest, 0); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("destination mode %o, want 700", got)
+	}
+}

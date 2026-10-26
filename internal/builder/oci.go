@@ -237,6 +237,12 @@ func extractTar(ctx context.Context, r io.Reader, destDir string, maxBytes int64
 			continue
 		}
 
+		// The archive root is the scratch directory itself. Its private host
+		// mode keeps other host users away from the image's setuid files,
+		// and mkfs sets the filesystem root's owner and mode regardless.
+		if target == absDest {
+			continue
+		}
 		// A hardlink shares its target's inode, which already has its owner
 		// and mode.
 		if hdr.Typeflag != tar.TypeLink {
