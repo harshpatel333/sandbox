@@ -26,8 +26,17 @@ type invoiceCashFixture struct {
 	pays       atomic.Int64
 }
 
-func newInvoiceCashFixture(t *testing.T, kind string, queuedState string) *invoiceCashFixture {
+func newInvoiceCashFixture(t *testing.T, kind string, queuedState string, creditAmounts ...int64) *invoiceCashFixture {
 	t.Helper()
+	credit := int64(500)
+	if len(creditAmounts) > 0 {
+		credit = creditAmounts[0]
+	}
+	net := int64(600) - credit
+	status := "open"
+	if net == 0 {
+		status = "paid"
+	}
 	h, team := newPlanAssignmentFixture(t)
 	f := &invoiceCashFixture{h: h, team: team, start: time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second), end: time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Second)}
 	exec := func(q string, args ...any) {
@@ -57,10 +66,10 @@ func newInvoiceCashFixture(t *testing.T, kind string, queuedState string) *invoi
 	exec(`INSERT INTO team_credit_grant(id,team_id,amount_usd,remaining_usd,reason) VALUES($1,$2,5,5,'unrelated retained fixture grant')`, grant, team)
 	exec(`INSERT INTO team_credit_ledger(team_id,grant_id,amount_usd,reason) VALUES($1,$2,5,'fixture original grant')`, team, grant)
 	exec(`INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','meter_round',$4)`, team, customer, subscription, f.start.Add(-time.Hour))
-	exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),6,5,1)`, team, f.start, f.end)
+	exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),6,$4::numeric/100,$5::numeric/100)`, team, f.start, f.end, credit, net)
 	exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,state,verified_at,plan,finalized_evidence)
-  VALUES($1,$2,$3,$4,'verified',clock_timestamp(),jsonb_build_object('customer',$5::text,'subscription',$6::text,'expected_cents',600,'credit_before_cents',500,'resources',jsonb_build_array(jsonb_build_object('resource','cpu','expected_cents',600,'snapshot',billing_meter_accounting_snapshot($1,$2,$3,'cpu')))), '{"credit_applied_cents":500,"credit_remaining_cents":0,"net_cents":100}')`, team, f.start, f.end, invoice, customer, subscription)
-	raw := fmt.Sprintf(`{"id":%q,"customer":%q,"currency":"usd","status":"open","collection_method":"charge_automatically","subtotal":600,"total":100,"amount_due":100,"amount_remaining":100,"parent":{"subscription_details":{"subscription":%q}},"total_pretax_credit_amounts":[{"type":"credit_balance_transaction","amount":500,"credit_balance_transaction":"cbtxn_fixture"}],"lines":{"data":[{"id":"il_fixture","amount":600}]}}`, invoice, customer, subscription)
+  VALUES($1,$2,$3,$4,'verified',clock_timestamp(),jsonb_build_object('customer',$5::text,'subscription',$6::text,'expected_cents',600,'credit_before_cents',$7::bigint,'resources',jsonb_build_array(jsonb_build_object('resource','cpu','expected_cents',600,'snapshot',billing_meter_accounting_snapshot($1,$2,$3,'cpu')))), jsonb_build_object('credit_applied_cents',$7::bigint,'credit_remaining_cents',0,'net_cents',$8::bigint))`, team, f.start, f.end, invoice, customer, subscription, credit, net)
+	raw := fmt.Sprintf(`{"id":%q,"customer":%q,"currency":"usd","status":%q,"collection_method":"charge_automatically","subtotal":600,"total":%d,"amount_due":%d,"amount_remaining":%d,"ending_balance":0,"parent":{"subscription_details":{"subscription":%q}},"total_pretax_credit_amounts":[{"type":"credit_balance_transaction","amount":%d,"credit_balance_transaction":"cbtxn_fixture"}],"lines":{"data":[{"id":"il_fixture","amount":600}]}}`, invoice, customer, status, net, net, net, subscription, credit)
 	if err := json.Unmarshal([]byte(raw), &f.invoice); err != nil {
 		t.Fatal(err)
 	}
@@ -402,5 +411,25 @@ func TestInvoiceCashServiceRoleTablePolicy(t *testing.T) {
 	var policy string
 	if err = tx.QueryRow(t.Context(), `SELECT policy FROM billing_invoice_cash_authority WHERE invoice_id=$1`, f.invoice.ID).Scan(&policy); err != nil || policy != "residual_allowed" {
 		t.Fatal("new table backend select policy", policy, err)
+	}
+}
+
+func TestInvoiceCashFullyCreditedStarter(t *testing.T) {
+	f := newInvoiceCashFixture(t, planKindPrepaid, "", 600)
+	if err := VerifyBillingInvoiceSettlement(f.invoice, 600, 600, 0); err != nil {
+		t.Fatal("fully credited provider settlement invalid", err)
+	}
+	p := billing.ExportPeriod{TeamID: f.team, Start: f.start, End: f.end}
+	if err := f.h.enqueueInvoiceCollection(t.Context(), p, f.invoice, true); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT state FROM billing_invoice_collection WHERE invoice_id=$1`, f.invoice.ID).Scan(&state); err != nil || state != "paid" {
+		t.Fatal("fully credited Starter settlement held", state, err)
+	}
+	j := f.claim(t)
+	state, reason := f.h.collectInvoice(t.Context(), f.client, &j)
+	if state != "paid" || f.pays.Load() != 0 {
+		t.Fatal("paid zero-cash settlement changed", state, reason, f.pays.Load())
 	}
 }
