@@ -978,11 +978,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		respondErrorMsg(c, "abuse_denied", "Sandbox operation is not permitted", http.StatusForbidden)
 		return "", false
 	}
-	if !h.requireBillingEligible(c, teamID) {
+	if !h.requireSandboxAdmission(c, teamID) {
 		return "", false
 	}
 
-	// One statement for the claim and the boot inputs; see ClaimResume.
+	// Lock current plan limits through the claim; boot inputs come from ClaimResume.
 	claimParams := db.ClaimResumeParams{
 		ID:      sandboxID,
 		TeamID:  teamID,
@@ -995,10 +995,24 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 		claimParams.MachinePrincipalID = pgtype.UUID{Bytes: caller.PrincipalID, Valid: true}
 	}
+	var limits db.ResumeShapeLimits
+	var shapeLimits sandboxShapeLimit
 	claim := func() (db.ClaimResumeRow, error) {
 		cctx, cancel := context.WithTimeout(c.Request.Context(), resumeClaimTimeout)
 		defer cancel()
-		return h.DB.ClaimResume(cctx, claimParams)
+		row, current, err := h.DB.ClaimResumeWithCurrentLimits(cctx, claimParams)
+		limits = current
+		shapeLimits = sandboxShapeLimit{}
+		if current.MaxVcpu != nil {
+			shapeLimits.vcpu = *current.MaxVcpu
+		}
+		if current.MaxMemoryMib != nil {
+			shapeLimits.memoryMib = *current.MaxMemoryMib
+		}
+		if current.MaxDiskMib != nil {
+			shapeLimits.diskMib = *current.MaxDiskMib
+		}
+		return row, err
 	}
 	claimed, err := claim()
 	// Only a failed machine claim needs a second read to distinguish denied
@@ -1007,6 +1021,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	if errors.Is(err, pgx.ErrNoRows) && claimParams.MachinePrincipalID.Valid && !h.requireMachineSandboxOwner(c, sandboxID, teamID) {
 		return "", false
 	}
+
 	if err == pgx.ErrNoRows && settled != nil {
 		// The caller's wait is its lookup, not this claim.
 		tWait := time.Now()
@@ -1016,6 +1031,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			return "", false
 		}
 		claimed, err = claim()
+	}
+	if errors.Is(err, pgx.ErrNoRows) && sandbox.Status == db.SandboxStatusPaused &&
+		limits.Exceeds(sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib) {
+		respondSandboxExceedsPlan(c, &shapeLimits, sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib)
+		return "", false
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		// A secret change may hold the sandbox, or have just let it go. While
@@ -1028,7 +1048,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				return false, nil
 			}
 			claimed, err = claim()
-			if !errors.Is(err, pgx.ErrNoRows) {
+			if !errors.Is(err, pgx.ErrNoRows) || sandbox.Status == db.SandboxStatusPaused &&
+				limits.Exceeds(sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib) {
 				return true, nil
 			}
 			return !h.secretWriteHeld(c, sandboxID) && !h.sandboxStillPaused(c, sandboxID, teamID), nil
@@ -1042,6 +1063,14 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 	if err != nil {
+		if respondSandboxAdmissionError(c, err) {
+			return "", false
+		}
+		if errors.Is(err, pgx.ErrNoRows) && sandbox.Status == db.SandboxStatusPaused &&
+			limits.Exceeds(sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib) {
+			respondSandboxExceedsPlan(c, &shapeLimits, sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib)
+			return "", false
+		}
 		if err == pgx.ErrNoRows {
 			// Someone else is already resuming, or the sandbox is no longer
 			// in paused state. Surface as conflict; client retries.
@@ -3192,7 +3221,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
-	if !h.requireComputeAllowed(c, teamID, abuse.ActionCreate) || !h.requireBillingEligible(c, teamID) {
+	if !h.requireComputeAllowed(c, teamID, abuse.ActionCreate) {
+		return
+	}
+	if !h.requireSandboxAdmission(c, teamID) {
 		return
 	}
 
@@ -3264,6 +3296,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			deltaDir = filepath.Dir(deltaPath)
 		}
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
+
 		imageVcpu = uint32(tpl.Vcpu)
 		imageMemMiB = uint32(tpl.MemoryMib)
 		fromTemplateName = tpl.Name
@@ -3299,6 +3332,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			respondErrorMsg(c, "conflict", fmt.Sprintf("a %q snapshot cannot create a sandbox yet", snap.Kind), http.StatusConflict)
 			return
 		}
+
 		source = snap
 		basePath = snap.BasePath
 		imageVcpu, imageMemMiB = uint32(snap.VcpuCount), uint32(snap.MemoryMib)
@@ -3783,6 +3817,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			respondSourceGone()
 			return
 		}
+		if respondSandboxAdmissionError(c, dbErr) {
+			return
+		}
 		if quotaExceeded {
 			h.respondQuotaExceeded(c, teamID)
 			return
@@ -3807,6 +3844,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		l.Error().Err(dbErr).Str("reason", transientReason).Msg("CreateSandbox: INSERT failed")
 		if sourceRace {
 			respondSourceGone()
+			return
+		}
+		if respondSandboxAdmissionError(c, dbErr) {
 			return
 		}
 		if quotaExceeded {

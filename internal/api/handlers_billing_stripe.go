@@ -148,10 +148,18 @@ type StripeBillingCreditGrant struct {
 }
 
 type StripeCreateCheckoutSessionParams struct {
+	ReleaseID                *uuid.UUID `json:",omitempty"`
+	OperationID              uuid.UUID  `json:",omitempty"`
+	OneOffProduct            string     `json:",omitempty"`
+	SetupOnly                bool       `json:",omitempty"`
+	OneOffAmount             int64      `json:",omitempty"`
+	OneOffName               string     `json:",omitempty"`
 	BasePriceID              string
 	DeferredResourcePriceIDs []string                      `json:",omitempty"`
 	ResourceTerms            []StripeCheckoutResourceTerms `json:",omitempty"`
+	PlanTerms                *StripeCheckoutPlanTerms      `json:",omitempty"`
 	Flexible                 bool
+	AllowPromotionCodes      bool `json:",omitempty"`
 	CustomerID               string
 	SuccessURL               string
 	CancelURL                string
@@ -160,6 +168,34 @@ type StripeCreateCheckoutSessionParams struct {
 	PriceIDs                 []string
 	IdempotencyKey           string
 	ExpiresAt                *time.Time
+	OneTimeLines             []StripeCheckoutOneTimeLine `json:",omitempty"`
+}
+
+// StripeCheckoutOneTimeLine is charged once on the subscription's first invoice.
+type StripeCheckoutOneTimeLine struct {
+	AmountCents int64
+	Name        string
+	Metadata    map[string]string
+}
+
+// StripeCheckoutPlanTerms freezes the catalog terms a purchase started with.
+// It is recorded with the request and never sent to Stripe.
+type StripeCheckoutPlanTerms struct {
+	PredecessorKnown  bool       `json:",omitempty"`
+	InitialAssignment *uuid.UUID `json:",omitempty"`
+	Amount            int64
+	Months            int32
+	Credit            int64
+	VersionID         uuid.UUID
+	Matching          *planMatching `json:",omitempty"`
+	Limits            *planLimits   `json:",omitempty"`
+	// PricingV2 purchases also freeze the plan identity they assign.
+	PricingV2   bool           `json:",omitempty"`
+	Family      string         `json:",omitempty"`
+	Version     int32          `json:",omitempty"`
+	DisplayName string         `json:",omitempty"`
+	Grants      []planGrant    `json:",omitempty"`
+	Allowance   *planAllowance `json:",omitempty"`
 }
 
 type StripeCheckoutSession struct {
@@ -464,8 +500,34 @@ func (c *stripeHTTPClient) GetCreditGrantLedgerBalance(ctx context.Context, cust
 }
 
 func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params StripeCreateCheckoutSessionParams) (StripeCheckoutSession, error) {
+	if params.OneOffAmount > 0 && len(params.PriceIDs) > 0 {
+		return StripeCheckoutSession{}, errors.New("one-off Checkout cannot include recurring items")
+	}
+	if params.SetupOnly && (params.OneOffAmount != 0 || len(params.PriceIDs) > 0 || params.BasePriceID != "") {
+		return StripeCheckoutSession{}, errors.New("card setup Checkout cannot include payment items")
+	}
 	form := url.Values{}
 	form.Set("mode", "subscription")
+	if params.SetupOnly {
+		form.Set("mode", "setup")
+		form.Set("payment_method_types[0]", "card")
+	}
+	if params.OneOffAmount > 0 {
+		form.Set("mode", "payment")
+		form.Set("payment_method_types[0]", "card")
+		form.Set("payment_intent_data[setup_future_usage]", "off_session")
+		form.Set("invoice_creation[enabled]", "true")
+		form.Set("line_items[0][price_data][currency]", "usd")
+		form.Set("line_items[0][price_data][unit_amount]", strconv.FormatInt(params.OneOffAmount, 10))
+		if params.OneOffProduct != "" {
+			form.Set("line_items[0][price_data][product]", params.OneOffProduct)
+		} else {
+			form.Set("line_items[0][price_data][product_data][name]", params.OneOffName)
+		}
+		form.Set("custom_text[submit][message]", params.OneOffName)
+		form.Set("invoice_creation[invoice_data][description]", params.OneOffName)
+		form.Set("line_items[0][quantity]", "1")
+	}
 	form.Set("customer", params.CustomerID)
 	form.Set("success_url", params.SuccessURL)
 	form.Set("cancel_url", params.CancelURL)
@@ -475,17 +537,40 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 	}
 	for key, value := range params.Metadata {
 		form.Set("metadata["+key+"]", value)
-		form.Set("subscription_data[metadata]["+key+"]", value)
+		if params.SetupOnly {
+			form.Set("setup_intent_data[metadata]["+key+"]", value)
+		} else if params.OneOffAmount > 0 {
+			form.Set("payment_intent_data[metadata]["+key+"]", value)
+			form.Set("invoice_creation[invoice_data][metadata]["+key+"]", value)
+		} else {
+			form.Set("subscription_data[metadata]["+key+"]", value)
+		}
 	}
 	for i, priceID := range params.PriceIDs {
 		form.Set(fmt.Sprintf("line_items[%d][price]", i), priceID)
 	}
-	if params.Flexible {
+	if params.Flexible && params.OneOffAmount == 0 {
 		form.Set("subscription_data[billing_mode][type]", "flexible")
 	}
-	if params.BasePriceID != "" {
+	if params.AllowPromotionCodes {
+		form.Set("allow_promotion_codes", "true")
+	}
+	if params.BasePriceID != "" && params.OneOffAmount == 0 {
 		i := len(params.PriceIDs)
 		form.Set(fmt.Sprintf("line_items[%d][price]", i), params.BasePriceID)
+		form.Set(fmt.Sprintf("line_items[%d][quantity]", i), "1")
+	}
+	for n, line := range params.OneTimeLines {
+		i := len(params.PriceIDs) + n
+		if params.BasePriceID != "" {
+			i++
+		}
+		form.Set(fmt.Sprintf("line_items[%d][price_data][currency]", i), "usd")
+		form.Set(fmt.Sprintf("line_items[%d][price_data][unit_amount]", i), strconv.FormatInt(line.AmountCents, 10))
+		form.Set(fmt.Sprintf("line_items[%d][price_data][product_data][name]", i), line.Name)
+		for key, value := range line.Metadata {
+			form.Set(fmt.Sprintf("line_items[%d][price_data][product_data][metadata][%s]", i, key), value)
+		}
 		form.Set(fmt.Sprintf("line_items[%d][quantity]", i), "1")
 	}
 	var resp struct {
@@ -555,7 +640,7 @@ func (c *stripeHTTPClient) doForm(ctx context.Context, method, path string, form
 	if err != nil {
 		return err
 	}
-	if method == http.MethodPost && (path == "/v1/checkout/sessions" || path == "/v1/billing/credit_grants" || (strings.HasPrefix(path, "/v1/invoices/") && strings.HasSuffix(path, "/pay"))) {
+	if method == http.MethodPost && (path == "/v1/checkout/sessions" || path == "/v1/billing/credit_grants" || path == "/v1/payment_intents" || (strings.HasPrefix(path, "/v1/invoices/") && strings.HasSuffix(path, "/pay"))) {
 		// Account for retries durably at the application boundary. A transparent
 		// transport replay could mask an accepted first request with a later 4xx.
 		req.GetBody = nil
@@ -1652,7 +1737,7 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 	}
 	if h.Pool != nil {
 		var proPending bool
-		if err := h.Pool.QueryRow(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN ('pro_monthly','pro_annual'))`, teamID).Scan(&proPending); err != nil {
+		if err := h.Pool.QueryRow(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers+`)`, teamID).Scan(&proPending); err != nil {
 			respondError(c, ErrInternal)
 			return
 		}
@@ -1676,27 +1761,37 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "use the publication-decision checkout route", http.StatusBadRequest)
 		return
 	}
+	h.createPAYGCheckout(c, teamID, actorID, req, trusted, nil)
+}
+
+// createPAYGCheckout opens the self-serve subscription checkout. A Starter
+// first purchase adds its credit as a one-time line on the first invoice.
+func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID, req billingCheckoutSessionRequest, trusted bool, prepaid *prepaidCheckoutLine) {
 	if strings.TrimSpace(req.SuccessURL) == "" || strings.TrimSpace(req.CancelURL) == "" {
 		respondErrorMsg(c, "bad_request", "success_url and cancel_url are required", http.StatusBadRequest)
 		return
 	}
-	successURL, err := h.validateBillingRedirectURL(req.SuccessURL)
-	if err != nil {
-		if errors.Is(err, errBillingRedirectOriginsNotConfigured) {
-			respondErrorMsg(c, "service_unavailable", "billing redirect origins are not configured", http.StatusServiceUnavailable)
+	var err error
+	successURL, cancelURL := req.SuccessURL, req.CancelURL
+	if prepaid == nil || !prepaid.acceptedRedirects {
+		successURL, err = h.validateBillingRedirectURL(req.SuccessURL)
+		if err != nil {
+			if errors.Is(err, errBillingRedirectOriginsNotConfigured) {
+				respondErrorMsg(c, "service_unavailable", "billing redirect origins are not configured", http.StatusServiceUnavailable)
+				return
+			}
+			respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 			return
 		}
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
-	}
-	cancelURL, err := h.validateBillingRedirectURL(req.CancelURL)
-	if err != nil {
-		if errors.Is(err, errBillingRedirectOriginsNotConfigured) {
-			respondErrorMsg(c, "service_unavailable", "billing redirect origins are not configured", http.StatusServiceUnavailable)
+		cancelURL, err = h.validateBillingRedirectURL(req.CancelURL)
+		if err != nil {
+			if errors.Is(err, errBillingRedirectOriginsNotConfigured) {
+				respondErrorMsg(c, "service_unavailable", "billing redirect origins are not configured", http.StatusServiceUnavailable)
+				return
+			}
+			respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 			return
 		}
-		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
-		return
 	}
 	exportEnabled, err := h.billingExportEnabled(c.Request.Context(), teamID)
 	if err != nil {
@@ -1742,7 +1837,14 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	requestKey := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs)
+	keyParts := priceIDs
+	if prepaid != nil {
+		keyParts = append(append([]string(nil), priceIDs...), "prepaid:"+strconv.FormatInt(prepaid.AmountCents, 10))
+	}
+	requestKey := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, keyParts)
+	if prepaid != nil && prepaid.OperationID != uuid.Nil {
+		requestKey += ":prepaid-operation:" + prepaid.OperationID.String()
+	}
 	attemptID := uuid.New()
 	var checkoutAccount db.TeamBillingAccount
 	if trusted {
@@ -1779,6 +1881,57 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 	// Replays use the original expiration and actor as well as the same key.
 	// The local fence outlives this deadline until expiration is confirmed.
 	expiresAt := leaseStartedAt.Add(checkoutSessionLifetime - time.Minute)
+	var oneTime []StripeCheckoutOneTimeLine
+	var purchaseID uuid.UUID
+	if prepaid != nil {
+		purchaseID = prepaidCheckoutPurchaseID(teamID, leaseStartedAt, prepaid.AmountCents)
+		if prepaid.OperationID != uuid.Nil {
+			purchaseID = prepaid.OperationID
+		}
+		if err := h.recordCheckoutPurchase(c.Request.Context(), purchaseID, teamID, customerID, checkoutActor, prepaid.AmountCents, ""); err != nil {
+			h.finishFailedStripeCheckoutAttempt(teamID, attemptID, checkoutAccount.CheckoutInitializingAt, false)
+			if errors.Is(err, errPrepaidTooManyUnspent) {
+				respondErrorMsg(c, "conflict", errPrepaidTooManyUnspent.Error(), http.StatusConflict)
+				return
+			}
+			if errors.Is(err, errPricingV2Off) {
+				respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
+				return
+			}
+			if errors.Is(err, errPrepaidPaymentPending) {
+				if prepaid.OperationID != uuid.Nil {
+					c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: purchaseID, State: "pending"})
+				} else {
+					respondErrorMsg(c, "payment_confirmation_pending", "checkout outcome requires recovery", http.StatusAccepted)
+				}
+				return
+			}
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("freeze prepaid checkout terms failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		if prepaid.OperationID != uuid.Nil {
+			// A fresh subscription lease must not extend the original purchase's
+			// settlement deadline. Stripe cannot open a payable session after expiry.
+			if err := h.Pool.QueryRow(c.Request.Context(), `SELECT payment_first_attempt_at+interval '23 hours' FROM billing_prepaid_purchase WHERE id=$1`, purchaseID).Scan(&expiresAt); err != nil {
+				h.finishFailedStripeCheckoutAttempt(teamID, attemptID, checkoutAccount.CheckoutInitializingAt, false)
+				respondError(c, ErrInternal)
+				return
+			}
+			// Fence the entire generation, including concurrent resumes. An older
+			// generation may already have a session and must retain its replay key.
+			if !prepaidCheckoutGenerationCanCreate(leaseStartedAt, expiresAt) {
+				h.finishFailedStripeCheckoutAttempt(teamID, attemptID, checkoutAccount.CheckoutInitializingAt, false)
+				c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: purchaseID, State: "pending"})
+				return
+			}
+		}
+		oneTime = []StripeCheckoutOneTimeLine{prepaidCheckoutOneTimeLine(purchaseID, prepaid.AmountCents)}
+	}
+	metadata := map[string]string{"activation_user_id": checkoutActor.String(), "checkout_generation": leaseStartedAt.Format(time.RFC3339Nano)}
+	if prepaid != nil {
+		metadata["prepaid_purchase_id"] = purchaseID.String()
+	}
 	session, err := h.Stripe.CreateCheckoutSession(c.Request.Context(), StripeCreateCheckoutSessionParams{
 		CustomerID:        customerID,
 		SuccessURL:        successURL,
@@ -1786,11 +1939,9 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		ClientReferenceID: teamID.String(),
 		PriceIDs:          priceIDs,
 		ExpiresAt:         &expiresAt,
-		Metadata: map[string]string{
-			"activation_user_id":  checkoutActor.String(),
-			"checkout_generation": leaseStartedAt.Format(time.RFC3339Nano),
-		},
-		IdempotencyKey: checkoutSessionIdempotencyKeyForLease(teamID, customerID, successURL, cancelURL, priceIDs, leaseStartedAt),
+		Metadata:          metadata,
+		IdempotencyKey:    checkoutSessionIdempotencyKeyForLease(teamID, customerID, successURL, cancelURL, keyParts, leaseStartedAt),
+		OneTimeLines:      oneTime,
 	})
 	if err != nil {
 		// A transport, timeout, or decode failure is ambiguous: Stripe may have
@@ -1811,6 +1962,17 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		// completion webhook. The local lease remains in place for retry.
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("persist Stripe checkout session failed")
 		respondError(c, ErrInternal)
+		return
+	}
+	if prepaid != nil {
+		if err := h.recordCheckoutPurchase(c.Request.Context(), purchaseID, teamID, customerID, checkoutActor, prepaid.AmountCents, session.ID); err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("record prepaid checkout purchase failed")
+			respondError(c, ErrInternal)
+			return
+		}
+	}
+	if prepaid != nil && prepaid.OperationID != uuid.Nil {
+		c.JSON(http.StatusOK, prepaidOperationResponse{ID: session.ID, URL: session.URL, PurchaseID: purchaseID, State: "pending"})
 		return
 	}
 	c.JSON(http.StatusOK, billingSessionResponse{ID: session.ID, URL: session.URL})
@@ -2497,7 +2659,7 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, read
 	var denialReason string
 	switch state {
 	case "acquired", "existing", "blocked":
-	case "ineligible", "user_already_redeemed", "owner_conflict", "device_already_redeemed", "evidence_missing", "device_reservation_pending", "sponsored":
+	case "ineligible", "user_already_redeemed", "owner_conflict", "device_already_redeemed", "evidence_missing", "device_reservation_pending", "sponsored", "pricing_v2":
 		denialReason = state
 		if state == "sponsored" {
 			denialReason = "sponsored_onboarding"
@@ -3329,6 +3491,9 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET next_attempt_at=LEAST(next_attempt_at,clock_timestamp()) WHERE checkout_session_id=$1 AND payment_state IN ('uncertain','processing')`, obj.ID); err != nil {
+			return err
+		}
 		teamID, err := uuid.Parse(strings.TrimSpace(obj.ClientReferenceID))
 		if err != nil {
 			return err
@@ -3632,6 +3797,9 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 		if _, err := tx.Exec(ctx, `UPDATE billing_invoice_collection SET next_attempt_at=LEAST(next_attempt_at,clock_timestamp()) WHERE invoice_id=$1 AND customer_id=$2 AND state NOT IN ('paid','void')`, obj.ID, obj.Customer); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET next_attempt_at=LEAST(next_attempt_at,clock_timestamp()) WHERE customer_id=$1 AND source='checkout' AND payment_state IN ('uncertain','processing')`, obj.Customer); err != nil {
+			return err
+		}
 		if event.Type == "invoice.updated" || event.Type == "invoice.payment_action_required" {
 			return nil
 		}
@@ -3658,6 +3826,17 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 			StripeInvoiceStatus:  stringPtr(status),
 		})
 		return err
+	case "charge.refunded", "charge.refund.updated", "charge.dispute.created", "charge.dispute.updated", "charge.dispute.closed", "charge.dispute.funds_withdrawn", "charge.dispute.funds_reinstated", "credit_note.created", "credit_note.voided":
+		var obj struct {
+			Customer      string `json:"customer"`
+			PaymentIntent string `json:"payment_intent"`
+			Charge        string `json:"charge"`
+			Invoice       string `json:"invoice"`
+		}
+		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
+			return err
+		}
+		return requestPrepaidReversalCheck(ctx, tx, obj.Customer, obj.PaymentIntent)
 	case "billing.meter.error_report_triggered", "v1.billing.meter.error_report_triggered", "billing.meter.no_meter_found", "v1.billing.meter.no_meter_found":
 		if samples := stripeMeterErrorSamplePayloads(event.Data.Object); len(samples) > 1 {
 			for _, sample := range samples[1:] {

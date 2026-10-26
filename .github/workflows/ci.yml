@@ -186,6 +186,17 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Run paired billing migration compatibility contracts
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+        run: |
+          command -v python3
+          if ! command -v psql >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+          python3 scripts/tests/test_billing_paired_migrations.py -v
+
       - name: Initialize migrated billing and storage database
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
@@ -201,7 +212,7 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
           YC_CLAIM_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
           YC_AUTHORITY_TEST_MIGRATION: ${{ github.workspace }}/supabase/shared-auth-migrations/20261016070000_yc_company_activation_authority.sql
-        run: go test -v -race -tags integration -count=1 -timeout 2m -run '^(TestYC|TestSponsored|TestEntitlement|TestInvoiceCredit|TestInvoiceDiscovery|TestEmptyCredit)' ./internal/api
+        run: go test -v -race -tags integration -count=1 -timeout 3m -run '^(TestYC|TestSponsored|TestEntitlement|TestInvoiceCredit|TestInvoiceDiscovery|TestEmptyCredit|TestMatchingCredit|TestPrepaid|TestPro|TestReleased|TestMRR|TestPlanTerms|TestPlanAssignment|TestStaffPlanAssignment|TestTeamPlanChange)' ./internal/api
 
       - name: Run retained storage API race contracts
         env:

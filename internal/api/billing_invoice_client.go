@@ -24,6 +24,7 @@ type StripeInvoiceAmounts struct {
 		PaidAt      int64 `json:"paid_at"`
 		FinalizedAt int64 `json:"finalized_at"`
 	} `json:"status_transitions"`
+	AmountPaid      *int64            `json:"amount_paid,omitempty"`
 	AmountRemaining *int64            `json:"amount_remaining"`
 	PeriodStart     int64             `json:"period_start"`
 	PeriodEnd       int64             `json:"period_end"`
@@ -46,7 +47,8 @@ type StripeInvoiceAmounts struct {
 	} `json:"parent"`
 	PretaxCredits   []StripeInvoicePretaxCredit `json:"total_pretax_credit_amounts"`
 	DiscountAmounts []struct {
-		Amount int64 `json:"amount"`
+		Amount   int64  `json:"amount"`
+		Discount string `json:"discount"`
 	} `json:"total_discount_amounts"`
 	Taxes                  []json.RawMessage `json:"total_taxes"`
 	AmountShipping         int64             `json:"amount_shipping"`
@@ -62,6 +64,7 @@ type StripeInvoicePretaxCredit struct {
 	Type                     string `json:"type"`
 	Amount                   int64  `json:"amount"`
 	CreditBalanceTransaction string `json:"credit_balance_transaction"`
+	Discount                 string `json:"discount"`
 }
 
 type StripeInvoiceAmountLine struct {

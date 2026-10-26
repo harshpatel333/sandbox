@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"sort"
 	"sync"
 	"time"
@@ -34,6 +33,8 @@ func (h *Handlers) StartUsageEntitlementService(ctx context.Context) {
 	}
 	workers := 8
 	h.startEntitlementCoverageMonitoring(ctx)
+	h.startMatchingCredits(ctx, h.Stripe.(*stripeHTTPClient))
+	h.startPrepaidCredits(ctx, h.Stripe.(*stripeHTTPClient))
 	h.startSponsoredReconciliation(ctx)
 	if h.Config != nil && h.Config.BillingEntitlementWorkers >= 2 {
 		workers = min(h.Config.BillingEntitlementWorkers, 32)
@@ -381,7 +382,11 @@ func (h *Handlers) reconcileUsageEntitlement(ctx context.Context, id uuid.UUID) 
 		if err = h.Pool.QueryRow(ctx, `SELECT invoice_id FROM billing_contract_payment WHERE contract_id=$1 AND service_period_start<=$2 AND service_period_end>=$3 ORDER BY service_period_start DESC,invoice_id LIMIT 1`, id, start, end).Scan(&paymentInvoice); err != nil {
 			return next, err
 		}
-		payment, verified, verifyErr := client.verifyProInvoice(ctx, paymentInvoice, proOffer{Key: c.OfferKey, Price: c.BasePriceID, Amount: c.ChargeAmountCents, Months: c.ChargeIntervalMonths}, c.CustomerID, c.SubscriptionID)
+		promotion, err := contractPromotion(ctx, h.Pool, id)
+		if err != nil {
+			return next, err
+		}
+		payment, verified, verifyErr := h.verifyProContractInvoice(ctx, client, id, paymentInvoice, proOffer{Key: c.OfferKey, Price: c.BasePriceID, Amount: c.ChargeAmountCents, Months: c.ChargeIntervalMonths, Promotion: promotion}, c.CustomerID, c.SubscriptionID)
 		if observeErr := h.observeProPaymentReview(ctx, team, paymentInvoice, payment, verifyErr); observeErr != nil {
 			return next, observeErr
 		}
@@ -468,12 +473,9 @@ func (h *Handlers) dispatchUsageEntitlement(ctx context.Context, c db.BillingCom
 	if err != nil {
 		return err
 	}
-	var grant entitlementGrant
-	if err = client.doForm(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, e.IdempotencyKey); err != nil {
+	grant, err := client.createCreditGrant(ctx, form, e.IdempotencyKey)
+	if err != nil {
 		return err
-	}
-	if grant.VoidedAt != 0 {
-		return errors.New("created grant was voided; operator recovery required")
 	}
 	raw, _ := json.Marshal(grant)
 	_, err = h.DB.ConfirmUsageEntitlementIssued(ctx, db.ConfirmUsageEntitlementIssuedParams{TeamID: c.TeamID, EntitlementID: e.ID, GrantID: &grant.ID, Evidence: raw})

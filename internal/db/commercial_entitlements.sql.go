@@ -740,14 +740,16 @@ WITH contract AS MATERIALIZED (
 )
 SELECT c.offer_key, c.status, c.starts_at, c.ends_at, c.charge_amount_cents, c.charge_interval_months,
     period.period_start, period.period_end, period.amount_cents AS period_amount_cents, e.state AS entitlement_state,
-    e.stripe_credit_grant_id AS entitlement_grant_id
+    e.stripe_credit_grant_id AS entitlement_grant_id,
+    COALESCE((SELECT bp.display_name FROM billing_plan bp WHERE bp.offer_key = c.offer_key), '')::text AS plan_display_name
 FROM contract c
 LEFT JOIN period ON period.contract_id = c.id
 LEFT JOIN billing_usage_entitlement e ON e.team_id = c.team_id AND e.contract_id = c.id
     AND e.kind = c.entitlement_kind AND e.period_start = period.period_start
 UNION ALL
 SELECT 'pro_annual'::text,'active'::text,a.starts_at,a.waiver_ends_at,0::bigint,12::integer,
- p.period_start::timestamptz,p.period_end::timestamptz,p.amount_cents::bigint,e.state,e.stripe_credit_grant_id
+ p.period_start::timestamptz,p.period_end::timestamptz,p.amount_cents::bigint,e.state,e.stripe_credit_grant_id,
+ COALESCE((SELECT bp.display_name FROM billing_plan bp WHERE bp.offer_key='pro_annual'), '')::text
 FROM billing_sponsored_annual_authority a JOIN billing_commercial_contract c ON c.id=a.contract_id
 LEFT JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract,clock_timestamp()) AS p(period_start,period_end,amount_cents) ON true
 LEFT JOIN billing_usage_entitlement e ON e.contract_id=c.id AND e.kind=c.entitlement_kind AND e.period_start=p.period_start
@@ -767,6 +769,7 @@ type GetCurrentCommercialPlanRow struct {
 	PeriodAmountCents    *int64             `json:"period_amount_cents"`
 	EntitlementState     *string            `json:"entitlement_state"`
 	EntitlementGrantID   *string            `json:"entitlement_grant_id"`
+	PlanDisplayName      string             `json:"plan_display_name"`
 }
 
 func (q *Queries) GetCurrentCommercialPlan(ctx context.Context, teamID uuid.UUID) (GetCurrentCommercialPlanRow, error) {
@@ -784,6 +787,7 @@ func (q *Queries) GetCurrentCommercialPlan(ctx context.Context, teamID uuid.UUID
 		&i.PeriodAmountCents,
 		&i.EntitlementState,
 		&i.EntitlementGrantID,
+		&i.PlanDisplayName,
 	)
 	return i, err
 }
@@ -1079,7 +1083,7 @@ INSERT INTO billing_contract_payment (
     $5, $6, $7,
     $8, $9, $10,
     $11, $12, $13,
-    $14, $15, $16
+    $14, clock_timestamp(), $15
 ) ON CONFLICT (invoice_id) DO NOTHING RETURNING id, team_id, contract_id, invoice_id, payment_reference, customer_id, subscription_id, base_price_id, service_period_start, service_period_end, base_amount_paid_cents, invoice_amount_paid_cents, invoice_amount_remaining_cents, currency, paid_at, verified_at, evidence
 `
 
@@ -1098,7 +1102,6 @@ type RecordCommercialBasePaymentParams struct {
 	InvoiceAmountRemainingCents int64     `json:"invoice_amount_remaining_cents"`
 	Currency                    string    `json:"currency"`
 	PaidAt                      time.Time `json:"paid_at"`
-	VerifiedAt                  time.Time `json:"verified_at"`
 	Evidence                    []byte    `json:"evidence"`
 }
 
@@ -1118,7 +1121,6 @@ func (q *Queries) RecordCommercialBasePayment(ctx context.Context, arg RecordCom
 		arg.InvoiceAmountRemainingCents,
 		arg.Currency,
 		arg.PaidAt,
-		arg.VerifiedAt,
 		arg.Evidence,
 	)
 	var i BillingContractPayment
