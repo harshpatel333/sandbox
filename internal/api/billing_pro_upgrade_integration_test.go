@@ -18,6 +18,16 @@ import (
 )
 
 func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
+	testProUpgradeFutureCredit(t, 25000)
+}
+
+func TestProUpgradeFutureContractFreezesIndependentMonthlyCredit(t *testing.T) {
+	for _, credit := range []int64{50000, 10000} {
+		t.Run(fmt.Sprint(credit), func(t *testing.T) { testProUpgradeFutureCredit(t, credit) })
+	}
+}
+
+func testProUpgradeFutureCredit(t *testing.T, monthlyCredit int64) {
 	h, team := newPlanAssignmentFixture(t)
 	cfg := h.Pool.Config()
 	cfg.MaxConns = 1
@@ -31,7 +41,14 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 	anchor := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 	end := anchor.AddDate(0, 1, 0)
 	h.Now = func() time.Time { return now }
-	terms, err := h.planTermsForPricingVersion(t.Context(), "pro_monthly", "v2")
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version='v2' WHERE singleton`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = h.Pool.Exec(context.Background(), `UPDATE billing_pricing_switch SET pricing_version='legacy' WHERE singleton`)
+	})
+	key := publishProCreditTestOffer(t, h, monthlyCredit)
+	terms, err := h.planTermsForPricingVersion(t.Context(), key, "v2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,6 +59,9 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	u.InitialAssignment = &initial.ID
+	if monthlyCredit != 25000 {
+		u.BridgeCredit = ptrProCredit(monthlyCredit / 2)
+	}
 	if _, err = h.Pool.Exec(t.Context(), `INSERT INTO profile(id,email,provider) VALUES($1,$2,'google')`, u.Actor, u.Actor.String()+"@example.test"); err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +78,7 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 	if _, err = h.Pool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status,commercial_billing_anchor) VALUES($1,$2,$3,'active',$4) ON CONFLICT(team_id) DO UPDATE SET stripe_customer_id=$2,stripe_subscription_id=$3,stripe_subscription_status='active',commercial_billing_anchor=$4`, team, u.Customer, *u.Subscription, anchor); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,grant_id,payment_evidence) VALUES($1,$2,$3,$4,$5,$6,'{}',$7,$7,$8,$9,12500,'credited',$10,'{}')`, u.ID, team, u.Actor, u.Customer, *u.Subscription, offer.Key, anchor, end, now, *u.Grant); err != nil {
+	if _, err = h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,grant_id,payment_evidence,bridge_credit_cents) VALUES($1,$2,$3,$4,$5,$6,'{}',$7,$7,$8,$9,12500,'credited',$10,'{}',$11)`, u.ID, team, u.Actor, u.Customer, *u.Subscription, offer.Key, anchor, end, now, *u.Grant, u.BridgeCredit); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = h.DB.ClaimStripeWebhookProcessingLease(t.Context(), db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: u.Customer, Token: token}); err != nil {
@@ -85,7 +105,7 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 	session := StripeRetrievedCheckoutSession{ID: *u.Session, Mode: "payment", CustomerID: u.Customer, ClientReferenceID: team.String(), Status: "complete", PaymentStatus: "paid", Currency: "usd", AmountSubtotal: u.Amount, AmountTotal: u.Amount, InvoiceID: invoice, PaymentIntentID: intent, Metadata: map[string]string{"pro_upgrade_id": u.ID.String()}}
 	var grant entitlementGrant
 	grant.ID, grant.Customer, grant.Category, grant.Priority = *u.Grant, u.Customer, "paid", 50
-	grant.Amount.Type, grant.Amount.Monetary.Currency, grant.Amount.Monetary.Value = "monetary", "usd", u.Amount
+	grant.Amount.Type, grant.Amount.Monetary.Currency, grant.Amount.Monetary.Value = "monetary", "usd", u.bridgeCreditAmount()
 	grant.Applicability.Scope.PriceType = "metered"
 	grant.Metadata = map[string]string{"pro_upgrade_id": u.ID.String()}
 	grant.EffectiveAt = now.Unix()
@@ -181,7 +201,11 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	assertView("pro_monthly", *terms.Limits.MaxConcurrent)
+	assertView(offer.Key, *terms.Limits.MaxConcurrent)
+	var frozenCredit int64
+	if err = conn.QueryRow(t.Context(), `SELECT entitlement_amount_cents FROM billing_commercial_contract WHERE id=$1`, u.Contract).Scan(&frozenCredit); err != nil || frozenCredit != monthlyCredit {
+		t.Fatalf("future monthly credit: %d %v", frozenCredit, err)
+	}
 	var starts, storedAnchor time.Time
 	var state string
 	var assignments int
@@ -201,7 +225,7 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 	bridgeTeams := func() int64 {
 		t.Helper()
 		var count int64
-		if err := conn.QueryRow(t.Context(), `SELECT COALESCE(sum(count),0)::bigint FROM (`+mrrContractGroupsQuery+`) groups WHERE offer_key='pro_monthly'`, reportAt, "use", "").Scan(&count); err != nil {
+		if err := conn.QueryRow(t.Context(), `SELECT COALESCE(sum(count),0)::bigint FROM (`+mrrContractGroupsQuery+`) groups WHERE offer_key=$4`, reportAt, "use", "", offer.Key).Scan(&count); err != nil {
 			t.Fatal(err)
 		}
 		return count
@@ -254,22 +278,57 @@ func TestProUpgradeRecurringReplayKeepsFutureContractAndLimits(t *testing.T) {
 }
 
 func TestProUpgradeCreditRecoversLostAcknowledgmentWithoutExpiry(t *testing.T) {
+	for _, credit := range []*int64{nil, ptrProCredit(25000), ptrProCredit(5000), ptrProCredit(0)} {
+		label := "legacy"
+		if credit != nil {
+			label = fmt.Sprint(*credit)
+		}
+		t.Run(label, func(t *testing.T) { testProUpgradeCreditRecovery(t, credit) })
+	}
+}
+
+func ptrProCredit(n int64) *int64 { return &n }
+
+func testProUpgradeCreditRecovery(t *testing.T, credit *int64) {
 	h, team := newPlanAssignmentFixture(t)
 	now := time.Now().UTC().Truncate(time.Second)
-	u := proUpgrade{ID: uuid.New(), Team: team, Actor: uuid.New(), Customer: "cus_" + uuid.NewString(), Offer: "pro_monthly", Anchor: now, Start: now, End: now.Add(24 * time.Hour), Quoted: now, Amount: 12500}
-	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence) VALUES($1,$2,$3,$4,$5,'{}',$6,$6,$7,$6,$8,'paid','{}')`, u.ID, team, u.Actor, u.Customer, u.Offer, now, u.End, u.Amount); err != nil {
+	u := proUpgrade{ID: uuid.New(), Team: team, Actor: uuid.New(), Customer: "cus_" + uuid.NewString(), Offer: "pro_monthly", Anchor: now, Start: now, End: now.Add(24 * time.Hour), Quoted: now, Amount: 12500, BridgeCredit: credit}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,bridge_credit_cents) VALUES($1,$2,$3,$4,$5,'{}',$6,$6,$7,$6,$8,'paid','{}',$9)`, u.ID, team, u.Actor, u.Customer, u.Offer, now, u.End, u.Amount, credit); err != nil {
 		t.Fatal(err)
+	}
+	loaded, err := h.proUpgrade(t.Context(), team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u = loaded
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade SET bridge_credit_cents=COALESCE(bridge_credit_cents,0)+1 WHERE id=$1`, u.ID); err == nil {
+		t.Fatal("repriced an accepted credit quote")
 	}
 	var g entitlementGrant
 	g.ID, g.Customer, g.Category, g.Priority = "cred_"+uuid.NewString(), u.Customer, "paid", 50
-	g.Amount.Type, g.Amount.Monetary.Currency, g.Amount.Monetary.Value = "monetary", "usd", u.Amount
+	g.Amount.Type, g.Amount.Monetary.Currency, g.Amount.Monetary.Value = "monetary", "usd", u.bridgeCreditAmount()
 	g.Applicability.Scope.PriceType = "metered"
 	g.Metadata = map[string]string{"pro_upgrade_id": u.ID.String()}
 	g.EffectiveAt = now.Unix()
+	cash := int64(6250)
+	if credit != nil && *credit > u.Amount {
+		cash = 0
+	}
+	invoice := "in_" + uuid.NewString()
+	session := StripeRetrievedCheckoutSession{Currency: "usd", AmountSubtotal: u.Amount, AmountTotal: cash, PaymentStatus: "paid", InvoiceID: invoice, PaymentIntentID: "pi_fixture"}
+	session.TotalDetails.Discount = u.Amount - cash
 	creates := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/v1/invoices/" + invoice:
+			fmt.Fprintf(w, `{"id":%q,"customer":%q,"status":"paid","currency":"usd","amount_paid":%d,"amount_due":%d,"amount_remaining":0,"ending_balance":0,"status_transitions":{"paid_at":%d},"lines":{"data":[{"amount":%d,"currency":"usd","quantity":1}]}}`, invoice, u.Customer, cash, cash, now.Unix(), u.Amount)
+		case "/v1/payment_intents/pi_fixture":
+			fmt.Fprintf(w, `{"id":"pi_fixture","customer":%q,"status":"succeeded","currency":"usd","amount_received":%d,"latest_charge":"ch_fixture","payment_method":"pm_fixture","setup_future_usage":"off_session","metadata":{"pro_upgrade_id":%q}}`, u.Customer, cash, u.ID.String())
+		case "/v1/charges/ch_fixture":
+			fmt.Fprintf(w, `{"id":"ch_fixture","customer":%q,"payment_intent":"pi_fixture","currency":"usd","paid":true,"captured":true,"amount_captured":%d}`, u.Customer, cash)
+		case "/v1/customers/" + u.Customer:
+			fmt.Fprintf(w, `{"id":%q,"invoice_settings":{"default_payment_method":"pm_fixture"}}`, u.Customer)
 		case "/v1/invoices":
 			_, _ = w.Write([]byte(`{"data":[]}`))
 		case "/v1/billing/credit_grants":
@@ -278,10 +337,10 @@ func TestProUpgradeCreditRecoversLostAcknowledgmentWithoutExpiry(t *testing.T) {
 				if err := r.ParseForm(); err != nil {
 					t.Error(err)
 				}
-				if r.Form.Has("expires_at") || r.Form.Get("category") != "paid" || r.Form.Get("amount[monetary][value]") != "12500" || r.Form.Get("applicability_config[scope][price_type]") != "metered" {
+				if r.Form.Has("expires_at") || r.Form.Get("category") != "paid" || r.Form.Get("amount[monetary][value]") != fmt.Sprint(u.bridgeCreditAmount()) || r.Form.Get("applicability_config[scope][price_type]") != "metered" {
 					t.Error("credit is expiring, promotional, or mismatched")
 				}
-				_ = json.NewEncoder(w).Encode(g)
+				http.Error(w, "lost acknowledgement", 503)
 			} else if creates == 0 {
 				_, _ = w.Write([]byte(`{"data":[]}`))
 			} else {
@@ -296,17 +355,30 @@ func TestProUpgradeCreditRecoversLostAcknowledgmentWithoutExpiry(t *testing.T) {
 	}))
 	defer srv.Close()
 	client := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+	if method, _, err := client.verifyProUpgradePayment(t.Context(), u, session, false); err != nil || method != "pm_fixture" {
+		t.Fatalf("coupon cash proof: %s %v", method, err)
+	}
 	conn, release, err := h.proUpgradeInvoiceLock(t.Context(), team)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer release()
-	if err = h.issueProUpgradeCredit(t.Context(), conn, &u, client); err != nil {
-		t.Fatal(err)
+	if err = h.issueProUpgradeCredit(t.Context(), conn, &u, client); u.bridgeCreditAmount() > 0 && err == nil {
+		t.Fatal("expected lost acknowledgement")
 	}
 	u.Grant = nil
 	if err = h.issueProUpgradeCredit(t.Context(), conn, &u, client); err != nil {
 		t.Fatal(err)
+	}
+	if u.bridgeCreditAmount() == 0 {
+		if creates != 0 {
+			t.Fatal("zero credit called provider")
+		}
+		var credited bool
+		if err = conn.QueryRow(t.Context(), `SELECT state='credited' AND grant_id IS NULL AND bridge_credit_cents=0 FROM billing_pro_upgrade WHERE id=$1`, u.ID).Scan(&credited); err != nil || !credited {
+			t.Fatalf("zero credit lacks durable proof: %v %v", credited, err)
+		}
+		return
 	}
 	if creates != 1 {
 		t.Fatalf("duplicate paid credit: %d", creates)
