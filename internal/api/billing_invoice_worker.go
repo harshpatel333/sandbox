@@ -710,7 +710,11 @@ func (h *Handlers) prepareInvoicePlan(ctx context.Context, p billing.ExportPerio
 		return plan, err
 	}
 	if a.Base.Price != "" || sponsored {
-		err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
+		var firstCycle bool
+		firstCycle, err = h.prepareFirstProCycleCredits(ctx, p, a, inv.ID, &plan, client)
+		if err == nil && !firstCycle {
+			err = h.prepareEntitlementCredits(ctx, p, a, inv.ID, &plan, client)
+		}
 	} else {
 		var released bool
 		released, err = h.prepareReleasedFundingCredits(ctx, p, a, inv.ID, &plan, client)

@@ -146,3 +146,41 @@ func TestProUpgradeAcceptsBackdatedInitialProviderPeriod(t *testing.T) {
 		t.Fatal("accepted a changed commercial period")
 	}
 }
+
+func TestProFirstCycleCreditExpiryRequiresFrozenFullMonth(t *testing.T) {
+	start := time.Date(2028, 1, 31, 23, 59, 59, 0, time.UTC)
+	end := time.Date(2028, 2, 29, 23, 59, 59, 0, time.UTC)
+	credit := int64(45678)
+	u := proUpgrade{Anchor: start, Start: start, Quoted: start, End: end, Amount: 35789, BridgeCredit: &credit}
+	u.Payload, _ = json.Marshal(StripeCreateCheckoutSessionParams{FirstPaidProCycle: true, PlanTerms: &StripeCheckoutPlanTerms{Amount: 35789, Months: 1, Credit: credit}})
+	if expiry, err := u.creditExpiry(); err != nil || expiry != end.Unix()+1 {
+		t.Fatalf("monthly expiry: %d %v", expiry, err)
+	}
+	for _, mutate := range []func(*proUpgrade){
+		func(v *proUpgrade) { v.End = v.End.Add(time.Second) },
+		func(v *proUpgrade) { v.Amount++ },
+		func(v *proUpgrade) { v.Quoted = v.Quoted.Add(time.Second) },
+		func(v *proUpgrade) { v.BridgeCredit = ptrProCreditUnit(1) },
+	} {
+		changed := u
+		mutate(&changed)
+		if _, err := changed.creditExpiry(); err == nil {
+			t.Fatal("accepted altered first-cycle terms")
+		}
+	}
+	u.Payload = []byte(`{}`)
+	if expiry, err := u.creditExpiry(); err != nil || expiry != 0 {
+		t.Fatalf("changed unmarked accepted bridge: %d %v", expiry, err)
+	}
+	text := proFirstCycleCheckoutDescription(proOffer{Amount: 35789, Credit: 45678}, start, end, true)
+	for _, want := range []string{"First monthly payment", "$357.89", "$456.78 usage credit that expires", "Jan 31, 2028 23:59 UTC", "Feb 29, 2028 23:59 UTC", "Promotion codes apply only to this first payment."} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in %q", want, text)
+		}
+	}
+	if strings.Contains(text, "non-expiring") || strings.Contains(text, "Prorated") || len(text) > 1200 {
+		t.Fatalf("incorrect first-month wording: %s", text)
+	}
+}
+
+func ptrProCreditUnit(n int64) *int64 { return &n }

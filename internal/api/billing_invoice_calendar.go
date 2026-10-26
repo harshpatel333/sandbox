@@ -52,6 +52,16 @@ func invoiceCalendarPeriod(p billing.ExportPeriod, sub invoiceSubscription, roun
 // partial initial period can precede it, but must be proven by start_date.
 func providerInvoicePeriod(sub invoiceSubscription, at time.Time) (time.Time, time.Time, bool) {
 	anchor := time.Unix(sub.BillingCycleAnchor, 0).UTC()
+	if cfg := sub.BillingCycleAnchorConfig; cfg != nil {
+		start := time.Unix(sub.StartDate, 0).UTC()
+		boundary, _, ok := billing.AnniversaryPeriod(start, anchor)
+		if cfg.Month != nil || cfg.DayOfMonth != start.Day() || cfg.Hour != start.Hour() || cfg.Minute != start.Minute() || cfg.Second != start.Second() || !ok || !boundary.Equal(anchor) {
+			return time.Time{}, time.Time{}, false
+		}
+		// A 31st-day config may expose a future March anchor while its first
+		// full period ends in February. Preserve the explicit original day.
+		return billing.AnniversaryPeriod(start, at)
+	}
 	if !at.Before(anchor) {
 		return billing.AnniversaryPeriod(anchor, at)
 	}
