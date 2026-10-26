@@ -67,8 +67,8 @@ func newPrepaidFixture(t *testing.T) *prepaidFixture {
 	}
 	t.Cleanup(pool.Close)
 	h := &Handlers{Pool: pool, DB: db.New(pool), Config: &config.Config{}}
-	installPrepaidPublicStateFixture(t, h)
 	setPricingVersion(t, h, "v2")
+	installPrepaidPublicStateFixture(t, h)
 	team, err := h.DB.CreateTeam(t.Context(), "prepaid-"+uuid.NewString())
 	if err != nil {
 		t.Fatal(err)

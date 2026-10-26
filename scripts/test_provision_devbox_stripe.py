@@ -131,7 +131,7 @@ class SourceAgreementTests(unittest.TestCase):
 
     def test_pro_amounts_match_the_plan_catalog(self):
         expected = {p["offer"]: p["cents"] for p in PRO}
-        catalog = (ROOT / "supabase/migrations/20261023000000_billing_plan_catalog.sql").read_text()
+        catalog = (ROOT / "supabase/migrations/20261026045510_billing_plan_catalog.sql").read_text()
         seeded = dict(re.findall(r"\('(pro_\w+)', 'pro', 'Pro', \d+, (\d+),", catalog))
         self.assertEqual(expected, {k: int(v) for k, v in seeded.items()})
         source = (ROOT / "internal/api/billing_pro_checkout.go").read_text()

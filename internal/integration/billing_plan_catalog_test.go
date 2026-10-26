@@ -1017,7 +1017,7 @@ func TestIntegration_PricingEntryReaderUsesRestrictedRole(t *testing.T) {
 	if _, err := tx.Exec(t.Context(), `DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role NOLOGIN; END IF; END $$; GRANT USAGE ON SCHEMA public TO service_role; DROP FUNCTION billing_lock_pricing_public_state()`); err != nil {
 		t.Fatal(err)
 	}
-	migration, err := os.ReadFile("../../supabase/migrations/20261024131000_pricing_adoption_entry.sql")
+	migration, err := os.ReadFile("../../supabase/migrations/20261026045533_pricing_adoption_entry.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -19,31 +19,24 @@ const closedPrepaidAssertionSQL = `CREATE OR REPLACE FUNCTION billing_assert_pri
 
 func installPrepaidPublicStateFixture(t *testing.T, h *Handlers) {
 	t.Helper()
-	_, err := h.Pool.Exec(t.Context(), `CREATE TABLE billing_pricing_adoption(singleton boolean PRIMARY KEY DEFAULT true,fixture_released boolean NOT NULL);
- INSERT INTO billing_pricing_adoption VALUES(true,true);
- CREATE FUNCTION billing_pricing_public_state() RETURNS TABLE(pricing_version text,entry_open boolean,epoch uuid)
- LANGUAGE sql AS $$ SELECT CASE WHEN s.pricing_version='v2' AND a.fixture_released THEN 'v2' ELSE 'legacy' END,
- COALESCE(s.pricing_version='v2' AND a.fixture_released,false),CASE WHEN a.singleton THEN '97cb97ef-7fde-4676-8d81-2d438939d47c'::uuid END FROM (SELECT 1) seed LEFT JOIN billing_pricing_switch s ON s.singleton LEFT JOIN billing_pricing_adoption a ON a.singleton $$`)
-	if err != nil {
+	var original []byte
+	var assertion string
+	if err := h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(a),pg_get_functiondef('billing_assert_pricing_entry_open(uuid,text)'::regprocedure) FROM billing_pricing_adoption a WHERE singleton`).Scan(&original, &assertion); err != nil {
 		t.Fatal(err)
 	}
-
-	_, err = h.Pool.Exec(t.Context(), `CREATE FUNCTION billing_assert_pricing_entry_open(p_epoch uuid DEFAULT NULL,p_pricing_version text DEFAULT NULL)
- RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path=public,pg_temp AS $$
- DECLARE actual_epoch uuid; model text; opened boolean;
- BEGIN
-  SELECT pricing_version,entry_open,epoch INTO model,opened,actual_epoch FROM billing_lock_pricing_public_state();
-  IF NOT opened OR actual_epoch IS NULL OR (p_epoch IS NULL)<>(p_pricing_version IS NULL)
-   OR (p_epoch IS NOT NULL AND p_epoch<>actual_epoch) OR (p_pricing_version IS NOT NULL AND p_pricing_version<>model) THEN
-   RAISE EXCEPTION 'pricing adoption entry is closed or epoch changed' USING ERRCODE='55000';
-  END IF;
-  RETURN actual_epoch;
- END $$`)
+	_, err := h.Pool.Exec(t.Context(), `UPDATE billing_pricing_adoption SET region='usw',system_team_id='97cb97ef-7fde-4676-8d81-2d438939d47c',state='released',released_at=clock_timestamp(),
+ evidence=jsonb_build_object('epoch',epoch,'region','usw','system_team_id','97cb97ef-7fde-4676-8d81-2d438939d47c','assembled_sha',repeat('1',40),'schema_sha',repeat('1',40),'worker_sha',repeat('1',40),'verified_worker',true,'deployment_reference','disposable-fixture','worker_reference','disposable-fixture') WHERE singleton`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := h.Pool.Exec(context.Background(), `DROP FUNCTION billing_assert_pricing_entry_open(uuid,text); DROP FUNCTION billing_pricing_public_state(); DROP TABLE billing_pricing_adoption`); err != nil {
+		if _, err := h.Pool.Exec(context.Background(), assertion); err != nil {
+			t.Error(err)
+		}
+		if _, err := h.Pool.Exec(context.Background(), `DELETE FROM billing_pricing_adoption`); err != nil {
+			t.Error(err)
+		}
+		if _, err := h.Pool.Exec(context.Background(), `INSERT INTO billing_pricing_adoption SELECT * FROM jsonb_populate_record(NULL::billing_pricing_adoption,$1)`, original); err != nil {
 			t.Error(err)
 		}
 	})
@@ -59,7 +52,7 @@ func TestPrepaidAdoptionGateReplaysAcceptedPurchaseButRejectsNewEntry(t *testing
 		t.Run(state, func(t *testing.T) {
 			switch state {
 			case "preparing":
-				f.exec(`UPDATE billing_pricing_adoption SET fixture_released=false`)
+				f.exec(`UPDATE billing_pricing_adoption SET state='preparing',released_at=NULL,evidence=NULL`)
 			case "missing-row":
 				f.exec(`DELETE FROM billing_pricing_adoption`)
 			case "missing":
@@ -112,7 +105,7 @@ func TestPrepaidAutoRechargeAdoptionGatePreservesBoundNoopAndDisable(t *testing.
 	if status := put(accepted); status != http.StatusOK {
 		t.Fatal("no-op replay reached closed assertion", status)
 	}
-	f.exec(`UPDATE billing_pricing_adoption SET fixture_released=false`)
+	f.exec(`UPDATE billing_pricing_adoption SET state='preparing',released_at=NULL,evidence=NULL`)
 	for _, state := range []string{"preparing", "off"} {
 		t.Run(state, func(t *testing.T) {
 			if state == "off" {
