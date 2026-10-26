@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -66,6 +67,10 @@ func freeZeroGoSnapshot(t *testing.T, fixed bool) {
 	team, actor := uuid.New(), uuid.New()
 	exec(`INSERT INTO profile(id,email,provider,provider_id) VALUES($1::uuid,$1::uuid::text||'@example.com','google',$1::uuid::text)`, actor)
 	exec(`INSERT INTO team(id,name) VALUES($1,'Go frozen Free')`, team)
+	var originalFloor time.Time
+	if err = tx.QueryRow(t.Context(), `SELECT free_since FROM billing_free_plan($1)`, team).Scan(&originalFloor); err != nil {
+		t.Fatal(err)
+	}
 	var sqlTeam, sqlAssignment uuid.UUID
 	if fixed {
 		sqlTeam = uuid.New()
@@ -95,6 +100,10 @@ func freeZeroGoSnapshot(t *testing.T, fixed bool) {
 		exec("ROLLBACK TO SAVEPOINT tampered_display")
 	}
 	exec(`SELECT pg_temp.transition_free_zero_templates($1,$2,$3,$4,'Go snapshot acceptance')`, team, current, replacement, actor)
+	var finalFloor time.Time
+	if err = tx.QueryRow(t.Context(), `SELECT free_since FROM billing_free_plan($1)`, team).Scan(&finalFloor); err != nil || !finalFloor.Equal(originalFloor) {
+		t.Fatalf("serializer transition reset allowance floor: original=%s final=%s err=%v", originalFloor, finalFloor, err)
+	}
 	if fixed {
 		exec(`SELECT pg_temp.transition_free_zero_templates($1,$2,$3,$4,'Go snapshot acceptance')`, sqlTeam, sqlAssignment, replacement, actor)
 	}

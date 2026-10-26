@@ -101,6 +101,7 @@ BEGIN
  END IF;
  IF prior.effective_to IS NOT NULL THEN RAISE EXCEPTION 'target assignment is no longer current'; END IF;
  IF EXISTS(SELECT 1 FROM team WHERE id=p_team AND (limits_customized OR max_templates IS NOT NULL))
+  OR EXISTS(SELECT 1 FROM billing_team_pause_request WHERE assignment_id=prior.id)
   OR EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=p_team)
   OR EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=p_team)
   OR EXISTS(SELECT 1 FROM billing_prepaid_checkout_operation WHERE team_id=p_team)
@@ -108,7 +109,7 @@ BEGIN
   OR EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=p_team AND
     (stripe_subscription_id IS NOT NULL OR commercial_billing_anchor IS NOT NULL OR checkout_initializing_at IS NOT NULL
      OR checkout_session_id IS NOT NULL OR checkout_may_exist OR checkout_request_key IS NOT NULL)) THEN
-  RAISE EXCEPTION 'target has custom limits or financial history/fence; coordinate separately';
+  RAISE EXCEPTION 'target has custom limits, pause request or financial history/fence; coordinate separately';
  END IF;
  at_time:=clock_timestamp();
  UPDATE team_plan_assignment SET effective_to=at_time WHERE id=p_assignment;

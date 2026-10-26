@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -100,6 +101,7 @@ func TestIntegration_FreeZeroTemplates(t *testing.T) {
 	for _, tc := range []struct{ name, setup string }{
 		{"override", `UPDATE team SET max_templates=25 WHERE id=$1`},
 		{"custom", `UPDATE team SET limits_customized=true WHERE id=$1`},
+		{"pause request", `INSERT INTO billing_team_pause_request(assignment_id,team_id) SELECT id,team_id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`},
 		{"payment fence", `INSERT INTO team_billing_account(team_id,checkout_initializing_at) VALUES($1,clock_timestamp()) ON CONFLICT(team_id) DO UPDATE SET checkout_initializing_at=EXCLUDED.checkout_initializing_at`},
 		{"pending prepaid intent", `INSERT INTO billing_prepaid_checkout_operation(id,team_id,actor_id,amount_cents,success_url,cancel_url) VALUES(gen_random_uuid(),$1,'00000000-0000-0000-0000-000000000001',500,'https://example.com/success','https://example.com/cancel')`},
 		{"commercial history", `INSERT INTO billing_commercial_contract(team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor) VALUES($1,'custom-test',now(),'cus_test','sub_test','price_test',25000,1,25000,now())`},
@@ -246,4 +248,123 @@ func TestIntegration_FreeZeroTemplatesContinuityBoundaries(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Caller-supplied continuity must never backdate entitlement or rewrite an
+// immutable assignment. Old rows with NULL retain their pre-migration floor.
+func TestIntegration_FreeZeroTemplatesStoredFloorAuthority(t *testing.T) {
+	ctx := t.Context()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, e := tx.Exec(ctx, q, args...); e != nil {
+			t.Fatal(e)
+		}
+	}
+	reject := func(q string, args ...any) {
+		t.Helper()
+		exec("SAVEPOINT bad_floor")
+		if _, e := tx.Exec(ctx, q, args...); e == nil {
+			t.Fatal("forged continuity accepted")
+		}
+		exec("ROLLBACK TO SAVEPOINT bad_floor")
+	}
+	exec(`UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+	team := uuid.New()
+	exec(`INSERT INTO team(id,name) VALUES($1,'Legacy Free floor')`, team)
+	var at time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()-interval '2 hours'`).Scan(&at); err != nil {
+		t.Fatal(err)
+	}
+	// Emulate a row that existed before this additive nullable-column migration.
+	// The existing immutable-history guard stays enabled throughout.
+	exec(`ALTER TABLE team_plan_assignment DISABLE TRIGGER team_plan_assignment_continuity`)
+	first := uuid.New()
+	exec(`INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,$2,'free','free','{"allowance":{"period":"day_window","amount_cents":5,"on_exhausted":"pause"}}','{"max_concurrent":2}',$3,'migration','legacy NULL fixture')`, first, team, at)
+	exec(`ALTER TABLE team_plan_assignment ENABLE TRIGGER team_plan_assignment_continuity`)
+	var since time.Time
+	if err = tx.QueryRow(ctx, `SELECT free_since FROM billing_free_plan($1)`, team).Scan(&since); err != nil || !since.Equal(at) {
+		t.Fatalf("legacy floor=%s %v", since, err)
+	}
+	reject(`UPDATE team_plan_assignment SET free_allowance_since=effective_from-interval '1 hour' WHERE id=$1`, first)
+	nextAt := at.Add(time.Hour)
+	exec(`UPDATE team_plan_assignment SET effective_to=$2 WHERE id=$1`, first, nextAt)
+	insert := `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason,free_allowance_since) SELECT team_id,plan_key,$2,terms,limits,$3,'migration','stored floor fixture',$4 FROM team_plan_assignment WHERE id=$1`
+	reject(insert, first, "free", nextAt, at.Add(-time.Hour))
+	reject(insert, first, "free", nextAt, nextAt)
+	reject(insert, first, "prepaid", nextAt, at)
+	reject(insert, first, "free", time.Now().Add(time.Hour), at)
+	exec(insert, first, "free", nextAt, at)
+	if err = tx.QueryRow(ctx, `SELECT free_since FROM billing_free_plan($1)`, team).Scan(&since); err != nil || !since.Equal(at) {
+		t.Fatalf("inherited legacy floor=%s %v", since, err)
+	}
+	reject(`UPDATE team_plan_assignment SET free_allowance_since=effective_from WHERE team_id=$1 AND effective_to IS NULL`, team)
+}
+
+// A large assignment history must not turn one admission lookup into a scan of
+// the team's past assignments. Inspect the actual database plan.
+func TestIntegration_FreeZeroTemplatesAdmissionReadsCurrentRowOnly(t *testing.T) {
+	ctx := t.Context()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, e := tx.Exec(ctx, q, args...); e != nil {
+			t.Fatal(e)
+		}
+	}
+	exec(`UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+	team := uuid.New()
+	exec(`INSERT INTO team(id,name) VALUES($1,'Long Free history')`, team)
+	exec(`INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free','{"allowance":{"period":"day_window","amount_cents":5,"on_exhausted":"pause"}}','{"max_concurrent":2}',clock_timestamp()-interval '2 days','migration','history fixture')`, team)
+	exec(`SELECT set_config('test.continuity_team',$1,true)`, team.String())
+	exec(`DO $$ DECLARE target uuid:=current_setting('test.continuity_team')::uuid; a team_plan_assignment; at_time timestamptz; BEGIN
+ FOR i IN 1..1000 LOOP
+  SELECT * INTO STRICT a FROM team_plan_assignment WHERE team_id=target AND effective_to IS NULL;
+  at_time:=a.effective_from+interval '1 minute';
+  UPDATE team_plan_assignment SET effective_to=at_time WHERE id=a.id;
+  INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason)
+   VALUES(target,a.plan_key,a.kind,a.terms,a.limits,at_time,'migration','history fixture');
+ END LOOP; END $$`)
+	var encoded []byte
+	if err = tx.QueryRow(ctx, `EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT free_since FROM billing_free_plan($1)`, team).Scan(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	var plans []map[string]any
+	if err = json.Unmarshal(encoded, &plans); err != nil {
+		t.Fatal(err)
+	}
+	assignmentScans := 0
+	var inspect func(map[string]any)
+	inspect = func(node map[string]any) {
+		if node["Node Type"] == "Recursive Union" || node["Node Type"] == "WorkTable Scan" {
+			t.Fatalf("recursive history admission: %s", encoded)
+		}
+		if node["Relation Name"] == "team_plan_assignment" {
+			assignmentScans++
+			if node["Node Type"] == "Seq Scan" {
+				t.Fatalf("admission scans history: %s", encoded)
+			}
+			if node["Actual Rows"] != float64(1) || node["Actual Loops"] != float64(1) {
+				t.Fatalf("admission visits assignment history: %s", encoded)
+			}
+		}
+		if children, ok := node["Plans"].([]any); ok {
+			for _, child := range children {
+				inspect(child.(map[string]any))
+			}
+		}
+	}
+	inspect(plans[0]["Plan"].(map[string]any))
+	if assignmentScans != 1 {
+		t.Fatalf("assignment scan count=%d: %s", assignmentScans, encoded)
+	}
+	t.Logf("1001-assignment admission plan: %s", encoded)
 }

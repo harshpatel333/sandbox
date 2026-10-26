@@ -1,8 +1,10 @@
 # Free template-cap correction
 
 This is a manual, explicit-target database operation, not an automatic migration
-of customer plans. The additive schema migration preserves allowance continuity;
-it does not publish a plan or select customer teams.
+of customer plans. The additive schema migration precomputes immutable allowance
+continuity when assignments are inserted; sandbox admission reads only the current
+row. Existing rows retain their existing assignment start. It does not publish a
+plan or select customer teams.
 
 Before executing:
 
@@ -57,8 +59,10 @@ Publication affects new signups immediately. Existing teams retain their frozen
 assignment until explicitly transitioned. A transition closes the old assignment
 and inserts the replacement at the same timestamp. It preserves frozen terms
 apart from version provenance and preserves limits apart from the template cap.
-Contiguous Free assignments with the same allowance retain their original Free
-start, allowance window, usage and blocked-until time. A gap, paid plan, changed
+Contiguous Free assignments with the same allowance inherit the immediately
+preceding stored floor (or its assignment start for an older row). They retain
+the allowance window, usage and blocked-until time. Derived `amount_usd` display
+serialization does not change allowance authority or reset continuity. A gap, paid plan, changed
 allowance or ambiguous zero-length predecessor stops continuity. The operation
 neither deletes existing templates nor interrupts an already in-flight build;
 new template creation and new rebuilds are denied by existing API admission.
@@ -71,7 +75,8 @@ no destructive cleanup. Previously created Free-owned artifacts require a
 separate operational decision if their future use should also be restricted.
 
 The helper deliberately rejects customized limits, explicit template overrides,
-commercial-contract history, any Pro operation, any prepaid intent/purchase, or a
+a pause request tied to the current assignment, commercial-contract history, any
+Pro operation, any prepaid intent/purchase, or a
 subscription/checkout/commercial-anchor fence. It also rejects non-signup/migration
 assignments, any frozen terms or limits that differ from the referenced catalog
 (including extra fields), and catalog changes beyond this cap. Report such a target as
