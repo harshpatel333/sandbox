@@ -1,0 +1,218 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+func TestIntegration_FreeZeroTemplates(t *testing.T) {
+	ctx := t.Context()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, e := tx.Exec(ctx, q, args...); e != nil {
+			t.Fatal(e)
+		}
+	}
+	sql, err := os.ReadFile("../../scripts/billing/free-zero-templates.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(string(sql))
+	exec(`UPDATE billing_pricing_switch SET pricing_version='v2'`)
+	actor := uuid.New()
+	exec(`INSERT INTO profile(id,email,provider,provider_id) VALUES($1::uuid,$1::uuid::text||'@example.com','google',$1::uuid::text)`, actor)
+	var old uuid.UUID
+	if err = tx.QueryRow(ctx, `SELECT id FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'`).Scan(&old); err != nil {
+		t.Fatal(err)
+	}
+	team := uuid.New()
+	exec(`INSERT INTO team(id,name) VALUES($1,'Free zero fixture')`, team)
+	var assignment uuid.UUID
+	if err = tx.QueryRow(ctx, `SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&assignment); err != nil {
+		t.Fatal(err)
+	}
+	// Store an already exhausted allowance window. Its exact persisted state must
+	// survive both dry-run and commit; the evaluator must retain its original floor.
+	var beforeSince time.Time
+	if err = tx.QueryRow(ctx, `SELECT free_since FROM billing_free_plan($1)`, team).Scan(&beforeSince); err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO billing_free_allowance VALUES($1,$2::timestamptz,$2::timestamptz+interval '24 hours',.02,.02,$2::timestamptz+interval '24 hours',$2::timestamptz)`, team, beforeSince)
+	snapshot := func() string {
+		var s string
+		if e := tx.QueryRow(ctx, `SELECT jsonb_build_object('allowance',(SELECT to_jsonb(a) FROM billing_free_allowance a WHERE team_id=$1),'billing',(SELECT to_jsonb(b) FROM team_billing_account b WHERE team_id=$1),'funding',(SELECT to_jsonb(f) FROM billing_funding_account f WHERE team_id=$1))::text`, team).Scan(&s); e != nil {
+			t.Fatal(e)
+		}
+		return s
+	}
+	before := snapshot()
+	replacement := uuid.New()
+	callPublish := func(id uuid.UUID) error {
+		_, e := tx.Exec(ctx, `SELECT pg_temp.publish_free_zero_templates($1,$2,$3,'disable Free templates',true)`, old, id, actor)
+		return e
+	}
+	reject := func(q string, args ...any) {
+		t.Helper()
+		exec("SAVEPOINT rejected")
+		if _, e := tx.Exec(ctx, q, args...); e == nil {
+			t.Fatal("unsafe operation accepted")
+		}
+		exec("ROLLBACK TO SAVEPOINT rejected")
+	}
+	reject(`SELECT pg_temp.publish_free_zero_templates($1,$2,$3,'disable Free templates',false)`, old, replacement, actor)
+	exec("SAVEPOINT dry_run")
+	if err = callPublish(replacement); err != nil {
+		t.Fatal(err)
+	}
+	exec("ROLLBACK TO SAVEPOINT dry_run")
+	if err = callPublish(replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err = callPublish(replacement); err != nil {
+		t.Fatalf("publish replay: %v", err)
+	}
+	if snapshot() != before {
+		t.Fatal("publication changed team financial state")
+	}
+	// Publication changes new signups, never existing frozen assignments.
+	var cap int
+	if err = tx.QueryRow(ctx, `SELECT max_templates FROM team_effective_limits($1)`, team).Scan(&cap); err != nil || cap != 10 {
+		t.Fatalf("old frozen cap=%d %v", cap, err)
+	}
+	fresh := uuid.New()
+	exec(`INSERT INTO team(id,name) VALUES($1,'Fresh Free zero')`, fresh)
+	if err = tx.QueryRow(ctx, `SELECT max_templates FROM team_effective_limits($1)`, fresh).Scan(&cap); err != nil || cap != 0 {
+		t.Fatalf("new signup cap=%d %v", cap, err)
+	}
+	// Every unsafe target must abort without clearing an override or payment fence.
+	for _, tc := range []struct{ name, setup string }{
+		{"override", `UPDATE team SET max_templates=25 WHERE id=$1`},
+		{"custom", `UPDATE team SET limits_customized=true WHERE id=$1`},
+		{"payment fence", `INSERT INTO team_billing_account(team_id,checkout_initializing_at) VALUES($1,clock_timestamp()) ON CONFLICT(team_id) DO UPDATE SET checkout_initializing_at=EXCLUDED.checkout_initializing_at`},
+		{"pending prepaid intent", `INSERT INTO billing_prepaid_checkout_operation(id,team_id,actor_id,amount_cents,success_url,cancel_url) VALUES(gen_random_uuid(),$1,'00000000-0000-0000-0000-000000000001',500,'https://example.com/success','https://example.com/cancel')`},
+		{"commercial history", `INSERT INTO billing_commercial_contract(team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor) VALUES($1,'custom-test',now(),'cus_test','sub_test','price_test',25000,1,25000,now())`},
+		{"pending quote", `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents) VALUES(gen_random_uuid(),$1,'00000000-0000-0000-0000-000000000001','cus_test','pro_monthly','{}',now(),now(),now()+interval '1 month',now(),25000)`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec("SAVEPOINT unsafe_target")
+			if tc.name == "commercial history" {
+				exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,commercial_billing_anchor) VALUES($1,'cus_test','sub_test',now()) ON CONFLICT(team_id) DO UPDATE SET stripe_customer_id=EXCLUDED.stripe_customer_id,stripe_subscription_id=EXCLUDED.stripe_subscription_id,commercial_billing_anchor=EXCLUDED.commercial_billing_anchor`, team)
+			}
+			exec(tc.setup, team)
+			reject(`SELECT pg_temp.transition_free_zero_templates($1,$2,$3,$4,'disable Free templates')`, team, assignment, replacement, actor)
+			exec("ROLLBACK TO SAVEPOINT unsafe_target")
+		})
+	}
+	var next uuid.UUID
+	q := `SELECT pg_temp.transition_free_zero_templates($1,$2,$3,$4,'disable Free templates')`
+	exec("SAVEPOINT transition_dry_run")
+	exec(q, team, assignment, replacement, actor)
+	exec("ROLLBACK TO SAVEPOINT transition_dry_run")
+	if snapshot() != before {
+		t.Fatal("dry-run modified allowance or financial state")
+	}
+	if err = tx.QueryRow(ctx, q, team, assignment, replacement, actor).Scan(&next); err != nil {
+		t.Fatal(err)
+	}
+	var replay uuid.UUID
+	if err = tx.QueryRow(ctx, q, team, assignment, replacement, actor).Scan(&replay); err != nil || replay != next {
+		t.Fatalf("transition replay=%s %v", replay, err)
+	}
+	if snapshot() != before {
+		t.Fatal("transition changed allowance, account or funding")
+	}
+	var since time.Time
+	var blocked bool
+	if err = tx.QueryRow(ctx, `SELECT f.free_since,billing_free_allowance_blocked($1),l.max_templates FROM billing_free_plan($1) f,team_effective_limits($1) l`, team).Scan(&since, &blocked, &cap); err != nil || !since.Equal(beforeSince) || !blocked || cap != 0 {
+		t.Fatalf("since=%s blocked=%v cap=%d err=%v", since, blocked, cap, err)
+	}
+	var preserved bool
+	if err = tx.QueryRow(ctx, `SELECT p.effective_to=n.effective_from AND p.terms-ARRAY['version_id','version']=n.terms-ARRAY['version_id','version'] AND p.limits-'max_templates'=n.limits-'max_templates' FROM team_plan_assignment p,team_plan_assignment n WHERE p.id=$1 AND n.id=$2`, assignment, next).Scan(&preserved); err != nil || !preserved {
+		t.Fatalf("history/terms not preserved %v %v", preserved, err)
+	}
+}
+
+func TestIntegration_FreeZeroTemplatesContinuityBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, middle       string
+		gap, changed, zero bool
+		expectHours        int
+	}{
+		{name: "continuous", expectHours: 3},
+		{name: "paid reentry", middle: "custom", expectHours: 1},
+		{name: "gap", gap: true, expectHours: 1},
+		{name: "changed allowance", changed: true, expectHours: 1},
+		{name: "zero length", zero: true, expectHours: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			tx, e := testPool.Begin(ctx)
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer tx.Rollback(context.Background())
+			exec := func(q string, args ...any) {
+				t.Helper()
+				if _, e := tx.Exec(ctx, q, args...); e != nil {
+					t.Fatal(e)
+				}
+			}
+			exec(`UPDATE billing_pricing_switch SET pricing_version='legacy'`)
+			team := uuid.New()
+			exec(`INSERT INTO team(id,name) VALUES($1,'Free continuity boundary')`, team)
+			var now time.Time
+			if e = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); e != nil {
+				t.Fatal(e)
+			}
+			allowance := `{"period":"day_window","amount_cents":5,"on_exhausted":"pause"}`
+			add := func(kind string, start time.Time) uuid.UUID {
+				t.Helper()
+				id := uuid.New()
+				exec(`INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,$2,'test',$3,jsonb_build_object('allowance',$4::jsonb),'{"max_concurrent":2}', $5,'staff','continuity test')`, id, team, kind, allowance, start)
+				return id
+			}
+			end := func(id uuid.UUID, at time.Time) {
+				exec(`UPDATE team_plan_assignment SET effective_to=$2 WHERE id=$1`, id, at)
+			}
+			first := add("free", now.Add(-3*time.Hour))
+			endAt := now.Add(-time.Hour)
+			if tc.gap || tc.middle != "" {
+				endAt = now.Add(-2 * time.Hour)
+			}
+			end(first, endAt)
+			if tc.middle != "" {
+				middle := add(tc.middle, endAt)
+				end(middle, now.Add(-time.Hour))
+			}
+			if tc.zero {
+				z := add("free", endAt)
+				end(z, endAt)
+			}
+			if tc.changed {
+				allowance = `{"period":"day_window","amount_cents":10,"on_exhausted":"pause"}`
+			}
+			current := add("free", now.Add(-time.Hour))
+			var since time.Time
+			if e = tx.QueryRow(ctx, `SELECT free_since FROM billing_free_plan($1)`, team).Scan(&since); e != nil || !since.Equal(now.Add(-time.Duration(tc.expectHours)*time.Hour)) {
+				t.Fatalf("floor=%s err=%v", since, e)
+			}
+			end(current, now)
+			add("prepaid", now)
+			var count int
+			if e = tx.QueryRow(ctx, `SELECT count(*) FROM billing_free_plan($1)`, team).Scan(&count); e != nil || count != 0 {
+				t.Fatalf("paid inherits Free=%d %v", count, e)
+			}
+		})
+	}
+}
