@@ -120,15 +120,22 @@ func buildMRROverview(groups []mrrContractGroup, totalTeams int64, proAnnual pla
 	return out
 }
 
-// Contracts are current when active and inside their term; pending and ended
-// contracts, and active ones whose term has lapsed, are excluded. A team has
-// at most one non-ended contract, so contract counts are team counts.
+// Activated prorated Pro includes its committed recurring fee during the paid
+// bridge, before recurring billing starts. The current assignment and active
+// paid upgrade must both identify that contract. Pending, ended and lapsed
+// contracts are excluded; each team has at most one non-ended contract.
 const mrrContractGroupsQuery = `SELECT c.offer_key,c.charge_kind,c.charge_amount_cents,c.charge_interval_months,
  c.charge_kind='sponsored_entitlement' AND EXISTS(SELECT 1 FROM billing_sponsored_annual_authority a
   WHERE a.contract_id=c.id AND a.team_id=c.team_id AND a.state<>'ended') AS sponsored_annual,
  count(*)
 FROM billing_commercial_contract c JOIN team t ON t.id=c.team_id
-WHERE c.status='active' AND c.starts_at<=$1 AND (c.ends_at IS NULL OR c.ends_at>$1) AND t.home_region=$2
+WHERE c.status='active' AND (c.starts_at<=$1 OR EXISTS(
+ SELECT 1 FROM billing_pro_upgrade u JOIN team_plan_assignment p ON p.team_id=u.team_id AND p.contract_id=u.contract_id
+ WHERE u.contract_id=c.id AND u.team_id=c.team_id AND u.customer_id=c.customer_id AND u.subscription_id=c.subscription_id
+  AND u.offer_key=c.offer_key AND u.period_end=c.starts_at AND u.quoted_at<=$1 AND u.state='active'
+  AND u.payment_evidence IS NOT NULL AND u.grant_id IS NOT NULL
+  AND p.plan_key='pro' AND p.kind='subscription' AND p.effective_from<=$1 AND p.effective_to IS NULL
+ )) AND (c.ends_at IS NULL OR c.ends_at>$1) AND t.home_region=$2
  AND t.id IS DISTINCT FROM NULLIF($3,'')::uuid
 GROUP BY 1,2,3,4,5`
 
@@ -151,6 +158,8 @@ func (h *Handlers) loadMRROverview(ctx context.Context, q db.DBTX, now time.Time
 	}
 	names := map[string]string{
 		"yc_2026":             "YC 2026",
+		"starter_monthly":     "Starter monthly",
+		"starter_annual":      "Starter annual",
 		mrrSponsoredAnnualKey: "Sponsored annual Pro",
 		"sponsored_usage":     "Sponsored credits",
 	}
@@ -180,8 +189,9 @@ func (h *Handlers) loadMRROverview(ctx context.Context, q db.DBTX, now time.Time
 }
 
 // GetPlatformBillingMRR reports this cell's monthly recurring revenue from
-// contract terms. It never consults Stripe, whose dashboard omits upfront and
-// fee-waived deals.
+// committed contract terms, including activated Pro bridges. Initial coupons
+// change cash collected, not the ongoing fee. It never consults Stripe, whose
+// dashboard omits upfront and fee-waived deals.
 func (h *Handlers) GetPlatformBillingMRR(c *gin.Context) {
 	if _, ok := h.requirePlatformBilling(c, platformBillingReadPermission); !ok {
 		return

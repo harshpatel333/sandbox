@@ -82,7 +82,7 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 
 	// Fixtures describe contract states directly; the lifecycle triggers that
 	// produce them are covered by their own suites.
-	var contracts []uuid.UUID
+	var contracts, teams []uuid.UUID
 	t.Cleanup(func() {
 		ctx := context.Background()
 		tx, err := testPool.Begin(ctx)
@@ -94,6 +94,8 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 		for _, sql := range []string{
 			`SET LOCAL session_replication_role=replica`,
 			`DELETE FROM billing_sponsored_annual_authority WHERE contract_id=ANY($1)`,
+			`DELETE FROM billing_pro_upgrade WHERE contract_id=ANY($1)`,
+			`DELETE FROM team_plan_assignment WHERE contract_id=ANY($1)`,
 			`DELETE FROM billing_commercial_contract WHERE id=ANY($1)`,
 		} {
 			args := []any{contracts}
@@ -104,6 +106,18 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 				t.Error(err)
 				return
 			}
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM team_plan_assignment WHERE team_id=ANY($1)`, teams); err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role=origin`); err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM team WHERE id=ANY($1)`, teams); err != nil {
+			t.Error(err)
+			return
 		}
 		if err := tx.Commit(ctx); err != nil {
 			t.Error(err)
@@ -127,6 +141,7 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 		if _, err := tx.Exec(ctx, `UPDATE team SET home_region=$2 WHERE id=$1`, team.ID, region); err != nil {
 			t.Fatal(err)
 		}
+		teams = append(teams, team.ID)
 		return team.ID
 	}
 	type contract struct {
@@ -191,6 +206,36 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 	notStarted := proMonthly
 	notStarted.starts = future
 	insert(newTeam("use"), notStarted)
+	// A paid bridge already runs Pro at the committed recurring fee, even when
+	// its first payment is completely covered by a coupon.
+	for _, scenario := range []string{"activated", "coupon", "unpaid", "ended-contract", "ended-assignment"} {
+		team := newTeam("use")
+		c := contract{"pro_monthly", "active", "subscription", 25000, 1, future, nil}
+		if scenario == "ended-contract" {
+			c.status = "ended"
+		}
+		id := insert(team, c)
+		state, evidence, grant := "active", `{"amount_paid":12500}`, "grant_"+uuid.NewString()
+		if scenario == "coupon" {
+			evidence = `{"amount_paid":0,"discount":12500}`
+		}
+		if scenario == "unpaid" {
+			state, evidence, grant = "checkout", "null", ""
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO billing_pro_upgrade
+ (id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,grant_id,contract_id)
+ VALUES(gen_random_uuid(),$1,gen_random_uuid(),'cus_'||$2::text,'sub_'||$2::text,'pro_monthly','{}',$3,$3,$4,$5,12500,$6,NULLIF($7::jsonb,'null'::jsonb),NULLIF($8,''),$2::uuid)`, team, id, past, future, now, state, evidence, grant); err != nil {
+			t.Fatal(err)
+		}
+		var closed *time.Time
+		if scenario == "ended-assignment" {
+			closed = &now
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,effective_to,contract_id,source,reason)
+ VALUES($1,'pro','subscription','{}','{"max_concurrent":100}',$2,$3,$4,'checkout','accepted Pro bridge')`, team, past, closed, id); err != nil {
+			t.Fatal(err)
+		}
+	}
 	insert(newTeam("usw"), proMonthly)
 	insert(testSystemTeamID, proMonthly)
 
@@ -202,23 +247,23 @@ func TestIntegration_PlatformBillingMRR(t *testing.T) {
 	if after.Region != "use" {
 		t.Fatalf("region = %q", after.Region)
 	}
-	if d := after.MRRCents - before.MRRCents; d != 120000+100000+10000+100000+100000 {
+	if d := after.MRRCents - before.MRRCents; d != 120000+100000+10000+100000+100000+25000+25000 {
 		t.Fatalf("mrr delta = %d", d)
 	}
-	if d := after.Teams - before.Teams; d != 11 {
+	if d := after.Teams - before.Teams; d != 16 {
 		t.Fatalf("team delta = %d", d)
 	}
-	if d := after.RevenueTeams - before.RevenueTeams; d != 5 {
+	if d := after.RevenueTeams - before.RevenueTeams; d != 7 {
 		t.Fatalf("revenue team delta = %d", d)
 	}
 	for _, want := range []mrrTestPlan{
-		{Key: "pro_monthly", Teams: 1, MRRCents: 120000},
+		{Key: "pro_monthly", Teams: 3, MRRCents: 170000},
 		{Key: "pro_annual", Teams: 1, MRRCents: 100000},
 		{Key: "starter_monthly", Teams: 1, MRRCents: 10000},
 		{Key: "yc_2026", Teams: 1, MRRCents: 100000},
 		{Key: "sponsored_annual_pro", Teams: 1, MRRCents: 100000},
 		{Key: "sponsored_usage", Teams: 2, MRRCents: 0},
-		{Key: "payg", Teams: 4, MRRCents: 0},
+		{Key: "payg", Teams: 7, MRRCents: 0},
 	} {
 		got, was := after.plan(want.Key), before.plan(want.Key)
 		if got.Teams-was.Teams != want.Teams || got.MRRCents-was.MRRCents != want.MRRCents {

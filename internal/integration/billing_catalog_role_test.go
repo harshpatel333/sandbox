@@ -113,14 +113,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon,aut
 		}
 	})
 	t.Run("denied authority", func(t *testing.T) {
-		for _, sql := range []string{`UPDATE billing_pricing_switch SET pricing_version='v2'`, `UPDATE billing_catalog_audit SET reason='changed'`, `DELETE FROM billing_catalog_audit`, `TRUNCATE billing_catalog_audit`, `UPDATE billing_contract_limits SET max_sandboxes=1`, `DELETE FROM billing_contract_limits`, `TRUNCATE billing_contract_limits`} {
+		for _, sql := range []string{`UPDATE billing_pricing_switch SET pricing_version='v2'`, `UPDATE billing_plan_version SET state='retired'`, `UPDATE billing_catalog_audit SET reason='changed'`, `DELETE FROM billing_catalog_audit`, `TRUNCATE billing_catalog_audit`, `UPDATE billing_contract_limits SET max_sandboxes=1`, `DELETE FROM billing_contract_limits`, `TRUNCATE billing_contract_limits`} {
 			_, err := service.Exec(t.Context(), sql)
 			var pgerr *pgconn.PgError
 			if !errors.As(err, &pgerr) || pgerr.Code != "42501" {
 				t.Errorf("%s: %v", sql, err)
 			}
 		}
-		_, err := service.Exec(t.Context(), `UPDATE billing_plan_version SET state='retired' WHERE state='published'`)
+		_, err := owner.Exec(t.Context(), `UPDATE billing_plan_version SET display_name='changed' WHERE state='published'`)
 		var immutable *pgconn.PgError
 		if !errors.As(err, &immutable) || immutable.Code != "P0001" || immutable.Message != "published catalog versions are immutable" {
 			t.Fatalf("raw retirement must preserve catalog immutability: %v", err)

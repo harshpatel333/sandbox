@@ -53,6 +53,7 @@ func TestPrepaidAdoptionGateReplaysAcceptedPurchaseButRejectsNewEntry(t *testing
 			case "missing-row":
 				// Simulate a physically absent row while retaining the production guard for the request.
 				f.exec(`ALTER TABLE billing_pricing_adoption DISABLE TRIGGER billing_pricing_adoption_retained; DELETE FROM billing_pricing_adoption; ALTER TABLE billing_pricing_adoption ENABLE TRIGGER billing_pricing_adoption_retained`)
+				defer f.exec(`INSERT INTO billing_pricing_adoption(singleton) VALUES(true)`)
 			case "missing":
 				f.exec(`ALTER TABLE billing_pricing_adoption RENAME TO prepaid_fixture_adoption`)
 				defer f.exec(`ALTER TABLE prepaid_fixture_adoption RENAME TO billing_pricing_adoption`)
