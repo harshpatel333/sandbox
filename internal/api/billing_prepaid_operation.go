@@ -102,6 +102,9 @@ func (h *Handlers) resumePrepaidCheckoutOperation(c *gin.Context, client *stripe
 	if terminal() {
 		return true, nil
 	}
+	if client == nil {
+		return true, errPrepaidPaymentPending
+	}
 	if session == nil {
 		if len(raw) > 0 {
 			err = h.settleCheckoutPurchase(ctx, client, req.OperationID)
@@ -219,8 +222,10 @@ func (h *Handlers) restorePrepaidSubscriptionCheckout(ctx context.Context, team,
 		if expired {
 			return errors.New("subscription checkout generation already expired")
 		}
-		if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET checkout_session_id=$2,checkout_may_exist=true,updated_at=clock_timestamp() WHERE team_id=$1`, team, saved.ID); err != nil {
-			return err
+		if account.CheckoutSessionID == nil || !account.CheckoutMayExist {
+			if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET checkout_session_id=$2,checkout_may_exist=true,updated_at=clock_timestamp() WHERE team_id=$1`, team, saved.ID); err != nil {
+				return err
+			}
 		}
 	} else if saved.Subscription == "" || derefString(account.StripeSubscriptionID) != saved.Subscription || derefString(account.CheckoutSubscriptionID) != saved.Subscription {
 		return errors.New("subscription checkout lease is no longer current")

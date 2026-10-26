@@ -90,19 +90,14 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	var managed bool
-	if err = h.Pool.QueryRow(ctx, `SELECT qm_team_managed_billing($1)`, team).Scan(&managed); err != nil {
-		respondError(c, ErrInternal)
-		return
-	}
-	if managed {
-		respondErrorMsg(c, "forbidden", "This team's billing is managed by QM", http.StatusForbidden)
-		return
-	}
-	client, ok := h.Stripe.(*stripeHTTPClient)
-	if !ok {
-		respondErrorMsg(c, "service_unavailable", "Stripe billing is not configured", http.StatusServiceUnavailable)
-		return
+	client, _ := h.Stripe.(*stripeHTTPClient)
+	recoverOperation := func() bool {
+		handled, resumeErr := h.resumePrepaidCheckoutOperation(c, client, team, actor, req)
+		if resumeErr != nil {
+			log.Warn().Err(resumeErr).Str("team_id", team.String()).Str("purchase_id", req.OperationID.String()).Msg("prepaid checkout operation awaits recovery")
+			c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: req.OperationID, State: "pending"})
+		}
+		return handled || resumeErr != nil
 	}
 	acceptedRedirects := false
 	if req.OperationID != uuid.Nil {
@@ -120,31 +115,49 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 			}
 			return
 		}
-		if !acceptedRedirects {
-			req.SuccessURL, err = h.validateBillingRedirectURL(req.SuccessURL)
-			if err != nil {
-				respondErrorMsg(c, "bad_request", "invalid success_url", 400)
-				return
-			}
-			req.CancelURL, err = h.validateBillingRedirectURL(req.CancelURL)
-			if err != nil {
-				respondErrorMsg(c, "bad_request", "invalid cancel_url", 400)
-				return
-			}
-			if err = h.bindPrepaidCheckoutOperation(ctx, team, actor, req); err != nil {
-				if errors.Is(err, errPrepaidOperationConflict) {
-					respondErrorMsg(c, "operation_conflict", err.Error(), 409)
-				} else {
-					respondError(c, ErrInternal)
-				}
-				return
-			}
+		if acceptedRedirects && recoverOperation() {
+			return
 		}
-		if handled, resumeErr := h.resumePrepaidCheckoutOperation(c, client, team, actor, req); handled || resumeErr != nil {
-			if resumeErr != nil {
-				log.Warn().Err(resumeErr).Str("team_id", team.String()).Str("purchase_id", req.OperationID.String()).Msg("prepaid checkout operation awaits recovery")
-				c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: req.OperationID, State: "pending"})
+	}
+	// Managed billing and other entry policies govern new dispatch, while an
+	// already accepted payment remains recoverable under its immutable identity.
+	var managed bool
+	if err = h.Pool.QueryRow(ctx, `SELECT qm_team_managed_billing($1)`, team).Scan(&managed); err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if managed {
+		if acceptedRedirects {
+			c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: req.OperationID, State: "pending"})
+		} else {
+			respondErrorMsg(c, "forbidden", "This team's billing is managed by QM", http.StatusForbidden)
+		}
+		return
+	}
+	if client == nil {
+		respondErrorMsg(c, "service_unavailable", "Stripe billing is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if req.OperationID != uuid.Nil && !acceptedRedirects {
+		req.SuccessURL, err = h.validateBillingRedirectURL(req.SuccessURL)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "invalid success_url", 400)
+			return
+		}
+		req.CancelURL, err = h.validateBillingRedirectURL(req.CancelURL)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "invalid cancel_url", 400)
+			return
+		}
+		if err = h.bindPrepaidCheckoutOperation(ctx, team, actor, req); err != nil {
+			if errors.Is(err, errPrepaidOperationConflict) {
+				respondErrorMsg(c, "operation_conflict", err.Error(), 409)
+			} else {
+				respondError(c, ErrInternal)
 			}
+			return
+		}
+		if recoverOperation() {
 			return
 		}
 	}

@@ -36,6 +36,17 @@ func prepaidOperationRouter(t *testing.T, f *prepaidFixture, team, actor uuid.UU
 	return r
 }
 
+func managePrepaidFixtureTeam(t *testing.T, f *prepaidFixture) func() {
+	t.Helper()
+	authority, org := uuid.New(), uuid.New()
+	namespace := "qa-" + uuid.NewString()
+	f.exec(`INSERT INTO qm_team_service_authority(namespace,authority_id,home_region) VALUES($1,$2,'use')`, namespace, authority)
+	f.exec(`INSERT INTO qm_organization_teams(namespace,qm_org_id,idempotency_key,authority_id,team_id,home_region) VALUES($1,$2,$3,$4,$5,'use')`, namespace, org, "qm-org:v1:"+org.String(), authority, f.team)
+	return func() {
+		f.exec(`UPDATE qm_organization_teams SET deleted_at=clock_timestamp() WHERE namespace=$1 AND qm_org_id=$2`, namespace, org)
+	}
+}
+
 func prepaidOperationPost(r *gin.Engine, req prepaidCheckoutBody) *httptest.ResponseRecorder {
 	body, _ := json.Marshal(req)
 	rec := httptest.NewRecorder()
@@ -169,6 +180,7 @@ func TestPrepaidOperationRecoversLostProviderReply(t *testing.T) {
 	if first.Code != http.StatusBadGateway {
 		t.Fatalf("expected lost reply, got %d %s", first.Code, first.Body)
 	}
+	defer managePrepaidFixtureTeam(t, f)()
 	retry := prepaidOperationPost(r, req)
 	var got prepaidOperationResponse
 	if retry.Code != 200 || json.Unmarshal(retry.Body.Bytes(), &got) != nil || got.ID == "" || got.PurchaseID != req.OperationID {
@@ -207,6 +219,12 @@ func TestPrepaidOperationFirstCheckoutUsesCallerPurchaseIdentity(t *testing.T) {
 }
 
 func TestPrepaidOperationFirstCheckoutLostReplyRestoresAssociation(t *testing.T) {
+	for _, managedAt := range []string{"paid", "credited"} {
+		t.Run(managedAt, func(t *testing.T) { testPrepaidFirstCheckoutAssociation(t, managedAt) })
+	}
+}
+
+func testPrepaidFirstCheckoutAssociation(t *testing.T, managedAt string) {
 	f, _ := prepaidPlanFixture(t)
 	actor := uuid.New()
 	r := prepaidOperationRouter(t, f, f.team, actor)
@@ -295,8 +313,13 @@ func TestPrepaidOperationFirstCheckoutLostReplyRestoresAssociation(t *testing.T)
 	f.sessions[session]["invoice"] = invoice
 	f.mu.Unlock()
 	completed := event("checkout.session.completed", map[string]any{"id": session, "customer": f.customer, "subscription": f.sub, "client_reference_id": f.team.String()})
+	managedTested := false
 	assertSettledWithoutProvider := func(want string) {
 		t.Helper()
+		if want == managedAt && !managedTested {
+			defer managePrepaidFixtureTeam(t, f)()
+			managedTested = true
+		}
 		var requests atomic.Int32
 		unavailable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			requests.Add(1)
@@ -450,5 +473,124 @@ func TestPrepaidSettledOperationRepairsOnlyUnpublishedOriginalLease(t *testing.T
 	}
 	if requests.Load() != 0 {
 		t.Fatalf("settled association recovery called unavailable provider %d times", requests.Load())
+	}
+}
+
+func TestPrepaidOperationManagedAdmissionPreservesAcceptedRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		first, unpublished bool
+	}{{"later", false, false}, {"first", true, false}, {"unpublished-first", true, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPrepaidFixture(t)
+			actor := uuid.New()
+			r := prepaidOperationRouter(t, f, f.team, actor)
+			if tc.first {
+				f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
+				f.exec(`UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL WHERE team_id=$1`, f.team)
+				f.exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, f.team)
+			}
+			req := prepaidCheckoutBody{OperationID: uuid.New(), AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+			var posts atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/v1/checkout/sessions" && request.Method == http.MethodPost && posts.Add(1) == 1 && tc.unpublished {
+					f.serve(httptest.NewRecorder(), request)
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					_ = conn.Close()
+					return
+				}
+				f.serve(w, request)
+			}))
+			defer srv.Close()
+			f.client.baseURL, f.client.httpClient = srv.URL, srv.Client()
+			opened := prepaidOperationPost(r, req)
+			var original prepaidOperationResponse
+			if tc.unpublished {
+				if opened.Code != 502 {
+					t.Fatalf("lost initial reply: %d %s", opened.Code, opened.Body)
+				}
+				f.mu.Lock()
+				for id := range f.sessions {
+					original.ID = id
+				}
+				f.mu.Unlock()
+			} else if opened.Code != 200 || json.Unmarshal(opened.Body.Bytes(), &original) != nil || original.URL == "" {
+				t.Fatalf("open: %d %s", opened.Code, opened.Body)
+			}
+			defer managePrepaidFixtureTeam(t, f)()
+			f.h.Config.AppAllowedOrigins = nil
+			expected := 200
+			if tc.unpublished {
+				expected = 202
+			}
+			if rec := prepaidOperationPost(r, req); rec.Code != expected {
+				t.Fatalf("managed accepted replay: %d %s", rec.Code, rec.Body)
+			}
+			if tc.unpublished {
+				var preserved bool
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT a.checkout_initializing_at IS NOT NULL AND a.checkout_session_id IS NULL AND p.checkout_session_id IS NULL AND p.payment_state='uncertain' AND p.credit_state='none' FROM team_billing_account a JOIN billing_prepaid_purchase p USING(team_id) WHERE p.id=$1`, req.OperationID).Scan(&preserved); err != nil || !preserved {
+					t.Fatalf("unpublished managed checkout changed: %v %v", preserved, err)
+				}
+			}
+			if posts.Load() != 1 {
+				t.Fatalf("managed recovery dispatched another session: %d", posts.Load())
+			}
+			bad := req
+			bad.AmountCents = 1000
+			if rec := prepaidOperationPost(r, bad); rec.Code != 409 {
+				t.Fatalf("managed mismatch: %d %s", rec.Code, rec.Body)
+			}
+			otherActor := prepaidOperationRouter(t, f, f.team, uuid.New())
+			if rec := prepaidOperationPost(otherActor, req); rec.Code != 409 {
+				t.Fatalf("managed actor mismatch: %d %s", rec.Code, rec.Body)
+			}
+			otherTeam, err := f.h.DB.CreateTeam(t.Context(), "managed-replay-"+uuid.NewString())
+			if err != nil {
+				t.Fatal(err)
+			}
+			otherRouter := prepaidOperationRouter(t, f, otherTeam.ID, actor)
+			if rec := prepaidOperationPost(otherRouter, req); rec.Code != 409 {
+				t.Fatalf("managed team mismatch: %d %s", rec.Code, rec.Body)
+			}
+			f.h.Config.AppAllowedOrigins = nil
+			bad = req
+			bad.OperationID = uuid.New()
+			if rec := prepaidOperationPost(r, bad); rec.Code != 403 {
+				t.Fatalf("managed fresh purchase: %d %s", rec.Code, rec.Body)
+			}
+			if err := f.h.bindPrepaidCheckoutOperation(t.Context(), f.team, actor, bad); err != nil {
+				t.Fatal(err)
+			}
+			if rec := prepaidOperationPost(r, bad); rec.Code != 403 {
+				t.Fatalf("managed unused binding: %d %s", rec.Code, rec.Body)
+			}
+			provider := f.h.Stripe
+			f.h.Stripe = nil
+			if rec := prepaidOperationPost(r, req); rec.Code != 202 {
+				t.Fatalf("provider disabled pending: %d %s", rec.Code, rec.Body)
+			}
+			f.h.Stripe = provider
+			f.mu.Lock()
+			f.sessions[original.ID]["status"] = "expired"
+			f.mu.Unlock()
+			var closed prepaidOperationResponse
+			rec := prepaidOperationPost(r, req)
+			if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &closed) != nil || closed.State != "failed" || closed.URL != "" {
+				t.Fatalf("managed terminal: %d %s", rec.Code, rec.Body)
+			}
+			f.h.Stripe = nil
+			if rec := prepaidOperationPost(r, req); rec.Code != 200 {
+				t.Fatalf("terminal provider disabled: %d %s", rec.Code, rec.Body)
+			}
+			f.exec(`DELETE FROM user_role_assignments WHERE user_id=$1 AND team_id=$2`, actor, f.team)
+			f.h.authzService().InvalidateTeam(f.team)
+			if rec := prepaidOperationPost(r, req); rec.Code != 403 {
+				t.Fatalf("replay bypassed permission: %d %s", rec.Code, rec.Body)
+			}
+		})
 	}
 }
