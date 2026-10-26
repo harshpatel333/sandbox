@@ -64,3 +64,35 @@ func TestIntegration_PrepaidHistoryProductionRole(t *testing.T) {
 		t.Fatalf("purchase history lost: %d %v", count, err)
 	}
 }
+
+func TestIntegration_MatchingHistoryProductionRole(t *testing.T) {
+	owner := teamCreationDatabase(t, func(pool *pgxpool.Pool) {
+		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon,authenticated,service_role`)
+	})
+	service := teamCreationServiceRolePool(t, owner)
+	for _, table := range []string{"billing_contract_matching_rule", "billing_matching_credit", "billing_matching_invoice_inspection"} {
+		for _, role := range []string{"anon", "authenticated", "service_role"} {
+			var destructive bool
+			if err := owner.QueryRow(t.Context(), `SELECT has_table_privilege($1,$2,'DELETE,TRUNCATE')`, role, table).Scan(&destructive); err != nil || destructive {
+				t.Fatalf("%s destructive on %s: %v %v", role, table, destructive, err)
+			}
+		}
+		var guarded bool
+		if err := owner.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=$1::regclass AND tgname='matching_history_no_truncate' AND tgenabled='O' AND (tgtype::int & 32)=32)`, table).Scan(&guarded); err != nil || !guarded {
+			t.Fatalf("%s missing statement truncate guard: %v", table, err)
+		}
+		_, err := service.Exec(t.Context(), "TRUNCATE "+table+" CASCADE")
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+			t.Fatalf("%s narrow ACL: %v", table, err)
+		}
+		rolloutExec(t, owner, "GRANT ALL ON "+table+" TO service_role")
+	}
+	for _, table := range []string{"billing_contract_matching_rule", "billing_matching_credit", "billing_matching_invoice_inspection"} {
+		_, err := service.Exec(t.Context(), "TRUNCATE "+table+" CASCADE")
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
+			t.Fatalf("%s regrant bypassed history guard: %v", table, err)
+		}
+	}
+}
