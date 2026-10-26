@@ -94,6 +94,10 @@ func (h *Handlers) preflightFirstProCycleCredits(ctx context.Context, team uuid.
 	if sub.ID != a.Subscription || sub.Customer != a.Customer {
 		return true, errors.New("first Pro month subscription identity differs")
 	}
+	if err = validateFirstProCycleProviderCalendar(u.ID, u.Anchor, sub); err != nil {
+		return true, err
+	}
+
 	prices := []string{a.Price}
 	for _, item := range sub.Items.Data {
 		if item.Price.ID != a.Price && item.Price.ID != a.Base.Price {

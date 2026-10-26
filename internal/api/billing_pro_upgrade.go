@@ -559,6 +559,7 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 			}
 			form := url.Values{"customer": {u.Customer}, "billing_mode[type]": {"flexible"}, "proration_behavior": {"none"}, "backdate_start_date": {strconv.FormatInt(u.Anchor.Unix(), 10)}, "metadata[pro_upgrade_id]": {u.ID.String()}}
 			if p.FirstPaidProCycle {
+				form.Set("metadata[first_paid_pro_cycle]", "true")
 				anchor := u.Anchor.UTC()
 				form.Set("billing_cycle_anchor_config[day_of_month]", strconv.Itoa(anchor.Day()))
 				form.Set("billing_cycle_anchor_config[hour]", strconv.Itoa(anchor.Hour()))
@@ -621,6 +622,11 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 }
 
 func validateProUpgradeSubscription(u proUpgrade, p StripeCreateCheckoutSessionParams, sub invoiceSubscription, rounding string, now time.Time) (time.Time, time.Time, error) {
+	if p.FirstPaidProCycle {
+		if err := validateFirstProCycleProviderCalendar(u.ID, u.Anchor, sub); err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+	}
 	if sub.ID != derefString(u.Subscription) || sub.Customer != u.Customer || sub.Status != "active" || sub.CancelAtPeriodEnd || sub.CancelAt != 0 || sub.PendingUpdate != nil || sub.Schedule != "" || len(sub.Discounts) != 0 || sub.AutomaticTax.Enabled || sub.BillingMode.Type != "flexible" {
 		return time.Time{}, time.Time{}, errors.New("subscription is unavailable for immediate Pro upgrade")
 	}

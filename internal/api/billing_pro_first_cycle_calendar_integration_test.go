@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,7 @@ func TestProFirstCycleDelayedProviderCreationKeepsMonthEndCalendar(t *testing.T)
 			}
 			sub.ID = "sub_" + team.String()
 			sub.Customer = u.Customer
+			sub.Metadata = map[string]string{"first_paid_pro_cycle": "true", "pro_upgrade_id": u.ID.String()}
 			sub.StartDate = anchor.Unix()
 			// Stripe exposes March31 as its anchor but its first full period ends in
 			// February. This response shape was separately verified with test clocks.
@@ -47,7 +49,7 @@ func TestProFirstCycleDelayedProviderCreationKeepsMonthEndCalendar(t *testing.T)
 				case r.Method == http.MethodPost && r.URL.Path == "/v1/subscriptions":
 					creates++
 					_ = r.ParseForm()
-					for key, want := range map[string]string{"backdate_start_date": fmt.Sprint(anchor.Unix()), "billing_cycle_anchor_config[day_of_month]": "31", "billing_cycle_anchor_config[hour]": "12", "billing_cycle_anchor_config[minute]": "0", "billing_cycle_anchor_config[second]": "0", "billing_mode[type]": "flexible", "proration_behavior": "none"} {
+					for key, want := range map[string]string{"backdate_start_date": fmt.Sprint(anchor.Unix()), "billing_cycle_anchor_config[day_of_month]": "31", "billing_cycle_anchor_config[hour]": "12", "billing_cycle_anchor_config[minute]": "0", "billing_cycle_anchor_config[second]": "0", "billing_mode[type]": "flexible", "proration_behavior": "none", "metadata[first_paid_pro_cycle]": "true", "metadata[pro_upgrade_id]": u.ID.String()} {
 						if r.Form.Get(key) != want {
 							t.Errorf("%s=%q want%q", key, r.Form.Get(key), want)
 						}
@@ -93,6 +95,73 @@ func TestProFirstCycleDelayedProviderCreationKeepsMonthEndCalendar(t *testing.T)
 			sub.BillingCycleAnchorConfig.Second++
 			if _, _, ok := providerInvoicePeriod(sub, anchor); ok {
 				t.Fatal("accepted a configured calendar differing from frozen start")
+			}
+		})
+	}
+}
+
+func TestProFirstCycleStoredAuthorityRejectsProviderMarkerRemoval(t *testing.T) {
+	anchor := time.Date(2027, 1, 31, 12, 0, 0, 0, time.UTC)
+	h, team, offer, params := newProFirstCycleQuoteFixture(t, anchor)
+	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+	u, err := h.proUpgrade(t.Context(), team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub := invoiceSubscription{ID: "sub_" + team.String(), Customer: u.Customer, StartDate: anchor.Unix(), BillingCycleAnchor: time.Date(2027, 3, 31, 12, 0, 0, 0, time.UTC).Unix(), Metadata: map[string]string{"first_paid_pro_cycle": "true", "pro_upgrade_id": u.ID.String()}}
+	if err = json.Unmarshal([]byte(`{"day_of_month":31,"hour":12,"minute":0,"second":0}`), &sub.BillingCycleAnchorConfig); err != nil {
+		t.Fatal(err)
+	}
+	resource := invoiceSubscriptionItem{Start: u.Start.Unix(), End: u.End.Unix()}
+	resource.Price.ID = "price_cpu"
+	sub.Items.Data = []invoiceSubscriptionItem{resource}
+
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade SET subscription_id=$2 WHERE id=$1`, u.ID, sub.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = h.verifyFirstProCycleProviderCalendar(t.Context(), h.Pool, sub); err != nil {
+		t.Fatal(err)
+	}
+	var returned invoiceSubscription
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/subscriptions/"+sub.ID {
+			t.Errorf("unexpected provider request %s %s", r.Method, r.URL)
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(returned)
+	}))
+	defer srv.Close()
+	client := &stripeHTTPClient{baseURL: srv.URL, httpClient: srv.Client(), apiVersion: "2026-05-27.dahlia"}
+	for _, mutation := range []string{"flag_missing", "flag_false", "operation_mismatch", "config_changed", "config_missing"} {
+		t.Run(mutation, func(t *testing.T) {
+			changed := sub
+			changed.Metadata = map[string]string{"first_paid_pro_cycle": "true", "pro_upgrade_id": u.ID.String()}
+			raw, _ := json.Marshal(sub.BillingCycleAnchorConfig)
+			changed.BillingCycleAnchorConfig = nil
+			_ = json.Unmarshal(raw, &changed.BillingCycleAnchorConfig)
+			switch mutation {
+			case "flag_missing":
+				delete(changed.Metadata, "first_paid_pro_cycle")
+			case "flag_false":
+				changed.Metadata["first_paid_pro_cycle"] = "false"
+			case "operation_mismatch":
+				changed.Metadata["pro_upgrade_id"] = "00000000-0000-0000-0000-000000000111"
+			case "config_changed":
+				changed.BillingCycleAnchorConfig.Hour++
+			case "config_missing":
+				changed.BillingCycleAnchorConfig = nil
+			}
+			if err := h.verifyFirstProCycleProviderCalendar(t.Context(), h.Pool, changed); err == nil {
+				t.Fatal("lost frozen calendar authority")
+			}
+			a := invoiceAccount{Customer: u.Customer, Subscription: sub.ID}
+			if err := h.validateInvoiceEnrollmentSubscription(t.Context(), team, a, client, changed, h.Pool); err == nil {
+				t.Fatal("enrollment silently fell back to legacy calendar")
+			}
+			returned = changed
+			if _, err := h.ensureInvoiceCalendar(t.Context(), billing.ExportPeriod{TeamID: team, Start: u.Start, End: u.End}, a, client); err == nil || !strings.Contains(err.Error(), "first Pro month") {
+				t.Fatalf("later invoice did not enforce frozen calendar authority: %v", err)
 			}
 		})
 	}

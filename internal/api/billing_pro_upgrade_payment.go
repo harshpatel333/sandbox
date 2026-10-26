@@ -252,6 +252,9 @@ func (h *Handlers) commitProUpgrade(ctx context.Context, conn *pgxpool.Conn, u *
 		return err
 	}
 	if accepted.FirstPaidProCycle {
+		if err = validateFirstProCycleProviderCalendar(u.ID, u.Anchor, sub); err != nil {
+			return err
+		}
 		if err = retireFirstProCycleReportingPeriods(ctx, tx, *u); err != nil {
 			return err
 		}

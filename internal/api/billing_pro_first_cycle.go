@@ -77,3 +77,33 @@ func customerProCheckoutTerms(ctx context.Context, q db.DBTX, team uuid.UUID, fr
 	}
 	return out, err
 }
+
+// Provider metadata selects the calendar interpretation, but the frozen local
+// operation independently requires it before financial work can proceed.
+func validateFirstProCycleProviderCalendar(id uuid.UUID, anchor time.Time, sub invoiceSubscription) error {
+	if sub.Metadata["first_paid_pro_cycle"] != "true" || sub.Metadata["pro_upgrade_id"] != id.String() || sub.StartDate != anchor.Unix() || sub.BillingCycleAnchorConfig == nil {
+		return errors.New("first Pro month provider calendar authority differs")
+	}
+	start, _, ok := providerInvoicePeriod(sub, anchor)
+	if !ok || !start.Equal(anchor) {
+		return errors.New("first Pro month provider calendar differs from accepted anniversary")
+	}
+	return nil
+}
+
+func (h *Handlers) verifyFirstProCycleProviderCalendar(ctx context.Context, reader db.DBTX, sub invoiceSubscription) error {
+	var id uuid.UUID
+	var anchor time.Time
+	var customer string
+	err := reader.QueryRow(ctx, `SELECT id,anchor,customer_id FROM billing_pro_upgrade WHERE subscription_id=$1 AND request_payload->>'FirstPaidProCycle'='true'`, sub.ID).Scan(&id, &anchor, &customer)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if sub.Customer != customer {
+		return errors.New("first Pro month provider customer differs")
+	}
+	return validateFirstProCycleProviderCalendar(id, anchor, sub)
+}

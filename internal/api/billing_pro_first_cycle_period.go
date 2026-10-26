@@ -75,9 +75,16 @@ func retireFirstProCycleReportingPeriods(ctx context.Context, tx pgx.Tx, u proUp
 	if err != nil {
 		return err
 	}
+	var ownedPaidTarget bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade u JOIN billing_commercial_contract c ON c.id=u.contract_id AND c.team_id=u.team_id AND c.customer_id=u.customer_id AND c.subscription_id=u.subscription_id
+ WHERE u.id=$1 AND c.starts_at=u.period_end AND c.entitlement_anchor=u.anchor
+ AND EXISTS(SELECT 1 FROM team_plan_assignment a WHERE a.team_id=u.team_id AND a.contract_id=c.id AND a.source='checkout' AND a.idempotency_key='checkout:'||c.id::text AND a.plan_version_id=(u.request_payload#>>'{PlanTerms,VersionID}')::uuid))`, u.ID).Scan(&ownedPaidTarget); err != nil {
+		return err
+	}
 	rows, err = tx.Query(ctx, `SELECT period_start,period_end,status='open' AND exported_at IS NULL AND approved_at IS NULL AND approved_by IS NULL AND blocked_at IS NULL AND blocked_reason IS NULL
  AND COALESCE(gross_charges_usd,0)=0 AND COALESCE(credits_applied_usd,0)=0 AND COALESCE(net_invoice_amount_usd,0)=0
- FROM team_billing_period WHERE team_id=$1 AND period_start<$2 AND period_end>$2 AND finalized_at IS NULL ORDER BY period_start FOR UPDATE`, u.Team, u.Start)
+ FROM team_billing_period WHERE team_id=$1 AND period_start<$3 AND period_end>$2 AND finalized_at IS NULL
+ AND NOT($4::boolean AND period_start=$2 AND period_end=$3) ORDER BY period_start FOR UPDATE`, u.Team, u.Start, u.End, ownedPaidTarget)
 	if err != nil {
 		return err
 	}
@@ -85,6 +92,7 @@ func retireFirstProCycleReportingPeriods(ctx context.Context, tx pgx.Tx, u proUp
 	// period at the accepted boundaries is never mistaken for a Free bucket.
 	type boundary struct{ start, end time.Time }
 	var periods []boundary
+	reuseFreeTarget := false
 	for rows.Next() {
 		var p boundary
 		var safe bool
@@ -96,14 +104,21 @@ func retireFirstProCycleReportingPeriods(ctx context.Context, tx pgx.Tx, u proUp
 			rows.Close()
 			return errors.New("Free reporting period already has financial activity")
 		}
-		periods = append(periods, p)
+		if p.start.Equal(u.Start) && p.end.Equal(u.End) {
+			// An untouched Free bucket with exactly the new boundaries can be
+			// reused by this paid transaction; finalizing its key would prevent
+			// materializing the same commercial interval on replay.
+			reuseFreeTarget = true
+		} else {
+			periods = append(periods, p)
+		}
 	}
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
 		return err
 	}
-	if len(periods) == 0 {
+	if len(periods) == 0 && !reuseFreeTarget {
 		return nil
 	}
 	var touched bool

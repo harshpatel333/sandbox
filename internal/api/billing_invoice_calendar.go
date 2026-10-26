@@ -52,7 +52,7 @@ func invoiceCalendarPeriod(p billing.ExportPeriod, sub invoiceSubscription, roun
 // partial initial period can precede it, but must be proven by start_date.
 func providerInvoicePeriod(sub invoiceSubscription, at time.Time) (time.Time, time.Time, bool) {
 	anchor := time.Unix(sub.BillingCycleAnchor, 0).UTC()
-	if cfg := sub.BillingCycleAnchorConfig; cfg != nil {
+	if cfg := sub.BillingCycleAnchorConfig; cfg != nil && sub.Metadata["first_paid_pro_cycle"] == "true" && sub.Metadata["pro_upgrade_id"] != "" {
 		start := time.Unix(sub.StartDate, 0).UTC()
 		boundary, _, ok := billing.AnniversaryPeriod(start, anchor)
 		if cfg.Month != nil || cfg.DayOfMonth != start.Day() || cfg.Hour != start.Hour() || cfg.Minute != start.Minute() || cfg.Second != start.Second() || !ok || !boundary.Equal(anchor) {
@@ -123,6 +123,9 @@ func (h *Handlers) ensureInvoiceCalendar(ctx context.Context, p billing.ExportPe
 	}
 	sub, err := client.invoiceSubscription(ctx, a.Subscription)
 	if err != nil {
+		return p, err
+	}
+	if err = h.verifyFirstProCycleProviderCalendar(ctx, h.Pool, sub); err != nil {
 		return p, err
 	}
 	sub, err = a.Base.stripSubscription(sub)

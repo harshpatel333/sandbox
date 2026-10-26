@@ -21,9 +21,16 @@ import (
 // This joins the real quote producer, persisted payment/credit activation, and
 // the invoice credit ledger. Only Stripe transport and elapsed time are fake.
 func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
-	for _, paid := range []int64{25000, 12500, 0} {
-		t.Run(fmt.Sprintf("paid-%d", paid), func(t *testing.T) {
+	for _, tc := range []struct {
+		paid    int64
+		delayed bool
+	}{{25000, false}, {12500, false}, {0, false}, {25000, true}} {
+		paid := tc.paid
+		t.Run(fmt.Sprintf("paid-%d-delayed-%v", paid, tc.delayed), func(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Second)
+			if tc.delayed {
+				now = time.Date(2026, 10, 31, 23, 50, 0, 0, time.UTC)
+			}
 			h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
 			poolConfig := h.Pool.Config()
 			poolConfig.MaxConns = 1
@@ -45,6 +52,27 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 			if !params.FirstPaidProCycle || u.Amount != 25000 || u.bridgeCreditAmount() != 25000 {
 				t.Fatalf("quote did not preserve full independent first-month terms: %+v", u)
 			}
+			freeUsageBefore := ""
+			if tc.delayed {
+				recoveredAt := now.Add(20 * time.Minute)
+				freeStart, freeEnd := billing.CurrentBillingPeriod(recoveredAt)
+				if _, err = h.DB.UpsertTeamBillingPeriod(t.Context(), db.UpsertTeamBillingPeriodParams{TeamID: team, PeriodStart: freeStart, PeriodEnd: freeEnd, Status: "open"}); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = h.Pool.Exec(t.Context(), `INSERT INTO team_billing_usage(team_id,period_start,period_end,vcpu_seconds) SELECT team_id,period_start,period_end,42 FROM team_billing_period WHERE team_id=$1`, team); err != nil {
+					t.Fatal(err)
+				}
+				if err = h.Pool.QueryRow(t.Context(), `SELECT jsonb_agg(to_jsonb(x) ORDER BY period_start)::text FROM team_billing_usage x WHERE team_id=$1`, team).Scan(&freeUsageBefore); err != nil {
+					t.Fatal(err)
+				}
+				h.Now = func() time.Time { return recoveredAt }
+				requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+				replay, e := h.proUpgrade(t.Context(), team)
+				if e != nil || replay.ID != u.ID || !replay.Anchor.Equal(u.Anchor) || string(replay.Payload) != string(u.Payload) {
+					t.Fatalf("cross-month recovery changed accepted quote: %+v %v", replay, e)
+				}
+			}
+			paidAt := h.nowUTC().Truncate(time.Second)
 			exec := func(sql string, args ...any) {
 				t.Helper()
 				if _, e := h.Pool.Exec(t.Context(), sql, args...); e != nil {
@@ -63,10 +91,12 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 			exec(`UPDATE billing_pro_upgrade SET subscription_id=$2,session_id=$3 WHERE id=$1`, u.ID, subID, session.ID)
 			var sub invoiceSubscription
 			sub.ID, sub.Customer, sub.Status, sub.DefaultPaymentMethod = subID, u.Customer, "active", "pm_first"
+			sub.Metadata = map[string]string{"first_paid_pro_cycle": "true", "pro_upgrade_id": u.ID.String()}
+			_ = json.Unmarshal([]byte(fmt.Sprintf(`{"day_of_month":%d,"hour":%d,"minute":%d,"second":%d}`, u.Anchor.UTC().Day(), u.Anchor.UTC().Hour(), u.Anchor.UTC().Minute(), u.Anchor.UTC().Second())), &sub.BillingCycleAnchorConfig)
 			sub.BillingMode.Type = "flexible"
 			sub.StartDate, sub.BillingCycleAnchor = u.Anchor.Unix(), u.End.Unix()
 			_ = json.Unmarshal([]byte(`{"behavior":"keep_as_draft"}`), &sub.PauseCollection)
-			base := invoiceSubscriptionItem{ID: "si_base", Created: now.Unix(), Quantity: 1, Metadata: map[string]string{"pro_upgrade_id": u.ID.String()}}
+			base := invoiceSubscriptionItem{ID: "si_base", Created: paidAt.Unix(), Quantity: 1, Metadata: map[string]string{"pro_upgrade_id": u.ID.String()}}
 			_ = json.Unmarshal([]byte(`{"id":"price_pro","currency":"usd","unit_amount_decimal":"25000","billing_scheme":"per_unit","recurring":{"usage_type":"licensed","interval":"month","interval_count":1}}`), &base.Price)
 			resource := invoiceSubscriptionItem{ID: "si_cpu", Start: u.Start.Unix(), End: u.End.Unix()}
 			if err = json.Unmarshal([]byte(`{"id":"price_cpu","active":true,"currency":"usd","unit_amount_decimal":"1","billing_scheme":"per_unit","recurring":{"usage_type":"metered","interval":"month","interval_count":1,"meter":"mtr_cpu"}}`), &resource.Price); err != nil {
@@ -82,7 +112,7 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 			grant.Amount.Type, grant.Amount.Monetary.Currency, grant.Amount.Monetary.Value = "monetary", "usd", offer.Credit
 			grant.Metadata = map[string]string{"pro_upgrade_id": u.ID.String()}
 			grant.Applicability.Scope.PriceType = "metered"
-			grant.Created, grant.EffectiveAt, grant.ExpiresAt = now.Unix(), now.Unix(), u.End.Unix()+1
+			grant.Created, grant.EffectiveAt, grant.ExpiresAt = paidAt.Unix(), paidAt.Unix(), u.End.Unix()+1
 			balance, grantCreates := offer.Credit, 0
 			grantPresent := false
 			usageInvoice := "in_usage_" + uuid.NewString()
@@ -91,7 +121,7 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 				var out any
 				switch r.URL.Path {
 				case "/v1/invoices/" + session.InvoiceID:
-					out = map[string]any{"id": session.InvoiceID, "customer": u.Customer, "status": "paid", "currency": "usd", "amount_paid": paid, "amount_due": paid, "amount_remaining": 0, "ending_balance": 0, "status_transitions": map[string]any{"paid_at": now.Unix()}, "lines": map[string]any{"data": []any{map[string]any{"amount": u.Amount, "currency": "usd", "quantity": 1}}}}
+					out = map[string]any{"id": session.InvoiceID, "customer": u.Customer, "status": "paid", "currency": "usd", "amount_paid": paid, "amount_due": paid, "amount_remaining": 0, "ending_balance": 0, "status_transitions": map[string]any{"paid_at": paidAt.Unix()}, "lines": map[string]any{"data": []any{map[string]any{"amount": u.Amount, "currency": "usd", "quantity": 1}}}}
 				case "/v1/payment_intents/" + session.PaymentIntentID:
 					out = map[string]any{"id": session.PaymentIntentID, "customer": u.Customer, "status": "succeeded", "currency": "usd", "amount_received": paid, "latest_charge": "ch_first", "payment_method": "pm_first", "setup_future_usage": "off_session", "metadata": map[string]string{"pro_upgrade_id": u.ID.String()}}
 				case "/v1/charges/ch_first":
@@ -203,6 +233,13 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 				t.Fatalf("full first-cycle invoice enrollment: %v", err)
 			}
 			cancelEnrollment()
+			for _, changed := range []map[string]string{{"pro_upgrade_id": u.ID.String()}, {"first_paid_pro_cycle": "true", "pro_upgrade_id": uuid.NewString()}} {
+				sub.Metadata = changed
+				if err = h.enrollInvoiceAccount(t.Context(), team, &invoiceAccount{Price: "price_round", Event: "round", Meter: "mtr_round"}); err == nil {
+					t.Fatal("existing enrollment silently accepted removed or changed first-cycle provider authority")
+				}
+			}
+			sub.Metadata = map[string]string{"first_paid_pro_cycle": "true", "pro_upgrade_id": u.ID.String()}
 			enrolledAccount, enrolled, err := h.invoiceAccount(t.Context(), team)
 			if err != nil || !enrolled || enrolledAccount.Subscription != subID || enrolledAccount.Base.Price != offer.Price {
 				t.Fatalf("first-cycle enrolled account %+v enrolled=%v err=%v", enrolledAccount, enrolled, err)
@@ -213,6 +250,16 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 			}
 			if grantCreates != 1 {
 				t.Fatalf("payment replay duplicated grant: %d", grantCreates)
+			}
+			if tc.delayed {
+				var usageAfter string
+				var retired int
+				if err = h.Pool.QueryRow(t.Context(), `SELECT jsonb_agg(to_jsonb(x) ORDER BY period_start)::text FROM team_billing_usage x WHERE team_id=$1`, team).Scan(&usageAfter); err != nil {
+					t.Fatal(err)
+				}
+				if err = h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM team_billing_period WHERE team_id=$1 AND finalized_at IS NOT NULL AND blocked_reason='reporting_only_calendar_period'`, team).Scan(&retired); err != nil || retired != 2 || usageAfter != freeUsageBefore {
+					t.Fatalf("delayed Free accounting history not preserved: retired=%d unchanged=%v err=%v", retired, usageAfter == freeUsageBefore, err)
+				}
 			}
 			var contractStart time.Time
 			var monthlyFee, monthlyCredit int64
@@ -264,6 +311,31 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 			raw, _ := json.Marshal(plan)
 			exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'exporting') ON CONFLICT(team_id,period_start,period_end) DO UPDATE SET status='exporting'`, team, p.Start, p.End)
 			exec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan) VALUES($1,$2,$3,$4,$5)`, team, p.Start, p.End, usageInvoice, raw)
+			if tc.delayed {
+				var before string
+				if err = h.Pool.QueryRow(t.Context(), `SELECT jsonb_agg(to_jsonb(x) ORDER BY period_start)::text FROM team_billing_period x WHERE team_id=$1`, team).Scan(&before); err != nil {
+					t.Fatal(err)
+				}
+				tx, e := h.Pool.Begin(t.Context())
+				if e != nil {
+					t.Fatal(e)
+				}
+				if _, e = h.DB.WithTx(tx).LockTeamBillingAccount(t.Context(), team); e == nil {
+					e = retireFirstProCycleReportingPeriods(t.Context(), tx, u)
+				}
+				if e == nil {
+					e = tx.Commit(t.Context())
+				} else {
+					_ = tx.Rollback(t.Context())
+				}
+				if e != nil {
+					t.Fatalf("verified paid target cannot replay: %v", e)
+				}
+				var after string
+				if err = h.Pool.QueryRow(t.Context(), `SELECT jsonb_agg(to_jsonb(x) ORDER BY period_start)::text FROM team_billing_period x WHERE team_id=$1`, team).Scan(&after); err != nil || before != after {
+					t.Fatalf("replay modified verified paid target: %v", err)
+				}
+			}
 			before, err := h.invoicePlanCredits(t.Context(), p, a, plan, nil, client)
 			if err != nil || before != 25000 {
 				t.Fatalf("first usage pre-finalization %d %v", before, err)
