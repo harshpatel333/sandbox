@@ -3,7 +3,6 @@
 package api
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -27,21 +26,27 @@ func TestMatchingCreditHistoryGuardsPreserveCapAndHold(t *testing.T) {
 		t.Fatalf("carry hold: %v", err)
 	}
 	tables := []string{"billing_contract_matching_rule", "billing_matching_credit", "billing_matching_invoice_inspection"}
-	for _, table := range tables {
-		m.exec("GRANT ALL ON " + table + " TO service_role")
-	}
-	t.Cleanup(func() {
-		for _, table := range tables {
-			if _, err := m.f.h.Pool.Exec(context.Background(), "REVOKE ALL ON "+table+" FROM service_role; GRANT SELECT,INSERT,UPDATE ON "+table+" TO service_role"); err != nil {
-				t.Error(err)
-			}
-		}
-	})
 	tx, err := m.f.h.Pool.Begin(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(t.Context())
+	// Fresh API-only CI clusters have no Supabase roles. Keep role setup and
+	// deliberately broad probe grants transactional, including existing-role attributes.
+	if _, err = tx.Exec(t.Context(), `DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+			CREATE ROLE service_role NOLOGIN;
+		END IF;
+	END $$;
+	ALTER ROLE service_role NOSUPERUSER BYPASSRLS;
+	GRANT USAGE ON SCHEMA public TO service_role`); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range tables {
+		if _, err = tx.Exec(t.Context(), "GRANT ALL ON "+table+" TO service_role"); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err = tx.Exec(t.Context(), "SET LOCAL ROLE service_role"); err != nil {
 		t.Fatal(err)
 	}
