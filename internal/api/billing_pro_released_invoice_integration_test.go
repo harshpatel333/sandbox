@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func TestReleasedProInvoiceIsDurableBeforeAcknowledgmentAndNewPurchaseDispatch(t *testing.T) {
@@ -139,6 +141,13 @@ func TestReleasedProLateCashRetainsExpiredCreditLiabilityAndRepeatProvenance(t *
 	if !end.Before(time.Now()) {
 		t.Fatal("late credit fixture has not expired")
 	}
+	var dbBefore time.Time
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT clock_timestamp()`).Scan(&dbBefore); err != nil {
+		t.Fatal(err)
+	}
+	// Verification publication uses the database clock even when the worker's
+	// business clock is ahead; provider payment timestamps remain independent.
+	providerPaidAt := dbBefore.Add(-time.Minute).Unix()
 	invoice := "in_" + uuid.NewString()
 	intent, charge := "pi_"+uuid.NewString(), "ch_"+uuid.NewString()
 	writes := 0
@@ -152,7 +161,7 @@ func TestReleasedProLateCashRetainsExpiredCreditLiabilityAndRepeatProvenance(t *
 		}
 		switch r.URL.Path {
 		case "/v1/invoices/" + invoice:
-			fmt.Fprintf(w, `{"id":%q,"customer":%q,"status":"paid","currency":"usd","subtotal":25000,"total":25000,"amount_paid":25000,"amount_due":25000,"amount_remaining":0,"ending_balance":0,"status_transitions":{"paid_at":%d},"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"amount":25000,"quantity":1,"currency":"usd","period":{"start":%d,"end":%d},"pricing":{"price_details":{"price":"price_pro"}},"parent":{"subscription_item_details":{"subscription":%q}}}]}}`, invoice, f.stripe.customer, time.Now().Unix(), f.stripe.sub, start.Unix(), end.Unix(), f.stripe.sub)
+			fmt.Fprintf(w, `{"id":%q,"customer":%q,"status":"paid","currency":"usd","subtotal":25000,"total":25000,"amount_paid":25000,"amount_due":25000,"amount_remaining":0,"ending_balance":0,"status_transitions":{"paid_at":%d},"parent":{"subscription_details":{"subscription":%q}},"lines":{"data":[{"amount":25000,"quantity":1,"currency":"usd","period":{"start":%d,"end":%d},"pricing":{"price_details":{"price":"price_pro"}},"parent":{"subscription_item_details":{"subscription":%q}}}]}}`, invoice, f.stripe.customer, providerPaidAt, f.stripe.sub, start.Unix(), end.Unix(), f.stripe.sub)
 		case "/v1/invoice_payments":
 			fmt.Fprintf(w, `{"data":[{"id":"inpay_fixture","invoice":%q,"status":"paid","currency":"usd","amount_paid":25000,"payment":{"type":"payment_intent","payment_intent":%q}}]}`, invoice, intent)
 		case "/v1/payment_intents/" + intent:
@@ -181,10 +190,25 @@ func TestReleasedProLateCashRetainsExpiredCreditLiabilityAndRepeatProvenance(t *
 			t.Fatalf("durable late webhook: %d %s", response.Code, response.Body.String())
 		}
 	}
-	for range 2 {
+	f.h.Now = func() time.Time { return dbBefore.Add(24 * time.Hour) }
+	var firstPayment db.BillingContractPayment
+	for attempt := range 2 {
 		err = f.h.reconcileReleasedProInvoice(t.Context(), f.h.Stripe.(*stripeHTTPClient), invoice)
 		if err == nil || !strings.Contains(err.Error(), "requires operator resolution") {
 			t.Fatalf("expired credit silently resolved: %v", err)
+		}
+		payment, paymentErr := f.h.DB.GetCommercialBasePayment(t.Context(), db.GetCommercialBasePaymentParams{TeamID: f.team, ContractID: *source.ContractID, InvoiceID: invoice})
+		var dbAfter time.Time
+		if clockErr := f.h.Pool.QueryRow(t.Context(), `SELECT clock_timestamp()`).Scan(&dbAfter); clockErr != nil {
+			t.Fatal(clockErr)
+		}
+		if paymentErr != nil || payment.VerifiedAt.Before(dbBefore) || payment.VerifiedAt.After(dbAfter) || payment.PaidAt.Unix() != providerPaidAt {
+			t.Fatalf("verification was not database bounded: %+v %v", payment, paymentErr)
+		}
+		if attempt == 0 {
+			firstPayment = payment
+		} else if !reflect.DeepEqual(payment, firstPayment) {
+			t.Fatal("replay changed immutable payment or verification timestamp")
 		}
 	}
 	var preserved bool
@@ -198,6 +222,25 @@ func TestReleasedProLateCashRetainsExpiredCreditLiabilityAndRepeatProvenance(t *
  FROM billing_pro_released_invoice j JOIN billing_plan_release r ON r.id=j.release_id WHERE j.invoice_id=$1`, invoice, source.ContractID, f.team, current.ID).Scan(&preserved)
 	if err != nil || !preserved || writes != 0 {
 		t.Fatalf("late payment lost liability or reactivated authority: %v %v writes=%d", preserved, err, writes)
+	}
+	// A future provider paid_at must still fail even with an ahead worker clock.
+	invoice = "in_" + uuid.NewString()
+	providerPaidAt = dbBefore.Add(time.Hour).Unix()
+	object, _ = json.Marshal(map[string]any{"id": invoice, "customer": f.stripe.customer, "parent": map[string]any{"subscription_details": map[string]any{"subscription": f.stripe.sub}}})
+	futureEvent := stripeEventEnvelope{ID: "evt_" + uuid.NewString(), Type: "invoice.paid", Data: stripeEventEnvelopeData{Object: object}}
+	futurePayload, _ := json.Marshal(futureEvent)
+	if _, err = f.h.Pool.Exec(t.Context(), `INSERT INTO stripe_webhook_event(event_id,event_type,payload) VALUES($1,$2,$3)`, futureEvent.ID, futureEvent.Type, futurePayload); err != nil {
+		t.Fatal(err)
+	}
+	if handled, eventErr := f.h.processProWebhook(t.Context(), futureEvent); eventErr != nil || !handled {
+		t.Fatalf("future receipt durable enqueue: %v %v", handled, eventErr)
+	}
+	if err = f.h.reconcileReleasedProInvoice(t.Context(), f.h.Stripe.(*stripeHTTPClient), invoice); err == nil || !strings.Contains(err.Error(), "invalid base payment period or verification time") {
+		t.Fatalf("future provider payment bypassed strict database validation: %v", err)
+	}
+	var rejected bool
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT NOT EXISTS(SELECT 1 FROM billing_contract_payment WHERE invoice_id=$1) AND EXISTS(SELECT 1 FROM billing_pro_released_invoice WHERE invoice_id=$1 AND receipt IS NULL)`, invoice).Scan(&rejected); err != nil || !rejected {
+		t.Fatalf("future provider proof was partially committed: %v %v", rejected, err)
 	}
 	newer, err := assignInTx(t, f.h, planAssignment{Team: f.team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourcePlanChange, Reason: "newer independent assignment"})
 	if err != nil {

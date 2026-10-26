@@ -290,7 +290,7 @@ func (h *Handlers) reconcileProUpgradeRenewals(ctx context.Context, u proUpgrade
 			return "", err
 		}
 		q := h.DB.WithTx(tx)
-		payment, err := q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: u.Team, ContractID: *u.Contract, InvoiceID: id, PaymentReference: receipt.Reference, CustomerID: u.Customer, SubscriptionID: u.Subscription, BasePriceID: o.Price, ServicePeriodStart: time.Unix(receipt.Start, 0), ServicePeriodEnd: time.Unix(receipt.End, 0), BaseAmountPaidCents: o.Amount, InvoiceAmountPaidCents: receipt.Invoice.AmountPaid, Currency: "usd", PaidAt: time.Unix(receipt.Invoice.StatusTransitions.PaidAt, 0), VerifiedAt: h.nowUTC(), Evidence: receipt.Raw})
+		payment, err := q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: u.Team, ContractID: *u.Contract, InvoiceID: id, PaymentReference: receipt.Reference, CustomerID: u.Customer, SubscriptionID: u.Subscription, BasePriceID: o.Price, ServicePeriodStart: time.Unix(receipt.Start, 0), ServicePeriodEnd: time.Unix(receipt.End, 0), BaseAmountPaidCents: o.Amount, InvoiceAmountPaidCents: receipt.Invoice.AmountPaid, Currency: "usd", PaidAt: time.Unix(receipt.Invoice.StatusTransitions.PaidAt, 0), Evidence: receipt.Raw})
 		_ = payment
 		if errors.Is(err, pgx.ErrNoRows) {
 			_, err = q.GetCommercialBasePayment(ctx, db.GetCommercialBasePaymentParams{TeamID: u.Team, ContractID: *u.Contract, InvoiceID: id})

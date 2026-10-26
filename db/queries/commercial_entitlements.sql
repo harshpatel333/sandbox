@@ -26,7 +26,7 @@ INSERT INTO billing_contract_payment (
     sqlc.arg(customer_id), sqlc.arg(subscription_id), sqlc.arg(base_price_id),
     sqlc.arg(service_period_start), sqlc.arg(service_period_end), sqlc.arg(base_amount_paid_cents),
     sqlc.arg(invoice_amount_paid_cents), sqlc.arg(invoice_amount_remaining_cents), sqlc.arg(currency),
-    sqlc.arg(paid_at), sqlc.arg(verified_at), sqlc.arg(evidence)
+    sqlc.arg(paid_at), clock_timestamp(), sqlc.arg(evidence)
 ) ON CONFLICT (invoice_id) DO NOTHING RETURNING *;
 
 -- name: GetCommercialBasePayment :one

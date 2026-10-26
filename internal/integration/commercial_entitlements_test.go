@@ -62,7 +62,7 @@ func commercialPayment(t *testing.T, c db.BillingCommercialContract) db.RecordCo
 		CustomerID: c.CustomerID, SubscriptionID: &c.SubscriptionID, BasePriceID: c.BasePriceID,
 		ServicePeriodStart: c.StartsAt, ServicePeriodEnd: c.StartsAt.UTC().AddDate(0, int(c.ChargeIntervalMonths), 0),
 		BaseAmountPaidCents: c.ChargeAmountCents, InvoiceAmountPaidCents: c.ChargeAmountCents,
-		Currency: "usd", PaidAt: c.StartsAt, VerifiedAt: commercialNow(t), Evidence: []byte(`{"verified_payment":"example"}`),
+		Currency: "usd", PaidAt: c.StartsAt, Evidence: []byte(`{"verified_payment":"example"}`),
 	}
 }
 

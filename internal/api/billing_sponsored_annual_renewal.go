@@ -169,7 +169,7 @@ func (h *Handlers) reconcileSponsoredAnnualRenewal(ctx context.Context, o sponso
 	}
 	covered := false
 	for _, receipt := range verified {
-		_, err = q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: o.Team, ContractID: o.Renewal, InvoiceID: receipt.Invoice.ID, PaymentReference: receipt.Reference, CustomerID: o.Customer, SubscriptionID: &o.Subscription, BasePriceID: offer.Price, ServicePeriodStart: time.Unix(receipt.Start, 0), ServicePeriodEnd: time.Unix(receipt.End, 0), BaseAmountPaidCents: 1200000, InvoiceAmountPaidCents: receipt.Invoice.AmountPaid, InvoiceAmountRemainingCents: 0, Currency: "usd", PaidAt: time.Unix(receipt.Invoice.StatusTransitions.PaidAt, 0), VerifiedAt: now, Evidence: receipt.Raw})
+		_, err = q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: o.Team, ContractID: o.Renewal, InvoiceID: receipt.Invoice.ID, PaymentReference: receipt.Reference, CustomerID: o.Customer, SubscriptionID: &o.Subscription, BasePriceID: offer.Price, ServicePeriodStart: time.Unix(receipt.Start, 0), ServicePeriodEnd: time.Unix(receipt.End, 0), BaseAmountPaidCents: 1200000, InvoiceAmountPaidCents: receipt.Invoice.AmountPaid, InvoiceAmountRemainingCents: 0, Currency: "usd", PaidAt: time.Unix(receipt.Invoice.StatusTransitions.PaidAt, 0), Evidence: receipt.Raw})
 		if errors.Is(err, pgx.ErrNoRows) {
 			saved, e := q.GetCommercialBasePayment(ctx, db.GetCommercialBasePaymentParams{TeamID: o.Team, ContractID: o.Renewal, InvoiceID: receipt.Invoice.ID})
 			if e != nil {

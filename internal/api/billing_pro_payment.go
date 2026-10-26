@@ -440,7 +440,7 @@ func (h *Handlers) persistProPayments(ctx context.Context, choice proChoice, sub
 		if err = recordPaymentPromotion(ctx, tx, choice.Team, contract.ID, receipt); err != nil {
 			return err
 		}
-		_, err = q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: choice.Team, ContractID: contract.ID, InvoiceID: receipt.Invoice.ID, PaymentReference: receipt.Reference, CustomerID: sub.Customer, SubscriptionID: &sub.ID, BasePriceID: choice.Price, ServicePeriodStart: time.Unix(receipt.Start, 0), ServicePeriodEnd: time.Unix(receipt.End, 0), BaseAmountPaidCents: offer.Amount, InvoiceAmountPaidCents: receipt.Invoice.AmountPaid, InvoiceAmountRemainingCents: 0, Currency: "usd", PaidAt: time.Unix(receipt.Invoice.StatusTransitions.PaidAt, 0), VerifiedAt: verifiedAt, Evidence: receipt.Raw})
+		_, err = q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: choice.Team, ContractID: contract.ID, InvoiceID: receipt.Invoice.ID, PaymentReference: receipt.Reference, CustomerID: sub.Customer, SubscriptionID: &sub.ID, BasePriceID: choice.Price, ServicePeriodStart: time.Unix(receipt.Start, 0), ServicePeriodEnd: time.Unix(receipt.End, 0), BaseAmountPaidCents: offer.Amount, InvoiceAmountPaidCents: receipt.Invoice.AmountPaid, InvoiceAmountRemainingCents: 0, Currency: "usd", PaidAt: time.Unix(receipt.Invoice.StatusTransitions.PaidAt, 0), Evidence: receipt.Raw})
 		if errors.Is(err, pgx.ErrNoRows) {
 			_, err = q.GetCommercialBasePayment(ctx, db.GetCommercialBasePaymentParams{TeamID: choice.Team, ContractID: contract.ID, InvoiceID: receipt.Invoice.ID})
 		}

@@ -156,7 +156,7 @@ func (h *Handlers) collectProUpgradeCatchup(ctx context.Context, conn *pgxpool.C
 	}
 	defer tx.Rollback(ctx)
 	q := h.DB.WithTx(tx)
-	_, err = q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: u.Team, ContractID: *u.Contract, InvoiceID: inv.ID, PaymentReference: receipt.Reference, CustomerID: u.Customer, SubscriptionID: u.Subscription, BasePriceID: o.Price, ServicePeriodStart: start, ServicePeriodEnd: end, BaseAmountPaidCents: o.Amount, InvoiceAmountPaidCents: inv.AmountPaid, Currency: "usd", PaidAt: time.Unix(inv.StatusTransitions.PaidAt, 0), VerifiedAt: h.nowUTC(), Evidence: receipt.Raw})
+	_, err = q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: u.Team, ContractID: *u.Contract, InvoiceID: inv.ID, PaymentReference: receipt.Reference, CustomerID: u.Customer, SubscriptionID: u.Subscription, BasePriceID: o.Price, ServicePeriodStart: start, ServicePeriodEnd: end, BaseAmountPaidCents: o.Amount, InvoiceAmountPaidCents: inv.AmountPaid, Currency: "usd", PaidAt: time.Unix(inv.StatusTransitions.PaidAt, 0), Evidence: receipt.Raw})
 	if errors.Is(err, pgx.ErrNoRows) {
 		_, err = q.GetCommercialBasePayment(ctx, db.GetCommercialBasePaymentParams{TeamID: u.Team, ContractID: *u.Contract, InvoiceID: inv.ID})
 	}

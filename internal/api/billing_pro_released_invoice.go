@@ -172,7 +172,7 @@ func (h *Handlers) reconcileReleasedProInvoice(ctx context.Context, client *stri
 	} else if !errors.Is(existingErr, pgx.ErrNoRows) {
 		return existingErr
 	} else {
-		_, err = q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: team, ContractID: contract, InvoiceID: invoice, PaymentReference: receipt.Reference, CustomerID: customer, SubscriptionID: &subscription, BasePriceID: price, ServicePeriodStart: time.Unix(receipt.Start, 0), ServicePeriodEnd: time.Unix(receipt.End, 0), BaseAmountPaidCents: offer.Amount, InvoiceAmountPaidCents: receipt.Invoice.AmountPaid, Currency: "usd", PaidAt: time.Unix(receipt.Invoice.StatusTransitions.PaidAt, 0), VerifiedAt: h.nowUTC(), Evidence: receipt.Raw})
+		_, err = q.RecordCommercialBasePayment(ctx, db.RecordCommercialBasePaymentParams{TeamID: team, ContractID: contract, InvoiceID: invoice, PaymentReference: receipt.Reference, CustomerID: customer, SubscriptionID: &subscription, BasePriceID: price, ServicePeriodStart: time.Unix(receipt.Start, 0), ServicePeriodEnd: time.Unix(receipt.End, 0), BaseAmountPaidCents: offer.Amount, InvoiceAmountPaidCents: receipt.Invoice.AmountPaid, Currency: "usd", PaidAt: time.Unix(receipt.Invoice.StatusTransitions.PaidAt, 0), Evidence: receipt.Raw})
 		if errors.Is(err, pgx.ErrNoRows) {
 			var same bool
 			err = tx.QueryRow(ctx, `SELECT contract_id=$2 AND evidence=$3 AND payment_reference=$4 FROM billing_contract_payment WHERE invoice_id=$1`, invoice, contract, receipt.Raw, receipt.Reference).Scan(&same)

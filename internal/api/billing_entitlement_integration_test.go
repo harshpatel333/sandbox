@@ -159,7 +159,7 @@ func newEntitlementFixtureAt(t *testing.T, at time.Time, annual ...bool) *entitl
 		if discount > 0 {
 			exec(`INSERT INTO billing_contract_promotion(contract_id,team_id,discount_id,promotion_code,coupon_id,coupon_duration,amount_off_cents,checkout_invoice_id,discounted_cents) VALUES($1,$2,'di_promo','promo_example','coupon_example','once',$3,$4,$3)`, c.ID, team.ID, discount, "in_paid_"+team.ID.String())
 		}
-		_, err = h.DB.RecordCommercialBasePayment(t.Context(), db.RecordCommercialBasePaymentParams{TeamID: team.ID, ContractID: c.ID, InvoiceID: "in_paid_" + team.ID.String(), PaymentReference: "pay_" + uuid.NewString(), CustomerID: customer, SubscriptionID: &subscription, BasePriceID: "price_base", ServicePeriodStart: anchor, ServicePeriodEnd: coverageEnd, BaseAmountPaidCents: amount, InvoiceAmountPaidCents: amount - discount, Currency: "usd", PaidAt: start, VerifiedAt: now, Evidence: []byte(`{"paid":true}`)})
+		_, err = h.DB.RecordCommercialBasePayment(t.Context(), db.RecordCommercialBasePaymentParams{TeamID: team.ID, ContractID: c.ID, InvoiceID: "in_paid_" + team.ID.String(), PaymentReference: "pay_" + uuid.NewString(), CustomerID: customer, SubscriptionID: &subscription, BasePriceID: "price_base", ServicePeriodStart: anchor, ServicePeriodEnd: coverageEnd, BaseAmountPaidCents: amount, InvoiceAmountPaidCents: amount - discount, Currency: "usd", PaidAt: start, Evidence: []byte(`{"paid":true}`)})
 		if err != nil {
 			t.Fatal(err)
 		}

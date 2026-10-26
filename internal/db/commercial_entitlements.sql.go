@@ -1083,7 +1083,7 @@ INSERT INTO billing_contract_payment (
     $5, $6, $7,
     $8, $9, $10,
     $11, $12, $13,
-    $14, $15, $16
+    $14, clock_timestamp(), $15
 ) ON CONFLICT (invoice_id) DO NOTHING RETURNING id, team_id, contract_id, invoice_id, payment_reference, customer_id, subscription_id, base_price_id, service_period_start, service_period_end, base_amount_paid_cents, invoice_amount_paid_cents, invoice_amount_remaining_cents, currency, paid_at, verified_at, evidence
 `
 
@@ -1102,7 +1102,6 @@ type RecordCommercialBasePaymentParams struct {
 	InvoiceAmountRemainingCents int64     `json:"invoice_amount_remaining_cents"`
 	Currency                    string    `json:"currency"`
 	PaidAt                      time.Time `json:"paid_at"`
-	VerifiedAt                  time.Time `json:"verified_at"`
 	Evidence                    []byte    `json:"evidence"`
 }
 
@@ -1122,7 +1121,6 @@ func (q *Queries) RecordCommercialBasePayment(ctx context.Context, arg RecordCom
 		arg.InvoiceAmountRemainingCents,
 		arg.Currency,
 		arg.PaidAt,
-		arg.VerifiedAt,
 		arg.Evidence,
 	)
 	var i BillingContractPayment
