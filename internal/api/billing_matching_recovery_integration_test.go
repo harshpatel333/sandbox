@@ -14,20 +14,6 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func TestMatchingCreditZeroCashBalanceCarryNeedsNoPaymentIntent(t *testing.T) {
-	m := newMatchingFixture(t, 10000, 8_000_000, 0)
-	ending := int64(40)
-	m.endingBalance = &ending
-	invoice := m.paidInvoice("paid", usageLine("price_cpu", 40))
-	m.paid[invoice] = 0
-	if err := m.tick(); err != nil {
-		t.Fatal(err)
-	}
-	if row := m.row(invoice); row.State != "issued" || row.Paid != 40 {
-		t.Fatal("zero-cash carry no longer matches where usage happened", row)
-	}
-}
-
 func TestMatchingCreditUncertainReversalNeverCreatesAnotherGrant(t *testing.T) {
 	for _, accepted := range []bool{false, true} {
 		t.Run(fmt.Sprintf("first post accepted=%t", accepted), func(t *testing.T) {

@@ -67,7 +67,12 @@ func (h *Handlers) GetTeamMatchingCredit(c *gin.Context) {
    JOIN billing_commercial_contract c ON c.id=r.contract_id
    CROSS JOIN LATERAL (SELECT COALESCE(sum(amount_cents),0) matched FROM billing_matching_credit WHERE contract_id=r.contract_id) m WHERE r.team_id=$1),
  'credits',(SELECT COALESCE(jsonb_agg(`+matchingCreditJSON+` ORDER BY x.created_at DESC),'[]') FROM
-   (SELECT * FROM billing_matching_credit WHERE team_id=$1 ORDER BY created_at DESC LIMIT 200) x))`, team).Scan(&raw)
+   (SELECT * FROM billing_matching_credit WHERE team_id=$1 ORDER BY created_at DESC LIMIT 200) x),
+ 'pending_reconciliation',(SELECT COALESCE(jsonb_agg(to_jsonb(x) ORDER BY x.period_start),'[]') FROM
+   (SELECT j.invoice_id,j.period_start,j.period_end,i.next_attempt_at,i.last_error FROM billing_matching_invoice_inspection i
+    JOIN billing_invoice_close j USING(invoice_id) WHERE j.team_id=$1 AND left(i.last_error,length($2))=$2
+    AND NOT EXISTS(SELECT 1 FROM billing_matching_credit m WHERE m.invoice_id=i.invoice_id)
+    ORDER BY j.period_start LIMIT 200) x))`, team, errMatchingCashReconciliation.Error()).Scan(&raw)
 	if err != nil {
 		respondError(c, ErrInternal)
 		return

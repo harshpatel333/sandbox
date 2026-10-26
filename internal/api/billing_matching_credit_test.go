@@ -36,13 +36,13 @@ func TestMatchingUsageExcludesFeeDiscountsAndCredits(t *testing.T) {
 	}
 }
 
-func TestMatchingUsageCountsBalanceCarryAsPaidWhereUsageHappened(t *testing.T) {
+func TestMatchingUsageExcludesUncollectedBalanceCarry(t *testing.T) {
 	var carried, collecting StripeInvoiceAmounts
 	if err := json.Unmarshal([]byte(`{"starting_balance":0,"ending_balance":40,"lines":{"data":[{"amount":40,"currency":"usd","pricing":{"price_details":{"price":"price_cpu"}}}]}}`), &carried); err != nil {
 		t.Fatal(err)
 	}
-	if u, err := matchingInvoiceUsage(carried, matchingPayment{}, []string{"price_cpu"}); err != nil || u.UnpaidCents != 0 || u.UsageCents != 40 {
-		t.Fatalf("usage carried onto the balance was not matched where it happened: %+v %v", u, err)
+	if u, err := matchingInvoiceUsage(carried, matchingPayment{}, []string{"price_cpu"}); err != nil || u.UnpaidCents != 40 || u.UsageCents != 40 {
+		t.Fatalf("uncollected debit carry was counted as cash: %+v %v", u, err)
 	}
 	if err := json.Unmarshal([]byte(`{"starting_balance":40,"ending_balance":0,"lines":{"data":[{"amount":30,"currency":"usd","pricing":{"price_details":{"price":"price_cpu"}}}]}}`), &collecting); err != nil {
 		t.Fatal(err)

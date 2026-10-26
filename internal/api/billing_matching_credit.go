@@ -54,17 +54,10 @@ type matchingPayment struct {
 	PaidOutOfBand bool  `json:"paid_out_of_band"`
 }
 
-// Stripe settles an invoice below its minimum charge by carrying the amount
-// onto the customer balance; that usage is paid where it happened, and the
-// later invoice collecting the carry matches only its own usage. Spending a
-// credit balance is not customer payment, so only growth in owed balance counts.
-func (p matchingPayment) settled(inv StripeInvoiceAmounts) int64 {
-	carried := int64(0)
-	if inv.EndingBalance != nil {
-		carried = max(max(*inv.EndingBalance, 0)-max(inv.StartingBalance, 0), 0)
-	}
-	return p.AmountPaid + carried
-}
+// A positive customer balance is debt, including invoices marked paid below
+// Stripe's minimum charge. Attribution to a later cash payment needs separate
+// reconciliation; it cannot consume matching eligibility at invoice close.
+var errMatchingCashReconciliation = errors.New("matching cash attribution requires reconciliation: customer debit balance")
 
 // Only usage-priced lines are matchable: the plan fee and anything else on the
 // invoice fall outside the frozen close plan's credit prices. Every applied
@@ -121,7 +114,7 @@ func matchingInvoiceUsage(inv StripeInvoiceAmounts, paid matchingPayment, prices
 		}
 	}
 	net := u.UsageCents - u.CreditCents - u.DiscountCents
-	u.UnpaidCents = max(net-max(paid.settled(inv)-max(other, 0), 0), 0)
+	u.UnpaidCents = max(net-max(paid.AmountPaid-max(other, 0), 0), 0)
 	return u, nil
 }
 
@@ -199,7 +192,8 @@ func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *strip
 		err := h.Pool.QueryRow(ctx, `INSERT INTO billing_matching_invoice_inspection(invoice_id) VALUES($1)
  ON CONFLICT(invoice_id) DO UPDATE SET failures=least(billing_matching_invoice_inspection.failures+1,10000),
  next_attempt_at=clock_timestamp()+make_interval(secs=>least(3600,300*power(2,least(billing_matching_invoice_inspection.failures,4)))::double precision),
- last_error=NULL WHERE billing_matching_invoice_inspection.next_attempt_at<=clock_timestamp() RETURNING invoice_id`, m.Invoice).Scan(&claimed)
+ last_error=CASE WHEN billing_matching_invoice_inspection.last_error=$2 THEN $2 ELSE NULL END
+ WHERE billing_matching_invoice_inspection.next_attempt_at<=clock_timestamp() RETURNING invoice_id`, m.Invoice, errMatchingCashReconciliation.Error()).Scan(&claimed)
 		if errors.Is(err, pgx.ErrNoRows) {
 			continue
 		}
@@ -222,6 +216,13 @@ func (h *Handlers) recordPaidMatchingInvoices(ctx context.Context, client *strip
 }
 
 func (h *Handlers) recordMatchingInvoice(ctx context.Context, client *stripeHTTPClient, m matchingCandidate) error {
+	var held bool
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_matching_invoice_inspection WHERE invoice_id=$1 AND last_error=$2)`, m.Invoice, errMatchingCashReconciliation.Error()).Scan(&held); err != nil {
+		return err
+	}
+	if held {
+		return errMatchingCashReconciliation
+	}
 	inv, err := client.RetrieveBillingInvoice(ctx, m.Invoice)
 	if err != nil {
 		return err
@@ -232,6 +233,15 @@ func (h *Handlers) recordMatchingInvoice(ctx context.Context, client *stripeHTTP
 	var paid matchingPayment
 	if err = client.doForm(ctx, http.MethodGet, "/v1/invoices/"+url.PathEscape(m.Invoice), nil, &paid, ""); err != nil {
 		return err
+	}
+	if inv.StartingBalance > 0 || inv.EndingBalance != nil && *inv.EndingBalance > 0 {
+		// Keep the durable inspection open. A zero-value immutable matching row
+		// would permanently discard the original usage's later cash eligibility.
+		if _, err := h.Pool.Exec(ctx, `INSERT INTO billing_matching_invoice_inspection(invoice_id,next_attempt_at,last_error)
+ VALUES($1,'infinity',$2) ON CONFLICT(invoice_id) DO UPDATE SET next_attempt_at='infinity',last_error=EXCLUDED.last_error`, m.Invoice, errMatchingCashReconciliation.Error()); err != nil {
+			return err
+		}
+		return errMatchingCashReconciliation
 	}
 	var flagEvidence []byte
 	u, err := matchingInvoiceUsage(inv, paid, m.Prices)

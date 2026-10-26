@@ -16,28 +16,30 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/superserve-ai/sandbox/internal/billing"
 )
 
 type matchingFixture struct {
-	t             *testing.T
-	f             *entitlementFixture
-	client        *stripeHTTPClient
-	mu            sync.Mutex
-	invoices      map[string]StripeInvoiceAmounts
-	grants        map[string]entitlementGrant
-	byKey         map[string]string
-	posts         []url.Values
-	keys          []string
-	lose          int
-	refunded      bool
-	unpaid        map[string]bool
-	paid          map[string]int64
-	prices        any
-	planSub       string
-	periodEnd     time.Time
-	endingBalance *int64
+	t               *testing.T
+	f               *entitlementFixture
+	client          *stripeHTTPClient
+	mu              sync.Mutex
+	invoices        map[string]StripeInvoiceAmounts
+	grants          map[string]entitlementGrant
+	byKey           map[string]string
+	posts           []url.Values
+	keys            []string
+	lose            int
+	refunded        bool
+	unpaid          map[string]bool
+	paid            map[string]int64
+	prices          any
+	planSub         string
+	periodEnd       time.Time
+	startingBalance int64
+	endingBalance   *int64
 }
 
 func newMatchingFixture(t *testing.T, matchingBps int32, capCents, prior int64) *matchingFixture {
@@ -205,6 +207,7 @@ func (m *matchingFixture) invoiceFor(start, end time.Time, closeState, collectio
 	id := "in_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	zero := int64(0)
 	inv := StripeInvoiceAmounts{ID: id, Customer: m.f.c.CustomerID, Currency: "usd", Status: "paid", AmountRemaining: &zero, BillingReason: "subscription_cycle", PeriodStart: start.Unix(), PeriodEnd: end.Unix(), CollectionMethod: "charge_automatically"}
+	inv.StartingBalance = m.startingBalance
 	inv.EndingBalance = m.endingBalance
 	inv.Parent.SubscriptionDetails = &struct {
 		Subscription string `json:"subscription"`
@@ -395,6 +398,86 @@ func TestMatchingCreditRequiresFullPayment(t *testing.T) {
 	}
 	if r := m.row(partial); r.State != "skipped" || r.Flag == "" || r.Paid != 0 {
 		t.Fatalf("payment discrepancy was not held for staff: %+v", r)
+	}
+}
+
+func TestMatchingDebitCarryPreservesEligibilityForReconciliation(t *testing.T) {
+	m := newMatchingFixture(t, 10000, 50, 0)
+	carry, zero := int64(40), int64(0)
+	m.endingBalance = &carry
+	original := m.paidInvoice("paid", usageLine("price_cpu", 40))
+	m.paid[original] = 0
+	assertHeld := func(want int) {
+		t.Helper()
+		m.exec(`UPDATE billing_matching_invoice_inspection SET next_attempt_at=clock_timestamp() WHERE invoice_id IN (SELECT invoice_id FROM billing_invoice_close WHERE team_id=$1)`, m.f.c.TeamID)
+		if err := m.tick(); !errors.Is(err, errMatchingCashReconciliation) {
+			t.Fatalf("missing cash attribution hold: %v", err)
+		}
+		var inspections, matches int
+		if err := m.f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_matching_invoice_inspection i JOIN billing_invoice_close j USING(invoice_id) WHERE j.team_id=$1 AND i.last_error=$2 AND i.next_attempt_at>clock_timestamp()`, m.f.c.TeamID, errMatchingCashReconciliation.Error()).Scan(&inspections); err != nil || inspections != want {
+			t.Fatalf("recoverable inspection holds=%d want=%d err=%v", inspections, want, err)
+		}
+		if err := m.f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_matching_credit WHERE contract_id=$1`, m.f.c.ID).Scan(&matches); err != nil || matches != 0 || len(m.posts) != 0 {
+			t.Fatalf("carry consumed eligibility or dispatched credit: matches=%d grants=%d err=%v", matches, len(m.posts), err)
+		}
+	}
+	assertHeld(1)
+	m.endingBalance, m.startingBalance = &zero, carry
+	collecting := m.paidInvoice("processing", usageLine("price_cpu", 30))
+	m.mu.Lock()
+	m.paid[collecting], m.unpaid[collecting] = 0, true
+	m.mu.Unlock()
+	assertHeld(1) // Failed later collection cannot turn the carry into cash.
+	m.mu.Lock()
+	m.paid[collecting] = 70
+	delete(m.unpaid, collecting)
+	m.mu.Unlock()
+	m.exec(`UPDATE billing_invoice_collection SET state='paid' WHERE invoice_id=$1`, collecting)
+	assertHeld(2) // Cash exists, but its attribution must be reconciled first.
+	m.mu.Lock()
+	changed := m.invoices[original]
+	changed.EndingBalance = &zero
+	m.invoices[original], m.paid[original] = changed, 40
+	m.mu.Unlock()
+	assertHeld(2) // Changed later provider evidence cannot silently release a hold.
+	m.mu.Lock()
+	m.refunded = true
+	m.mu.Unlock()
+	assertHeld(2) // A later refund cannot close either unresolved allocation.
+
+	actor := uuid.New()
+	m.exec(`INSERT INTO profile(id,email,provider) VALUES($1,'staff@superserve.ai','google')`, actor)
+	m.exec(`INSERT INTO user_role_assignments(user_id,role_id,scope_type) SELECT $1,id,'platform' FROM roles WHERE name='platform_admin'`, actor)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	c.Request.Header.Set(internalActorHeader, actor.String())
+	c.Params = gin.Params{{Key: "team_id", Value: m.f.c.TeamID.String()}}
+	m.f.h.GetTeamMatchingCredit(c)
+	var result struct {
+		Pending []struct {
+			Invoice string `json:"invoice_id"`
+		} `json:"pending_reconciliation"`
+		Rules []struct {
+			Remaining int64 `json:"remaining_cents"`
+		} `json:"rules"`
+	}
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &result) != nil || len(result.Pending) != 2 || len(result.Rules) != 1 || result.Rules[0].Remaining != 50 {
+		t.Fatalf("staff cannot see preserved cash/cap exception: %d %s", w.Code, w.Body.String())
+	}
+	if result.Pending[0].Invoice != original || result.Pending[1].Invoice != collecting {
+		t.Fatalf("wrong invoices in reconciliation queue: %+v", result.Pending)
+	}
+	m.mu.Lock()
+	m.refunded = false
+	m.mu.Unlock()
+	m.startingBalance = 0
+	ordinary := m.paidInvoice("paid", usageLine("price_cpu", 50))
+	if err := m.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if row := m.row(ordinary); row.Paid != 50 || row.State != "issued" || len(m.posts) != 1 {
+		t.Fatalf("held carry consumed the rule's cap or blocked ordinary cash: %+v", row)
 	}
 }
 
