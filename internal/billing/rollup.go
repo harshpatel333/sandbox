@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
@@ -249,7 +251,7 @@ func storageBillableForHour(ctx context.Context, pool *pgxpool.Pool, teamID uuid
 // reports or the storage calculation, which can exceed the rollup budget for
 // large teams. Storage is display-only here and is measured best-effort.
 func upsertUnbilledStorageRollupUsage(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, job rollupJob) error {
-	_, err := q.UpsertTeamBillingUsageHourCompute(ctx, db.UpsertTeamBillingUsageHourComputeParams{
+	row, err := q.UpsertTeamBillingUsageHourCompute(ctx, db.UpsertTeamBillingUsageHourComputeParams{
 		TeamID:    job.TeamID,
 		HourStart: job.HourStart,
 		HourEnd:   job.HourEnd,
@@ -260,6 +262,11 @@ func upsertUnbilledStorageRollupUsage(ctx context.Context, pool *pgxpool.Pool, q
 	if err != nil {
 		return err
 	}
+	// Storage is measured only once the hour's reports are complete, so a
+	// measured value is final; the scheduler's refreshes need not repeat it.
+	if row.StorageMibSeconds.Valid || unbilledStorageBackoff.active(job.TeamID, time.Now()) {
+		return nil
+	}
 	err = measureUnbilledRollupStorage(ctx, pool, job)
 	if errors.Is(err, ErrStorageReportsIncomplete) {
 		// Compute is recorded; keep the job deferred so storage is measured once
@@ -267,10 +274,55 @@ func upsertUnbilledStorageRollupUsage(ctx context.Context, pool *pgxpool.Pool, q
 		return err
 	}
 	if err != nil {
+		if storageBudgetExceeded(err) {
+			unbilledStorageBackoff.start(job.TeamID, time.Now())
+			log.Info().Str("team_id", job.TeamID.String()).Dur("for", unbilledStorageBackoffFor).
+				Msg("unbilled hourly storage exceeded its budget; not measuring this team's storage for a while")
+			return nil
+		}
 		log.Debug().Err(err).Str("team_id", job.TeamID.String()).Time("hour_start", job.HourStart).
 			Msg("unbilled hourly storage left unmeasured")
 	}
 	return nil
+}
+
+// unbilledStorageBackoffFor is how long a team whose storage calculation ran
+// out of budget goes unmeasured. The scheduler refreshes every team's lookback
+// window each tick, so without it a team too large for the budget re-runs the
+// calculation, and is cancelled, for each unmeasured hour on every tick.
+const unbilledStorageBackoffFor = 6 * time.Hour
+
+// unbilledStorageBackoff is per process: each instance learns a slow team on
+// its own first timeout.
+var unbilledStorageBackoff = &teamBackoff{until: map[uuid.UUID]time.Time{}}
+
+type teamBackoff struct {
+	mu    sync.Mutex
+	until map[uuid.UUID]time.Time
+}
+
+func (b *teamBackoff) start(team uuid.UUID, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.until[team] = now.Add(unbilledStorageBackoffFor)
+}
+
+func (b *teamBackoff) active(team uuid.UUID, now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	until, ok := b.until[team]
+	if ok && !now.Before(until) {
+		delete(b.until, team)
+		return false
+	}
+	return ok
+}
+
+// storageBudgetExceeded reports whether the measurement was cut off by its
+// time budget, as opposed to failing for another reason.
+func storageBudgetExceeded(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &pgErr) && pgErr.Code == "57014")
 }
 
 // measureUnbilledRollupStorage skips the receipt fence: the value is not
