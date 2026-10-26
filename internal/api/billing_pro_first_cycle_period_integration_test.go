@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,5 +192,82 @@ func TestProFirstCycleRetirementFencesStaleCloseDiscovery(t *testing.T) {
 	var completed bool
 	if err = blocker.QueryRow(t.Context(), `SELECT count(*)=1 AND bool_and(completed_at IS NOT NULL AND stage='reporting_only_calendar_period' AND attempts=0 AND lease_token IS NULL) FROM billing_period_close_work WHERE team_id=$1`, team).Scan(&completed); err != nil || !completed {
 		t.Fatalf("stale discovery queued retired Free work: %v %v", completed, err)
+	}
+}
+
+func TestProFirstCycleRetirementRollsBackNewlyClaimedCloseWork(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second).AddDate(0, -1, 0)
+	h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
+	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+	u, err := h.proUpgrade(t.Context(), team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade SET state='credited',payment_evidence='{"verified":true}',grant_id=$2 WHERE id=$1`, u.ID, "cred_"+uuid.NewString()); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(t.Context())
+	var original string
+	// This lock delays retirement after its empty close-work scan, while still
+	// allowing the new close job's foreign-key reference to the same period.
+	if err = blocker.QueryRow(t.Context(), `SELECT to_jsonb(p)::text FROM team_billing_period p WHERE team_id=$1 FOR NO KEY UPDATE`, team).Scan(&original); err != nil {
+		t.Fatal(err)
+	}
+	worker, err := h.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Release()
+	done := make(chan error, 1)
+	go func() {
+		done <- func() error {
+			tx, e := worker.Begin(t.Context())
+			if e != nil {
+				return e
+			}
+			defer tx.Rollback(t.Context())
+			if _, e = h.DB.WithTx(tx).LockTeamBillingAccount(t.Context(), team); e == nil {
+				e = retireFirstProCycleReportingPeriods(t.Context(), tx, u)
+			}
+			if e == nil {
+				e = tx.Commit(t.Context())
+			}
+			return e
+		}()
+	}()
+	waiting := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if err = blocker.QueryRow(t.Context(), `SELECT COALESCE(wait_event_type='Lock',false) FROM pg_stat_activity WHERE pid=$1`, worker.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !waiting {
+		t.Fatal("retirement did not reach the locked reporting period")
+	}
+	start, end := billing.CurrentBillingPeriod(now)
+	if _, err = blocker.Exec(t.Context(), `INSERT INTO billing_period_close_work(team_id,period_start,period_end,attempts,lease_token,lease_until) VALUES($1,$2,$3,1,$4,now()+interval '1 minute')`, team, start, end, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if err = blocker.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-done; err == nil || !strings.Contains(err.Error(), "progressed during retirement") {
+		t.Fatalf("newly claimed close work did not abort retirement: %v", err)
+	}
+	var unchanged string
+	if err = h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(p)::text FROM team_billing_period p WHERE team_id=$1`, team).Scan(&unchanged); err != nil || unchanged != original {
+		t.Fatalf("raced retirement changed Free history: %v", err)
+	}
+	var retained bool
+	if err = h.Pool.QueryRow(t.Context(), `SELECT attempts=1 AND lease_token IS NOT NULL AND completed_at IS NULL AND stage='pending' FROM billing_period_close_work WHERE team_id=$1`, team).Scan(&retained); err != nil || !retained {
+		t.Fatalf("raced retirement discarded claimed close work: %v %v", retained, err)
 	}
 }
