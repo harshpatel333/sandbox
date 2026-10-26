@@ -61,6 +61,97 @@ CREATE TRIGGER pro_released_invoice_guard BEFORE INSERT OR UPDATE OR DELETE ON b
  FOR EACH ROW EXECUTE FUNCTION guard_pro_released_invoice();
 REVOKE ALL ON FUNCTION guard_pro_released_invoice() FROM PUBLIC;
 
+-- Existing staging can already have independent fee/usage subscriptions. Keep
+-- that authority at this replacement; canonical targets acquire no paired DDL.
+DO $compose$
+DECLARE paired boolean; missing text;
+BEGIN
+ SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace='public'::regnamespace
+   AND (relname='billing_contract_provider_binding' OR relname LIKE 'billing_provider_pair_%'))
+   OR EXISTS(SELECT 1 FROM pg_proc WHERE pronamespace='public'::regnamespace
+      AND (proname LIKE 'billing_provider_pair_%'
+        OR proname IN ('billing_payment_authorizes_entitlement','billing_payment_allows_activation')))
+   OR EXISTS(SELECT 1 FROM pg_attribute WHERE NOT attisdropped AND
+       ((attrelid='public.billing_usage_entitlement'::regclass AND attname='paired_waiver_id')
+        OR (attrelid='public.billing_entitlement_work'::regclass
+         AND attname IN ('paired_invoice_cursor','paired_invoice_period_start')))) INTO paired;
+ IF paired THEN
+  SELECT string_agg(required.relation || '.' || required.col, ', ') INTO missing
+  FROM (VALUES
+    ('billing_contract_provider_binding','contract_id','uuid'),
+    ('billing_contract_provider_binding','team_id','uuid'),
+    ('billing_contract_provider_binding','customer_id','text'),
+    ('billing_contract_provider_binding','usage_subscription_id','text'),
+    ('billing_contract_provider_binding','fee_subscription_id','text'),
+    ('billing_contract_provider_binding','anchor','timestamptz'),
+    ('billing_contract_provider_binding','fee_anchor','timestamptz'),
+    ('billing_contract_provider_binding','assignment_id','uuid'),
+    ('billing_provider_pair_revocation','contract_id','uuid'),
+    ('billing_provider_pair_waiver','contract_id','uuid'),
+    ('billing_provider_pair_waiver','team_id','uuid'),
+    ('billing_provider_pair_waiver','starts_at','timestamptz'),
+    ('billing_provider_pair_waiver','ends_at','timestamptz'),
+    ('billing_provider_pair_waiver','revoked_at','timestamptz'),
+    ('billing_provider_pair_waiver','authority_checked_at','timestamptz'),
+    ('billing_provider_pair_waiver','authority_valid_until','timestamptz'),
+    ('billing_provider_pair_monthly_payment','payment_id','uuid'),
+    ('billing_provider_pair_monthly_payment','contract_id','uuid'),
+    ('billing_provider_pair_monthly_payment','team_id','uuid'),
+    ('billing_provider_pair_monthly_payment','period_start','timestamptz'),
+    ('billing_provider_pair_monthly_payment','period_end','timestamptz'),
+    ('billing_commercial_offer_activation','contract_id','uuid'),
+    ('billing_commercial_offer_activation','assignment_id','uuid'),
+    ('billing_usage_entitlement','paired_waiver_id','uuid'),
+    ('billing_entitlement_work','paired_invoice_cursor','text'),
+    ('billing_entitlement_work','paired_invoice_period_start','timestamptz')
+  ) AS required(relation,col,typ)
+  WHERE NOT EXISTS(SELECT 1 FROM pg_attribute a
+    WHERE a.attrelid=to_regclass('public.' || required.relation) AND a.attname=required.col
+      AND NOT a.attisdropped AND a.atttypid=to_regtype(required.typ));
+  IF missing IS NOT NULL
+   OR NOT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('public.billing_provider_pair_covered(public.billing_commercial_contract,timestamptz,timestamptz,boolean)') AND prorettype='boolean'::regtype AND NOT prosecdef)
+   OR NOT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('public.billing_payment_authorizes_entitlement(public.billing_commercial_contract,public.billing_contract_payment,timestamptz,timestamptz)') AND prorettype='boolean'::regtype AND NOT prosecdef) THEN
+   RAISE EXCEPTION 'incomplete provider-pair authority schema: %', COALESCE(missing,'helper contract');
+  END IF;
+ END IF;
+ IF paired THEN
+  EXECUTE $paired$
+CREATE OR REPLACE FUNCTION guard_billing_contract_payment() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE c billing_commercial_contract; m integer; first_month integer; fee_anchor timestamptz; fee_subscription text;
+BEGIN
+    IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION 'base payment evidence is immutable'; END IF;
+    SELECT * INTO STRICT c FROM billing_commercial_contract WHERE team_id = NEW.team_id AND id = NEW.contract_id FOR SHARE;
+    SELECT b.fee_subscription_id,b.fee_anchor INTO fee_subscription,fee_anchor
+      FROM public.billing_contract_provider_binding b WHERE b.contract_id=c.id AND b.team_id=c.team_id;
+    fee_subscription := COALESCE(fee_subscription,c.subscription_id);
+    fee_anchor := COALESCE(fee_anchor,c.entitlement_anchor);
+    IF (NEW.customer_id, NEW.subscription_id, NEW.base_price_id, NEW.currency, NEW.base_amount_paid_cents)
+        IS DISTINCT FROM (c.customer_id, CASE c.charge_kind WHEN 'subscription' THEN fee_subscription ELSE NULL END, c.base_price_id, c.currency, c.charge_amount_cents) THEN
+        RAISE EXCEPTION 'base payment does not match commercial terms';
+    END IF;
+    IF c.charge_kind = 'upfront' AND ((NEW.service_period_start, NEW.service_period_end) IS DISTINCT FROM (c.starts_at, c.ends_at)
+        OR NEW.evidence->'parent' IS DISTINCT FROM 'null'::jsonb) THEN
+        RAISE EXCEPTION 'upfront receipt requires standalone invoice and exact contract term';
+    END IF;
+    IF (c.status = 'ended' AND NOT EXISTS(SELECT 1 FROM billing_pro_released_invoice j
+        WHERE j.contract_id=c.id AND j.invoice_id=NEW.invoice_id AND j.receipt=NEW.evidence
+        AND j.payment_reference=NEW.payment_reference)) OR NEW.service_period_start < c.starts_at OR NEW.paid_at > clock_timestamp()
+        OR NEW.verified_at > clock_timestamp() THEN RAISE EXCEPTION 'invalid base payment period or verification time'; END IF;
+    m := (extract(year FROM NEW.service_period_start AT TIME ZONE 'UTC')::integer - extract(year FROM fee_anchor AT TIME ZONE 'UTC')::integer) * 12
+        + extract(month FROM NEW.service_period_start AT TIME ZONE 'UTC')::integer - extract(month FROM fee_anchor AT TIME ZONE 'UTC')::integer;
+    first_month := (extract(year FROM c.starts_at AT TIME ZONE 'UTC')::integer - extract(year FROM fee_anchor AT TIME ZONE 'UTC')::integer) * 12
+        + extract(month FROM c.starts_at AT TIME ZONE 'UTC')::integer - extract(month FROM fee_anchor AT TIME ZONE 'UTC')::integer;
+    IF (m - first_month) % c.charge_interval_months <> 0
+        OR NEW.service_period_start <> billing_anniversary_boundary(fee_anchor, m)
+        OR NEW.service_period_end <> billing_anniversary_boundary(fee_anchor, m + c.charge_interval_months) THEN
+        RAISE EXCEPTION 'base payment service period differs from contract cadence';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+$paired$;
+ ELSE
+  EXECUTE $canonical$
 CREATE OR REPLACE FUNCTION guard_billing_contract_payment() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE c billing_commercial_contract; m integer; first_month integer;
 BEGIN
@@ -90,5 +181,8 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+$canonical$;
+ END IF;
+END $compose$;
 
 REVOKE ALL ON FUNCTION guard_billing_contract_payment() FROM PUBLIC;
