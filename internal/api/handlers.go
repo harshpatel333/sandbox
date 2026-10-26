@@ -982,7 +982,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return "", false
 	}
 
-	// One statement for the claim and the boot inputs; see ClaimResume.
+	// Lock current plan limits through the claim; boot inputs come from ClaimResume.
 	claimParams := db.ClaimResumeParams{
 		ID:      sandboxID,
 		TeamID:  teamID,
@@ -995,10 +995,13 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 		claimParams.MachinePrincipalID = pgtype.UUID{Bytes: caller.PrincipalID, Valid: true}
 	}
+	var limits teamLimits
 	claim := func() (db.ClaimResumeRow, error) {
 		cctx, cancel := context.WithTimeout(c.Request.Context(), resumeClaimTimeout)
 		defer cancel()
-		return h.DB.ClaimResume(cctx, claimParams)
+		row, current, err := h.DB.ClaimResumeWithCurrentLimits(cctx, claimParams)
+		limits = teamLimits{MaxVCPU: current.MaxVcpu, MaxMemoryMiB: current.MaxMemoryMib, MaxDiskMiB: current.MaxDiskMib}
+		return row, err
 	}
 	claimed, err := claim()
 	// Only a failed machine claim needs a second read to distinguish denied
@@ -1018,6 +1021,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 		claimed, err = claim()
 	}
+	if errors.Is(err, pgx.ErrNoRows) && sandbox.Status == db.SandboxStatusPaused &&
+		(sandbox.VcpuCount > limits.MaxVCPU || sandbox.MemoryMib > limits.MaxMemoryMiB || sandbox.DiskMib > limits.MaxDiskMiB) {
+		respondError(c, ErrInvalidState)
+		return "", false
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		// A secret change may hold the sandbox, or have just let it go. While
 		// held, only the hold is read; the claim runs again once it clears.
@@ -1029,7 +1037,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				return false, nil
 			}
 			claimed, err = claim()
-			if !errors.Is(err, pgx.ErrNoRows) {
+			if !errors.Is(err, pgx.ErrNoRows) || sandbox.Status == db.SandboxStatusPaused &&
+				(sandbox.VcpuCount > limits.MaxVCPU || sandbox.MemoryMib > limits.MaxMemoryMiB || sandbox.DiskMib > limits.MaxDiskMiB) {
 				return true, nil
 			}
 			return !h.secretWriteHeld(c, sandboxID) && !h.sandboxStillPaused(c, sandboxID, teamID), nil

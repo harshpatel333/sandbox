@@ -233,6 +233,9 @@ type mockRow struct {
 func (r *mockRow) Scan(dest ...any) error { return r.scanFn(dest...) }
 
 type mockDBTX struct {
+	resumeLimits    *teamLimits
+	resumeLimitsErr error
+
 	capabilityTxEvent func(string)
 	queryRowFn        func(ctx context.Context, sql string, args ...any) pgx.Row
 	execFn            func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
@@ -263,6 +266,9 @@ func (tx *mockCapabilityTx) QueryRow(ctx context.Context, sql string, args ...an
 	return tx.mock.QueryRow(ctx, sql, args...)
 }
 func (tx *mockCapabilityTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, "SELECT 1 FROM team WHERE id=$1 FOR SHARE") {
+		return pgconn.NewCommandTag("SELECT 1"), nil
+	}
 	if strings.Contains(sql, "-- name: LockHostForCapabilities :execrows") {
 		if tx.mock.capabilityTxEvent != nil {
 			tx.mock.capabilityTxEvent("lock")
@@ -335,6 +341,22 @@ func (b *mockBatch) Close() error {
 }
 
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "-- name: GetTeamEffectiveLimits :one") {
+		return &mockRow{scanFn: func(dest ...any) error {
+			if m.resumeLimitsErr != nil {
+				return m.resumeLimitsErr
+			}
+			limits := teamLimits{MaxConcurrent: 100, MaxVCPU: 64, MaxMemoryMiB: 262144, MaxDiskMiB: 2097152, MaxTemplates: 100}
+			if m.resumeLimits != nil {
+				limits = *m.resumeLimits
+			}
+			for i, value := range []int32{limits.MaxConcurrent, limits.MaxVCPU, limits.MaxMemoryMiB, limits.MaxDiskMiB, limits.MaxTemplates} {
+				*dest[i].(*int32) = value
+			}
+			return nil
+		}}
+	}
+
 	if strings.Contains(sql, "owner_principal_id,team_id FROM sandbox_machine_owner WHERE") {
 		return &mockRow{scanFn: func(...any) error { return pgx.ErrNoRows }}
 	}
@@ -5431,7 +5453,7 @@ func TestResumeSandbox_PostBootCheckIsOneStatementUnderTheHostLock(t *testing.T)
 			if postChecks != 1 || policyReads != 0 || lockedChecks != 0 {
 				t.Fatalf("post-boot checks=%d policy reads=%d locked checks=%d; want 1/0/0", postChecks, policyReads, lockedChecks)
 			}
-			if !slices.Equal(events, []string{"begin", "lock", "read", "commit"}) {
+			if !slices.Equal(events, []string{"begin", "commit", "begin", "lock", "read", "commit"}) {
 				t.Fatalf("batch events = %v, want the read after the host lock in one batch", events)
 			}
 			if paused != !eligible {
