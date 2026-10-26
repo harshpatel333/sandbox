@@ -4,11 +4,13 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -162,35 +164,6 @@ func TestPrepaidOperationRecoversLostProviderReply(t *testing.T) {
 	}
 }
 
-func TestPrepaidOperationFirstPurchaseReplayAfterSubscriptionEstablished(t *testing.T) {
-	f := newPrepaidFixture(t)
-	actor := uuid.New()
-	r := prepaidOperationRouter(t, f, f.team, actor)
-	req := prepaidCheckoutBody{OperationID: uuid.New(), AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
-	if err := f.h.bindPrepaidCheckoutOperation(t.Context(), f.team, actor, req); err != nil {
-		t.Fatal(err)
-	}
-	session := "cs_first_" + uuid.NewString()
-	// A subscription-mode purchase has no later-payment dispatch payload.
-	if err := f.h.recordCheckoutPurchase(t.Context(), req.OperationID, f.team, f.customer, actor, 500, session); err != nil {
-		t.Fatal(err)
-	}
-	f.mu.Lock()
-	f.sessions[session] = map[string]any{"id": session, "url": "https://checkout.example.com/" + session, "mode": "subscription", "status": "open", "customer": f.customer, "metadata": map[string]string{"prepaid_purchase_id": req.OperationID.String()}}
-	f.mu.Unlock()
-	rec := prepaidOperationPost(r, req)
-	var got prepaidOperationResponse
-	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.ID != session {
-		t.Fatalf("first→later seam duplicated purchase: %d %s", rec.Code, rec.Body)
-	}
-	f.mu.Lock()
-	count := len(f.sessions)
-	f.mu.Unlock()
-	if count != 1 {
-		t.Fatalf("first purchase duplicated: %d", count)
-	}
-}
-
 func TestPrepaidOperationFirstCheckoutUsesCallerPurchaseIdentity(t *testing.T) {
 	f := newPrepaidFixture(t)
 	actor := uuid.New()
@@ -212,5 +185,176 @@ func TestPrepaidOperationFirstCheckoutUsesCallerPurchaseIdentity(t *testing.T) {
 	var replay prepaidOperationResponse
 	if retry.Code != 200 || json.Unmarshal(retry.Body.Bytes(), &replay) != nil || replay.ID != got.ID {
 		t.Fatalf("first checkout retry: %d %s", retry.Code, retry.Body)
+	}
+}
+
+func TestPrepaidOperationFirstCheckoutLostReplyRestoresAssociation(t *testing.T) {
+	f, _ := prepaidPlanFixture(t)
+	actor := uuid.New()
+	r := prepaidOperationRouter(t, f, f.team, actor)
+	f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
+	f.exec(`UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL WHERE team_id=$1`, f.team)
+	f.exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, f.team)
+	var dropped atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/checkout/sessions" && r.Method == http.MethodPost && !dropped.Swap(true) {
+			rec := httptest.NewRecorder()
+			f.serve(rec, r)
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		f.serve(w, r)
+	}))
+	defer srv.Close()
+	f.client.baseURL = srv.URL
+	f.client.httpClient = srv.Client()
+	req := prepaidCheckoutBody{OperationID: uuid.New(), AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+	if rec := prepaidOperationPost(r, req); rec.Code != 502 {
+		t.Fatalf("first lost reply: %d %s", rec.Code, rec.Body)
+	}
+	var initial bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT a.checkout_session_id IS NULL AND p.checkout_session_id IS NULL AND a.checkout_initializing_at IS NOT NULL FROM team_billing_account a JOIN billing_prepaid_purchase p USING(team_id) WHERE p.id=$1`, req.OperationID).Scan(&initial); err != nil || !initial {
+		t.Fatalf("lost-response precondition: %v %v", initial, err)
+	}
+	done := make(chan *httptest.ResponseRecorder, 2)
+	for range 2 {
+		go func() { done <- prepaidOperationPost(r, req) }()
+	}
+	var session string
+	for range 2 {
+		rec := <-done
+		var got prepaidOperationResponse
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.ID == "" || got.PurchaseID != req.OperationID {
+			t.Fatalf("first recovery: %d %s", rec.Code, rec.Body)
+		}
+		if session != "" && session != got.ID {
+			t.Fatal("first recovery duplicated session")
+		}
+		session = got.ID
+	}
+	var bound bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT a.checkout_session_id=$2 AND p.checkout_session_id=$2 AND a.checkout_may_exist FROM team_billing_account a JOIN billing_prepaid_purchase p USING(team_id) WHERE p.id=$1`, req.OperationID, session).Scan(&bound); err != nil || !bound {
+		t.Fatalf("both associations not restored: %v %v", bound, err)
+	}
+	f.mu.Lock()
+	metadata := f.sessions[session]["metadata"].(map[string]string)
+	generation := metadata["checkout_generation"]
+	f.mu.Unlock()
+	now := time.Now().UTC().Truncate(time.Second)
+	event := func(kind string, obj any) stripeEventEnvelope {
+		raw, _ := json.Marshal(obj)
+		e := stripeEventEnvelope{ID: "evt_" + uuid.NewString(), Type: kind, Created: stripeEventTimestamp(now.Unix()), Data: stripeEventEnvelopeData{Object: raw}}
+		payload, _ := json.Marshal(e)
+		f.exec(`INSERT INTO stripe_webhook_event(event_id,event_type,payload) VALUES($1,$2,$3)`, e.ID, e.Type, payload)
+		return e
+	}
+	sub := event("customer.subscription.created", map[string]any{"id": f.sub, "customer": f.customer, "status": "active", "current_period_start": now.Unix(), "current_period_end": now.AddDate(0, 1, 0).Unix(), "metadata": map[string]string{"activation_user_id": actor.String(), "checkout_generation": generation}})
+	if err := f.h.processRecordedStripeWebhook(t.Context(), sub); !errors.Is(err, errStripeCheckoutAssociationPending) {
+		t.Fatalf("first subscription event should await completion: %v", err)
+	}
+	invoice := "in_" + uuid.NewString()
+	zero := int64(0)
+	inv := StripeInvoiceAmounts{ID: invoice, Customer: f.customer, Status: "paid", AmountRemaining: &zero, Currency: "usd"}
+	inv.Lines.Data = []StripeInvoiceAmountLine{usageLine("price_cpu", 0), usageLine("price_credit", 500)}
+	inv.Lines.Data[0].Parent.SubscriptionItemDetails = &struct {
+		Subscription     string `json:"subscription"`
+		SubscriptionItem string `json:"subscription_item"`
+		Proration        bool   `json:"proration"`
+	}{Subscription: f.sub}
+	inv.Lines.Data[0].Pricing.PriceDetails.Product = "prod_cpu"
+	inv.Lines.Data[1].Pricing.PriceDetails.Product = "prod_credit"
+	f.mu.Lock()
+	f.invoices[invoice] = inv
+	f.products["prod_credit"] = map[string]string{"prepaid_purchase_id": req.OperationID.String()}
+	f.sessions[session]["status"] = "complete"
+	f.sessions[session]["subscription"] = f.sub
+	f.sessions[session]["invoice"] = invoice
+	f.mu.Unlock()
+	completed := event("checkout.session.completed", map[string]any{"id": session, "customer": f.customer, "subscription": f.sub, "client_reference_id": f.team.String()})
+	for range 2 {
+		if err := f.h.processRecordedStripeWebhook(t.Context(), completed); err != nil {
+			t.Fatal("checkout completed reconciliation", err)
+		}
+		if err := f.h.processRecordedStripeWebhook(t.Context(), sub); err != nil {
+			t.Fatal("subscription reconciliation", err)
+		}
+		if err := f.h.settlePrepaidPurchase(t.Context(), f.client, req.OperationID); err != nil {
+			t.Fatal("first purchase settlement", err)
+		}
+	}
+	var settled bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT a.stripe_subscription_id=$2 AND a.checkout_subscription_id=$2 AND a.stripe_subscription_status='active' AND a.stripe_subscription_event_at IS NOT NULL AND a.checkout_initializing_at IS NULL AND a.checkout_session_id IS NULL AND p.payment_state='succeeded' AND p.credit_state='issued' FROM team_billing_account a JOIN billing_prepaid_purchase p USING(team_id) WHERE p.id=$1`, req.OperationID, f.sub).Scan(&settled); err != nil || !settled {
+		t.Fatalf("first checkout did not fully settle association/lease/credit: %v %v", settled, err)
+	}
+	f.mu.Lock()
+	sessions, grants := len(f.sessions), len(f.grantPosts)
+	f.mu.Unlock()
+	if sessions != 1 || grants != 1 {
+		t.Fatalf("replay duplicated financial effects: sessions=%d credits=%d", sessions, grants)
+	}
+	current, ok, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil || !ok || current.Kind != planKindPrepaid || current.Source != planSourceCreditPurchase {
+		t.Fatalf("verified first payment did not assign Starter: %+v %v", current, err)
+	}
+	rec := prepaidOperationPost(r, req)
+	var terminal prepaidOperationResponse
+	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &terminal) != nil || terminal.State != "credited" || terminal.URL != "" {
+		t.Fatalf("settled first-purchase replay: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestPrepaidOperationRecoveryDoesNotOverwriteChangedCheckout(t *testing.T) {
+	for _, name := range []string{"newer generation", "other customer", "other actor", "other operation", "newer session", "conflicting purchase session", "expired generation"} {
+		t.Run(name, func(t *testing.T) {
+			f := newPrepaidFixture(t)
+			actor, purchase := uuid.New(), uuid.New()
+			generation := time.Now().UTC().Truncate(time.Microsecond)
+			_ = prepaidOperationRouter(t, f, f.team, actor)
+			boundSession := ""
+			if name == "conflicting purchase session" {
+				boundSession = "cs_different_" + purchase.String()
+			}
+			if err := f.h.recordCheckoutPurchase(t.Context(), purchase, f.team, f.customer, actor, 500, boundSession); err != nil {
+				t.Fatal(err)
+			}
+			f.exec(`UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL,checkout_initializing_at=$2,checkout_session_id=NULL,checkout_subscription_id=NULL,checkout_request_key=$3,stripe_checkout_actor_id=$4 WHERE team_id=$1`, f.team, generation, "checkout:original:prepaid-operation:"+purchase.String(), actor)
+			switch name {
+			case "newer generation":
+				f.exec(`UPDATE team_billing_account SET checkout_initializing_at=$2 WHERE team_id=$1`, f.team, generation.Add(time.Minute))
+			case "other customer":
+				f.exec(`UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, f.team, "cus_changed_"+uuid.NewString())
+			case "other actor":
+				other := uuid.New()
+				_ = prepaidOperationRouter(t, f, f.team, other)
+				f.exec(`UPDATE team_billing_account SET stripe_checkout_actor_id=$2,checkout_initializing_at=$3 WHERE team_id=$1`, f.team, other, generation.Add(time.Minute))
+			case "other operation":
+				f.exec(`UPDATE team_billing_account SET checkout_request_key=$2 WHERE team_id=$1`, f.team, "checkout:other:prepaid-operation:"+uuid.NewString())
+			case "newer session":
+				f.exec(`UPDATE team_billing_account SET checkout_session_id=$2 WHERE team_id=$1`, f.team, "cs_newer_"+uuid.NewString())
+			case "expired generation":
+				f.exec(`INSERT INTO stripe_checkout_expiration_evidence(team_id,stripe_customer_id,checkout_generation,checkout_session_id) VALUES($1,$2,$3,'cs_original')`, f.team, f.customer, generation)
+			}
+			snapshot := func() string {
+				t.Helper()
+				var raw []byte
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_object('account',to_jsonb(a),'purchase',to_jsonb(p)) FROM team_billing_account a JOIN billing_prepaid_purchase p USING(team_id) WHERE p.id=$1`, purchase).Scan(&raw); err != nil {
+					t.Fatal(err)
+				}
+				return string(raw)
+			}
+			before := snapshot()
+			saved := prepaidCheckoutSession{ID: "cs_original", Mode: "subscription", Status: "open", Customer: f.customer, ClientReferenceID: f.team.String(), Metadata: map[string]string{"activation_user_id": actor.String(), "checkout_generation": generation.Format(time.RFC3339Nano), "prepaid_purchase_id": purchase.String()}}
+			if err := f.h.restorePrepaidSubscriptionCheckout(t.Context(), f.team, actor, purchase, f.customer, saved); err == nil {
+				t.Fatal("changed checkout accepted")
+			}
+			if after := snapshot(); after != before {
+				t.Fatal("recovery changed another checkout or partially published the association")
+			}
+		})
 	}
 }

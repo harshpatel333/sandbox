@@ -30,16 +30,17 @@ type prepaidCheckoutRequest struct {
 }
 
 type prepaidCheckoutSession struct {
-	ID            string            `json:"id"`
-	URL           string            `json:"url"`
-	Mode          string            `json:"mode"`
-	Status        string            `json:"status"`
-	PaymentStatus string            `json:"payment_status"`
-	Customer      string            `json:"customer"`
-	PaymentIntent string            `json:"payment_intent"`
-	Invoice       string            `json:"invoice"`
-	Subscription  string            `json:"subscription"`
-	Metadata      map[string]string `json:"metadata"`
+	ClientReferenceID string            `json:"client_reference_id"`
+	ID                string            `json:"id"`
+	URL               string            `json:"url"`
+	Mode              string            `json:"mode"`
+	Status            string            `json:"status"`
+	PaymentStatus     string            `json:"payment_status"`
+	Customer          string            `json:"customer"`
+	PaymentIntent     string            `json:"payment_intent"`
+	Invoice           string            `json:"invoice"`
+	Subscription      string            `json:"subscription"`
+	Metadata          map[string]string `json:"metadata"`
 }
 
 // A replayed first-purchase checkout reuses its lease, so the purchase identity

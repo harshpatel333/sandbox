@@ -184,8 +184,14 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 		id, ok := f.sessionByKey[key]
 		if !ok {
 			id = "cs_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-			f.sessions[id] = map[string]any{"id": id, "url": "https://checkout.example.com/" + id, "mode": r.PostForm.Get("mode"), "status": "open", "customer": r.PostForm.Get("customer"),
-				"metadata": map[string]string{"prepaid_purchase_id": r.PostForm.Get("metadata[prepaid_purchase_id]")}, "amount": r.PostForm.Get("line_items[0][price_data][unit_amount]")}
+			metadata := map[string]string{}
+			for name, values := range r.PostForm {
+				if strings.HasPrefix(name, "metadata[") && strings.HasSuffix(name, "]") && len(values) > 0 {
+					metadata[strings.TrimSuffix(strings.TrimPrefix(name, "metadata["), "]")] = values[0]
+				}
+			}
+			f.sessions[id] = map[string]any{"id": id, "url": "https://checkout.example.com/" + id, "mode": r.PostForm.Get("mode"), "status": "open", "customer": r.PostForm.Get("customer"), "client_reference_id": r.PostForm.Get("client_reference_id"),
+				"metadata": metadata, "amount": r.PostForm.Get("line_items[0][price_data][unit_amount]")}
 			f.sessionByKey[key] = id
 		}
 		json.NewEncoder(w).Encode(f.sessions[id])
