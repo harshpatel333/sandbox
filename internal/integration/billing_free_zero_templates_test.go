@@ -51,11 +51,12 @@ func TestIntegration_FreeZeroTemplates(t *testing.T) {
 	exec(`INSERT INTO billing_free_allowance VALUES($1,$2::timestamptz,$2::timestamptz+interval '24 hours',.02,.02,$2::timestamptz+interval '24 hours',$2::timestamptz)`, team, beforeSince)
 	snapshot := func() string {
 		var s string
-		if e := tx.QueryRow(ctx, `SELECT jsonb_build_object('allowance',(SELECT to_jsonb(a) FROM billing_free_allowance a WHERE team_id=$1),'billing',(SELECT to_jsonb(b) FROM team_billing_account b WHERE team_id=$1),'funding',(SELECT to_jsonb(f) FROM billing_funding_account f WHERE team_id=$1))::text`, team).Scan(&s); e != nil {
+		if e := tx.QueryRow(ctx, `SELECT jsonb_build_object('allowance',(SELECT to_jsonb(a) FROM billing_free_allowance a WHERE team_id=$1),'billing',(SELECT to_jsonb(b) FROM team_billing_account b WHERE team_id=$1),'funding',(SELECT to_jsonb(f) FROM billing_funding_account f WHERE team_id=$1),'templates',(SELECT jsonb_agg(to_jsonb(t)) FROM template t WHERE team_id=$1))::text`, team).Scan(&s); e != nil {
 			t.Fatal(e)
 		}
 		return s
 	}
+	exec(`INSERT INTO template(team_id,name,build_spec) VALUES($1,'existing-free-artifact','{"from":"python:3.11"}')`, team)
 	before := snapshot()
 	replacement := uuid.New()
 	callPublish := func(id uuid.UUID) error {
@@ -112,6 +113,36 @@ func TestIntegration_FreeZeroTemplates(t *testing.T) {
 			exec(tc.setup, team)
 			reject(`SELECT pg_temp.transition_free_zero_templates($1,$2,$3,$4,'disable Free templates')`, team, assignment, replacement, actor)
 			exec("ROLLBACK TO SAVEPOINT unsafe_target")
+		})
+	}
+	// An immutable version reference alone does not make a customized migration
+	// snapshot ordinary. Build new history through its normal insert/close guards.
+	for _, custom := range []struct{ name, terms, limits string }{
+		{"changed allowance", `jsonb_set(terms,'{allowance}','{"period":"day_window","on_exhausted":"pause","amount_cents":999}')`, `limits`},
+		{"changed resource cap", `terms`, `jsonb_set(limits,'{max_vcpu}','8')`},
+		{"extra term", `terms||'{"custom_entitlement":true}'::jsonb`, `limits`},
+		{"extra limit", `terms`, `limits||'{"custom_limit":null}'::jsonb`},
+	} {
+		t.Run(custom.name, func(t *testing.T) {
+			exec("SAVEPOINT customized_snapshot")
+			var target uuid.UUID
+			if e := tx.QueryRow(ctx, `WITH closed AS (UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE id=$1 RETURNING *) INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason) SELECT team_id,plan_key,kind,plan_version_id,`+custom.terms+`,`+custom.limits+`,effective_to,'migration','custom migration fixture' FROM closed RETURNING id`, assignment).Scan(&target); e != nil {
+				t.Fatal(e)
+			}
+			var historyBefore, historyAfter string
+			history := `SELECT jsonb_agg(to_jsonb(a) ORDER BY effective_from,id)::text FROM team_plan_assignment a WHERE team_id=$1`
+			if e := tx.QueryRow(ctx, history, team).Scan(&historyBefore); e != nil {
+				t.Fatal(e)
+			}
+			state := snapshot()
+			reject(`SELECT pg_temp.transition_free_zero_templates($1,$2,$3,$4,'disable Free templates')`, team, target, replacement, actor)
+			if e := tx.QueryRow(ctx, history, team).Scan(&historyAfter); e != nil {
+				t.Fatal(e)
+			}
+			if historyBefore != historyAfter || state != snapshot() {
+				t.Fatal("rejection changed customized history or allowance state")
+			}
+			exec("ROLLBACK TO SAVEPOINT customized_snapshot")
 		})
 	}
 	var next uuid.UUID

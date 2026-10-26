@@ -41,7 +41,7 @@ END $$;
 CREATE FUNCTION pg_temp.transition_free_zero_templates(p_team uuid,p_assignment uuid,p_version uuid,p_actor uuid,p_reason text)
 RETURNS uuid LANGUAGE plpgsql AS $$
 DECLARE prior team_plan_assignment; v billing_plan_version; previous billing_plan_version; replay team_plan_assignment;
- at_time timestamptz; result uuid; key text:='free-zero-templates:'||p_assignment::text;
+ at_time timestamptz; result uuid; expected_terms jsonb; expected_limits jsonb; key text:='free-zero-templates:'||p_assignment::text;
 BEGIN
  IF p_actor IS NULL OR NOT EXISTS(SELECT 1 FROM profile WHERE id=p_actor) OR p_reason IS NULL OR length(btrim(p_reason)) NOT BETWEEN 1 AND 500 THEN
   RAISE EXCEPTION 'operator profile and audit reason required';
@@ -54,8 +54,25 @@ BEGIN
  SELECT * INTO STRICT prior FROM team_plan_assignment WHERE id=p_assignment AND team_id=p_team;
  SELECT * INTO STRICT v FROM billing_plan_version WHERE id=p_version FOR SHARE;
  SELECT * INTO STRICT previous FROM billing_plan_version WHERE id=prior.plan_version_id;
+ -- Match the complete frozen snapshot, not only its version reference. JSONB
+ -- compares numeric values semantically and ignores key order. These are the
+ -- signup SQL / Go freezePlanTerms shapes; compute allowances retain their
+ -- basis with amount_cents=0 and omit the resolved display-only amount_usd.
+ expected_terms:=jsonb_build_object(
+  'offer_key',previous.family,'display_name',previous.display_name,'fee_cents',0,'interval_months',0,
+  'monthly_credit_cents',COALESCE(billing_plan_version_monthly_credit(previous),0),
+  'version_id',previous.id,'version',previous.version,'pricing_version',previous.pricing_version,
+  'kind',previous.kind,'family',previous.family,'grants',previous.credit_schedule,
+  'matching',CASE WHEN previous.matching_bps IS NULL THEN NULL ELSE jsonb_build_object('matching_bps',previous.matching_bps,'cap_cents',previous.cap_cents) END,
+  'allowance',CASE WHEN previous.allowance_period IS NULL THEN NULL ELSE jsonb_strip_nulls(jsonb_build_object(
+   'amount_cents',COALESCE(previous.allowance_cents,0),'period',previous.allowance_period,'on_exhausted',previous.allowance_on_exhausted,
+   'compute',CASE WHEN previous.allowance_compute_seconds IS NULL THEN NULL ELSE jsonb_build_object(
+    'seconds',previous.allowance_compute_seconds,'vcpu',previous.allowance_compute_vcpu,'memory_gib',previous.allowance_compute_memory_gib) END)) END);
+ expected_limits:=jsonb_build_object('max_concurrent',previous.max_sandboxes,'max_vcpu',previous.max_template_vcpu,
+  'max_memory_mib',previous.max_template_memory_mib,'max_disk_mib',previous.max_template_disk_mib,'max_templates',previous.max_templates);
  IF prior.kind<>'free' OR prior.plan_key<>'free' OR prior.contract_id IS NOT NULL
   OR prior.source NOT IN ('signup','migration')
+  OR prior.terms IS DISTINCT FROM expected_terms OR prior.limits IS DISTINCT FROM expected_limits
   OR previous.family<>'free' OR previous.pricing_version<>'v2'
   OR prior.terms->>'version_id' IS DISTINCT FROM previous.id::text
   OR prior.terms->>'kind' IS DISTINCT FROM 'free'

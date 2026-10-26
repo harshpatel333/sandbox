@@ -62,11 +62,19 @@ start, allowance window, usage and blocked-until time. A gap, paid plan, changed
 allowance or ambiguous zero-length predecessor stops continuity. The operation
 neither deletes existing templates nor interrupts an already in-flight build;
 new template creation and new rebuilds are denied by existing API admission.
+Existing artifacts remain in the ordinary template list and existing sandboxes
+are not paused or deleted by this correction. Sandbox starts still use the normal
+Free resource-shape and budget checks; selecting a ready template is separate
+from creating/rebuilding one. Platform default templates remain available. The
+quota watcher skips nonpositive template caps for alert calculations and performs
+no destructive cleanup. Previously created Free-owned artifacts require a
+separate operational decision if their future use should also be restricted.
 
 The helper deliberately rejects customized limits, explicit template overrides,
 commercial-contract history, any Pro operation, any prepaid intent/purchase, or a
 subscription/checkout/commercial-anchor fence. It also rejects non-signup/migration
-assignments and catalog changes beyond this cap. Report such a target as
+assignments, any frozen terms or limits that differ from the referenced catalog
+(including extra fields), and catalog changes beyond this cap. Report such a target as
 **blocked**, retaining its payment and customer state, and coordinate a separate
 reviewed transition with its owner. Do not cancel pending payment, clear an
 override, rewrite accepted quotes or claim all Free accounts have changed.
