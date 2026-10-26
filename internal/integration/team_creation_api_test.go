@@ -1183,10 +1183,25 @@ func TestIntegration_TeamCreationServiceRoleV2Signup(t *testing.T) {
 	if err := tx.Rollback(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	rolloutExec(t, pool, `SELECT retire_billing_plan_version(id,NULL) FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'`)
+	// Construct missing-catalog activation in a privileged transaction. The
+	// active Free version cannot be retired; test the restricted signup role
+	// against the incomplete fixture without committing that configuration.
+	fixture, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fixture.Rollback(context.Background())
+	if _, err := fixture.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version='legacy';
+		SELECT retire_billing_plan_version(id,NULL) FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published';
+		UPDATE billing_pricing_switch SET pricing_version='v2'; SET LOCAL ROLE service_role`); err != nil {
+		t.Fatal(err)
+	}
 	name := "missing-free-" + uuid.NewString()
-	if _, err := service.Exec(t.Context(), `INSERT INTO team(name) VALUES($1)`, name); pgCode(err) != "55000" {
+	if _, err := fixture.Exec(t.Context(), `INSERT INTO team(name) VALUES($1)`, name); pgCode(err) != "55000" {
 		t.Fatalf("service signup without Free: %v", err)
+	}
+	if err := fixture.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 	if count := teamCreationCount(t, pool, `SELECT count(*) FROM team WHERE name=$1`, name); count != 0 {
 		t.Fatalf("planless service team persisted: %d", count)
