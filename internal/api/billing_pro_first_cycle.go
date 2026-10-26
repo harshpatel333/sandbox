@@ -97,6 +97,9 @@ func (h *Handlers) verifyFirstProCycleProviderCalendar(ctx context.Context, read
 	var customer string
 	err := reader.QueryRow(ctx, `SELECT id,anchor,customer_id FROM billing_pro_upgrade WHERE subscription_id=$1 AND request_payload->>'FirstPaidProCycle'='true'`, sub.ID).Scan(&id, &anchor, &customer)
 	if errors.Is(err, pgx.ErrNoRows) {
+		if sub.Metadata["first_paid_pro_cycle"] == "true" {
+			return errors.New("first Pro month provider marker lacks frozen local authority")
+		}
 		return nil
 	}
 	if err != nil {

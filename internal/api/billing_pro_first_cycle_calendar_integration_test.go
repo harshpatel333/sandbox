@@ -116,6 +116,21 @@ func TestProFirstCycleStoredAuthorityRejectsProviderMarkerRemoval(t *testing.T) 
 	resource.Price.ID = "price_cpu"
 	sub.Items.Data = []invoiceSubscriptionItem{resource}
 
+	// Provider-only metadata cannot opt a legacy or unknown subscription into
+	// the first-cycle calendar, even when it names a real but unbound quote.
+	for _, operation := range []string{u.ID.String(), "00000000-0000-0000-0000-000000000111", ""} {
+		orphan := sub
+		orphan.Metadata = map[string]string{"first_paid_pro_cycle": "true", "pro_upgrade_id": operation}
+		if err = h.verifyFirstProCycleProviderCalendar(t.Context(), h.Pool, orphan); err == nil {
+			t.Fatalf("accepted provider marker without local subscription authority: %q", operation)
+		}
+	}
+	legacy := sub
+	legacy.Metadata = nil
+	if err = h.verifyFirstProCycleProviderCalendar(t.Context(), h.Pool, legacy); err != nil {
+		t.Fatalf("unmarked legacy subscription rejected: %v", err)
+	}
+
 	if _, err = h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade SET subscription_id=$2 WHERE id=$1`, u.ID, sub.ID); err != nil {
 		t.Fatal(err)
 	}
