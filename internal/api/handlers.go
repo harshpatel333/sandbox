@@ -995,12 +995,23 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 		claimParams.MachinePrincipalID = pgtype.UUID{Bytes: caller.PrincipalID, Valid: true}
 	}
-	var limits teamLimits
+	var limits db.ResumeShapeLimits
+	var shapeLimits sandboxShapeLimit
 	claim := func() (db.ClaimResumeRow, error) {
 		cctx, cancel := context.WithTimeout(c.Request.Context(), resumeClaimTimeout)
 		defer cancel()
 		row, current, err := h.DB.ClaimResumeWithCurrentLimits(cctx, claimParams)
-		limits = teamLimits{MaxVCPU: current.MaxVcpu, MaxMemoryMiB: current.MaxMemoryMib, MaxDiskMiB: current.MaxDiskMib}
+		limits = current
+		shapeLimits = sandboxShapeLimit{}
+		if current.MaxVcpu != nil {
+			shapeLimits.vcpu = *current.MaxVcpu
+		}
+		if current.MaxMemoryMib != nil {
+			shapeLimits.memoryMib = *current.MaxMemoryMib
+		}
+		if current.MaxDiskMib != nil {
+			shapeLimits.diskMib = *current.MaxDiskMib
+		}
 		return row, err
 	}
 	claimed, err := claim()
@@ -1022,8 +1033,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		claimed, err = claim()
 	}
 	if errors.Is(err, pgx.ErrNoRows) && sandbox.Status == db.SandboxStatusPaused &&
-		(sandbox.VcpuCount > limits.MaxVCPU || sandbox.MemoryMib > limits.MaxMemoryMiB || sandbox.DiskMib > limits.MaxDiskMiB) {
-		respondSandboxExceedsPlan(c, &sandboxShapeLimit{vcpu: limits.MaxVCPU, memoryMib: limits.MaxMemoryMiB, diskMib: limits.MaxDiskMiB}, sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib)
+		limits.Exceeds(sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib) {
+		respondSandboxExceedsPlan(c, &shapeLimits, sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib)
 		return "", false
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1038,7 +1049,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			}
 			claimed, err = claim()
 			if !errors.Is(err, pgx.ErrNoRows) || sandbox.Status == db.SandboxStatusPaused &&
-				(sandbox.VcpuCount > limits.MaxVCPU || sandbox.MemoryMib > limits.MaxMemoryMiB || sandbox.DiskMib > limits.MaxDiskMiB) {
+				limits.Exceeds(sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib) {
 				return true, nil
 			}
 			return !h.secretWriteHeld(c, sandboxID) && !h.sandboxStillPaused(c, sandboxID, teamID), nil
@@ -1056,8 +1067,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			return "", false
 		}
 		if errors.Is(err, pgx.ErrNoRows) && sandbox.Status == db.SandboxStatusPaused &&
-			(sandbox.VcpuCount > limits.MaxVCPU || sandbox.MemoryMib > limits.MaxMemoryMiB || sandbox.DiskMib > limits.MaxDiskMiB) {
-			respondSandboxExceedsPlan(c, &sandboxShapeLimit{vcpu: limits.MaxVCPU, memoryMib: limits.MaxMemoryMiB, diskMib: limits.MaxDiskMiB}, sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib)
+			limits.Exceeds(sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib) {
+			respondSandboxExceedsPlan(c, &shapeLimits, sandbox.VcpuCount, sandbox.MemoryMib, sandbox.DiskMib)
 			return "", false
 		}
 		if err == pgx.ErrNoRows {

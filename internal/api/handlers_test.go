@@ -341,6 +341,23 @@ func (b *mockBatch) Close() error {
 }
 
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "-- resume shape limits") {
+		return &mockRow{scanFn: func(dest ...any) error {
+			if m.resumeLimitsErr != nil {
+				return m.resumeLimitsErr
+			}
+			limits := teamLimits{MaxVCPU: 64, MaxMemoryMiB: 262144, MaxDiskMiB: 2097152}
+			if m.resumeLimits != nil {
+				limits = *m.resumeLimits
+			}
+			*dest[0].(*bool) = false
+			for i, value := range []int32{limits.MaxVCPU, limits.MaxMemoryMiB, limits.MaxDiskMiB} {
+				v := value
+				*dest[i+1].(**int32) = &v
+			}
+			return nil
+		}}
+	}
 	if strings.Contains(sql, "-- name: GetTeamEffectiveLimits :one") {
 		return &mockRow{scanFn: func(dest ...any) error {
 			if m.resumeLimitsErr != nil {

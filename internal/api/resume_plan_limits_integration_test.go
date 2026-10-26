@@ -110,7 +110,7 @@ type resumeLimitTx struct {
 
 func (t resumeLimitTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	row := t.Tx.QueryRow(ctx, sql, args...)
-	if strings.Contains(sql, "-- name: GetTeamEffectiveLimits :one") {
+	if strings.Contains(sql, "-- resume shape limits") {
 		return resumeLimitRow{Row: row, afterRead: t.afterRead}
 	}
 	return row
@@ -171,7 +171,7 @@ func TestResumeSerializesConcurrentLimitReduction(t *testing.T) {
 		}
 	}})
 	_, caps, err := query.ClaimResumeWithCurrentLimits(t.Context(), db.ClaimResumeParams{ID: id, TeamID: team, LockKey: id.String()})
-	if err != nil || caps.MaxVcpu != 8 {
+	if err != nil || (caps.MaxVcpu == nil || *caps.MaxVcpu != 8) {
 		t.Fatalf("serialized claim caps=%+v err=%v", caps, err)
 	}
 	select {
@@ -186,7 +186,63 @@ func TestResumeSerializesConcurrentLimitReduction(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, caps, err = db.New(pool).ClaimResumeWithCurrentLimits(t.Context(), db.ClaimResumeParams{ID: id, TeamID: team, LockKey: id.String()})
-	if !errors.Is(err, pgx.ErrNoRows) || caps.MaxVcpu != 2 {
+	if !errors.Is(err, pgx.ErrNoRows) || (caps.MaxVcpu == nil || *caps.MaxVcpu != 2) {
 		t.Fatalf("post-reduction claim caps=%+v err=%v", caps, err)
+	}
+}
+
+func TestResumePreservesFreeOptionalShapeCaps(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cpu     int32
+		allowed bool
+	}{{"absent memory and disk", 2, true}, {"present CPU cap", 3, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, team := newPlanAssignmentFixture(t)
+			pool := h.Pool
+			if _, err := pool.Exec(t.Context(), `INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason) VALUES($1,'free','free','{"allowance":{"amount_cents":13,"period":"day_window","on_exhausted":"pause","compute":{"seconds":7200,"vcpu":1,"memory_gib":1}}}','{"max_concurrent":1,"max_vcpu":2}',clock_timestamp(),'migration','optional shape fixture')`, team); err != nil {
+				t.Fatal(err)
+			}
+			admission, err := h.DB.GetTeamSandboxAdmission(t.Context(), team)
+			if err != nil || !admission.ShapeLimited || admission.MaxVcpu != 2 || admission.MaxMemoryMib != 0 || admission.MaxDiskMib != 0 || admission.AllowanceBlocked {
+				t.Fatalf("Free authority=%+v %v", admission, err)
+			}
+			id, snap := uuid.New(), uuid.New()
+			if _, err = pool.Exec(t.Context(), `INSERT INTO sandbox(id,team_id,name,host_id,status,vcpu_count,memory_mib,disk_mib) VALUES($1,$2,'optional-free-shape','default','paused',$3,8192,65536)`, id, team, tc.cpu); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(t.Context(), `INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES($1,$2,$3,'/fixture/vmstate.snap','pause')`, snap, id, team); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = pool.Exec(t.Context(), `UPDATE sandbox SET snapshot_id=$1 WHERE id=$2`, snap, id); err != nil {
+				t.Fatal(err)
+			}
+			// Check the typed claim contract before testing its handler classification.
+			if tc.allowed {
+				_, caps, err := h.DB.ClaimResumeWithCurrentLimits(t.Context(), db.ClaimResumeParams{ID: id, TeamID: team, LockKey: id.String()})
+				if err != nil || !caps.Free || caps.MaxVcpu == nil || *caps.MaxVcpu != 2 || caps.MaxMemoryMib != nil || caps.MaxDiskMib != nil {
+					t.Fatalf("typed Free caps=%+v %v", caps, err)
+				}
+				if _, err = pool.Exec(t.Context(), `UPDATE sandbox SET status='paused' WHERE id=$1`, id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			boot := false
+			h.VMD = &stubVMD{resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
+				boot = true
+				return "", status.Error(codes.InvalidArgument, "stop after authoritative claim")
+			}}
+			// Real DB admission/claim; existing focused seam excludes independent
+			// account-funding and RBAC layers so they cannot mask shape decisions.
+			h.Pool = nil
+			w := httptest.NewRecorder()
+			setupTestRouter(h, team.String()).ServeHTTP(w, resumeRequest(id.String()))
+			if boot != tc.allowed {
+				t.Fatalf("boot=%v want%v HTTP%d %s", boot, tc.allowed, w.Code, w.Body)
+			}
+			if !tc.allowed && (w.Code != 402 || !strings.Contains(w.Body.String(), "sandbox_exceeds_plan_limits")) {
+				t.Fatalf("present cap=%d %s", w.Code, w.Body)
+			}
+		})
 	}
 }
