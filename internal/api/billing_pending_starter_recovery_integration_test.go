@@ -14,8 +14,8 @@ import (
 	"github.com/google/uuid"
 )
 
-func TestPendingStarterRecovery(t *testing.T) {
-	for _, scenario := range []string{"resume", "cancel", "expired", "paid", "lost_ack", "timeout", "mismatch", "changed_generation", "wrong_actor", "wrong_request", "failed_fence", "closed_entry", "wrong_team", "expired_webhook_race", "paid_during_expire", "timeout_after_expire", "mismatch_after_expire", "wrong_generation"} {
+func TestPrepaidPendingStarterRecovery(t *testing.T) {
+	for _, scenario := range []string{"resume", "cancel", "expired", "paid", "lost_ack", "timeout", "mismatch", "changed_generation", "wrong_actor", "wrong_request", "failed_fence", "closed_entry", "wrong_team", "expired_webhook_race", "paid_during_expire", "timeout_after_expire", "mismatch_after_expire", "wrong_generation", "legacy_resume", "legacy_cancel", "legacy_closed_entry", "expired_with_invoice", "expired_with_payment_intent", "expired_with_subscription"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newPrepaidFixture(t)
 			actor := uuid.New()
@@ -24,6 +24,9 @@ func TestPendingStarterRecovery(t *testing.T) {
 			f.exec(`UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL WHERE team_id=$1`, f.team)
 			f.exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, f.team)
 			req := prepaidCheckoutBody{OperationID: uuid.New(), AmountCents: 2500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+			if strings.HasPrefix(scenario, "legacy_") {
+				req.OperationID = uuid.Nil
+			}
 			rec := prepaidOperationPost(r, req)
 			var created prepaidOperationResponse
 			if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &created) != nil || created.ID == "" {
@@ -36,7 +39,7 @@ func TestPendingStarterRecovery(t *testing.T) {
 			if scenario == "failed_fence" {
 				f.exec(`UPDATE billing_prepaid_purchase SET payment_state='failed',failure_reason='Prior checkout failure' WHERE id=$1`, p.Purchase)
 			}
-			if scenario == "closed_entry" {
+			if scenario == "closed_entry" || scenario == "legacy_closed_entry" {
 				f.exec(`UPDATE team_feature_flag SET enabled=false WHERE team_id=$1 AND key='billing_export_enabled'`, f.team)
 				f.h.Config.AppAllowedOrigins = []string{"https://different.example.com"}
 			}
@@ -79,8 +82,17 @@ func TestPendingStarterRecovery(t *testing.T) {
 					}
 					f.mu.Unlock()
 					data["payment_status"] = "unpaid"
-					if scenario == "expired" {
+					if scenario == "expired" || strings.HasPrefix(scenario, "expired_with_") {
 						data["status"] = "expired"
+					}
+					if scenario == "expired_with_invoice" {
+						data["invoice"] = "in_pending"
+					}
+					if scenario == "expired_with_payment_intent" {
+						data["payment_intent"] = "pi_pending"
+					}
+					if scenario == "expired_with_subscription" {
+						data["subscription"] = "sub_pending"
 					}
 					if scenario == "paid" || (scenario == "paid_during_expire" && cancelCalls > 0) {
 						data["status"] = "complete"
@@ -137,7 +149,7 @@ func TestPendingStarterRecovery(t *testing.T) {
 			if discover.Code != 200 || !strings.Contains(discover.Body.String(), "pending_starter_checkout") || strings.Contains(discover.Body.String(), "https:") {
 				t.Fatalf("discovery %d %s", discover.Code, discover.Body)
 			}
-			input := pendingStarterRequest{PurchaseID: p.Purchase, Generation: &p.Account.CheckoutInitializingAt.Time, Cancel: scenario != "resume" && scenario != "closed_entry"}
+			input := pendingStarterRequest{PurchaseID: p.Purchase, Generation: &p.Account.CheckoutInitializingAt.Time, Cancel: scenario != "resume" && scenario != "closed_entry" && scenario != "expired" && scenario != "legacy_resume" && scenario != "legacy_closed_entry"}
 			if scenario == "wrong_generation" {
 				g := input.Generation.Add(time.Second)
 				input.Generation = &g
@@ -152,13 +164,19 @@ func TestPendingStarterRecovery(t *testing.T) {
 				t.Fatal(err)
 			}
 			switch scenario {
-			case "resume", "closed_entry":
+			case "resume", "closed_entry", "legacy_resume", "legacy_closed_entry":
 				if got.Code != 200 || !strings.Contains(got.Body.String(), "recovered") || cancelCalls != 0 || !fence {
 					t.Fatalf("resume %d %s fence%v", got.Code, got.Body, fence)
 				}
-			case "cancel", "expired", "failed_fence", "expired_webhook_race":
+			case "cancel", "expired", "failed_fence", "expired_webhook_race", "legacy_cancel":
 				if got.Code != 200 || !strings.Contains(got.Body.String(), "retryable") || fence || payment != "failed" {
 					t.Fatalf("release %d %s fence%v %s", got.Code, got.Body, fence, payment)
+				}
+				if scenario == "expired" {
+					var reason string
+					if err := f.h.Pool.QueryRow(t.Context(), `SELECT failure_reason FROM billing_prepaid_purchase WHERE id=$1`, p.Purchase).Scan(&reason); err != nil || reason != "The unpaid checkout expired" {
+						t.Fatalf("natural expiry attribution %q %v", reason, err)
+					}
 				}
 				var evidence bool
 				if err := f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM stripe_checkout_expiration_evidence WHERE team_id=$1)`, f.team).Scan(&evidence); err != nil || !evidence {
@@ -199,6 +217,26 @@ func TestPendingStarterRecovery(t *testing.T) {
 			var count int
 			if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&count); err != nil || count != 1 {
 				t.Fatalf("duplicated purchase %d %v", count, err)
+			}
+		})
+	}
+}
+
+func TestPrepaidPendingStarterRecoveryRejectsInvalidAction(t *testing.T) {
+	f := newPrepaidFixture(t)
+	actor := uuid.New()
+	r := prepaidOperationRouter(t, f, f.team, actor)
+	r.POST("/billing/prepaid/checkout/recover", func(c *gin.Context) {
+		c.Set("team_id", f.team.String())
+		c.Set("actor_id", actor)
+		f.h.RecoverPendingStarterCheckout(c)
+	})
+	for _, body := range []string{`null`, `[]`, `{"cancel":true}`, `{"purchase_id":"` + uuid.NewString() + `"}`, `{"checkout_generation":"2026-10-26T12:00:00Z"}`, `{"unknown":true}`, `{} {}`, `{"purchase_id":"invalid"}`, `{"checkout_generation":"invalid","purchase_id":"` + uuid.NewString() + `"}`} {
+		t.Run(body, func(t *testing.T) {
+			out := httptest.NewRecorder()
+			r.ServeHTTP(out, httptest.NewRequest("POST", "/billing/prepaid/checkout/recover", strings.NewReader(body)))
+			if out.Code != 400 {
+				t.Fatalf("invalid action %d %s", out.Code, out.Body)
 			}
 		})
 	}

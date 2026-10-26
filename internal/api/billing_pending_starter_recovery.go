@@ -43,7 +43,7 @@ func (h *Handlers) loadPendingStarter(ctx context.Context, team, actor uuid.UUID
 	if !a.StripeCheckoutActorID.Valid || uuid.UUID(a.StripeCheckoutActorID.Bytes) != actor || !a.CheckoutInitializingAt.Valid || a.CheckoutSessionID == nil || a.StripeCustomerID == nil {
 		return p, pgx.ErrNoRows
 	}
-	err = h.Pool.QueryRow(ctx, `SELECT id,amount_cents,payment_state,credit_state FROM billing_prepaid_purchase WHERE team_id=$1 AND actor_id=$2 AND customer_id=$3 AND checkout_session_id=$4 AND source='checkout' AND $5::text LIKE '%:prepaid-operation:'||id::text`, team, actor, *a.StripeCustomerID, *a.CheckoutSessionID, derefString(a.CheckoutRequestKey)).Scan(&p.Purchase, &p.Amount, &p.Payment, &p.Credit)
+	err = h.Pool.QueryRow(ctx, `SELECT id,amount_cents,payment_state,credit_state FROM billing_prepaid_purchase WHERE team_id=$1 AND actor_id=$2 AND customer_id=$3 AND checkout_session_id=$4 AND source='checkout'`, team, actor, *a.StripeCustomerID, *a.CheckoutSessionID).Scan(&p.Purchase, &p.Amount, &p.Payment, &p.Credit)
 	return p, err
 }
 
@@ -76,10 +76,10 @@ func (h *Handlers) RecoverPendingStarterCheckout(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	var input pendingStarterRequest
+	var input *pendingStarterRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 4096))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&input) != nil || !errors.Is(decoder.Decode(new(any)), io.EOF) || ((input.PurchaseID == uuid.Nil) != (input.Generation == nil)) || (input.Cancel && input.PurchaseID == uuid.Nil) {
+	if decoder.Decode(&input) != nil || input == nil || !errors.Is(decoder.Decode(new(any)), io.EOF) || ((input.PurchaseID == uuid.Nil) != (input.Generation == nil)) || (input.Cancel && input.PurchaseID == uuid.Nil) {
 		respondErrorMsg(c, "bad_request", "purchase and checkout generation are required together", 400)
 		return
 	}
@@ -185,7 +185,7 @@ func (h *Handlers) reconcilePendingStarter(ctx context.Context, client *stripeHT
 		if err = q.RecordStripeCheckoutExpiration(ctx, db.RecordStripeCheckoutExpirationParams{TeamID: current.TeamID, StripeCustomerID: s.CustomerID, CheckoutGeneration: current.CheckoutInitializingAt.Time, CheckoutSessionID: s.ID}); err != nil {
 			return "", "", err
 		}
-		if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_state='failed',failure_code='checkout_expired',failure_reason='Customer canceled unpaid checkout',payment_evidence=COALESCE(payment_evidence,'{}'::jsonb)||jsonb_build_object('customer_expiration',$2::jsonb) WHERE id=$1 AND payment_state IN ('pending','uncertain','processing')`, p.Purchase, mustStarterEvidence(s)); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_state='failed',failure_code='checkout_expired',failure_reason='The unpaid checkout expired',payment_evidence=COALESCE(payment_evidence,'{}'::jsonb)||jsonb_build_object('customer_expiration',$2::jsonb) WHERE id=$1 AND payment_state IN ('pending','uncertain','processing')`, p.Purchase, mustStarterEvidence(s)); err != nil {
 			return "", "", err
 		}
 		if err = q.AbortTeamBillingCheckout(ctx, db.AbortTeamBillingCheckoutParams{TeamID: current.TeamID, LeaseStartedAt: current.CheckoutInitializingAt}); err != nil {
