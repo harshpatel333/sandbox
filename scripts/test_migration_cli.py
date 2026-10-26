@@ -119,5 +119,52 @@ class BillingRolesMigrationCLITest(MigrationCLITest):
         self.assert_no_pending_migrations()
 
 
+class InvoiceCashAuthorityMigrationCLITest(MigrationCLITest):
+    test_fresh_database = None
+
+    def test_cash_authority_without_supabase_roles(self):
+        self.copy_migrations()
+        self.push()
+        self.assertEqual(self.sql(
+            "SELECT count(*) FROM pg_roles WHERE rolname IN ('anon','authenticated','service_role')"), "0")
+        self.assertEqual(self.sql(
+            "SELECT relrowsecurity FROM pg_class WHERE oid='public.billing_invoice_cash_authority'::regclass"), "t")
+        for function in ("guard_invoice_cash_authority()", "resolve_invoice_cash_authority(text)",
+                         "guard_invoice_cash_intent()", "guard_frozen_invoice_plan_history()"):
+            self.assertEqual(self.sql(
+                "SELECT count(*) FROM pg_proc p CROSS JOIN LATERAL "
+                "aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) a "
+                f"WHERE p.oid='public.{function}'::regprocedure "
+                "AND a.grantee=0 AND a.privilege_type='EXECUTE'"), "0")
+        self.assert_no_pending_migrations()
+
+
+class InvoiceCashAuthorityDefaultACLMigrationCLITest(MigrationCLITest):
+    test_fresh_database = None
+
+    def test_cash_authority_resets_backend_default_all(self):
+        self.sql("CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role")
+        self.sql("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO service_role; "
+                 "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO service_role")
+        self.copy_migrations()
+        self.push()
+        for role in ("anon", "authenticated", "service_role"):
+            for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"):
+                with self.subTest(role=role, privilege=privilege):
+                    expected = "t" if role == "service_role" and privilege in ("SELECT", "INSERT") else "f"
+                    self.assertEqual(self.sql(
+                        f"SELECT has_table_privilege('{role}','public.billing_invoice_cash_authority','{privilege}')"), expected)
+            for function in ("guard_invoice_cash_authority()", "resolve_invoice_cash_authority(text)",
+                             "guard_invoice_cash_intent()", "guard_frozen_invoice_plan_history()"):
+                expected = "t" if role == "service_role" and function.startswith("resolve_") else "f"
+                self.assertEqual(self.sql(
+                    f"SELECT has_function_privilege('{role}','public.{function}','EXECUTE')"), expected)
+        self.assertEqual(self.sql(
+            "SELECT count(*) FROM pg_policies WHERE schemaname='public' "
+            "AND tablename='billing_invoice_cash_authority' AND roles=ARRAY['service_role']::name[] "
+            "AND cmd='ALL' AND qual='true' AND with_check='true'"), "1")
+        self.assert_no_pending_migrations()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

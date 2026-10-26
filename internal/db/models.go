@@ -721,6 +721,19 @@ type BillingInvoiceCalendar struct {
 	CreatedAt          time.Time `json:"created_at"`
 }
 
+type BillingInvoiceCashAuthority struct {
+	InvoiceID      string    `json:"invoice_id"`
+	TeamID         uuid.UUID `json:"team_id"`
+	PeriodStart    time.Time `json:"period_start"`
+	PeriodEnd      time.Time `json:"period_end"`
+	CustomerID     string    `json:"customer_id"`
+	SubscriptionID string    `json:"subscription_id"`
+	PolicyVersion  int32     `json:"policy_version"`
+	Policy         string    `json:"policy"`
+	Evidence       []byte    `json:"evidence"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
 type BillingInvoiceClose struct {
 	TeamID            uuid.UUID          `json:"team_id"`
 	PeriodStart       time.Time          `json:"period_start"`

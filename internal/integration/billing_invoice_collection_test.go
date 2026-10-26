@@ -13,14 +13,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 )
 
 func seedCollection(t *testing.T, state string, first *time.Time, collectionMethods ...string) api.StripeInvoiceAmounts {
 	t.Helper()
-	_, p := seedIncrementalPeriod(t)
+	team, err := testQueries.CreateTeam(t.Context(), "collection-"+uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := billing.ExportPeriod{TeamID: team.ID, Start: time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second), End: time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Second)}
 	inv := api.StripeInvoiceAmounts{CollectionMethod: "charge_automatically", ID: "in_" + p.TeamID.String(), Customer: "cus_" + p.TeamID.String(), Currency: "usd", Status: "open", AmountDue: 500, Total: 500, Subtotal: 500}
+	correctionExec(t, `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,$2)`, p.TeamID, inv.Customer)
 	if len(collectionMethods) > 0 {
 		inv.CollectionMethod = collectionMethods[0]
 	}
@@ -28,7 +35,9 @@ func seedCollection(t *testing.T, state string, first *time.Time, collectionMeth
 	if err := json.Unmarshal([]byte(raw), &inv); err != nil {
 		t.Fatal(err)
 	}
-	correctionExec(t, `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan) VALUES($1,$2,$3,$4,'{}')`, p.TeamID, p.Start, p.End, inv.ID)
+	// Collection begins only after closed accounting and a verified retained association.
+	correctionExec(t, `INSERT INTO team_billing_period(team_id,period_start,period_end,status,finalized_at,gross_charges_usd,credits_applied_usd,net_invoice_amount_usd) VALUES($1,$2,$3,'finalized',clock_timestamp(),5,0,5)`, p.TeamID, p.Start, p.End)
+	correctionExec(t, `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan,state,verified_at,finalized_evidence) VALUES($1,$2,$3,$4,jsonb_build_object('customer',$5::text,'subscription','sub_example'),'released',clock_timestamp(),'{"net_cents":500}')`, p.TeamID, p.Start, p.End, inv.ID, inv.Customer)
 	correctionExec(t, `INSERT INTO billing_invoice_collection(invoice_id,customer_id,subscription_id,livemode,settlement_hash,idempotency_key,payment_authorized,state,first_attempt_at) VALUES($1,$2,'sub_example',false,$3,$4,true,$5,$6)`, inv.ID, inv.Customer, api.InvoiceCollectionHashForTest(inv), "billing-invoice-pay:v1:"+inv.ID, state, first)
 	t.Cleanup(func() {
 		_, _ = testPool.Exec(context.Background(), `UPDATE billing_invoice_collection SET next_attempt_at=now()+interval '10 years' WHERE invoice_id=$1`, inv.ID)
