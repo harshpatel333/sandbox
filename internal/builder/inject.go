@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -190,7 +191,13 @@ func hostsMaps(hosts, name string) bool {
 			line = line[:i]
 		}
 		fields := strings.Fields(line)
-		for _, f := range fields[min(1, len(fields)):] {
+		if len(fields) < 2 {
+			continue
+		}
+		if _, err := netip.ParseAddr(fields[0]); err != nil {
+			continue
+		}
+		for _, f := range fields[1:] {
 			if f == name {
 				return true
 			}

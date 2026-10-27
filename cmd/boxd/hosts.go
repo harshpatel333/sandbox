@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -56,7 +57,13 @@ func mapsName(line, name string) bool {
 		line = line[:i]
 	}
 	fields := strings.Fields(line)
-	for _, f := range fields[min(1, len(fields)):] {
+	if len(fields) < 2 {
+		return false
+	}
+	if _, err := netip.ParseAddr(fields[0]); err != nil {
+		return false
+	}
+	for _, f := range fields[1:] {
 		if f == name {
 			return true
 		}

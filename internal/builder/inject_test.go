@@ -448,6 +448,7 @@ func TestEnsureLocalhost(t *testing.T) {
 		"other entries only": {ptr("10.0.0.5\tdb\n"), localhostEntries + "10.0.0.5\tdb\n"},
 		"image maps it":      {ptr("127.0.0.1 localhost\n"), "127.0.0.1 localhost\n"},
 		"only in a comment":  {ptr("# 127.0.0.1 localhost\n"), localhostEntries + "# 127.0.0.1 localhost\n"},
+		"not an address":     {ptr("not-an-ip localhost\n"), localhostEntries + "not-an-ip localhost\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

@@ -25,6 +25,10 @@ func TestMapHostname(t *testing.T) {
 			before: "127.0.0.1\tlocalhost sandbox-b\n",
 			want:   "127.0.0.1\tlocalhost sandbox-b\n",
 		},
+		"ignores a line without an address": {
+			before: "not-an-ip\tsandbox-b\n",
+			want:   "not-an-ip\tsandbox-b\n127.0.1.1\tsandbox-b\t# sandbox hostname\n",
+		},
 		"creates a missing file": {
 			before: "",
 			want:   "127.0.1.1\tsandbox-b\t# sandbox hostname\n",
