@@ -253,8 +253,8 @@ func (v planVersion) validate() error {
 	if v.FundingPolicy != "" && v.FundingPolicy != fundingPolicyPrepaid && v.FundingPolicy != fundingPolicyPostpaid {
 		return errors.New("funding policy must be prepaid or postpaid")
 	}
-	if v.prepaidFunded() && v.Kind != "subscription" {
-		return errors.New("only subscription plans take a prepaid funding policy")
+	if v.prepaidFunded() && (v.Kind != "subscription" || v.PricingVersion != "v2") {
+		return errors.New("only v2 subscription plans take a prepaid funding policy")
 	}
 	if t := v.Topoff; t != nil && (!v.prepaidFunded() || !validNewPrepaidAmount(t.AmountCents) || !validNewPrepaidAmount(t.ThresholdCents)) {
 		return errors.New("top-off needs a prepaid funding policy, and its amount and threshold must be multiples of $5 up to $10,000")

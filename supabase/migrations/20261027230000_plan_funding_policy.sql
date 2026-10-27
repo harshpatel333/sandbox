@@ -6,7 +6,7 @@ ALTER TABLE billing_plan_version
  ADD COLUMN topoff_amount_cents bigint CHECK (topoff_amount_cents BETWEEN 500 AND 1000000 AND topoff_amount_cents%500=0),
  ADD COLUMN topoff_threshold_cents bigint CHECK (topoff_threshold_cents BETWEEN 500 AND 1000000 AND topoff_threshold_cents%500=0),
  ADD COLUMN topoff_default_enabled boolean,
- ADD CHECK (funding_policy='postpaid' OR kind='subscription'),
+ ADD CHECK (funding_policy='postpaid' OR (kind='subscription' AND pricing_version='v2')),
  ADD CHECK ((topoff_amount_cents IS NULL) = (topoff_threshold_cents IS NULL)
   AND (topoff_amount_cents IS NULL) = (topoff_default_enabled IS NULL)),
  ADD CHECK (topoff_amount_cents IS NULL OR funding_policy='prepaid');

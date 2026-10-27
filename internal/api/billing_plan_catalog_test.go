@@ -119,6 +119,7 @@ func TestPlanVersionValidate(t *testing.T) {
 		},
 		"NUL in name":            func(v *planVersion) { v.DisplayName = "Pr\x00o" },
 		"unknown funding policy": func(v *planVersion) { v.FundingPolicy = "credit" },
+		"legacy prepaid funding": func(v *planVersion) { v.PricingVersion, v.FundingPolicy = "legacy", fundingPolicyPrepaid },
 		"top-off while postpaid": func(v *planVersion) { v.Topoff = &planTopoff{AmountCents: 500, ThresholdCents: 500} },
 		"top-off checkout refuses": func(v *planVersion) {
 			v.FundingPolicy, v.Topoff = fundingPolicyPrepaid, &planTopoff{AmountCents: 750, ThresholdCents: 500}
