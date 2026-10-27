@@ -885,3 +885,35 @@ func (a *GRPCAdapter) ReviveVM(ctx context.Context, req *vmdpb.ReviveVMRequest) 
 	}
 	return &vmdpb.ReviveVMResponse{DiskPath: diskPath, HostIp: hostIP}, nil
 }
+
+// ReshapeVM cold-boots a paused sandbox at a new shape; see
+// Manager.ReshapeVM.
+func (a *GRPCAdapter) ReshapeVM(ctx context.Context, req *vmdpb.ReshapeVMRequest) (*vmdpb.ReshapeVMResponse, error) {
+	var rules *sandboxNetworkRules
+	if len(req.GetAllowedCidrs()) > 0 || len(req.GetDeniedCidrs()) > 0 || len(req.GetAllowedDomains()) > 0 {
+		rules = &sandboxNetworkRules{
+			allowedCIDRs:   req.GetAllowedCidrs(),
+			deniedCIDRs:    req.GetDeniedCidrs(),
+			allowedDomains: req.GetAllowedDomains(),
+		}
+	}
+	inst, err := a.mgr.ReshapeVM(ctx, req.GetVmId(), req.GetVcpu(), req.GetMemMib(), rules)
+	if err != nil {
+		return nil, err
+	}
+	inst.mu.RLock()
+	hostIP, vcpu, memMiB := inst.IP, inst.Config.VCPU, inst.Config.MemoryMiB
+	inst.mu.RUnlock()
+	if len(req.GetEnvVars()) > 0 || req.GetSecretsJwt() != "" {
+		if _, err := a.InjectSandboxEnv(ctx, &vmdpb.InjectSandboxEnvRequest{
+			VmId:       req.GetVmId(),
+			EnvVars:    req.GetEnvVars(),
+			SecretsJwt: req.GetSecretsJwt(),
+		}); err != nil {
+			// The VM is up at the new shape, so retrying ReshapeVM takes
+			// the idempotent path and injects again.
+			return nil, status.Errorf(codes.Internal, "reshaped but configuration injection failed: %v", err)
+		}
+	}
+	return &vmdpb.ReshapeVMResponse{HostIp: hostIP, Vcpu: vcpu, MemMib: memMiB}, nil
+}
