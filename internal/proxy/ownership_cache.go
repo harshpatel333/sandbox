@@ -112,6 +112,13 @@ func (c *CachedOwnershipResolver) ResolveSandbox(ctx context.Context, id string)
 		c.mu.Lock()
 		c.waiters--
 		c.mu.Unlock()
+		// A caller canceled while waiting must not take the freed slot.
+		if waitErr == nil {
+			waitErr = ctx.Err()
+		}
+		if waitErr == nil {
+			waitErr = c.ctx.Err()
+		}
 		if waitErr != nil {
 			waitLimit.Stop()
 			return SandboxRoute{}, waitErr
