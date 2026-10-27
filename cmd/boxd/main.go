@@ -273,6 +273,13 @@ func handleInit(ctx *sandboxContext) http.HandlerFunc {
 				log.Printf("init: set hostname %q failed: %v", body.Hostname, err)
 			} else {
 				log.Printf("init: hostname set to %q", body.Hostname)
+				// Off the response: create waits for /init, and this is a
+				// second disk write that can stall right after a restore.
+				go func(name string) {
+					if err := mapHostname(etcHostsPath, name); err != nil {
+						log.Printf("init: map hostname %q in /etc/hosts failed: %v", name, err)
+					}
+				}(body.Hostname)
 			}
 		}
 

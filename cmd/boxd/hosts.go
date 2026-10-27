@@ -1,0 +1,76 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+)
+
+const etcHostsPath = "/etc/hosts"
+
+// hostnameEntryMarker tags the line boxd owns, so a later hostname replaces
+// it without touching the image's own entries.
+const hostnameEntryMarker = "# sandbox hostname"
+
+var hostsMu sync.Mutex
+
+// mapHostname makes the sandbox's hostname resolve, as a container runtime's
+// /etc/hosts does. A template's build VM writes its own name first, so the
+// line boxd owns is replaced rather than added to. A name already mapped is
+// left alone without a write.
+func mapHostname(path, name string) error {
+	hostsMu.Lock()
+	defer hostsMu.Unlock()
+
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	var kept []string
+	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if strings.HasSuffix(line, hostnameEntryMarker) {
+			if f := strings.Fields(line); len(f) > 1 && f[1] == name {
+				return nil
+			}
+			continue
+		}
+		if line != "" && mapsName(line, name) {
+			return nil
+		}
+		kept = append(kept, line)
+	}
+	kept = append(kept, "127.0.1.1\t"+name+"\t"+hostnameEntryMarker)
+	body := strings.TrimLeft(strings.Join(kept, "\n"), "\n") + "\n"
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".hosts-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(body); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+func mapsName(line, name string) bool {
+	if i := strings.IndexByte(line, '#'); i >= 0 {
+		line = line[:i]
+	}
+	fields := strings.Fields(line)
+	for _, f := range fields[min(1, len(fields)):] {
+		if f == name {
+			return true
+		}
+	}
+	return false
+}

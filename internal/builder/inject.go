@@ -123,6 +123,10 @@ func injectGuestAgent(ctx context.Context, rootfsDir, boxdBinaryPath string, fre
 		return 0, fmt.Errorf("write /etc/resolv.conf: %w", err)
 	}
 
+	if err := ensureLocalhost(filepath.Join(rootfsDir, "etc/hosts")); err != nil {
+		return 0, fmt.Errorf("write /etc/hosts: %w", err)
+	}
+
 	// Canonical's public apt mirrors are intermittently throttled or
 	// unreachable, which surfaces inside build VMs as hung fetches, partial
 	// .deb downloads and steps running past their deadline. Point the image
@@ -135,6 +139,46 @@ func injectGuestAgent(ctx context.Context, rootfsDir, boxdBinaryPath string, fre
 	}
 
 	return binSize, nil
+}
+
+// localhostEntries are the lines a container runtime puts in /etc/hosts.
+const localhostEntries = "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n"
+
+// ensureLocalhost makes localhost resolve. Container runtimes write
+// /etc/hosts when a container starts, so images usually ship it empty or not
+// at all; a sandbox boots the image as is and nothing would write it. An
+// image's own localhost entry is kept.
+func ensureLocalhost(path string) error {
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		// A link would resolve against the guest at boot, not this rootfs.
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if hostsMaps(string(data), "localhost") {
+		return nil
+	}
+	return os.WriteFile(path, []byte(localhostEntries+string(data)), 0o644)
+}
+
+// hostsMaps reports whether an /etc/hosts body maps name to an address.
+func hostsMaps(hosts, name string) bool {
+	for _, line := range strings.Split(hosts, "\n") {
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		fields := strings.Fields(line)
+		for _, f := range fields[min(1, len(fields)):] {
+			if f == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Ubuntu-only. deb.debian.org is on a separate mirror network and currently
@@ -406,6 +450,9 @@ options timeout:2 attempts:2
 //	to tini cleanly via exec (shell process is replaced, tini becomes PID 1).
 //
 // POSIX sh is assumed; all our allowed base images (debian, ubuntu) have it.
+// imageRunTmpMaxKiB bounds the /tmp or /run tree copied into memory at boot.
+const imageRunTmpMaxKiB = 64 * 1024
+
 const initScriptTemplate = `#!/bin/sh
 # Superserve template init — mounts essentials, then execs tini to become
 # PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
@@ -424,6 +471,20 @@ mkdir -p /dev/pts /dev/shm /home/user
 mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
 # POSIX shared memory (Python multiprocessing locks, Chrome) needs /dev/shm.
 mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null
+
+# The tmpfs mounts hide what the image ships in /tmp and /run; copy it in, as
+# a container would show it. They are memory, so a large tree is left out.
+mkdir -p /dev/.image-root
+if mount -o bind / /dev/.image-root 2>/dev/null; then
+  for d in tmp run; do
+    set -- $(du -sk /dev/.image-root/$d 2>/dev/null)
+    if [ -n "$1" ] && [ "$1" -le %d ]; then
+      cp -a /dev/.image-root/$d/. /$d/ 2>/dev/null
+    fi
+  done
+  umount /dev/.image-root
+fi
+rmdir /dev/.image-root 2>/dev/null
 
 %s# Seed the kernel entropy pool. Firecracker VMs lack virtio-rng and
 # RDRAND, so getrandom() blocks until entropy is credited. The
@@ -466,7 +527,7 @@ func initScriptFor(freezeWorkload bool) string {
 	if freezeWorkload {
 		block += initFreezerBlock
 	}
-	return fmt.Sprintf(initScriptTemplate, guestPathEnv(), block)
+	return fmt.Sprintf(initScriptTemplate, guestPathEnv(), imageRunTmpMaxKiB, block)
 }
 
 // copyFile copies src → dst, creating parent directories as needed. Overwrites
