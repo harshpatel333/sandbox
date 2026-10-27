@@ -74,6 +74,13 @@ func newTeamCohortTestFixture(t *testing.T) newTeamCohortFixture {
 		t.Fatal(err)
 	}
 	exec(`SELECT publish_billing_plan_version($1,NULL)`, free)
+	var developer uuid.UUID
+	err = pool.QueryRow(ctx, `INSERT INTO billing_plan_version(family,version,pricing_version,kind,public,self_serve,display_name,monthly_fee_cents,credit_schedule,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates)
+ VALUES('developer',1,'v2','subscription',true,true,'Developer',3100,jsonb_build_array(jsonb_build_object('start_months',0,'repeat',NULL,'every_months',1,'amount_cents',3100,'expires_after_months',1)),7,3,3072,9216,4) RETURNING id`).Scan(&developer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`SELECT publish_billing_plan_version($1,NULL)`, developer)
 	if err = pool.QueryRow(ctx, `SELECT billing_prepare_new_team_gate('use',$1,'test','new-team API test')`, system).Scan(&f.epoch); err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +101,52 @@ func newTeamCohortTestFixture(t *testing.T) newTeamCohortFixture {
 	f.h.Stripe = &stripeHTTPClient{}
 	return f
 }
+
+// onFree puts the pending team on Free, as teams enrolled before paid-first
+// signup still are.
+func (f newTeamCohortFixture) onFree(t *testing.T) {
+	t.Helper()
+	terms, err := f.h.planTermsForPricingVersion(t.Context(), "free", "v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err = assignTeamPlan(t.Context(), tx, planAssignment{Team: f.team, Terms: terms, Source: planSourceStaff, Actor: &f.actor, Reason: "enrolled before paid-first signup"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f newTeamCohortFixture) entryState(t *testing.T, team uuid.UUID) (string, bool) {
+	t.Helper()
+	r := gin.New()
+	r.GET("/plan", func(c *gin.Context) {
+		c.Set("team_id", team.String())
+		c.Set("actor_id", f.actor)
+		f.h.GetBillingPlan(c)
+	})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/plan", nil))
+	var v struct {
+		Plan       *customerPlan       `json:"plan"`
+		EntryState string              `json:"entry_state"`
+		Checkout   customerProCheckout `json:"pro_checkout"`
+	}
+	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &v) != nil {
+		t.Fatalf("billing plan response: %d %s", rec.Code, rec.Body.String())
+	}
+	if v.EntryState != entryActive && v.Plan != nil {
+		t.Fatalf("entry state %s disagrees with plan %+v", v.EntryState, v.Plan)
+	}
+	return v.EntryState, v.Checkout.FirstPaidProCycle
+}
+
 func (f newTeamCohortFixture) close(t *testing.T) {
 	t.Helper()
 	if _, err := f.h.Pool.Exec(t.Context(), `SELECT billing_close_new_team_gate($1,'test','close new acceptance only')`, f.epoch); err != nil {
@@ -151,6 +204,7 @@ func TestNewTeamCohortCapabilitiesAreTeamScopedAndKeepClosedDisplay(t *testing.T
 
 func TestNewTeamCohortStarterFreezesAndReplaysAcrossGateClosure(t *testing.T) {
 	f := newTeamCohortTestFixture(t)
+	f.onFree(t)
 	customer := "cus_local_cohort"
 	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,$2)`, f.team, customer); err != nil {
 		t.Fatal(err)
@@ -226,9 +280,27 @@ func TestNewTeamCohortFirstProUsesFullMonthAndRetainsAcceptedQuote(t *testing.T)
 			t.Fatalf("cohort quote %d %s", rec.Code, rec.Body.String())
 		}
 	}
+	if state, first := f.entryState(t, f.team); state != entryPendingPayment || !first {
+		t.Fatalf("new team before checkout: %s first=%v", state, first)
+	}
+	if state, _ := f.entryState(t, f.old); state != entryActive {
+		t.Fatalf("existing team entry state %s", state)
+	}
 	quote()
 	accepted, err := f.h.proUpgrade(t.Context(), f.team)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := f.entryState(t, f.team); state != entryPendingPayment {
+		t.Fatalf("open checkout entry state %s", state)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade_setup(id,upgrade_id,request_payload,created_at) VALUES(gen_random_uuid(),$1,'{}',now())`, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := f.entryState(t, f.team); state != entryPaymentFailed {
+		t.Fatalf("checkout needing a card entry state %s", state)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade_setup SET state='expired' WHERE upgrade_id=$1`, accepted.ID); err != nil {
 		t.Fatal(err)
 	}
 	_, end, valid := billing.AnniversaryPeriod(now, now)
@@ -313,6 +385,7 @@ func TestNewTeamCohortRechargeSchedulerKeepsAcceptedConsentAfterClose(t *testing
 
 func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
 	f := newTeamCohortTestFixture(t)
+	f.onFree(t)
 	f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
 	f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
 	for _, sql := range []string{`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_implicit')`, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)`} {
@@ -478,6 +551,7 @@ func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
 
 func TestNewTeamCohortImplicitRedirectDelimiterCannotBypassPolicy(t *testing.T) {
 	f := newTeamCohortTestFixture(t)
+	f.onFree(t)
 	f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
 	f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
 	original := prepaidCheckoutBody{AmountCents: 500, SuccessURL: "https://console.example.com/ok?x=a", CancelURL: "https://console.example.com/cancel?x=b|https://evil.example/out"}
@@ -520,6 +594,7 @@ func TestNewTeamCohortImplicitRecoverySurvivesFreshPolicyChanges(t *testing.T) {
 	for _, policy := range []string{"capacity", "pro_pending", "export", "managed"} {
 		t.Run(policy, func(t *testing.T) {
 			f := newTeamCohortTestFixture(t)
+			f.onFree(t)
 			f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
 			f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
 			exec := func(sql string, args ...any) {
@@ -628,6 +703,7 @@ func TestNewTeamCohortImplicitPriceDriftReturnsStatusWithoutReplay(t *testing.T)
 	for _, drift := range []string{"prices", "resources", "missing_prices"} {
 		t.Run(drift, func(t *testing.T) {
 			f := newTeamCohortTestFixture(t)
+			f.onFree(t)
 			f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
 			f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
 			for _, sql := range []string{`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_drift')`, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)`} {

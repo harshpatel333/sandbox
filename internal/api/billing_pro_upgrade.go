@@ -178,8 +178,13 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 		proConflict(c)
 		return
 	}
+	pending, err := teamPendingPayment(ctx, tx, team)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
 	now := h.nowUTC().Truncate(time.Second)
-	firstPaidCycle, err := firstProCycleEligible(ctx, tx, team, assigned && plan.Kind == planKindFree, a.CommercialBillingAnchor.Valid, a.StripeSubscriptionID != nil)
+	firstPaidCycle, err := firstProCycleEligible(ctx, tx, team, pending || (assigned && plan.Kind == planKindFree), a.CommercialBillingAnchor.Valid, a.StripeSubscriptionID != nil)
 	if errors.Is(err, errProFirstCycleReconciliation) {
 		respondErrorMsg(c, "billing_reconciliation_required", err.Error(), http.StatusConflict)
 		return
