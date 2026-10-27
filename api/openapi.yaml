@@ -4948,7 +4948,8 @@ components:
             OCI image reference for the base. Examples: `python:3.11`,
             `node:22-slim`, `ghcr.io/myorg/foo:v1`. Resolved to a digest at
             build time and recorded for reproducibility. Must be a Linux/amd64
-            image. Alpine and distroless bases are rejected at validation.
+            image with a shell at `/bin/sh` and the `mkdir`, `mount`,
+            `chmod`, and `sync` commands.
           example: python:3.11
         steps:
           type: array

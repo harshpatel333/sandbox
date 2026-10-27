@@ -45,27 +45,18 @@ func TestValidateBuildSpec_RequiresFrom(t *testing.T) {
 	}
 }
 
-func TestValidateBuildSpec_RejectsAlpine(t *testing.T) {
-	cases := []string{
-		"alpine",
+func TestValidateBuildSpec_AcceptsAnyImageName(t *testing.T) {
+	// Base images are judged by their contents after the pull. An image whose
+	// name mentions alpine or distroless may well boot.
+	for _, from := range []string{
 		"alpine:3.21",
-		"docker.io/library/alpine:latest",
 		"python:3.11-alpine3.21",
-	}
-	for _, from := range cases {
-		t.Run(from, func(t *testing.T) {
-			err := validateBuildSpec(&buildSpec{From: from})
-			if err == nil || !strings.Contains(err.Error(), "alpine") {
-				t.Fatalf("expected alpine rejection for %q, got: %v", from, err)
-			}
-		})
-	}
-}
-
-func TestValidateBuildSpec_RejectsDistroless(t *testing.T) {
-	err := validateBuildSpec(&buildSpec{From: "gcr.io/distroless/base"})
-	if err == nil || !strings.Contains(err.Error(), "distroless") {
-		t.Fatalf("expected distroless rejection, got: %v", err)
+		"example.com/team/qemu-alpine-ssh:1",
+		"gcr.io/distroless/base",
+	} {
+		if err := validateBuildSpec(&buildSpec{From: from}); err != nil {
+			t.Errorf("validateBuildSpec(%q) = %v, want nil", from, err)
+		}
 	}
 }
 

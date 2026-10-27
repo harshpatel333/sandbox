@@ -79,9 +79,9 @@ func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir
 	return digest.String(), nil
 }
 
-// validatePlatform rejects images that don't match the required OS/arch and
-// rejects known-incompatible bases (alpine, distroless) early with a clear
-// message. Catches configuration mistakes before the slow mkfs.ext4 step.
+// validatePlatform rejects images that don't match the required OS/arch,
+// before the slow mkfs.ext4 step. Whether the image can boot is decided from
+// its contents once extracted (requireShell).
 func validatePlatform(img v1.Image, wantOS, wantArch string) error {
 	cfg, err := img.ConfigFile()
 	if err != nil {
@@ -92,17 +92,6 @@ func validatePlatform(img v1.Image, wantOS, wantArch string) error {
 	}
 	if cfg.Architecture != wantArch {
 		return fmt.Errorf("image architecture is %q, want %q", cfg.Architecture, wantArch)
-	}
-	// Heuristic: look at the config's labels and entrypoint for hints that
-	// this is an alpine / distroless / busybox-only image. Cheap, catches
-	// the common cases before we waste time pulling.
-	for _, env := range cfg.Config.Env {
-		if strings.HasPrefix(strings.ToLower(env), "path=") {
-			if strings.Contains(env, "/sbin:/bin") && !strings.Contains(env, "/usr/sbin") {
-				// Busybox-style layout. Alpine fits this pattern.
-				return fmt.Errorf("image appears to be alpine or busybox-based (PATH looks minimal); use a debian/ubuntu-based image")
-			}
-		}
 	}
 	return nil
 }
