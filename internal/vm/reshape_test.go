@@ -19,11 +19,12 @@ import (
 func TestReshapeVMRefusesBeforeTeardown(t *testing.T) {
 	dir := t.TempDir()
 	net := &fakeNetMgr{}
-	m := &Manager{log: zerolog.Nop(), netMgr: net}
+	m := &Manager{log: zerolog.Nop(), netMgr: net, unitDead: func(context.Context, string) bool { return false }}
 	m.cfg = ManagerConfig{RunDir: filepath.Join(dir, "run"), SnapshotDir: filepath.Join(dir, "snapshots")}
 	m.vms = map[string]*VMInstance{
-		"vm-running": {ID: "vm-running", Status: StatusRunning, Config: VMConfig{VCPU: 1, MemoryMiB: 1024}},
-		"vm-gone":    {ID: "vm-gone", Status: StatusPaused, SnapshotPath: filepath.Join(dir, "snapshots", "vm-gone", "vmstate.snap"), Config: VMConfig{VCPU: 1, MemoryMiB: 1024}},
+		"vm-running":  {ID: "vm-running", Status: StatusRunning, Config: VMConfig{VCPU: 1, MemoryMiB: 1024}},
+		"vm-reshaped": {ID: "vm-reshaped", Status: StatusRunning, RevivedDisk: filepath.Join(m.reshapeStageDir("vm-reshaped"), "rootfs.ext4"), Config: VMConfig{VCPU: 1, MemoryMiB: 1024}},
+		"vm-gone":     {ID: "vm-gone", Status: StatusPaused, SnapshotPath: filepath.Join(dir, "snapshots", "vm-gone", "vmstate.snap"), Config: VMConfig{VCPU: 1, MemoryMiB: 1024}},
 	}
 	ctx := context.Background()
 	open := &sandboxNetworkRules{}
@@ -41,6 +42,7 @@ func TestReshapeVMRefusesBeforeTeardown(t *testing.T) {
 		{"too little memory", "vm-running", 2, reshapeMinMemMiB - 1, open, codes.InvalidArgument},
 		{"no egress policy", "vm-gone", 2, 2048, nil, codes.InvalidArgument},
 		{"running at another shape", "vm-running", 2, 2048, open, codes.FailedPrecondition},
+		{"running at the shape but never reshaped", "vm-running", 1, 1024, open, codes.FailedPrecondition},
 		{"paused with nothing to boot", "vm-gone", 2, 2048, open, codes.FailedPrecondition},
 	} {
 		if _, err := m.ReshapeVM(ctx, tc.id, tc.vcpu, tc.mem, tc.rules); status.Code(err) != tc.want {
@@ -48,12 +50,12 @@ func TestReshapeVMRefusesBeforeTeardown(t *testing.T) {
 		}
 	}
 
-	// A retry after a lost response finds the VM already at its target and
-	// reapplies the policy: a vmd restart in between reattaches the VM
-	// without it.
+	// A retry after a lost response finds the VM it reshaped already at
+	// its target and reapplies the policy: a vmd restart in between
+	// reattaches the VM without it.
 	deny := &sandboxNetworkRules{deniedCIDRs: []string{"0.0.0.0/0"}}
-	inst, err := m.ReshapeVM(ctx, "vm-running", 1, 1024, deny)
-	if err != nil || inst.ID != "vm-running" {
+	inst, err := m.ReshapeVM(ctx, "vm-reshaped", 1, 1024, deny)
+	if err != nil || inst.ID != "vm-reshaped" {
 		t.Fatalf("retry at the current shape: %v, want the running VM", err)
 	}
 	if len(net.firewallCalls) != 1 || len(net.firewallCalls[0].deniedCIDRs) != 1 {
@@ -87,8 +89,10 @@ func TestReshapeVMRetryFindsTheDurableAnchor(t *testing.T) {
 
 func TestReshapeVMRequiresTheEgressPolicy(t *testing.T) {
 	a := NewGRPCAdapter(newTestManager())
-	_, err := a.ReshapeVM(context.Background(), &vmdpb.ReshapeVMRequest{VmId: "vm-1", Vcpu: 2, MemMib: 2048})
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("err = %v, want InvalidArgument for a request without sandbox_network", err)
+	for _, net := range []*vmdpb.SandboxNetworkConfig{nil, {}} {
+		_, err := a.ReshapeVM(context.Background(), &vmdpb.ReshapeVMRequest{VmId: "vm-1", Vcpu: 2, MemMib: 2048, SandboxNetwork: net})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("sandbox_network %v: err = %v, want InvalidArgument without an egress policy", net, err)
+		}
 	}
 }

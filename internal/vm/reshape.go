@@ -55,23 +55,26 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 		curVCPU, curMem          uint32
 		snap, mem, baseMem, base string
 		teamID, ownerID          string
-		disk                     string
+		disk, revivedDisk        string
 	)
+	stageDir := m.reshapeStageDir(vmID)
 	inst, ierr := m.getInstance(vmID)
 	if ierr == nil {
 		inst.mu.RLock()
 		st, unverified = inst.Status, inst.Unverified
 		curVCPU, curMem = inst.Config.VCPU, inst.Config.MemoryMiB
 		snap, mem, baseMem, base = inst.SnapshotPath, inst.MemFilePath, inst.BaseMemPath, inst.Config.BasePath
-		teamID, ownerID = inst.TeamID, inst.OwnerID
+		teamID, ownerID, revivedDisk = inst.TeamID, inst.OwnerID, inst.RevivedDisk
 		netInfo := &network.VMNetInfo{HostIP: inst.IP, TAPDevice: inst.TAPDevice, Namespace: inst.Namespace}
 		inst.mu.RUnlock()
 		disk = m.instanceDiskPath(inst)
 
-		// A retry after a lost response finds its own work done. Policy is
-		// reapplied: a vmd restart in between reattaches the VM without it,
-		// and a retry may carry a corrected policy.
-		if st == StatusRunning && !unverified && curVCPU == vcpu && curMem == memMiB {
+		// A retry after a lost response finds its own work done: a live VM
+		// at the target shape that booted from this sandbox's staged disk.
+		// Policy is reapplied: a vmd restart in between reattaches the VM
+		// without it, and a retry may carry a corrected policy.
+		if st == StatusRunning && !unverified && curVCPU == vcpu && curMem == memMiB &&
+			filepath.Dir(revivedDisk) == stageDir && !m.vmConfirmedAtRest(ctx, vmID) {
 			if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
 				return nil, status.Errorf(codes.Internal, "reapply network rules on idempotent reshape: %v", err)
 			}
@@ -89,7 +92,6 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 		}
 	}
 
-	stageDir := filepath.Join(m.cfg.SnapshotDir, vmID, "reshape")
 	if ierr != nil || st == StatusError {
 		// A failed or interrupted attempt leaves the durable record as the
 		// anchor (marked RevivalPending) and the staged disk beside it.
@@ -114,6 +116,7 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 	}
 	stagedDisk := filepath.Join(stageDir, diskName)
 	stagedMap := ""
+	start := time.Now()
 	if mem != "" && pauseArtifactsPresent(snap, mem, baseMem, disk, base) {
 		// The paused disk is authoritative; any copy left by an earlier
 		// failed attempt predates it and is replaced.
@@ -140,7 +143,7 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 		return nil, status.Errorf(codes.FailedPrecondition, "vm %s has neither its pause artifacts nor a staged reshape disk", vmID)
 	}
 
-	start := time.Now()
+	staged := time.Since(start)
 	revived, err := m.reviveVMLocked(ctx, vmID, stagedDisk, base, stagedMap, false, false, true, teamID, ownerID, vcpu, memMiB, rules, "")
 	if err != nil {
 		// Revival put the paused record back; memory must follow it or
@@ -152,9 +155,21 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 	m.log.Info().Str("vm_id", vmID).
 		Uint32("from_vcpu", curVCPU).Uint32("from_mem_mib", curMem).
 		Uint32("vcpu", vcpu).Uint32("mem_mib", memMiB).
+		Dur("staging", staged).
 		Dur("total", time.Since(start)).
 		Msg("sandbox reshaped")
 	return revived, nil
+}
+
+// reshapeStageDir is where a reshape stages the disk it boots. Resolved
+// like revive resolves the disk it records, so the live VM's RevivedDisk
+// can be matched against it.
+func (m *Manager) reshapeStageDir(vmID string) string {
+	root := m.cfg.SnapshotDir
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		root = r
+	}
+	return filepath.Join(root, vmID, "reshape")
 }
 
 // stateRecord reads vmID's durable record directly: the on-demand loader

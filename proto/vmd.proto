@@ -343,9 +343,10 @@ message ReshapeVMRequest {
   string vm_id = 1;
   uint32 vcpu = 2;
   uint32 mem_mib = 3;
-  // Required: the host does not record egress policy and a cold boot
-  // comes up open, so the request must restate it. An empty egress
-  // config is the explicit statement that the sandbox is unrestricted.
+  // Required, egress included: the host does not record egress policy
+  // and a cold boot comes up open, so the request must restate it. An
+  // egress config with no rules is the explicit statement that the
+  // sandbox is unrestricted.
   SandboxNetworkConfig sandbox_network = 4;
   // Re-injected after boot: a cold boot starts boxd with an empty context.
   map<string, string> env_vars = 5;

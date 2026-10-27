@@ -1433,9 +1433,10 @@ type ReshapeVMRequest struct {
 	VmId   string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
 	Vcpu   uint32                 `protobuf:"varint,2,opt,name=vcpu,proto3" json:"vcpu,omitempty"`
 	MemMib uint32                 `protobuf:"varint,3,opt,name=mem_mib,json=memMib,proto3" json:"mem_mib,omitempty"`
-	// Required: the host does not record egress policy and a cold boot
-	// comes up open, so the request must restate it. An empty egress
-	// config is the explicit statement that the sandbox is unrestricted.
+	// Required, egress included: the host does not record egress policy
+	// and a cold boot comes up open, so the request must restate it. An
+	// egress config with no rules is the explicit statement that the
+	// sandbox is unrestricted.
 	SandboxNetwork *SandboxNetworkConfig `protobuf:"bytes,4,opt,name=sandbox_network,json=sandboxNetwork,proto3" json:"sandbox_network,omitempty"`
 	// Re-injected after boot: a cold boot starts boxd with an empty context.
 	EnvVars       map[string]string `protobuf:"bytes,5,rep,name=env_vars,json=envVars,proto3" json:"env_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`

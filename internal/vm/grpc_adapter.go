@@ -891,10 +891,10 @@ func (a *GRPCAdapter) ReviveVM(ctx context.Context, req *vmdpb.ReviveVMRequest) 
 func (a *GRPCAdapter) ReshapeVM(ctx context.Context, req *vmdpb.ReshapeVMRequest) (*vmdpb.ReshapeVMResponse, error) {
 	// Fail closed: a request that omits the policy would bring a
 	// restricted sandbox back open.
-	if req.GetSandboxNetwork() == nil {
-		return nil, status.Error(codes.InvalidArgument, "sandbox_network is required: the cold boot must restate the sandbox's egress policy")
-	}
 	egress := req.GetSandboxNetwork().GetEgress()
+	if egress == nil {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_network.egress is required: the cold boot must restate the sandbox's egress policy")
+	}
 	rules := &sandboxNetworkRules{
 		allowedCIDRs:   egress.GetAllowedCidrs(),
 		deniedCIDRs:    egress.GetDeniedCidrs(),
