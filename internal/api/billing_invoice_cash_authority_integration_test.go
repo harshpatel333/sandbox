@@ -433,3 +433,117 @@ func TestInvoiceCashFullyCreditedStarter(t *testing.T) {
 		t.Fatal("paid zero-cash settlement changed", state, reason, f.pays.Load())
 	}
 }
+
+// These are retained historical purchases: a covering paid assignment is not
+// proof that an earlier payment or credit operation has finished.
+func TestInvoiceCashPreperiodUnresolvedPurchaseWithFullCoverage(t *testing.T) {
+	for _, kind := range []string{planKindLegacyPAYG, planKindSubscription} {
+		for _, outcome := range []struct {
+			name, payment, credit string
+			hold                  bool
+		}{
+			{"unopened", "pending", "none", true},
+			{"payment uncertain", "uncertain", "none", true},
+			{"payment processing", "processing", "none", true},
+			{"paid unfulfilled", "succeeded", "none", true},
+			{"credit pending", "succeeded", "pending", true},
+			{"credit uncertain", "succeeded", "uncertain", true},
+			{"credit issued late", "succeeded", "issued", true},
+			{"credit issued before period", "succeeded", "issued_before", false},
+			{"checkout expired", "failed", "none", false},
+			{"checkout canceled", "failed", "none", false},
+		} {
+			t.Run(kind+"/"+outcome.name, func(t *testing.T) {
+				f := newInvoiceCashFixture(t, kind, "pending")
+				id := uuid.New()
+				exec := func(query string, args ...any) {
+					t.Helper()
+					if _, err := f.h.Pool.Exec(t.Context(), query, args...); err != nil {
+						t.Fatal(err)
+					}
+				}
+				exec(`INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key,plan_snapshot,created_at)
+ VALUES($1,$2,$3,'checkout',500,$4,'','','{"terms":{"kind":"prepaid"}}',$5)`, id, f.team, f.invoice.Customer, uuid.New(), f.start.Add(-2*time.Hour))
+				switch outcome.payment {
+				case "succeeded":
+					exec(`UPDATE billing_prepaid_purchase SET payment_state='succeeded',paid_at=clock_timestamp(),payment_evidence=jsonb_build_object('amount_cents',amount_cents,'customer',customer_id) WHERE id=$1`, id)
+				case "failed":
+					exec(`UPDATE billing_prepaid_purchase SET payment_state='failed',failure_reason=$2 WHERE id=$1`, id, outcome.name)
+				case "uncertain", "processing":
+					exec(`UPDATE billing_prepaid_purchase SET payment_state=$2,payment_first_attempt_at=clock_timestamp() WHERE id=$1`, id, outcome.payment)
+				}
+				if outcome.credit != "none" {
+					request, err := prepaidCreditRequest(id, f.invoice.Customer, 500, "checkout")
+					if err != nil {
+						t.Fatal(err)
+					}
+					exec(`UPDATE billing_prepaid_purchase SET credit_state='pending',credit_request=$2 WHERE id=$1`, id, request)
+					if outcome.credit != "pending" {
+						exec(`UPDATE billing_prepaid_purchase SET credit_state='uncertain',credit_first_attempt_at=clock_timestamp() WHERE id=$1`, id)
+					}
+					if outcome.credit == "issued" || outcome.credit == "issued_before" {
+						exec(`UPDATE billing_prepaid_purchase SET credit_state='issued',stripe_credit_grant_id=$2,credit_evidence=credit_request || jsonb_build_object('id',$2::text),credited_at=clock_timestamp() WHERE id=$1`, id, "cg_"+id.String())
+					}
+					if outcome.credit == "issued_before" {
+						// Import a valid old grant timestamp into this disposable historical
+						// fixture. Production's immutable paid/grant evidence is never rewritten.
+						tx, err := f.h.Pool.Begin(t.Context())
+						if err != nil {
+							t.Fatal(err)
+						}
+						defer tx.Rollback(t.Context())
+						for _, query := range []string{
+							`ALTER TABLE billing_prepaid_purchase DISABLE TRIGGER billing_prepaid_purchase_guard`,
+							`UPDATE billing_prepaid_purchase SET paid_at=created_at,credit_first_attempt_at=created_at,credited_at=created_at WHERE id=$1`,
+							`ALTER TABLE billing_prepaid_purchase ENABLE TRIGGER billing_prepaid_purchase_guard`,
+						} {
+							var args []any
+							if query[0:6] == "UPDATE" {
+								args = []any{id}
+							}
+							if _, err := tx.Exec(t.Context(), query, args...); err != nil {
+								t.Fatal(err)
+							}
+						}
+						if err := tx.Commit(t.Context()); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				before := f.financialSnapshot(t)
+				j := f.claim(t)
+				state, reason := f.h.collectInvoice(t.Context(), f.client, &j)
+				wantState, wantPays := "unknown", int64(1)
+				if outcome.hold {
+					wantState, wantPays = "review_required", 0
+				}
+				if state != wantState || f.pays.Load() != wantPays {
+					t.Fatalf("pre-period purchase cash fence: state=%s reason=%s pays=%d want=%s/%d", state, reason, f.pays.Load(), wantState, wantPays)
+				}
+				if after := f.financialSnapshot(t); before != after {
+					t.Fatal("cash decision rewrote retained financial rows")
+				}
+				var policy string
+				var count int
+				var gap bool
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT policy,jsonb_array_length(evidence->'assignments'),(evidence->>'gap')::boolean FROM billing_invoice_cash_authority WHERE invoice_id=$1`, f.invoice.ID).Scan(&policy, &count, &gap); err != nil {
+					t.Fatal(err)
+				}
+				if count != 1 || gap {
+					t.Fatal("fixture must cover the complete invoice interval", count, gap)
+				}
+				if outcome.hold {
+					if policy != "prepaid_hold" {
+						t.Fatal("cash authority did not freeze prepaid hold", policy)
+					}
+					// A retained old writer cannot bypass the collector and save a cash intent.
+					if _, err := f.h.Pool.Exec(t.Context(), `UPDATE billing_invoice_collection SET state='unknown',first_attempt_at=clock_timestamp() WHERE invoice_id=$1`, f.invoice.ID); err == nil {
+						t.Fatal("old writer bypassed the SQL cash fence")
+					}
+				} else if policy != "residual_allowed" {
+					t.Fatal("settled prior purchase blocked legitimate residual cash", policy)
+				}
+			})
+		}
+	}
+}
