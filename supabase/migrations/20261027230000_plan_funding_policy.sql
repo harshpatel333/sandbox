@@ -11,6 +11,12 @@ ALTER TABLE billing_plan_version
   AND (topoff_amount_cents IS NULL) = (topoff_default_enabled IS NULL)),
  ADD CHECK (topoff_amount_cents IS NULL OR funding_policy='prepaid');
 
+DO $$ BEGIN
+ IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+  GRANT UPDATE (funding_policy, topoff_amount_cents, topoff_threshold_cents, topoff_default_enabled) ON billing_plan_version TO service_role;
+ END IF;
+END $$;
+
 -- Prepaid kinds and prepaid-funded subscriptions share the credit gate and
 -- auto-recharge. Terms are frozen, so a catalog edit never moves a team.
 CREATE FUNCTION billing_assignment_prepaid_funded(a team_plan_assignment) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$
