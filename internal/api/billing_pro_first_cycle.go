@@ -13,33 +13,25 @@ import (
 
 var errProFirstCycleReconciliation = errors.New("An earlier billing setup requires reconciliation before starting a new Pro billing month.")
 
-// Team entry states. A new team waits for payment, with no plan and no
-// compute, until its first checkout assigns a plan.
+// Team entry states. A new team is on its trial, with compute while the
+// trial credit lasts, until its first checkout assigns a plan.
 const (
-	entryPendingPayment = "pending_payment"
-	entryPaymentFailed  = "payment_failed"
-	entryActive         = "active"
+	entryTrial         = "trial"
+	entryTrialEnded    = "trial_ended"
+	entryPaymentFailed = "payment_failed"
+	entryActive        = "active"
 )
 
-func teamPendingPayment(ctx context.Context, q db.DBTX, team uuid.UUID) (bool, error) {
-	var pending bool
-	err := q.QueryRow(ctx, `SELECT billing_team_pending_payment($1)`, team).Scan(&pending)
-	return pending, err
+func teamAwaitingPlan(ctx context.Context, q db.DBTX, team uuid.UUID) (bool, error) {
+	var awaiting bool
+	err := q.QueryRow(ctx, `SELECT billing_team_awaiting_plan($1)`, team).Scan(&awaiting)
+	return awaiting, err
 }
 
-// teamEntryState is payment_failed while a pending team's paid checkout still
-// needs a usable card, so it cannot activate.
 func teamEntryState(ctx context.Context, q db.DBTX, team uuid.UUID) (string, error) {
-	pending, err := teamPendingPayment(ctx, q, team)
-	if err != nil || !pending {
-		return entryActive, err
-	}
-	var cardRequired bool
-	err = q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_pro_upgrade_setup s JOIN billing_pro_upgrade u ON u.id=s.upgrade_id WHERE u.team_id=$1 AND u.state NOT IN ('expired','ended') AND s.state='open')`, team).Scan(&cardRequired)
-	if cardRequired {
-		return entryPaymentFailed, err
-	}
-	return entryPendingPayment, err
+	var state string
+	err := q.QueryRow(ctx, `SELECT billing_team_entry_state($1)`, team).Scan(&state)
+	return state, err
 }
 
 func firstProCycleEligible(ctx context.Context, q db.DBTX, team uuid.UUID, free, anchored, subscribed bool) (bool, error) {

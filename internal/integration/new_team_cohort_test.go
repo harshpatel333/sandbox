@@ -30,6 +30,7 @@ func cohortFixture(t *testing.T) (*pgxpool.Pool, uuid.UUID, uuid.UUID) {
 	for _, family := range []string{"developer", "pro"} {
 		cohortPublishSubscription(t, pool, family)
 	}
+	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=0.07,max_sandboxes=2,max_vcpu=3,max_memory_mib=3072,max_disk_mib=9216 WHERE singleton`)
 	return pool, system, actor
 }
 
@@ -99,14 +100,14 @@ func TestIntegration_NewTeamCohortPreservesOldAndRotatesAdmission(t *testing.T) 
 	var reason string
 	var plans, count int
 	var pending, eligible bool
-	if err := pool.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM team_plan_assignment WHERE team_id=$1),o.reason,billing_team_pending_payment($1),team_sandbox_billing_eligible($1) FROM team_signup_promotion_outcome o WHERE o.team_id=$1`, team).Scan(&plans, &reason, &pending, &eligible); err != nil {
+	if err := pool.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM team_plan_assignment WHERE team_id=$1),o.reason,billing_team_awaiting_plan($1),team_sandbox_billing_eligible($1) FROM team_signup_promotion_outcome o WHERE o.team_id=$1`, team).Scan(&plans, &reason, &pending, &eligible); err != nil {
 		t.Fatal(err)
 	}
-	if plans != 0 || reason != "pricing_v2" || !pending || eligible {
-		t.Fatalf("new team was not pending without compute: plans=%d reason=%s pending=%v eligible=%v", plans, reason, pending, eligible)
+	if plans != 0 || reason != "first_user_claim" && reason != "first_identity_claim" || !pending || !eligible {
+		t.Fatalf("new team did not start on its trial: plans=%d reason=%s awaiting=%v eligible=%v", plans, reason, pending, eligible)
 	}
-	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM team_credit_grant WHERE team_id=$1`, team).Scan(&count); err != nil || count != 0 {
-		t.Fatalf("signup granted legacy credit: %d %v", count, err)
+	if err := pool.QueryRow(t.Context(), `SELECT count(*) FROM team_credit_grant WHERE team_id=$1 AND amount_usd=0.07`, team).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("signup trial was not the configured grant: %d %v", count, err)
 	}
 	rolloutExec(t, pool, `SELECT billing_close_new_team_gate($1,'local-test','hold fresh entry')`, epoch)
 	if err := pool.QueryRow(t.Context(), `SELECT * FROM billing_team_pricing_state($1)`, team).Scan(&model, &source, &open, &current, &enrolled); err != nil {
@@ -251,24 +252,64 @@ func TestIntegration_NewTeamCohortPaidFirstNeedsSellableSubscriptions(t *testing
 	onFree := cohortCreate(t, pool, actor)
 	var kind string
 	var pending bool
-	if err := pool.QueryRow(t.Context(), `SELECT a.kind,billing_team_pending_payment($1) FROM team_plan_assignment a WHERE a.team_id=$1 AND a.effective_to IS NULL`, onFree).Scan(&kind, &pending); err != nil || kind != "free" || pending {
-		t.Fatalf("signup without a sellable Developer plan was not kept on Free: %s %v %v", kind, pending, err)
+	var trialGrants int
+	if err := pool.QueryRow(t.Context(), `SELECT a.kind,billing_team_awaiting_plan($1),(SELECT count(*) FROM team_credit_grant WHERE team_id=$1) FROM team_plan_assignment a WHERE a.team_id=$1 AND a.effective_to IS NULL`, onFree).Scan(&kind, &pending, &trialGrants); err != nil || kind != "free" || pending || trialGrants != 0 {
+		t.Fatalf("retiring Developer did not stop trial signups (want today's Free): %s awaiting=%v grants=%d %v", kind, pending, trialGrants, err)
 	}
+	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=NULL WHERE singleton`)
+	cohortPublishSubscription(t, pool, "developer")
+	unconfigured := cohortCreate(t, pool, actor)
+	if err := pool.QueryRow(t.Context(), `SELECT a.kind,billing_team_awaiting_plan($1) FROM team_plan_assignment a WHERE a.team_id=$1 AND a.effective_to IS NULL`, unconfigured).Scan(&kind, &pending); err != nil || kind != "free" || pending {
+		t.Fatalf("signup without a configured trial was not kept on Free: %s %v %v", kind, pending, err)
+	}
+	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=0.07 WHERE singleton`)
+	rolloutExec(t, pool, retire, "developer")
 	if _, err := pool.Exec(t.Context(), retire, "free"); pgCode(err) != "55000" {
 		t.Fatalf("Free retired while signups still fall back to it: %v", err)
 	}
 	cohortPublishSubscription(t, pool, "developer")
 	rolloutExec(t, pool, retire, "free")
-	if !cohortPending(t, pool, cohortCreate(t, pool, actor)) {
-		t.Fatal("signup with sellable plans and no Free was not pending")
+	if !cohortAwaitingPlan(t, pool, cohortCreate(t, pool, actor)) {
+		t.Fatal("signup with sellable plans and no Free was not awaiting its plan")
 	}
 }
 
-func cohortPending(t *testing.T, pool *pgxpool.Pool, team uuid.UUID) bool {
+func cohortAwaitingPlan(t *testing.T, pool *pgxpool.Pool, team uuid.UUID) bool {
 	t.Helper()
 	var pending bool
-	if err := pool.QueryRow(t.Context(), `SELECT billing_team_pending_payment($1)`, team).Scan(&pending); err != nil {
+	if err := pool.QueryRow(t.Context(), `SELECT billing_team_awaiting_plan($1)`, team).Scan(&pending); err != nil {
 		t.Fatal(err)
 	}
 	return pending
+}
+
+func TestIntegration_NewTeamCohortTrialUsesConfiguredCreditLimitsAndFences(t *testing.T) {
+	pool, system, actor := cohortFixture(t)
+	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=0.07,max_sandboxes=2,max_vcpu=3,max_memory_mib=3072,max_disk_mib=9216 WHERE singleton`)
+	cohortRelease(t, pool, system)
+	team := cohortCreate(t, pool, actor)
+	var credit float64
+	var concurrent, vcpu, memory, disk, templates int
+	var state string
+	var eligible bool
+	if err := pool.QueryRow(t.Context(), `SELECT g.amount_usd::float8,l.max_concurrent,l.max_vcpu,l.max_memory_mib,l.max_disk_mib,l.max_templates,billing_team_entry_state($1),team_sandbox_billing_eligible($1)
+ FROM team_credit_grant g CROSS JOIN team_effective_limits($1) l WHERE g.team_id=$1 AND g.reason='signup trial credit'`, team).Scan(&credit, &concurrent, &vcpu, &memory, &disk, &templates, &state, &eligible); err != nil {
+		t.Fatal(err)
+	}
+	if credit != 0.07 || concurrent != 2 || vcpu != 3 || memory != 3072 || disk != 9216 || templates != 0 || state != "trial" || !eligible {
+		t.Fatalf("trial did not freeze configured terms: credit=%v limits=%d/%d/%d/%d templates=%d state=%s eligible=%v", credit, concurrent, vcpu, memory, disk, templates, state, eligible)
+	}
+	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=1 WHERE singleton`)
+	if err := pool.QueryRow(t.Context(), `SELECT amount_usd::float8 FROM team_credit_grant WHERE team_id=$1 AND reason='signup trial credit'`, team).Scan(&credit); err != nil || credit != 0.07 {
+		t.Fatalf("a running trial followed later configuration: %v %v", credit, err)
+	}
+	rolloutExec(t, pool, `UPDATE team_trial_eligibility_cache SET eligible=false WHERE team_id=$1`, team)
+	if err := pool.QueryRow(t.Context(), `SELECT billing_team_entry_state($1),team_sandbox_billing_eligible($1)`, team).Scan(&state, &eligible); err != nil || state != "trial_ended" || eligible {
+		t.Fatalf("used-up trial kept compute: %s %v %v", state, eligible, err)
+	}
+	second := cohortCreate(t, pool, actor)
+	var reason string
+	if err := pool.QueryRow(t.Context(), `SELECT o.reason,billing_team_entry_state($1),EXISTS(SELECT 1 FROM team_credit_grant WHERE team_id=$1) FROM team_signup_promotion_outcome o WHERE o.team_id=$1`, second).Scan(&reason, &state, &eligible); err != nil || (reason != "user_already_claimed" && reason != "identity_already_claimed") || state != "trial_ended" || eligible {
+		t.Fatalf("second team for the same user got another trial: %s %s grant=%v %v", reason, state, eligible, err)
+	}
 }

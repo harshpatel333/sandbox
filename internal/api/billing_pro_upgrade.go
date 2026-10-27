@@ -180,13 +180,13 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 		proConflict(c)
 		return
 	}
-	pending, err := teamPendingPayment(ctx, tx, team)
+	awaiting, err := teamAwaitingPlan(ctx, tx, team)
 	if err != nil {
 		respondError(c, ErrInternal)
 		return
 	}
 	now := h.nowUTC().Truncate(time.Second)
-	firstPaidCycle, err := firstProCycleEligible(ctx, tx, team, pending || (assigned && plan.Kind == planKindFree), a.CommercialBillingAnchor.Valid, a.StripeSubscriptionID != nil)
+	firstPaidCycle, err := firstProCycleEligible(ctx, tx, team, awaiting || (assigned && plan.Kind == planKindFree), a.CommercialBillingAnchor.Valid, a.StripeSubscriptionID != nil)
 	if errors.Is(err, errProFirstCycleReconciliation) {
 		respondErrorMsg(c, "billing_reconciliation_required", err.Error(), http.StatusConflict)
 		return
@@ -529,6 +529,13 @@ func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params 
 		return "", err
 	}
 	if err = applyUpgradeTopoff(ctx, tx, u, params, session); err != nil {
+		return "", err
+	}
+	// Paid activation ends the signup trial, dropping any credit left on it.
+	if _, err = tx.Exec(ctx, `UPDATE team_credit_grant SET remaining_usd=0,updated_at=clock_timestamp() WHERE team_id=$1 AND reason='signup trial credit' AND remaining_usd<>0`, u.Team); err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET trial_ended_at=COALESCE(trial_ended_at,clock_timestamp()),updated_at=clock_timestamp() WHERE team_id=$1 AND trial_ended_at IS NULL`, u.Team); err != nil {
 		return "", err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_signup_choice SET state='committed',offer_key=$2,generation=$3,actor_id=$4,base_price_id=$5,request_payload=$6,session_id=$7,subscription_id=$8,revision=revision+1,admission_source=(SELECT admission_source FROM billing_pro_upgrade WHERE id=$9),admission_epoch=(SELECT admission_epoch FROM billing_pro_upgrade WHERE id=$9) WHERE team_id=$1 AND state='selecting'`, u.Team, u.Offer, u.Quoted, u.Actor, params.BasePriceID, u.Payload, u.Session, u.Subscription, u.ID); err != nil {

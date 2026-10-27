@@ -245,8 +245,14 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 				t.Fatalf("first-cycle enrolled account %+v enrolled=%v err=%v", enrolledAccount, enrolled, err)
 			}
 			a = enrolledAccount
+			exec(`INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason) VALUES($1,0.07,0.07,'signup trial credit')`, team)
 			if outcome, e := h.activateProUpgrade(t.Context(), u, params, session); e != nil || outcome != "active" {
 				t.Fatalf("activation: %s %v", outcome, e)
+			}
+			var leftover float64
+			var ended bool
+			if e := h.Pool.QueryRow(t.Context(), `SELECT (SELECT COALESCE(sum(remaining_usd),0)::float8 FROM team_credit_grant WHERE team_id=$1 AND reason='signup trial credit'),(SELECT trial_ended_at IS NOT NULL FROM team_billing_account WHERE team_id=$1)`, team).Scan(&leftover, &ended); e != nil || leftover != 0 || !ended {
+				t.Fatalf("paid activation kept trial credit: %v ended=%v %v", leftover, ended, e)
 			}
 			if grantCreates != 1 {
 				t.Fatalf("payment replay duplicated grant: %d", grantCreates)

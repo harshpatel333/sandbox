@@ -1,11 +1,33 @@
--- New-team signups start pending: enrolled, with no plan and no compute,
--- until their first paid checkout assigns a plan. Teams already enrolled with
--- a Free assignment keep it and its existing authority checks.
+-- New-team signups start on a no-card trial: enrolled with no plan until their
+-- first paid checkout assigns one. Teams already enrolled with a Free
+-- assignment keep it and its existing authority checks.
 ALTER TABLE billing_new_team_enrollment
  ALTER COLUMN initial_assignment_id DROP NOT NULL,
  ALTER COLUMN initial_free_version_id DROP NOT NULL,
  ADD CONSTRAINT billing_new_team_enrollment_initial_free_pair
   CHECK((initial_assignment_id IS NULL)=(initial_free_version_id IS NULL));
+
+-- The trial a new team gets before it pays. It is configuration: signups stay
+-- on Free until every value is set, and the values are frozen into the team's
+-- credit grant and limits when its trial starts.
+CREATE TABLE billing_trial_policy (
+ singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),
+ credit_usd numeric(12,6) CHECK(credit_usd>0),
+ max_sandboxes integer CHECK(max_sandboxes>0),
+ max_vcpu integer CHECK(max_vcpu>0),
+ max_memory_mib integer CHECK(max_memory_mib>0),
+ max_disk_mib integer CHECK(max_disk_mib>0),
+ updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+INSERT INTO billing_trial_policy DEFAULT VALUES;
+ALTER TABLE billing_trial_policy ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON billing_trial_policy FROM PUBLIC;
+
+CREATE FUNCTION billing_trial_configured() RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+ SELECT COALESCE((SELECT credit_usd IS NOT NULL AND max_sandboxes IS NOT NULL AND max_vcpu IS NOT NULL
+  AND max_memory_mib IS NOT NULL AND max_disk_mib IS NOT NULL FROM billing_trial_policy WHERE singleton),false);
+$$;
 
 -- Paid-first signup sends every new team to a self-serve subscription, so it
 -- applies only while both are sellable. Until then signups keep Free.
@@ -15,10 +37,32 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp A
   AND kind='subscription' AND public AND self_serve AND NOT display_only AND monthly_fee_cents>0;
 $$;
 
-CREATE FUNCTION billing_team_pending_payment(p_team uuid) RETURNS boolean
+CREATE FUNCTION billing_team_awaiting_plan(p_team uuid) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
  SELECT EXISTS(SELECT 1 FROM billing_new_team_enrollment e WHERE e.team_id=p_team AND e.initial_assignment_id IS NULL)
   AND NOT EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=p_team AND p.effective_to IS NULL);
+$$;
+
+
+-- A team awaiting its plan has compute only while its trial credit lasts; the
+-- trial eligibility worker settles exhaustion as for the signup trial.
+CREATE FUNCTION billing_team_trial_active(p_team uuid) RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+ SELECT billing_team_awaiting_plan(p_team)
+  AND EXISTS(SELECT 1 FROM team_credit_grant g WHERE g.team_id=p_team AND g.reason='signup trial credit' AND g.remaining_usd>0
+   AND (g.expires_at IS NULL OR g.expires_at>now()))
+  AND NOT EXISTS(SELECT 1 FROM team_billing_account a WHERE a.team_id=p_team AND a.trial_ended_at IS NOT NULL)
+  AND COALESCE((SELECT c.eligible FROM team_trial_eligibility_cache c WHERE c.team_id=p_team),true);
+$$;
+
+CREATE FUNCTION billing_team_entry_state(p_team uuid) RETURNS text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+ SELECT CASE
+  WHEN NOT billing_team_awaiting_plan(p_team) THEN 'active'
+  WHEN billing_team_trial_active(p_team) THEN 'trial'
+  WHEN EXISTS(SELECT 1 FROM billing_pro_upgrade_setup s JOIN billing_pro_upgrade u ON u.id=s.upgrade_id
+   WHERE u.team_id=p_team AND u.state NOT IN ('expired','ended') AND s.state='open') THEN 'payment_failed'
+  ELSE 'trial_ended' END;
 $$;
 
 CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS boolean LANGUAGE sql STABLE AS $$
@@ -26,7 +70,7 @@ CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS
  WHEN EXISTS(SELECT 1 FROM abuse_restrictions r WHERE r.subject_team_id=p_team_id AND r.released_at IS NULL
  AND (r.expires_at IS NULL OR r.expires_at>now()) AND r.action IN ('create','resume')) THEN false
  WHEN qm_team_managed_billing(p_team_id) THEN true
- WHEN billing_team_pending_payment(p_team_id) THEN false
+ WHEN billing_team_awaiting_plan(p_team_id) THEN billing_team_trial_active(p_team_id)
  WHEN EXISTS(SELECT 1 FROM billing_free_plan(p_team_id)) THEN NOT billing_free_allowance_blocked(p_team_id)
  WHEN NOT COALESCE(f.enforce,false) THEN team_sandbox_billing_eligible_legacy(p_team_id)
  WHEN f.observed_generation IS DISTINCT FROM f.generation
@@ -41,8 +85,8 @@ CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS
  LEFT JOIN team_billing_account a USING(team_id);
 $$;
 
--- A team waiting for payment has no plan, so it must not fall back to the
--- legacy pay-as-you-go defaults for sandboxes or templates.
+-- A team awaiting its plan has no plan to fall back on: its trial limits are
+-- on the team, and it builds no templates.
 CREATE OR REPLACE FUNCTION team_effective_limits(p_team uuid)
 RETURNS TABLE(max_concurrent integer, max_vcpu integer, max_memory_mib integer, max_disk_mib integer, max_templates integer)
 LANGUAGE sql STABLE AS $$
@@ -57,9 +101,9 @@ LANGUAGE sql STABLE AS $$
         SELECT l.max_templates FROM billing_commercial_contract c JOIN billing_contract_limits l ON l.contract_id = c.id
         WHERE c.team_id = p_team AND c.status = 'active' ORDER BY c.starts_at DESC LIMIT 1
     ), pending AS (
-        SELECT billing_team_pending_payment(p_team) AS pending
+        SELECT billing_team_awaiting_plan(p_team) AS pending
     )
-    SELECT CASE WHEN p.pending THEN 0 ELSE t.max_sandboxes END,
+    SELECT t.max_sandboxes,
         COALESCE(t.max_template_vcpu, b.max_template_vcpu),
         COALESCE(t.max_template_memory_mib, b.max_template_memory_mib),
         COALESCE(t.max_template_disk_mib, b.max_template_disk_mib),
@@ -86,7 +130,7 @@ LANGUAGE sql STABLE AS $$
    CASE
     WHEN EXISTS(SELECT 1 FROM team_plan_assignment pa WHERE pa.team_id = p_team AND pa.effective_to IS NULL) THEN 'already_assigned'
     WHEN qm_team_managed_billing(p_team) THEN 'qm_managed_billing'
-    WHEN billing_team_pending_payment(p_team) THEN 'pending_payment'
+    WHEN billing_team_awaiting_plan(p_team) THEN 'awaiting_plan'
     WHEN EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id = p_team AND c.status='active') THEN 'active_contract'
     WHEN EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id = p_team AND c.status='pending') THEN 'pending_contract'
     WHEN a.checkout_initializing_at IS NOT NULL OR a.checkout_may_exist
@@ -147,7 +191,8 @@ BEGIN
    RAISE EXCEPTION 'signup region or identity does not match new-team cell' USING ERRCODE='55000';
   END IF;
   PERFORM 1 FROM billing_plan_version WHERE family IN ('developer','pro','free') AND pricing_version='v2' AND state='published' FOR SHARE;
-  IF billing_paid_first_sellable() THEN
+  PERFORM 1 FROM billing_trial_policy WHERE singleton FOR SHARE;
+  IF billing_paid_first_sellable() AND billing_trial_configured() THEN
    INSERT INTO billing_new_team_enrollment(team_id,region,enrollment_epoch,creator_user_id,source)
     VALUES(p_id,p_region,g.epoch,p_actor,p_source);
   ELSE
@@ -159,6 +204,102 @@ BEGIN
  INSERT INTO team(id,name,home_region) VALUES(p_id,p_name,p_region) RETURNING * INTO result;
  RETURN result;
 END $$;
+
+-- A team awaiting its plan claims the configured trial through the same user
+-- and device fences as the signup trial, instead of the fixed legacy grant.
+CREATE OR REPLACE FUNCTION claim_team_signup_trial_with_device(p_team_id uuid, p_user_id uuid)
+RETURNS TABLE(outcome text, reason text)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
+DECLARE v_reason text; v_fingerprint text; v_outcome text; v_claim_reason text; v_actor uuid;
+    v_provenance team_signup_trial_provenance; v_trial billing_trial_policy; v_cohort_trial boolean;
+BEGIN
+    PERFORM 1 FROM team WHERE id = p_team_id FOR NO KEY UPDATE NOWAIT;
+    IF NOT FOUND THEN RAISE EXCEPTION 'signup team does not exist' USING ERRCODE = '22023'; END IF;
+    SELECT o.user_id, o.outcome, o.reason INTO v_actor, v_outcome, v_claim_reason
+        FROM team_signup_promotion_outcome o WHERE o.team_id = p_team_id;
+    IF FOUND THEN
+        IF v_actor <> p_user_id THEN
+            RAISE EXCEPTION 'signup trial creator cannot change' USING ERRCODE = '22023';
+        END IF;
+        RETURN QUERY SELECT v_outcome, v_claim_reason;
+        RETURN;
+    END IF;
+    SELECT * INTO v_provenance FROM team_signup_trial_provenance
+        WHERE team_id = p_team_id FOR UPDATE;
+    IF NOT FOUND OR v_provenance.completed_at IS NOT NULL THEN
+        RETURN QUERY SELECT 'promotion_ineligible'::text, 'not_initial_creation'::text;
+        RETURN;
+    END IF;
+    IF v_provenance.creator_bound_at IS NOT NULL
+       AND v_provenance.creator_user_id IS DISTINCT FROM p_user_id THEN
+        RAISE EXCEPTION 'signup trial creator cannot change' USING ERRCODE = '22023';
+    END IF;
+    IF p_user_id IS NULL THEN RAISE EXCEPTION 'signup trial requires a creator' USING ERRCODE = '22023'; END IF;
+    SELECT * INTO v_trial FROM billing_trial_policy WHERE singleton;
+    v_cohort_trial := billing_team_awaiting_plan(p_team_id);
+    IF v_cohort_trial AND (v_trial.credit_usd IS NULL OR v_trial.max_sandboxes IS NULL OR v_trial.max_vcpu IS NULL
+        OR v_trial.max_memory_mib IS NULL OR v_trial.max_disk_mib IS NULL) THEN
+        v_reason := 'trial_not_configured';
+    ELSIF billing_pricing_version() = 'v2' OR (NOT v_cohort_trial AND EXISTS(SELECT 1 FROM billing_new_team_enrollment WHERE team_id=p_team_id)) THEN
+        v_reason := 'pricing_v2';
+    ELSIF EXISTS (SELECT 1 FROM team_promotion_creation_attempt a
+        WHERE a.team_id = p_team_id AND a.user_id = p_user_id AND a.authority_unavailable) THEN
+        v_reason := 'authority_unavailable';
+    ELSE
+        SET LOCAL lock_timeout = '5s';
+        PERFORM pg_advisory_xact_lock(hashtext('stripe-promo-user:' || p_user_id::text)::bigint);
+        PERFORM pg_advisory_xact_lock(hashtext('promotion-device-user:' || p_user_id::text)::bigint);
+        BEGIN
+            v_reason := promotion_device_decision(p_user_id, 'signup');
+        EXCEPTION WHEN SQLSTATE '55000' OR no_data_found THEN
+            v_reason := 'authority_unavailable';
+        END;
+    END IF;
+    IF v_reason <> 'eligible' THEN
+        IF v_provenance.legacy_grant_id IS NULL THEN
+            INSERT INTO team_signup_trial_denial(team_id) VALUES(p_team_id) ON CONFLICT DO NOTHING;
+        END IF;
+        INSERT INTO team_signup_promotion_outcome(team_id, user_id, outcome, reason)
+            VALUES(p_team_id, p_user_id, 'promotion_ineligible', v_reason);
+        UPDATE team_signup_trial_provenance SET creator_user_id = p_user_id,
+            creator_bound_at = COALESCE(creator_bound_at, now()), completed_at = now()
+            WHERE team_id = p_team_id;
+        RETURN QUERY SELECT 'promotion_ineligible'::text, v_reason;
+        RETURN;
+    END IF;
+    BEGIN
+        SELECT c.outcome, c.reason INTO v_outcome, v_claim_reason
+            FROM claim_team_signup_trial_without_device(p_team_id, p_user_id) c;
+    EXCEPTION WHEN SQLSTATE '55000' THEN
+        -- A class condition also catches retryable lock errors such as 55P03.
+        IF SQLSTATE <> '55000' THEN RAISE; END IF;
+        v_outcome := 'promotion_ineligible';
+        v_claim_reason := 'authority_unavailable';
+        IF v_provenance.legacy_grant_id IS NULL THEN
+            INSERT INTO team_signup_trial_denial(team_id) VALUES(p_team_id) ON CONFLICT DO NOTHING;
+        END IF;
+        INSERT INTO team_signup_promotion_outcome(team_id, user_id, outcome, reason)
+            VALUES(p_team_id, p_user_id, v_outcome, v_claim_reason);
+        UPDATE team_signup_trial_provenance SET creator_user_id = p_user_id,
+            creator_bound_at = COALESCE(creator_bound_at, now()), completed_at = now()
+            WHERE team_id = p_team_id;
+        RETURN QUERY SELECT v_outcome, v_claim_reason;
+        RETURN;
+    END;
+    IF v_outcome = 'granted' AND v_cohort_trial THEN
+        UPDATE team_credit_grant g SET amount_usd = v_trial.credit_usd, remaining_usd = v_trial.credit_usd
+            WHERE g.team_id = p_team_id AND g.reason = 'signup trial credit';
+        PERFORM apply_assignment_limits(p_team_id, jsonb_build_object('max_concurrent', v_trial.max_sandboxes,
+            'max_vcpu', v_trial.max_vcpu, 'max_memory_mib', v_trial.max_memory_mib, 'max_disk_mib', v_trial.max_disk_mib));
+    END IF;
+    IF v_outcome = 'granted' THEN
+        SELECT e.fingerprint INTO v_fingerprint FROM promotion_signup_device_evidence e WHERE e.user_id = p_user_id;
+        INSERT INTO promotion_device_grant(promotion, user_id, team_id, fingerprint)
+            VALUES('signup', p_user_id, p_team_id, v_fingerprint) ON CONFLICT DO NOTHING;
+    END IF;
+    RETURN QUERY SELECT v_outcome, v_claim_reason;
+END;
+$$;
 
 CREATE OR REPLACE FUNCTION billing_validate_new_team_enrollment() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
@@ -198,7 +339,10 @@ BEGIN
   IF e.team_id IS NULL OR e.region<>NEW.home_region OR e.region<>g.region OR e.enrollment_epoch<>g.epoch THEN
    RAISE EXCEPTION 'trusted actual new-team creation required' USING ERRCODE='55000';
   END IF;
-  IF e.initial_assignment_id IS NULL THEN RETURN NULL; END IF;
+  IF e.initial_assignment_id IS NULL THEN
+   PERFORM apply_assignment_limits(NEW.id,jsonb_build_object('max_concurrent',0));
+   RETURN NULL;
+  END IF;
  END IF;
  SELECT * INTO v FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published' FOR SHARE;
  IF NOT FOUND THEN RAISE EXCEPTION 'published v2 Free plan is required for team creation' USING ERRCODE='55000'; END IF;
@@ -231,10 +375,10 @@ BEGIN
  END IF;
  g.evidence:=p_evidence;
  IF NOT billing_new_team_evidence_valid(g) THEN RAISE EXCEPTION 'verified cohort-contract writer and schema evidence required' USING ERRCODE='55000'; END IF;
- IF NOT billing_paid_first_sellable() THEN
-  RAISE EXCEPTION 'published self-serve Developer and Pro subscriptions required' USING ERRCODE='55000';
+ IF NOT billing_paid_first_sellable() OR NOT billing_trial_configured() THEN
+  RAISE EXCEPTION 'published self-serve Developer and Pro subscriptions and a configured trial required' USING ERRCODE='55000';
  END IF;
- IF to_regprocedure('billing_lock_team_pricing_state(uuid)') IS NULL OR to_regprocedure('billing_team_pending_payment(uuid)') IS NULL
+ IF to_regprocedure('billing_lock_team_pricing_state(uuid)') IS NULL OR to_regprocedure('billing_team_awaiting_plan(uuid)') IS NULL
   OR NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='team'::regclass AND tgname='team_new_free_plan' AND tgenabled IN ('O','A') AND tgfoid='assign_new_team_free_plan()'::regprocedure) THEN
   RAISE EXCEPTION 'cohort and pending-payment schema required' USING ERRCODE='55000';
  END IF;
@@ -248,7 +392,7 @@ END $$;
 CREATE OR REPLACE FUNCTION billing_keep_cohort_free_catalog() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 BEGIN
- IF (billing_new_team_ready() OR EXISTS(SELECT 1 FROM billing_new_team_enrollment)) AND NOT billing_paid_first_sellable()
+ IF (billing_new_team_ready() OR EXISTS(SELECT 1 FROM billing_new_team_enrollment)) AND NOT (billing_paid_first_sellable() AND billing_trial_configured())
   AND NOT EXISTS(SELECT 1 FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published'
    AND v.kind='free' AND v.max_templates=0 AND v.allowance_period='day_window' AND v.allowance_on_exhausted='pause'
    AND v.allowance_compute_seconds>0 AND v.allowance_compute_vcpu>0 AND v.allowance_compute_memory_gib>0) THEN
@@ -258,11 +402,18 @@ BEGIN
 END $$;
 
 DO $$ DECLARE r text; f text; BEGIN
- FOREACH f IN ARRAY ARRAY['billing_paid_first_sellable()','billing_team_pending_payment(uuid)'] LOOP
+ FOREACH f IN ARRAY ARRAY['billing_paid_first_sellable()','billing_trial_configured()','billing_team_awaiting_plan(uuid)','billing_team_trial_active(uuid)','billing_team_entry_state(uuid)'] LOOP
   EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC',f);
   FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
    IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I',f,r); END IF;
   END LOOP;
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role',f); END IF;
  END LOOP;
+ FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON billing_trial_policy FROM %I',r); END IF;
+ END LOOP;
+ IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+  GRANT SELECT ON billing_trial_policy TO service_role;
+  CREATE POLICY billing_trial_policy_backend ON billing_trial_policy FOR SELECT TO service_role USING(true);
+ END IF;
 END $$;

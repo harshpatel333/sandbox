@@ -1438,6 +1438,16 @@ type BillingTeamPauseTarget struct {
 	DoneAt       pgtype.Timestamptz `json:"done_at"`
 }
 
+type BillingTrialPolicy struct {
+	Singleton    bool           `json:"singleton"`
+	CreditUsd    pgtype.Numeric `json:"credit_usd"`
+	MaxSandboxes *int32         `json:"max_sandboxes"`
+	MaxVcpu      *int32         `json:"max_vcpu"`
+	MaxMemoryMib *int32         `json:"max_memory_mib"`
+	MaxDiskMib   *int32         `json:"max_disk_mib"`
+	UpdatedAt    time.Time      `json:"updated_at"`
+}
+
 type BillingUsageEntitlement struct {
 	ID                           uuid.UUID          `json:"id"`
 	TeamID                       uuid.UUID          `json:"team_id"`
