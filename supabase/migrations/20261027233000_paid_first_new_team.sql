@@ -375,8 +375,11 @@ BEGIN
  END IF;
  g.evidence:=p_evidence;
  IF NOT billing_new_team_evidence_valid(g) THEN RAISE EXCEPTION 'verified cohort-contract writer and schema evidence required' USING ERRCODE='55000'; END IF;
- IF NOT billing_paid_first_sellable() OR NOT billing_trial_configured() THEN
-  RAISE EXCEPTION 'published self-serve Developer and Pro subscriptions and a configured trial required' USING ERRCODE='55000';
+ IF NOT (billing_paid_first_sellable() AND billing_trial_configured()) AND NOT EXISTS(SELECT 1 FROM billing_plan_version v
+   WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published' AND v.kind='free' AND v.max_templates=0
+    AND v.allowance_period='day_window' AND v.allowance_on_exhausted='pause' AND v.allowance_compute_seconds>0
+    AND v.allowance_compute_vcpu>0 AND v.allowance_compute_memory_gib>0) THEN
+  RAISE EXCEPTION 'a usable Free catalog, or sellable Developer and Pro with a configured trial, required' USING ERRCODE='55000';
  END IF;
  IF to_regprocedure('billing_lock_team_pricing_state(uuid)') IS NULL OR to_regprocedure('billing_team_awaiting_plan(uuid)') IS NULL
   OR NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='team'::regclass AND tgname='team_new_free_plan' AND tgenabled IN ('O','A') AND tgfoid='assign_new_team_free_plan()'::regprocedure) THEN
@@ -400,6 +403,8 @@ BEGIN
  END IF;
  RETURN NULL;
 END $$;
+CREATE CONSTRAINT TRIGGER cohort_trial_policy_retained AFTER UPDATE ON billing_trial_policy
+ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION billing_keep_cohort_free_catalog();
 
 DO $$ DECLARE r text; f text; BEGIN
  FOREACH f IN ARRAY ARRAY['billing_paid_first_sellable()','billing_trial_configured()','billing_team_awaiting_plan(uuid)','billing_team_trial_active(uuid)','billing_team_entry_state(uuid)'] LOOP

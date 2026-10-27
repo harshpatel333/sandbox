@@ -243,12 +243,7 @@ func TestIntegration_NewTeamCohortPaidFirstNeedsSellableSubscriptions(t *testing
 	pool, system, actor := cohortFixture(t)
 	retire := `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family=$1 AND pricing_version='v2' AND state='published'),NULL)`
 	rolloutExec(t, pool, retire, "developer")
-	if _, err := cohortTryRelease(t, pool, system); pgCode(err) != "55000" {
-		t.Fatalf("gate opened without a sellable Developer plan: %v", err)
-	}
-	cohortPublishSubscription(t, pool, "developer")
 	cohortRelease(t, pool, system)
-	rolloutExec(t, pool, retire, "developer")
 	onFree := cohortCreate(t, pool, actor)
 	var kind string
 	var pending bool
@@ -271,6 +266,9 @@ func TestIntegration_NewTeamCohortPaidFirstNeedsSellableSubscriptions(t *testing
 	rolloutExec(t, pool, retire, "free")
 	if !cohortAwaitingPlan(t, pool, cohortCreate(t, pool, actor)) {
 		t.Fatal("signup with sellable plans and no Free was not awaiting its plan")
+	}
+	if _, err := pool.Exec(t.Context(), `UPDATE billing_trial_policy SET credit_usd=NULL WHERE singleton`); pgCode(err) != "55000" {
+		t.Fatalf("trial unconfigured with no Free to fall back on: %v", err)
 	}
 }
 
@@ -311,5 +309,15 @@ func TestIntegration_NewTeamCohortTrialUsesConfiguredCreditLimitsAndFences(t *te
 	var reason string
 	if err := pool.QueryRow(t.Context(), `SELECT o.reason,billing_team_entry_state($1),EXISTS(SELECT 1 FROM team_credit_grant WHERE team_id=$1) FROM team_signup_promotion_outcome o WHERE o.team_id=$1`, second).Scan(&reason, &state, &eligible); err != nil || (reason != "user_already_claimed" && reason != "identity_already_claimed") || state != "trial_ended" || eligible {
 		t.Fatalf("second team for the same user got another trial: %s %s grant=%v %v", reason, state, eligible, err)
+	}
+}
+
+func TestIntegration_NewTeamCohortReleaseNeedsFreeOrSellableTrial(t *testing.T) {
+	pool, system, _ := cohortFixture(t)
+	retire := `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family=$1 AND pricing_version='v2' AND state='published'),NULL)`
+	rolloutExec(t, pool, retire, "free")
+	rolloutExec(t, pool, retire, "developer")
+	if _, err := cohortTryRelease(t, pool, system); pgCode(err) != "55000" {
+		t.Fatalf("gate opened with neither Free nor a sellable trial: %v", err)
 	}
 }

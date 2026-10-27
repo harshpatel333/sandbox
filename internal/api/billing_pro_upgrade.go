@@ -528,14 +528,18 @@ func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params 
 	if err = h.DB.WithTx(tx).ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: u.Team, StripeGrantID: ""}); err != nil {
 		return "", err
 	}
+	var newTeamTrial bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_new_team_enrollment WHERE team_id=$1 AND initial_assignment_id IS NULL)`, u.Team).Scan(&newTeamTrial); err != nil {
+		return "", err
+	}
 	if err = applyUpgradeTopoff(ctx, tx, u, params, session); err != nil {
 		return "", err
 	}
-	// Paid activation ends the signup trial, dropping any credit left on it.
-	if _, err = tx.Exec(ctx, `UPDATE team_credit_grant SET remaining_usd=0,updated_at=clock_timestamp() WHERE team_id=$1 AND reason='signup trial credit' AND remaining_usd<>0`, u.Team); err != nil {
+	// A new team's first paid plan ends its trial, dropping any credit left.
+	if _, err = tx.Exec(ctx, `UPDATE team_credit_grant SET remaining_usd=0,updated_at=clock_timestamp() WHERE team_id=$1 AND reason='signup trial credit' AND remaining_usd<>0 AND $2`, u.Team, u.InitialAssignment == nil && newTeamTrial); err != nil {
 		return "", err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET trial_ended_at=COALESCE(trial_ended_at,clock_timestamp()),updated_at=clock_timestamp() WHERE team_id=$1 AND trial_ended_at IS NULL`, u.Team); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET trial_ended_at=COALESCE(trial_ended_at,clock_timestamp()),updated_at=clock_timestamp() WHERE team_id=$1 AND trial_ended_at IS NULL AND $2`, u.Team, u.InitialAssignment == nil && newTeamTrial); err != nil {
 		return "", err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_signup_choice SET state='committed',offer_key=$2,generation=$3,actor_id=$4,base_price_id=$5,request_payload=$6,session_id=$7,subscription_id=$8,revision=revision+1,admission_source=(SELECT admission_source FROM billing_pro_upgrade WHERE id=$9),admission_epoch=(SELECT admission_epoch FROM billing_pro_upgrade WHERE id=$9) WHERE team_id=$1 AND state='selecting'`, u.Team, u.Offer, u.Quoted, u.Actor, params.BasePriceID, u.Payload, u.Session, u.Subscription, u.ID); err != nil {
