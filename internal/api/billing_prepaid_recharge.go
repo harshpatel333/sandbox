@@ -156,8 +156,8 @@ var errTopoffNotOffered = errors.New("the team's plan does not offer Auto Topoff
 // applyCheckoutTopoff records the Auto Topoff choice made at checkout for a
 // prepaid-funded subscription, inside the caller's settlement transaction and
 // with the admission that checkout accepted. Amount and threshold come from
-// the plan's frozen terms. Replaying a session changes nothing, so a later
-// change by the customer survives settlement retries. It also queues the team
+// the plan's frozen terms. Replaying any applied session changes nothing, so
+// a later choice survives settlement retries, even out of order. It also queues the team
 // for funding observation, which retryPrepaidEnrolment completes outside tx
 // because the observation cohort may be full.
 func applyCheckoutTopoff(ctx context.Context, tx pgx.Tx, team uuid.UUID, session string, enabled bool, admission pricingPublicState) error {
@@ -171,20 +171,23 @@ func applyCheckoutTopoff(ctx context.Context, tx pgx.Tx, team uuid.UUID, session
 	if !ok || plan.Kind != planKindSubscription || !plan.prepaidFunded() || (enabled && plan.Terms.Topoff == nil) {
 		return errTopoffNotOffered
 	}
+	applied, err := tx.Exec(ctx, `INSERT INTO billing_checkout_topoff(session_id,team_id,enabled) VALUES($1,$2,$3) ON CONFLICT(session_id) DO NOTHING`, session, team, enabled)
+	if err != nil || applied.RowsAffected() == 0 {
+		return err
+	}
 	var amount, threshold *int64
 	if t := plan.Terms.Topoff; t != nil {
 		amount, threshold = &t.AmountCents, &t.ThresholdCents
 	}
 	// Turning it off keeps the saved admission: only consent may change it.
-	if _, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,checkout_session_id,admission_source,admission_epoch)
- VALUES($1,$2,$3,$4,$5,$6,$7)
+	if _, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,admission_source,admission_epoch)
+ VALUES($1,$2,$3,$4,$5,$6)
  ON CONFLICT(team_id) DO UPDATE SET enabled=EXCLUDED.enabled,threshold_cents=EXCLUDED.threshold_cents,amount_cents=EXCLUDED.amount_cents,
-  checkout_session_id=EXCLUDED.checkout_session_id,updated_by=NULL,updated_at=clock_timestamp(),
+  updated_by=NULL,updated_at=clock_timestamp(),
   disabled_reason=NULL,disabled_at=NULL,disabled_by=NULL,notified_at=NULL,
   admission_source=CASE WHEN EXCLUDED.enabled THEN EXCLUDED.admission_source ELSE billing_prepaid_auto_recharge.admission_source END,
-  admission_epoch=CASE WHEN EXCLUDED.enabled THEN EXCLUDED.admission_epoch ELSE billing_prepaid_auto_recharge.admission_epoch END
- WHERE billing_prepaid_auto_recharge.checkout_session_id IS DISTINCT FROM EXCLUDED.checkout_session_id`,
-		team, enabled, threshold, amount, session, pricingSource(admission), pricingEpoch(admission)); err != nil {
+  admission_epoch=CASE WHEN EXCLUDED.enabled THEN EXCLUDED.admission_epoch ELSE billing_prepaid_auto_recharge.admission_epoch END`,
+		team, enabled, threshold, amount, pricingSource(admission), pricingEpoch(admission)); err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO billing_funding_account(team_id,prepaid_enrolment_due_at) VALUES($1,clock_timestamp())

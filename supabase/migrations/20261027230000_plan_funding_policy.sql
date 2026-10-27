@@ -136,6 +136,22 @@ BEGIN
  RETURN result;
 END $$;
 
--- The checkout whose Auto Topoff choice the row holds, so a replayed
--- settlement never overwrites a later change by the customer.
-ALTER TABLE billing_prepaid_auto_recharge ADD COLUMN checkout_session_id text CHECK (btrim(checkout_session_id)<>'');
+-- Checkouts whose Auto Topoff choice was applied. A retried settlement of any
+-- of them, even an older one, never overwrites a later choice.
+CREATE TABLE billing_checkout_topoff (
+ session_id text PRIMARY KEY CHECK (btrim(session_id)<>''),
+ team_id uuid NOT NULL REFERENCES team(id) ON DELETE CASCADE,
+ enabled boolean NOT NULL,
+ applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+ALTER TABLE billing_checkout_topoff ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON billing_checkout_topoff FROM PUBLIC;
+DO $$ DECLARE r text; BEGIN
+ FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON billing_checkout_topoff FROM %I',r); END IF;
+ END LOOP;
+ IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+  GRANT SELECT, INSERT ON billing_checkout_topoff TO service_role;
+  CREATE POLICY backend_access ON billing_checkout_topoff TO service_role USING (true) WITH CHECK (true);
+ END IF;
+END $$;

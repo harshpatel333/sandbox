@@ -201,6 +201,15 @@ func TestPrepaidFundedSubscriptionTopoffChoiceReplaysPerSession(t *testing.T) {
 	if enabled, amount := state(); !enabled || amount != 1500 {
 		t.Fatal("a new checkout's choice was not applied", enabled, amount)
 	}
+	if err := f.applyTopoff("cs_third", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.applyTopoff("cs_second", true); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, _ := state(); enabled {
+		t.Fatal("an older checkout retried out of order overrode a newer choice")
+	}
 }
 
 func TestPrepaidFundedSubscriptionTopoffNeedsAnOffer(t *testing.T) {

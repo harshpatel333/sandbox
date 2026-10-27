@@ -354,6 +354,13 @@ type BillingCatalogAudit struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type BillingCheckoutTopoff struct {
+	SessionID string    `json:"session_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	Enabled   bool      `json:"enabled"`
+	AppliedAt time.Time `json:"applied_at"`
+}
+
 type BillingCommercialContract struct {
 	ID                     uuid.UUID          `json:"id"`
 	TeamID                 uuid.UUID          `json:"team_id"`
@@ -1008,19 +1015,18 @@ type BillingPlanVersion struct {
 }
 
 type BillingPrepaidAutoRecharge struct {
-	TeamID            uuid.UUID          `json:"team_id"`
-	Enabled           bool               `json:"enabled"`
-	ThresholdCents    *int64             `json:"threshold_cents"`
-	AmountCents       *int64             `json:"amount_cents"`
-	UpdatedBy         pgtype.UUID        `json:"updated_by"`
-	UpdatedAt         time.Time          `json:"updated_at"`
-	DisabledReason    *string            `json:"disabled_reason"`
-	DisabledAt        pgtype.Timestamptz `json:"disabled_at"`
-	DisabledBy        pgtype.UUID        `json:"disabled_by"`
-	NotifiedAt        pgtype.Timestamptz `json:"notified_at"`
-	AdmissionSource   *string            `json:"admission_source"`
-	AdmissionEpoch    pgtype.UUID        `json:"admission_epoch"`
-	CheckoutSessionID *string            `json:"checkout_session_id"`
+	TeamID          uuid.UUID          `json:"team_id"`
+	Enabled         bool               `json:"enabled"`
+	ThresholdCents  *int64             `json:"threshold_cents"`
+	AmountCents     *int64             `json:"amount_cents"`
+	UpdatedBy       pgtype.UUID        `json:"updated_by"`
+	UpdatedAt       time.Time          `json:"updated_at"`
+	DisabledReason  *string            `json:"disabled_reason"`
+	DisabledAt      pgtype.Timestamptz `json:"disabled_at"`
+	DisabledBy      pgtype.UUID        `json:"disabled_by"`
+	NotifiedAt      pgtype.Timestamptz `json:"notified_at"`
+	AdmissionSource *string            `json:"admission_source"`
+	AdmissionEpoch  pgtype.UUID        `json:"admission_epoch"`
 }
 
 type BillingPrepaidCheckoutOperation struct {
