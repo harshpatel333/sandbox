@@ -131,6 +131,23 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 			return
 		}
 	}
+	// A proven first-purchase lease resumes its accepted payment before policies
+	// that only admit new purchases. The dispatch path rechecks the locked lease.
+	if acceptedLease != nil {
+		var managed, proPending bool
+		if err = h.Pool.QueryRow(ctx, `SELECT qm_team_managed_billing($1),EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers+`)`, team).Scan(&managed, &proPending); err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		// Conflicting managed or Pro authority retains the original payment
+		// status without bypassing the subscription-account SQL guards.
+		if managed || proPending || client == nil {
+			c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: acceptedLease.PurchaseID, State: "pending"})
+			return
+		}
+		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, acceptedRedirects: true, acceptedLease: acceptedLease})
+		return
+	}
 	if !acceptedRedirects && acceptedLease == nil {
 		admission, admissionErr := h.teamPricingState(ctx, team)
 		if admissionErr != nil {

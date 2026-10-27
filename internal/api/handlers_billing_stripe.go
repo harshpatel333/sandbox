@@ -1805,15 +1805,17 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 			return
 		}
 	}
-	exportEnabled, err := h.billingExportEnabled(c.Request.Context(), teamID)
-	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read billing export feature flag failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	if !exportEnabled {
-		respondErrorMsg(c, "forbidden", "Stripe checkout is unavailable in shadow billing mode", http.StatusForbidden)
-		return
+	if prepaid == nil || prepaid.acceptedLease == nil {
+		exportEnabled, err := h.billingExportEnabled(c.Request.Context(), teamID)
+		if err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("read billing export feature flag failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		if !exportEnabled {
+			respondErrorMsg(c, "forbidden", "Stripe checkout is unavailable in shadow billing mode", http.StatusForbidden)
+			return
+		}
 	}
 	account, err := h.DB.GetTeamBillingAccount(c.Request.Context(), teamID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {

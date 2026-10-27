@@ -512,6 +512,114 @@ func TestNewTeamCohortImplicitRedirectDelimiterCannotBypassPolicy(t *testing.T) 
 	}
 }
 
+func TestNewTeamCohortImplicitRecoverySurvivesFreshPolicyChanges(t *testing.T) {
+	for _, policy := range []string{"capacity", "pro_pending", "export", "managed"} {
+		t.Run(policy, func(t *testing.T) {
+			f := newTeamCohortTestFixture(t)
+			f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
+			f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := f.h.Pool.Exec(t.Context(), sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_policy')`, f.team)
+			exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)`, f.team)
+			calls := 0
+			var key, expiry string
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/checkout/sessions" {
+					t.Errorf("unexpected provider request %s %s", r.Method, r.URL.Path)
+					http.Error(w, "unexpected", 500)
+					return
+				}
+				if err := r.ParseForm(); err != nil {
+					t.Error(err)
+				}
+				calls++
+				if calls == 1 {
+					key, expiry = r.Header.Get("Idempotency-Key"), r.Form.Get("expires_at")
+					http.Error(w, "lost response", 500)
+					return
+				}
+				if key != r.Header.Get("Idempotency-Key") || expiry != r.Form.Get("expires_at") {
+					t.Error("recovery changed provider identity")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"cs_policy","url":"https://checkout.stripe.com/policy"}`))
+			}))
+			t.Cleanup(provider.Close)
+			f.h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+			r := gin.New()
+			r.POST("/billing/prepaid/checkout", func(c *gin.Context) {
+				c.Set("team_id", f.team.String())
+				c.Set("actor_id", f.actor)
+				f.h.CreatePrepaidCheckout(c)
+			})
+			req := prepaidCheckoutBody{AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+			if rec := prepaidOperationPost(r, req); rec.Code != http.StatusBadGateway {
+				t.Fatalf("initial ambiguous response: %d %s", rec.Code, rec.Body)
+			}
+			var frozen []byte
+			if err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_object('id',id,'amount',amount_cents,'snapshot',plan_snapshot,'epoch',admission_epoch,'payment_key',payment_idempotency_key,'credit_key',credit_idempotency_key) FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&frozen); err != nil {
+				t.Fatal(err)
+			}
+			var accountBefore []byte
+			if err := f.h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(a) FROM team_billing_account a WHERE team_id=$1`, f.team).Scan(&accountBefore); err != nil {
+				t.Fatal(err)
+			}
+			freshStatus := http.StatusForbidden
+			switch policy {
+			case "capacity":
+				exec(`INSERT INTO billing_funding_account(team_id,observe) VALUES($1,true) ON CONFLICT(team_id) DO UPDATE SET observe=true`, f.old)
+				exec(`UPDATE billing_funding_policy SET max_observed_teams=1`)
+				if available, err := f.h.prepaidCapacityAvailable(t.Context(), f.team); err != nil || available {
+					t.Fatalf("capacity fixture not exhausted: %v/%v", available, err)
+				}
+				freshStatus = http.StatusServiceUnavailable
+			case "pro_pending":
+				exec(`UPDATE billing_signup_choice SET offer_key='pro_monthly',state='pending',generation=clock_timestamp(),actor_id=$2,base_price_id='price_pro',request_payload='{"PlanTerms":{"PricingV2":true}}',admission_source='new_team',admission_epoch=$3 WHERE team_id=$1`, f.team, f.actor, f.epoch)
+				freshStatus = http.StatusConflict
+			case "export":
+				exec(`UPDATE team_feature_flag SET enabled=false WHERE team_id=$1 AND key='billing_export_enabled'`, f.team)
+			case "managed":
+				authority, org := uuid.New(), uuid.New()
+				exec(`INSERT INTO qm_team_service_authority(namespace,authority_id,home_region) VALUES('policy-test',$1,'use')`, authority)
+				exec(`INSERT INTO qm_organization_teams(namespace,qm_org_id,idempotency_key,authority_id,team_id,home_region) VALUES('policy-test',$1::uuid,'qm-org:v1:'||$1::text,$2,$3,'use')`, org, authority, f.team)
+			}
+			fresh := req
+			fresh.OperationID = uuid.New()
+			if rec := prepaidOperationPost(r, fresh); rec.Code != freshStatus || calls != 1 {
+				t.Fatalf("fresh %s policy bypass: %d %s calls=%d", policy, rec.Code, rec.Body, calls)
+			}
+			f.close(t)
+			rec := prepaidOperationPost(r, req)
+			want, callsWant := http.StatusOK, 2
+			if policy == "managed" || policy == "pro_pending" {
+				want, callsWant = http.StatusAccepted, 1
+			}
+			if rec.Code != want || calls != callsWant {
+				t.Fatalf("retained %s recovery: %d %s calls=%d", policy, rec.Code, rec.Body, calls)
+			}
+			var after []byte
+			if err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_object('id',id,'amount',amount_cents,'snapshot',plan_snapshot,'epoch',admission_epoch,'payment_key',payment_idempotency_key,'credit_key',credit_idempotency_key) FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&after); err != nil || string(after) != string(frozen) {
+				t.Fatalf("retained purchase changed: %v", err)
+			}
+			if policy == "managed" || policy == "pro_pending" {
+				var accountAfter []byte
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(a) FROM team_billing_account a WHERE team_id=$1`, f.team).Scan(&accountAfter); err != nil || string(accountBefore) != string(accountAfter) {
+					t.Fatalf("conflicting authority mutated the accepted account: %v", err)
+				}
+				var got prepaidOperationResponse
+				if json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.PurchaseID == uuid.Nil || got.State != "pending" {
+					t.Fatalf("managed takeover lost accepted status: %s", rec.Body)
+				}
+			}
+		})
+	}
+}
+
 func TestNewTeamCohortFirstCheckoutClosureRaceIsConflict(t *testing.T) {
 	f := newTeamCohortTestFixture(t)
 	f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
