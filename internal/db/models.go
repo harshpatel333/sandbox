@@ -1001,21 +1001,26 @@ type BillingPlanVersion struct {
 	PublishedAt               pgtype.Timestamptz `json:"published_at"`
 	RetiredBy                 pgtype.UUID        `json:"retired_by"`
 	RetiredAt                 pgtype.Timestamptz `json:"retired_at"`
+	FundingPolicy             string             `json:"funding_policy"`
+	TopoffAmountCents         *int64             `json:"topoff_amount_cents"`
+	TopoffThresholdCents      *int64             `json:"topoff_threshold_cents"`
+	TopoffDefaultEnabled      *bool              `json:"topoff_default_enabled"`
 }
 
 type BillingPrepaidAutoRecharge struct {
-	TeamID          uuid.UUID          `json:"team_id"`
-	Enabled         bool               `json:"enabled"`
-	ThresholdCents  *int64             `json:"threshold_cents"`
-	AmountCents     *int64             `json:"amount_cents"`
-	UpdatedBy       pgtype.UUID        `json:"updated_by"`
-	UpdatedAt       time.Time          `json:"updated_at"`
-	DisabledReason  *string            `json:"disabled_reason"`
-	DisabledAt      pgtype.Timestamptz `json:"disabled_at"`
-	DisabledBy      pgtype.UUID        `json:"disabled_by"`
-	NotifiedAt      pgtype.Timestamptz `json:"notified_at"`
-	AdmissionSource *string            `json:"admission_source"`
-	AdmissionEpoch  pgtype.UUID        `json:"admission_epoch"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	Enabled           bool               `json:"enabled"`
+	ThresholdCents    *int64             `json:"threshold_cents"`
+	AmountCents       *int64             `json:"amount_cents"`
+	UpdatedBy         pgtype.UUID        `json:"updated_by"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	DisabledReason    *string            `json:"disabled_reason"`
+	DisabledAt        pgtype.Timestamptz `json:"disabled_at"`
+	DisabledBy        pgtype.UUID        `json:"disabled_by"`
+	NotifiedAt        pgtype.Timestamptz `json:"notified_at"`
+	AdmissionSource   *string            `json:"admission_source"`
+	AdmissionEpoch    pgtype.UUID        `json:"admission_epoch"`
+	CheckoutSessionID *string            `json:"checkout_session_id"`
 }
 
 type BillingPrepaidCheckoutOperation struct {
