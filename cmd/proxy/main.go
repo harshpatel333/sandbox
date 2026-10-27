@@ -577,22 +577,29 @@ func routingBootstrapGate(fresh func() bool, warmup time.Duration) func() bool {
 
 const routingBootstrapPoll = 10 * time.Millisecond
 
-// withRoutingBootstrap holds requests during warmup instead of refusing them;
-// the gate opens by its deadline, which bounds the wait. A request held until
-// the deadline, with routing state still cold, is refused as before rather
-// than released into the ownership fallback with the rest of the backlog.
+// withRoutingBootstrap holds warmup requests on one shared waiter. Requests
+// still held when the deadline opens the gate on cold state are refused, so a
+// restart backlog never floods the ownership fallback.
 func withRoutingBootstrap(next http.Handler, ready, warmed func() bool) http.Handler {
+	var once sync.Once
+	opened := make(chan struct{})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !ready() {
-			tick := time.NewTicker(routingBootstrapPoll)
-			defer tick.Stop()
+			once.Do(func() {
+				go func() {
+					tick := time.NewTicker(routingBootstrapPoll)
+					defer tick.Stop()
+					for !ready() {
+						<-tick.C
+					}
+					close(opened)
+				}()
+			})
 			held := true
-			for held && !ready() {
-				select {
-				case <-r.Context().Done():
-					held = false
-				case <-tick.C:
-				}
+			select {
+			case <-opened:
+			case <-r.Context().Done():
+				held = false
 			}
 			if !held || !warmed() {
 				w.Header().Set("Content-Type", "application/json")
