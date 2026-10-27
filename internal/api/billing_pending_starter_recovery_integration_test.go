@@ -3,7 +3,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,7 +17,7 @@ import (
 )
 
 func TestPrepaidPendingStarterRecovery(t *testing.T) {
-	for _, scenario := range []string{"resume", "cancel", "expired", "paid", "lost_ack", "timeout", "mismatch", "changed_generation", "wrong_actor", "wrong_request", "failed_fence", "closed_entry", "wrong_team", "expired_webhook_race", "paid_during_expire", "timeout_after_expire", "mismatch_after_expire", "wrong_generation", "legacy_resume", "legacy_cancel", "legacy_closed_entry", "expired_with_invoice", "expired_with_payment_intent", "expired_with_subscription", "established_subscription_resume"} {
+	for _, scenario := range []string{"missing_link_resume", "missing_link_cancel", "missing_link_wrong_actor", "missing_link_paid", "missing_link_newer_generation", "missing_link_foreign_purchase", "missing_link_other_session", "resume", "cancel", "expired", "paid", "lost_ack", "timeout", "mismatch", "changed_generation", "wrong_actor", "wrong_request", "failed_fence", "closed_entry", "wrong_team", "expired_webhook_race", "paid_during_expire", "timeout_after_expire", "mismatch_after_expire", "wrong_generation", "legacy_resume", "legacy_cancel", "legacy_closed_entry", "expired_with_invoice", "expired_with_payment_intent", "expired_with_subscription", "established_subscription_resume"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newPrepaidFixture(t)
 			actor := uuid.New()
@@ -27,9 +29,35 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 			if strings.HasPrefix(scenario, "legacy_") {
 				req.OperationID = uuid.Nil
 			}
+			missingLink := strings.HasPrefix(scenario, "missing_link_")
+			trigger := "test_checkout_link_" + strings.ReplaceAll(f.team.String(), "-", "")
+			if missingLink {
+				f.exec(fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected association write failure'; END $$`, trigger))
+				f.exec(fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE OF checkout_session_id ON billing_prepaid_purchase FOR EACH ROW WHEN (NEW.team_id='%s'::uuid AND OLD.checkout_session_id IS NULL AND NEW.checkout_session_id IS NOT NULL) EXECUTE FUNCTION %s()`, trigger, f.team, trigger))
+				t.Cleanup(func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if _, err := f.h.Pool.Exec(ctx, fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON billing_prepaid_purchase`, trigger)); err != nil {
+						t.Error(err)
+					}
+					if _, err := f.h.Pool.Exec(ctx, fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, trigger)); err != nil {
+						t.Error(err)
+					}
+				})
+			}
 			rec := prepaidOperationPost(r, req)
 			var created prepaidOperationResponse
-			if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &created) != nil || created.ID == "" {
+			if missingLink {
+				if rec.Code != 500 {
+					t.Fatalf("association interruption %d %s", rec.Code, rec.Body)
+				}
+				account, err := f.h.DB.GetTeamBillingCheckoutForRecovery(t.Context(), f.team)
+				if err != nil || account.CheckoutSessionID == nil {
+					t.Fatalf("retained provider session %v %v", account.CheckoutSessionID, err)
+				}
+				created.ID = *account.CheckoutSessionID
+				f.exec(fmt.Sprintf(`DROP TRIGGER %s ON billing_prepaid_purchase`, trigger))
+			} else if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &created) != nil || created.ID == "" {
 				t.Fatalf("create %d %s", rec.Code, rec.Body)
 			}
 			p, err := f.h.loadPendingStarter(t.Context(), f.team, actor)
@@ -72,6 +100,9 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 						}
 					}
 					gets++
+					if scenario == "missing_link_newer_generation" && gets == 3 {
+						f.exec(`UPDATE team_billing_account SET checkout_initializing_at=checkout_initializing_at+interval '1 second' WHERE team_id=$1`, f.team)
+					}
 					if scenario == "established_subscription_resume" {
 						f.exec(`UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status='active' WHERE team_id=$1`, f.team, f.sub)
 					}
@@ -98,7 +129,10 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 					if scenario == "expired_with_subscription" {
 						data["subscription"] = "sub_pending"
 					}
-					if scenario == "paid" || (scenario == "paid_during_expire" && cancelCalls > 0) {
+					if scenario == "missing_link_foreign_purchase" {
+						data["metadata"] = map[string]string{"activation_user_id": actor.String(), "checkout_generation": p.Account.CheckoutInitializingAt.Time.UTC().Format(time.RFC3339Nano), "prepaid_purchase_id": uuid.NewString()}
+					}
+					if scenario == "missing_link_paid" || scenario == "paid" || (scenario == "paid_during_expire" && cancelCalls > 0) {
 						data["status"] = "complete"
 						data["payment_status"] = "paid"
 						data["subscription"] = "sub_completed"
@@ -115,7 +149,7 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 			f.client.baseURL = provider.URL
 			f.client.httpClient = provider.Client()
 			currentActor := actor
-			if scenario == "wrong_actor" {
+			if scenario == "wrong_actor" || scenario == "missing_link_wrong_actor" {
 				currentActor = uuid.New()
 			}
 			r.POST("/billing/prepaid/checkout/recover", func(c *gin.Context) {
@@ -128,7 +162,7 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 				f.h.RecoverPendingStarterCheckout(c)
 			})
 			// The alternate actor has billing access but cannot recover somebody else's session.
-			if scenario == "wrong_actor" {
+			if scenario == "wrong_actor" || scenario == "missing_link_wrong_actor" {
 				prepaidOperationRouter(t, f, f.team, currentActor)
 			}
 			post := func(input pendingStarterRequest) *httptest.ResponseRecorder {
@@ -137,14 +171,26 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 				r.ServeHTTP(out, httptest.NewRequest("POST", "/billing/prepaid/checkout/recover", strings.NewReader(string(b))))
 				return out
 			}
+			if strings.HasPrefix(scenario, "missing_link_") {
+				f.exec(`UPDATE billing_prepaid_purchase SET checkout_session_id=NULL WHERE id=$1`, p.Purchase)
+				if scenario == "missing_link_other_session" {
+					f.exec(`UPDATE billing_prepaid_purchase SET checkout_session_id=$2 WHERE id=$1`, p.Purchase, "cs_other_"+uuid.NewString())
+				}
+			}
 			discover := post(pendingStarterRequest{})
+			if scenario == "missing_link_foreign_purchase" || scenario == "missing_link_other_session" {
+				if discover.Code != 500 || strings.Contains(discover.Body.String(), "no_pending_starter_checkout") || strings.Contains(discover.Body.String(), "https:") || cancelCalls != 0 {
+					t.Fatalf("unsafe association discovery %d %s", discover.Code, discover.Body)
+				}
+				return
+			}
 			if scenario == "wrong_team" {
 				if discover.Code != 403 {
 					t.Fatalf("wrong team %d %s", discover.Code, discover.Body)
 				}
 				return
 			}
-			if scenario == "wrong_actor" {
+			if scenario == "wrong_actor" || scenario == "missing_link_wrong_actor" {
 				if !strings.Contains(discover.Body.String(), "no_pending_starter_checkout") || gets != 0 {
 					t.Fatalf("actor exposure %d %s", discover.Code, discover.Body)
 				}
@@ -153,7 +199,7 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 			if discover.Code != 200 || !strings.Contains(discover.Body.String(), "pending_starter_checkout") || strings.Contains(discover.Body.String(), "https:") {
 				t.Fatalf("discovery %d %s", discover.Code, discover.Body)
 			}
-			input := pendingStarterRequest{PurchaseID: p.Purchase, Generation: &p.Account.CheckoutInitializingAt.Time, Cancel: scenario != "resume" && scenario != "closed_entry" && scenario != "expired" && scenario != "legacy_resume" && scenario != "legacy_closed_entry" && scenario != "established_subscription_resume"}
+			input := pendingStarterRequest{PurchaseID: p.Purchase, Generation: &p.Account.CheckoutInitializingAt.Time, Cancel: scenario != "missing_link_resume" && scenario != "missing_link_newer_generation" && scenario != "resume" && scenario != "closed_entry" && scenario != "expired" && scenario != "legacy_resume" && scenario != "legacy_closed_entry" && scenario != "established_subscription_resume"}
 			if scenario == "wrong_generation" {
 				g := input.Generation.Add(time.Second)
 				input.Generation = &g
@@ -168,11 +214,11 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 				t.Fatal(err)
 			}
 			switch scenario {
-			case "resume", "closed_entry", "legacy_resume", "legacy_closed_entry":
+			case "missing_link_resume", "resume", "closed_entry", "legacy_resume", "legacy_closed_entry":
 				if got.Code != 200 || !strings.Contains(got.Body.String(), "recovered") || cancelCalls != 0 || !fence {
 					t.Fatalf("resume %d %s fence%v", got.Code, got.Body, fence)
 				}
-			case "cancel", "expired", "failed_fence", "expired_webhook_race", "legacy_cancel":
+			case "missing_link_cancel", "cancel", "expired", "failed_fence", "expired_webhook_race", "legacy_cancel":
 				if got.Code != 200 || !strings.Contains(got.Body.String(), "retryable") || fence || payment != "failed" {
 					t.Fatalf("release %d %s fence%v %s", got.Code, got.Body, fence, payment)
 				}
@@ -199,13 +245,32 @@ func TestPrepaidPendingStarterRecovery(t *testing.T) {
 					t.Fatalf("unsafe uncertain release %s %d %s fence%v", scenario, got.Code, got.Body, fence)
 				}
 			}
+			if scenario == "missing_link_resume" || scenario == "missing_link_cancel" {
+				var linked string
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT checkout_session_id FROM billing_prepaid_purchase WHERE id=$1`, p.Purchase).Scan(&linked); err != nil || linked != created.ID {
+					t.Fatalf("original session association %q %v", linked, err)
+				}
+			}
+			if scenario == "missing_link_newer_generation" {
+				var unlinked bool
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT checkout_session_id IS NULL FROM billing_prepaid_purchase WHERE id=$1`, p.Purchase).Scan(&unlinked); err != nil || !unlinked {
+					t.Fatalf("newer generation bound stale session %v %v", unlinked, err)
+				}
+			}
+
 			if scenario == "lost_ack" {
 				retry := post(input)
 				if retry.Code != 200 || !strings.Contains(retry.Body.String(), "retryable") || cancelCalls != 1 {
 					t.Fatalf("lost ack retry %d %s", retry.Code, retry.Body)
 				}
 			}
-			if scenario == "cancel" {
+			if scenario == "missing_link_resume" {
+				replay := post(input)
+				if replay.Code != 200 || replay.Body.String() != got.Body.String() || cancelCalls != 0 {
+					t.Fatalf("association recovery replay %d %s", replay.Code, replay.Body)
+				}
+			}
+			if scenario == "cancel" || scenario == "missing_link_cancel" {
 				replay := post(input)
 				if replay.Code != 200 || !strings.Contains(replay.Body.String(), "no_pending_starter_checkout") || cancelCalls != 1 {
 					t.Fatalf("cancel replay %d %s", replay.Code, replay.Body)

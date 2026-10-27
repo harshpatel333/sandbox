@@ -44,6 +44,28 @@ func (h *Handlers) loadPendingStarter(ctx context.Context, team, actor uuid.UUID
 		return p, pgx.ErrNoRows
 	}
 	err = h.Pool.QueryRow(ctx, `SELECT id,amount_cents,payment_state,credit_state FROM billing_prepaid_purchase WHERE team_id=$1 AND actor_id=$2 AND customer_id=$3 AND checkout_session_id=$4 AND source='checkout'`, team, actor, *a.StripeCustomerID, *a.CheckoutSessionID).Scan(&p.Purchase, &p.Amount, &p.Payment, &p.Credit)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return p, err
+	}
+	// The account session can commit before its purchase association. Discover
+	// only the purchase identified by that exact provider session, never the
+	// newest local purchase. An explicit action binds it under the account lock.
+	client, ok := h.Stripe.(*stripeHTTPClient)
+	if !ok {
+		return p, errors.New("Starter provider verification unavailable")
+	}
+	s, err := client.RetrieveCheckoutSession(ctx, *a.CheckoutSessionID)
+	if err != nil {
+		return p, err
+	}
+	p.Purchase, err = uuid.Parse(s.Metadata["prepaid_purchase_id"])
+	if err != nil || !pendingStarterIdentity(s, p, actor) {
+		return p, errors.New("Starter checkout purchase identity differs")
+	}
+	err = h.Pool.QueryRow(ctx, `SELECT amount_cents,payment_state,credit_state FROM billing_prepaid_purchase WHERE id=$1 AND team_id=$2 AND actor_id=$3 AND customer_id=$4 AND checkout_session_id IS NULL AND source='checkout'`, p.Purchase, team, actor, *a.StripeCustomerID).Scan(&p.Amount, &p.Payment, &p.Credit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return p, errors.New("Starter checkout purchase association is unavailable")
+	}
 	return p, err
 }
 
@@ -83,6 +105,9 @@ func (h *Handlers) RecoverPendingStarterCheckout(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "purchase and checkout generation are required together", 400)
 		return
 	}
+	if input.PurchaseID != uuid.Nil {
+		log.Info().Str("team_id", team.String()).Str("purchase_id", input.PurchaseID.String()).Bool("cancel", input.Cancel).Msg("Starter checkout recovery requested")
+	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
 	defer cancel()
 	p, err := h.loadPendingStarter(ctx, team, actor)
@@ -109,10 +134,11 @@ func (h *Handlers) RecoverPendingStarterCheckout(c *gin.Context) {
 	}
 	outcome, target, err := h.reconcilePendingStarter(ctx, client, p, actor, input.Cancel)
 	if err != nil {
-		log.Warn().Err(err).Str("team_id", team.String()).Str("purchase_id", p.Purchase.String()).Msg("pending Starter checkout recovery retained original fence")
+		log.Warn().Err(err).Str("team_id", team.String()).Str("purchase_id", p.Purchase.String()).Bool("cancel", input.Cancel).Str("outcome", "payment_confirmation_pending").Msg("pending Starter checkout recovery retained original fence")
 		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
 		return
 	}
+	log.Info().Str("team_id", team.String()).Str("purchase_id", p.Purchase.String()).Bool("cancel", input.Cancel).Str("outcome", outcome).Bool("unpaid_cancellation_confirmed", input.Cancel && outcome == "retryable").Msg("Starter checkout recovery completed")
 	response := gin.H{"outcome": outcome, "purchase_id": p.Purchase, "amount_cents": p.Amount, "checkout_generation": p.Account.CheckoutInitializingAt.Time.UTC()}
 	if target != "" {
 		response["url"] = target
@@ -181,8 +207,11 @@ func (h *Handlers) reconcilePendingStarter(ctx context.Context, client *stripeHT
 		return "", "", errors.New("Starter checkout tuple changed")
 	}
 	var payment, credit string
-	err = tx.QueryRow(ctx, `SELECT payment_state,credit_state FROM billing_prepaid_purchase WHERE id=$1 AND team_id=$2 AND actor_id=$3 AND customer_id=$4 AND checkout_session_id=$5 FOR UPDATE`, p.Purchase, current.TeamID, actor, s.CustomerID, s.ID).Scan(&payment, &credit)
+	err = tx.QueryRow(ctx, `SELECT payment_state,credit_state FROM billing_prepaid_purchase WHERE id=$1 AND team_id=$2 AND actor_id=$3 AND customer_id=$4 AND (checkout_session_id=$5 OR checkout_session_id IS NULL) AND source='checkout' FOR UPDATE`, p.Purchase, current.TeamID, actor, s.CustomerID, s.ID).Scan(&payment, &credit)
 	if err != nil {
+		return "", "", err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET checkout_session_id=$2 WHERE id=$1 AND checkout_session_id IS NULL`, p.Purchase, s.ID); err != nil {
 		return "", "", err
 	}
 	if pendingStarterExpiredUnpaid(s) && payment != "succeeded" && credit != "issued" && !current.CheckoutCompletedAt.Valid && current.CheckoutSubscriptionID == nil && !billingAccountHasEstablishedSubscription(db.GetTeamBillingAccountRow{StripeSubscriptionID: current.StripeSubscriptionID, StripeSubscriptionStatus: current.StripeSubscriptionStatus}) {
