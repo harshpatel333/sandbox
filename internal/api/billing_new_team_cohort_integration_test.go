@@ -309,6 +309,7 @@ func TestNewTeamCohortFirstProUsesFullMonthAndRetainsAcceptedQuote(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback(context.Background())
 	if _, err = tx.Exec(t.Context(), `UPDATE billing_pro_upgrade SET state='credited',payment_evidence='{}',grant_id='credgr_local' WHERE id=$1`, accepted.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -316,6 +317,9 @@ func TestNewTeamCohortFirstProUsesFullMonthAndRetainsAcceptedQuote(t *testing.T)
 		t.Fatalf("paid first month of a team waiting for payment cannot settle: %v", err)
 	}
 	contract := uuid.New()
+	if _, err = tx.Exec(t.Context(), `UPDATE team_billing_account SET stripe_subscription_id='sub_local',stripe_subscription_status='active',commercial_billing_anchor=$2 WHERE team_id=$1`, f.team, accepted.Anchor); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = tx.Exec(t.Context(), `INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'pro_monthly',$3,$4,'sub_local','price_local_pro',25000,1,25000,'monthly',$3)`, contract, f.team, accepted.Anchor, customer); err != nil {
 		t.Fatal(err)
 	}
