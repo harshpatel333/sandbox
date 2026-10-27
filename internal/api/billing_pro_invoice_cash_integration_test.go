@@ -611,3 +611,128 @@ func TestProFirstRenewalZeroRoundedUnmarkedBridge(t *testing.T) {
 		t.Fatalf("later recurring allowance must bypass old bridge: handled=%v err=%v", handled, err)
 	}
 }
+
+func insertProCashFundingPurchase(t *testing.T, h *Handlers, team uuid.UUID, customer, source, state string, at time.Time) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key,created_at)
+ VALUES($1,$2,$3,$4,500,$5,'','',$6)`, id, team, customer, source, uuid.New(), at); err != nil {
+		t.Fatal(err)
+	}
+	switch state {
+	case "uncertain":
+		if _, err := h.Pool.Exec(t.Context(), `UPDATE billing_prepaid_purchase SET payment_state='uncertain',payment_first_attempt_at=clock_timestamp() WHERE id=$1`, id); err != nil {
+			t.Fatal(err)
+		}
+	case "succeeded":
+		if _, err := h.Pool.Exec(t.Context(), `UPDATE billing_prepaid_purchase SET payment_state='succeeded',paid_at=clock_timestamp(),payment_evidence=jsonb_build_object('amount_cents',amount_cents,'customer',customer_id) WHERE id=$1`, id); err != nil {
+			t.Fatal(err)
+		}
+	case "failed":
+		if _, err := h.Pool.Exec(t.Context(), `UPDATE billing_prepaid_purchase SET payment_state='failed',failure_reason='conclusively failed' WHERE id=$1`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return id
+}
+
+func TestProInvoiceCashUnresolvedFundingCannotUseComponentProof(t *testing.T) {
+	for _, source := range []string{"checkout", "auto_recharge"} {
+		for _, payment := range []string{"pending", "uncertain", "succeeded", "failed"} {
+			t.Run(source+"/"+payment, func(t *testing.T) {
+				// Mutations run before the real prepareInvoicePlan producer. The
+				// purchase therefore exists before any cash policy/proof freezes.
+				h, _ := newPlanAssignmentFixture(t)
+				f, _ := newProCashFixtureMode(t, planKindPrepaid, 2, 30000, 25000, true, func(plan *billing.InvoiceClosePlan, inv *StripeInvoiceAmounts) {
+					team := uuid.MustParse(strings.TrimPrefix(inv.Customer, "cus_"))
+					insertProCashFundingPurchase(t, h, team, inv.Customer, source, payment, time.Unix(plan.InvoiceStart, 0).Add(-time.Hour))
+				})
+				f.quiescePrepaidPurchases(t)
+				if err := f.h.enqueueInvoiceCollection(t.Context(), billing.ExportPeriod{TeamID: f.team, Start: f.start, End: f.end}, f.invoice, true); err != nil {
+					t.Fatal(err)
+				}
+				j := f.claim(t)
+				state, reason := f.h.collectInvoice(t.Context(), f.client, &j)
+				wantState, wantPays, wantProofs := "review_required", int64(0), 0
+				if payment == "failed" {
+					wantState, wantPays, wantProofs = "unknown", 1, 1
+				}
+				var proofs int
+				var firstAttempt bool
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM billing_pro_invoice_cash_authority WHERE invoice_id=$1),first_attempt_at IS NOT NULL FROM billing_invoice_collection WHERE invoice_id=$1`, f.invoice.ID).Scan(&proofs, &firstAttempt); err != nil {
+					t.Fatal(err)
+				}
+				if state != wantState || f.pays.Load() != wantPays || proofs != wantProofs || firstAttempt != (payment == "failed") {
+					t.Fatalf("component funding fence: %s %s pays=%d proofs=%d intent=%v; want %s/%d/%d", state, reason, f.pays.Load(), proofs, firstAttempt, wantState, wantPays, wantProofs)
+				}
+				if payment != "failed" {
+					if _, err := f.h.Pool.Exec(t.Context(), `UPDATE billing_invoice_collection SET state='unknown',first_attempt_at=clock_timestamp() WHERE invoice_id=$1`, f.invoice.ID); err == nil {
+						t.Fatal("old writer bypassed unresolved funding through Pro component proof")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestProInvoiceCashRetainedProofCannotBypassUnresolvedFunding(t *testing.T) {
+	for _, source := range []string{"checkout", "auto_recharge"} {
+		for _, payment := range []string{"pending", "uncertain", "succeeded", "failed"} {
+			t.Run(source+"/"+payment, func(t *testing.T) {
+				f, _ := newProCashFixtureMode(t, planKindPrepaid, 2, 30000, 25000, true)
+				f.quiescePrepaidPurchases(t)
+				allowed, err := f.h.freezeProInvoiceCash(t.Context(), f.invoice)
+				if err != nil || !allowed {
+					t.Fatal("legitimate initial component proof unavailable", allowed, err)
+				}
+				var before string
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(p)::text FROM billing_pro_invoice_cash_authority p WHERE invoice_id=$1`, f.invoice.ID).Scan(&before); err != nil {
+					t.Fatal(err)
+				}
+				// Represent a retained proof from an older writer that omitted
+				// this historical purchase. Never edit or replace that proof.
+				insertProCashFundingPurchase(t, f.h, f.team, f.invoice.Customer, source, payment, f.start.Add(-time.Hour))
+				var valid bool
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT pro_invoice_cash_source_valid($1,$2)`, f.invoice.ID, invoiceSettlementHash(f.invoice)).Scan(&valid); err != nil || valid != (payment == "failed") {
+					t.Fatal("retained proof funding validity", valid, err)
+				}
+				if err := f.h.enqueueInvoiceCollection(t.Context(), billing.ExportPeriod{TeamID: f.team, Start: f.start, End: f.end}, f.invoice, true); err != nil {
+					t.Fatal(err)
+				}
+				j := f.claim(t)
+				state, reason := f.h.collectInvoice(t.Context(), f.client, &j)
+				if payment != "failed" {
+					if state != "review_required" || f.pays.Load() != 0 {
+						t.Fatal("retained proof bypassed funding hold", state, reason, f.pays.Load())
+					}
+					if _, err := f.h.Pool.Exec(t.Context(), `UPDATE billing_invoice_collection SET state='unknown',first_attempt_at=clock_timestamp() WHERE invoice_id=$1`, f.invoice.ID); err == nil {
+						t.Fatal("old SQL writer reused a proof with unresolved funding")
+					}
+				} else {
+					if state != "unknown" || f.pays.Load() != 1 {
+						t.Fatal("terminal failure blocked legitimate retained proof", state, reason, f.pays.Load())
+					}
+					// A payment already observed as paid must still reconcile once,
+					// even if additional old funding evidence arrives afterward.
+					var intentBefore string
+					if err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_array(idempotency_key,settlement_hash,payment_authorized,first_attempt_at)::text FROM billing_invoice_collection WHERE invoice_id=$1`, f.invoice.ID).Scan(&intentBefore); err != nil {
+						t.Fatal(err)
+					}
+					insertProCashFundingPurchase(t, f.h, f.team, f.invoice.Customer, source, "pending", f.start.Add(-time.Hour))
+					state, reason = f.h.collectInvoice(t.Context(), f.client, &j)
+					var intentAfter string
+					if err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_array(idempotency_key,settlement_hash,payment_authorized,first_attempt_at)::text FROM billing_invoice_collection WHERE invoice_id=$1`, f.invoice.ID).Scan(&intentAfter); err != nil {
+						t.Fatal(err)
+					}
+					if state != "paid" || f.pays.Load() != 1 || intentAfter != intentBefore {
+						t.Fatal("paid replay lost accepted intent or duplicated cash", state, reason, f.pays.Load())
+					}
+				}
+				var after string
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT to_jsonb(p)::text FROM billing_pro_invoice_cash_authority p WHERE invoice_id=$1`, f.invoice.ID).Scan(&after); err != nil || after != before {
+					t.Fatal("retained proof history rewritten", err)
+				}
+			})
+		}
+	}
+}
