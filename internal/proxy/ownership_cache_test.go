@@ -202,7 +202,7 @@ func TestOwnershipCacheBoundsCallersWaitingForSlots(t *testing.T) {
 	}
 	for {
 		cache.mu.Lock()
-		held := len(cache.flights) == ownershipMaxLookups && cache.waiters == ownershipMaxWaiters
+		held := len(cache.flights) == ownershipMaxLookups && cache.waiters.Len() == ownershipMaxWaiters
 		cache.mu.Unlock()
 		if held {
 			break
