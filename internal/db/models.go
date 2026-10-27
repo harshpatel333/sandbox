@@ -1137,6 +1137,23 @@ type BillingProClosedPurchase struct {
 	Evidence       []byte    `json:"evidence"`
 }
 
+type BillingProInvoiceCashAuthority struct {
+	InvoiceID          string    `json:"invoice_id"`
+	SettlementHash     string    `json:"settlement_hash"`
+	TeamID             uuid.UUID `json:"team_id"`
+	CustomerID         string    `json:"customer_id"`
+	SubscriptionID     string    `json:"subscription_id"`
+	UpgradeID          uuid.UUID `json:"upgrade_id"`
+	ContractID         uuid.UUID `json:"contract_id"`
+	AssignmentID       uuid.UUID `json:"assignment_id"`
+	ProtectedCents     int64     `json:"protected_cents"`
+	CreditAppliedCents int64     `json:"credit_applied_cents"`
+	FeeCents           int64     `json:"fee_cents"`
+	UsageNetCents      int64     `json:"usage_net_cents"`
+	Evidence           []byte    `json:"evidence"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
 type BillingProInvoiceSeen struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	InvoiceID string    `json:"invoice_id"`
