@@ -920,9 +920,7 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 		// adduser call can actually create the account.
 		root := bc
 		root.user = "root"
-		check := fmt.Sprintf("id -u %s >/dev/null 2>&1 || adduser --disabled-password --gecos \"\" %s",
-			shellquote.Single(name), shellquote.Single(name))
-		if err := runShellCmd(ctx, vmIP, check, root); err != nil {
+		if err := runShellCmd(ctx, vmIP, ensureUserCommand(name), root); err != nil {
 			return bc, fmt.Errorf("ensure user %s: %w", name, err)
 		}
 		if step.User.Sudo {
@@ -941,7 +939,7 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 		bc.user = name
 		// Later steps and start_cmd run as this user; without this they would
 		// inherit root's HOME and write their config into /root.
-		passwd, err := runShellCapture(ctx, vmIP, "getent passwd "+shellquote.Single(name), root)
+		passwd, err := runShellCapture(ctx, vmIP, passwdEntryCommand(name), root)
 		if err != nil {
 			return bc, fmt.Errorf("resolve home for %s: %w", name, err)
 		}
@@ -952,6 +950,24 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 	default:
 		return bc, fmt.Errorf("step has no op set")
 	}
+}
+
+// ensureUserCommand creates the account unless it exists. Debian's adduser
+// runs first, so images that ship it behave as they always have. A stock
+// Ubuntu image has only useradd, and a BusyBox one, such as Alpine, has an
+// adduser that rejects Debian's flags.
+func ensureUserCommand(name string) string {
+	q := shellquote.Single(name)
+	return fmt.Sprintf("id -u %[1]s >/dev/null 2>&1 || "+
+		"adduser --disabled-password --gecos \"\" %[1]s 2>/dev/null || "+
+		"useradd -m %[1]s 2>/dev/null || adduser -D %[1]s", q)
+}
+
+// passwdEntryCommand prints the account's passwd line. Images without getent
+// still have /etc/passwd; validateUserName keeps the name safe as a pattern.
+func passwdEntryCommand(name string) string {
+	return fmt.Sprintf("getent passwd %s 2>/dev/null || grep %s /etc/passwd",
+		shellquote.Single(name), shellquote.Single("^"+name+":"))
 }
 
 // homeFromPasswd reads the home field of a `getent passwd` line, falling
