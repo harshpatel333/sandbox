@@ -2,8 +2,10 @@ package builder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/rs/zerolog/log"
 )
@@ -82,6 +84,10 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 	}
 	logger.Info().Str("digest", digest).Msg("image flattened")
 
+	if err := requireShell(scratch); err != nil {
+		return BuildRootfsResult{}, err
+	}
+
 	boxdBytes, err := injectGuestAgent(ctx, scratch, b.cfg.BoxdBinaryPath, b.cfg.FreezeWorkload, &logger)
 	if err != nil {
 		return BuildRootfsResult{}, fmt.Errorf("inject boxd: %w", err)
@@ -107,4 +113,20 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 		ResolvedDigest: digest,
 		SizeBytes:      info.Size(),
 	}, nil
+}
+
+// errNoShell marks a base image without /bin/sh, which the guest init and
+// every build step run under.
+var errNoShell = errors.New("image has no /bin/sh")
+
+// requireShell rejects a flattened image that cannot boot because it has no
+// shell, such as a distroless or scratch-based one. /bin may be a symlink to
+// /usr/bin, so the path is resolved inside the rootfs rather than on the host.
+func requireShell(rootfsDir string) error {
+	for _, p := range []string{"bin/sh", "usr/bin/sh"} {
+		if _, err := os.Lstat(filepath.Join(rootfsDir, p)); err == nil {
+			return nil
+		}
+	}
+	return errNoShell
 }

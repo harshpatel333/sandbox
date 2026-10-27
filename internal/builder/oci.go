@@ -80,8 +80,8 @@ func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir
 }
 
 // validatePlatform rejects images that don't match the required OS/arch and
-// rejects known-incompatible bases (alpine, distroless) early with a clear
-// message. Catches configuration mistakes before the slow mkfs.ext4 step.
+// busybox-only bases early with a clear message. Catches configuration
+// mistakes before the slow mkfs.ext4 step.
 func validatePlatform(img v1.Image, wantOS, wantArch string) error {
 	cfg, err := img.ConfigFile()
 	if err != nil {
@@ -93,14 +93,13 @@ func validatePlatform(img v1.Image, wantOS, wantArch string) error {
 	if cfg.Architecture != wantArch {
 		return fmt.Errorf("image architecture is %q, want %q", cfg.Architecture, wantArch)
 	}
-	// Heuristic: look at the config's labels and entrypoint for hints that
-	// this is an alpine / distroless / busybox-only image. Cheap, catches
-	// the common cases before we waste time pulling.
+	// Heuristic: a busybox-only layout shows in the config's PATH. Cheap, so
+	// it runs before the layers are pulled.
 	for _, env := range cfg.Config.Env {
 		if strings.HasPrefix(strings.ToLower(env), "path=") {
 			if strings.Contains(env, "/sbin:/bin") && !strings.Contains(env, "/usr/sbin") {
-				// Busybox-style layout. Alpine fits this pattern.
-				return fmt.Errorf("image appears to be alpine or busybox-based (PATH looks minimal); use a debian/ubuntu-based image")
+				// Busybox-style layout.
+				return fmt.Errorf("image appears to be busybox-only (PATH looks minimal)")
 			}
 		}
 	}

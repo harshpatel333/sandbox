@@ -137,6 +137,12 @@ func classifyBuildError(err error) (code, userMsg string) {
 		strings.Contains(raw, "image architecture is "):
 		return "unsupported_platform", "only linux/amd64 images are supported"
 
+	case strings.Contains(raw, "image has no /bin/sh"):
+		return "unsupported_base", "base image has no shell at /bin/sh; use an image that ships one"
+
+	case strings.Contains(raw, "image appears to be busybox-only"):
+		return "unsupported_base", "busybox-only base images are not supported; use an image with a standard userland"
+
 	case strings.Contains(raw, "tar entry escapes"),
 		strings.Contains(raw, "symlink target escapes"),
 		strings.Contains(raw, "hardlink target escapes"):
