@@ -62,14 +62,16 @@ BEGIN
  -- A pre-period purchase can still issue credit despite full assignment coverage.
  -- Hold unresolved payments/credits and grants issued during or after the period.
  -- A terminal failure or grant issued before the period adds no new ambiguity
- -- when assignment coverage is complete. Existing frozen decisions stay intact.
+ -- when assignment coverage is complete. Both checkout and auto-recharge rows
+ -- are funding authority even without a plan snapshot. Retain the original
+ -- snapshot footprint without holding settled legacy rows forever. Frozen decisions stay intact.
  SELECT COALESCE(jsonb_agg(jsonb_build_object('id',id,'created_at',created_at,'plan_snapshot',plan_snapshot) ORDER BY created_at,id),'[]')
  INTO purchase_evidence FROM billing_prepaid_purchase
  WHERE team_id=c.team_id AND created_at<c.period_end
-  AND (created_at>=c.period_start OR n=0 OR has_gap
+  AND (((created_at>=c.period_start OR n=0 OR has_gap)
+    AND plan_snapshot IS NOT NULL AND plan_snapshot->'terms'->>'kind'='prepaid')
    OR (payment_state<>'failed' AND (payment_state<>'succeeded'
-    OR credit_state<>'issued' OR credited_at>=c.period_start)))
-  AND plan_snapshot IS NOT NULL AND plan_snapshot->'terms'->>'kind'='prepaid';
+    OR credit_state<>'issued' OR credited_at>=c.period_start)));
  IF purchase_evidence<>'[]' THEN decision:='prepaid_hold'; END IF;
  IF EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=c.team_id
   AND effective_from<c.period_end AND (terms->>'pricing_version'='v2' OR kind IN ('free','prepaid'))) THEN
