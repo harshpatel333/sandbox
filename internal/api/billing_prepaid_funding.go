@@ -51,13 +51,16 @@ func prepaidUnspentPurchases(ctx context.Context, q db.DBTX, team uuid.UUID) (in
 // A fresh observation after grant issuance starts prepaid enforcement even at
 // zero: consumed credit or provider lag must not leave legacy PAYG access open.
 // A prepaid-funded subscription may never buy credit, so its issued monthly
-// grant counts as issuance too.
+// grant counts as issuance too, as does the first-cycle grant of an upgrade,
+// whose recurring contract only starts at the period end.
 const prepaidEnforcementDue = ` f.observe AND NOT f.prepaid AND f.observed_generation=f.generation AND f.credit_usd>=0 AND f.credit_valid_until>clock_timestamp()
  AND EXISTS(SELECT 1 FROM team_plan_assignment a WHERE a.team_id=f.team_id AND a.effective_to IS NULL AND billing_assignment_prepaid_funded(a))
  AND EXISTS(SELECT 1 FROM team_billing_account a WHERE a.team_id=f.team_id AND f.customer_id=a.stripe_customer_id AND f.subscription_id IS NOT DISTINCT FROM a.stripe_subscription_id
   AND (EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=f.team_id AND p.credit_state='issued' AND p.customer_id=a.stripe_customer_id AND f.credit_checked_at>p.credited_at)
    OR EXISTS(SELECT 1 FROM billing_usage_entitlement e JOIN team_plan_assignment s ON s.contract_id=e.contract_id AND s.effective_to IS NULL
-    WHERE e.team_id=f.team_id AND s.team_id=f.team_id AND s.kind='subscription' AND e.state='issued' AND f.credit_checked_at>e.issued_at)))`
+    WHERE e.team_id=f.team_id AND s.team_id=f.team_id AND s.kind='subscription' AND e.state='issued' AND f.credit_checked_at>e.issued_at)
+   OR EXISTS(SELECT 1 FROM billing_pro_upgrade u JOIN billing_provider_credit c ON c.customer_id=u.customer_id AND c.grant_id=u.grant_id
+    WHERE u.team_id=f.team_id AND u.state IN ('credited','active') AND u.customer_id=a.stripe_customer_id AND f.credit_checked_at>c.observed_at)))`
 
 func (h *Handlers) startPrepaidEnforcement(ctx context.Context) error {
 	tx, err := h.Pool.Begin(ctx)

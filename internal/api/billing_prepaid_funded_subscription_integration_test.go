@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -12,11 +13,23 @@ import (
 )
 
 // fundedSubscriptionFixture moves a prepaid fixture team onto a published
-// prepaid-funded subscription backed by an active contract. All values are
-// arbitrary fixtures, not catalog values.
+// prepaid-funded subscription backed by a contract. All values are arbitrary
+// fixtures, not catalog values.
 func fundedSubscriptionFixture(t *testing.T, topoff *planTopoff) (*prepaidFixture, uuid.UUID) {
 	t.Helper()
 	f := newPrepaidFixture(t)
+	terms := f.publishFundedPlan(topoff, false)
+	contract := f.fundedContract(terms.OfferKey)
+	if _, err := assignInTx(t, f.h, planAssignment{Team: f.team, Terms: terms, Source: planSourceCheckout, Reason: "funded subscription fixture", ContractID: &contract}); err != nil {
+		t.Fatal(err)
+	}
+	return f, contract
+}
+
+// publishFundedPlan publishes a prepaid-funded subscription, sold at checkout
+// when sellable, and returns its monthly terms.
+func (f *prepaidFixture) publishFundedPlan(topoff *planTopoff, sellable bool) planTerms {
+	f.t.Helper()
 	family := "funded" + uuid.NewString()[:8]
 	var version uuid.UUID
 	var amount, threshold *int64
@@ -24,31 +37,33 @@ func fundedSubscriptionFixture(t *testing.T, topoff *planTopoff) (*prepaidFixtur
 	if topoff != nil {
 		amount, threshold, preselect = &topoff.AmountCents, &topoff.ThresholdCents, &topoff.DefaultEnabled
 	}
-	if err := f.h.Pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version(family,version,pricing_version,kind,display_name,monthly_fee_cents,credit_schedule,max_sandboxes,
-  funding_policy,topoff_amount_cents,topoff_threshold_cents,topoff_default_enabled)
- VALUES($1,1,'v2','subscription','Funded fixture',700,'[{"start_months":0,"every_months":1,"amount_cents":700,"expires_after_months":1}]',3,'prepaid',$2,$3,$4) RETURNING id`,
-		family, amount, threshold, preselect).Scan(&version); err != nil {
-		t.Fatal(err)
+	if err := f.h.Pool.QueryRow(f.t.Context(), `INSERT INTO billing_plan_version(family,version,pricing_version,kind,display_name,monthly_fee_cents,credit_schedule,max_sandboxes,
+  public,self_serve,funding_policy,topoff_amount_cents,topoff_threshold_cents,topoff_default_enabled)
+ VALUES($1,1,'v2','subscription','Funded fixture',700,'[{"start_months":0,"every_months":1,"amount_cents":700,"expires_after_months":1}]',3,$5,$5,'prepaid',$2,$3,$4) RETURNING id`,
+		family, amount, threshold, preselect, sellable).Scan(&version); err != nil {
+		f.t.Fatal(err)
 	}
 	f.exec(`UPDATE billing_plan_version SET state='published',published_at=clock_timestamp() WHERE id=$1`, version)
-	t.Cleanup(func() {
+	f.t.Cleanup(func() {
 		_, _ = f.h.Pool.Exec(context.Background(), `UPDATE billing_plan_version SET state='retired',retired_at=clock_timestamp() WHERE id=$1`, version)
 	})
-	terms, err := f.h.planTermsVersion(t.Context(), version, 1)
+	terms, err := f.h.planTermsVersion(f.t.Context(), version, 1)
 	if err != nil {
-		t.Fatal(err)
+		f.t.Fatal(err)
 	}
+	return terms
+}
+
+func (f *prepaidFixture) fundedContract(offerKey string) uuid.UUID {
+	f.t.Helper()
 	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 	f.exec(`UPDATE team_billing_account SET commercial_billing_anchor=$2 WHERE team_id=$1`, f.team, start)
 	var contract uuid.UUID
-	if err = f.h.Pool.QueryRow(t.Context(), `INSERT INTO billing_commercial_contract(team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor)
- VALUES($1,$2,$3,$4,$5,'price_fixture',700,1,700,$3) RETURNING id`, f.team, terms.OfferKey, start, f.customer, f.sub).Scan(&contract); err != nil {
-		t.Fatal(err)
+	if err := f.h.Pool.QueryRow(f.t.Context(), `INSERT INTO billing_commercial_contract(team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_anchor)
+ VALUES($1,$2,$3,$4,$5,'price_fixture',700,1,700,$3) RETURNING id`, f.team, offerKey, start, f.customer, f.sub).Scan(&contract); err != nil {
+		f.t.Fatal(err)
 	}
-	if _, err = assignInTx(t, f.h, planAssignment{Team: f.team, Terms: terms, Source: planSourceCheckout, Reason: "funded subscription fixture", ContractID: &contract}); err != nil {
-		t.Fatal(err)
-	}
-	return f, contract
+	return contract
 }
 
 // issueIncludedGrant records the period's included grant as issued, as the
@@ -244,5 +259,82 @@ func TestInvoiceCashFundedSubscriptionCollectsDespiteSettledTopoff(t *testing.T)
 				t.Fatalf("cash authority = %q, want %q (%v)", policy, tc.want, err)
 			}
 		})
+	}
+}
+
+func TestPrepaidFundedSubscriptionCheckoutFreezesFunding(t *testing.T) {
+	f := newPrepaidFixture(t)
+	topoff := &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true}
+	terms := f.publishFundedPlan(topoff, true)
+	offer, err := f.h.proOfferForPricingVersion(t.Context(), terms.OfferKey, "v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(StripeCreateCheckoutSessionParams{AllowPromotionCodes: true, PlanTerms: checkoutPlanTerms(offer, true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	choice := proChoice{Team: f.team, Offer: terms.OfferKey, Actor: uuid.New(), Payload: payload}
+	frozen, err := choice.frozenOffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, _, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen.PredecessorKnown, frozen.InitialAssignment = true, &current.ID
+	tx, err := f.h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.WithoutCancel(t.Context()))
+	if err = assignCheckoutPlan(t.Context(), tx, choice, frozen, f.fundedContract(terms.OfferKey)); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	plan, _, err := currentTeamPlan(t.Context(), f.h.Pool, f.team)
+	if err != nil || !plan.prepaidFunded() || plan.Terms.Topoff == nil || *plan.Terms.Topoff != *topoff {
+		t.Fatalf("checkout lost the plan's funding terms: %+v %v", plan.Terms, err)
+	}
+	if err = f.applyTopoff("cs_checkout", true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrepaidFundedSubscriptionUpgradeGrantStartsEnforcement(t *testing.T) {
+	f, _ := fundedSubscriptionFixture(t, nil)
+	f.observe(500, true)
+	conn, err := f.h.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	// Only the credited upgrade and its grant matter here, not how they got there.
+	if _, err = conn.Exec(t.Context(), `SET session_replication_role=replica`); err != nil {
+		t.Fatal(err)
+	}
+	grant := "cg_" + uuid.NewString()
+	if _, err = conn.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,grant_id)
+ VALUES(gen_random_uuid(),$1,gen_random_uuid(),$2,'funded_monthly','{}',clock_timestamp()-interval '1 hour',clock_timestamp()-interval '1 hour',clock_timestamp()+interval '29 days',clock_timestamp()-interval '1 hour',700,'credited','{}',$3)`,
+		f.team, f.customer, grant); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(t.Context(), `INSERT INTO billing_provider_credit(customer_id,grant_id,evidence,effective_at,expires_at) VALUES($1,$2,'{}',0,0)`, f.customer, grant); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.Exec(t.Context(), `RESET session_replication_role`); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`UPDATE billing_pro_upgrade SET next_check_at='9999-01-01' WHERE team_id=$1`, f.team)
+	f.observe(500, true)
+	if err = f.h.startPrepaidEnforcement(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var prepaid bool
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT prepaid FROM billing_funding_account WHERE team_id=$1`, f.team).Scan(&prepaid); err != nil || !prepaid {
+		t.Fatal("an observed first-cycle upgrade grant did not start enforcement", prepaid, err)
 	}
 }
