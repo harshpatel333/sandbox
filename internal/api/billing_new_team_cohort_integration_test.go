@@ -369,8 +369,12 @@ func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
 	for _, change := range []func(*prepaidCheckoutBody){func(p *prepaidCheckoutBody) { p.AmountCents = 1000 }, func(p *prepaidCheckoutBody) { p.SuccessURL += "?other=1" }, func(p *prepaidCheckoutBody) { p.CancelURL += "?other=1" }, func(p *prepaidCheckoutBody) { p.OperationID = uuid.New() }} {
 		bad := req
 		change(&bad)
-		if rec := prepaidOperationPost(r, bad); rec.Code != 409 {
-			t.Fatalf("different request bypassed closed gate %d %s", rec.Code, rec.Body)
+		want := http.StatusConflict
+		if bad.OperationID == uuid.Nil && bad.AmountCents == req.AmountCents {
+			want = http.StatusAccepted // Existing purchase status only; never dispatch.
+		}
+		if rec := prepaidOperationPost(r, bad); rec.Code != want {
+			t.Fatalf("different request response %d %s", rec.Code, rec.Body)
 		}
 	}
 	otherActor := uuid.New()
@@ -399,8 +403,8 @@ func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
 		f.h.Config.AppAllowedOrigins = origins
 		altered := req
 		altered.SuccessURL += "?changed=1"
-		if rec := prepaidOperationPost(r, altered); rec.Code != http.StatusConflict {
-			t.Fatalf("policy change admitted altered redirects: %d %s", rec.Code, rec.Body)
+		if rec := prepaidOperationPost(r, altered); rec.Code != http.StatusAccepted {
+			t.Fatalf("policy change did not preserve status-only altered redirects: %d %s", rec.Code, rec.Body)
 		}
 		replay := req
 		replay.SuccessURL = "  " + replay.SuccessURL + "  "
@@ -615,6 +619,85 @@ func TestNewTeamCohortImplicitRecoverySurvivesFreshPolicyChanges(t *testing.T) {
 				if json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.PurchaseID == uuid.Nil || got.State != "pending" {
 					t.Fatalf("managed takeover lost accepted status: %s", rec.Body)
 				}
+			}
+		})
+	}
+}
+
+func TestNewTeamCohortImplicitPriceDriftReturnsStatusWithoutReplay(t *testing.T) {
+	for _, drift := range []string{"prices", "resources", "missing_prices"} {
+		t.Run(drift, func(t *testing.T) {
+			f := newTeamCohortTestFixture(t)
+			f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
+			f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
+			for _, sql := range []string{`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_drift')`, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)`} {
+				if _, err := f.h.Pool.Exec(t.Context(), sql, f.team); err != nil {
+					t.Fatal(err)
+				}
+			}
+			calls := 0
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; http.Error(w, "lost response", 500) }))
+			t.Cleanup(provider.Close)
+			f.h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+			r := gin.New()
+			r.POST("/billing/prepaid/checkout", func(c *gin.Context) {
+				c.Set("team_id", f.team.String())
+				c.Set("actor_id", f.actor)
+				f.h.CreatePrepaidCheckout(c)
+			})
+			req := prepaidCheckoutBody{AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+			if rec := prepaidOperationPost(r, req); rec.Code != http.StatusBadGateway || calls != 1 {
+				t.Fatalf("initial ambiguous checkout: %d %s/%d", rec.Code, rec.Body, calls)
+			}
+			var purchase uuid.UUID
+			if err := f.h.Pool.QueryRow(t.Context(), `SELECT id FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&purchase); err != nil {
+				t.Fatal(err)
+			}
+			snapshot := func() []byte {
+				t.Helper()
+				var raw []byte
+				if err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_object('account',(SELECT to_jsonb(a) FROM team_billing_account a WHERE team_id=$1),'purchase',(SELECT to_jsonb(p) FROM billing_prepaid_purchase p WHERE id=$2),'operations',(SELECT count(*) FROM billing_prepaid_checkout_operation WHERE team_id=$1))`, f.team, purchase).Scan(&raw); err != nil {
+					t.Fatal(err)
+				}
+				return raw
+			}
+			switch drift {
+			case "prices":
+				f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu_v2", "price_memory_v2"}
+			case "resources":
+				f.h.Config.BillingResources = defaultBillingResourcesFromPriceIDs(f.h.Config.StripeCheckoutPriceIDs)
+				f.h.Config.BillingResources[1].CheckoutEnabled = false
+			case "missing_prices":
+				f.h.Config.StripeCheckoutPriceIDs = nil
+			}
+			f.close(t)
+			before := snapshot()
+			for _, alterURL := range []bool{false, true} {
+				statusReq := req
+				if alterURL {
+					statusReq.CancelURL = "https://unapproved.example/out"
+				}
+				rec := prepaidOperationPost(r, statusReq)
+				var got prepaidOperationResponse
+				if rec.Code != http.StatusAccepted || json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.PurchaseID != purchase || got.State != "pending" || got.URL != "" || got.ID != "" {
+					t.Fatalf("drift status: %d %s", rec.Code, rec.Body)
+				}
+				if calls != 1 || string(snapshot()) != string(before) {
+					t.Fatal("status fallback mutated account/purchase/operation or called provider")
+				}
+			}
+			for _, change := range []func(*prepaidCheckoutBody){func(p *prepaidCheckoutBody) { p.AmountCents = 1000 }, func(p *prepaidCheckoutBody) { p.OperationID = uuid.New() }} {
+				bad := req
+				change(&bad)
+				if rec := prepaidOperationPost(r, bad); rec.Code != http.StatusConflict || calls != 1 {
+					t.Fatalf("different purchase got status authority: %d %s", rec.Code, rec.Body)
+				}
+			}
+			if _, err := f.h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_customer_id='cus_other' WHERE team_id=$1`, f.team); err != nil {
+				t.Fatal(err)
+			}
+			if rec := prepaidOperationPost(r, req); rec.Code != http.StatusConflict || calls != 1 {
+				t.Fatalf("changed customer got status authority: %d %s", rec.Code, rec.Body)
 			}
 		})
 	}

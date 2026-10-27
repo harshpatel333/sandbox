@@ -130,6 +130,19 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
+		if acceptedLease == nil {
+			retained, statusErr := h.retainedImplicitPrepaidPurchase(ctx, team, actor, req)
+			if statusErr != nil {
+				respondError(c, ErrInternal)
+				return
+			}
+			if retained != nil {
+				// A historical request hash cannot distinguish changed provider
+				// prices from changed URLs. Expose status without replay authority.
+				c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: retained.PurchaseID, State: "pending"})
+				return
+			}
+		}
 	}
 	// A proven first-purchase lease resumes its accepted payment before policies
 	// that only admit new purchases. The dispatch path rechecks the locked lease.
