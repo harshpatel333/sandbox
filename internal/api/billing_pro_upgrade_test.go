@@ -215,7 +215,7 @@ func TestProUpgradeCheckoutAsksForTopoffAndReadsTheAnswer(t *testing.T) {
 	}
 	for raw, want := range map[string]bool{checkoutTopoffOn: true, checkoutTopoffOff: false} {
 		var s StripeRetrievedCheckoutSession
-		if err := json.Unmarshal([]byte(`{"custom_fields":[{"key":"other","dropdown":{"value":"auto_topoff"}},{"key":"auto_topoff","dropdown":{"value":"`+raw+`"}}]}`), &s); err != nil {
+		if err := json.Unmarshal([]byte(`{"custom_fields":[{"key":"other","dropdown":{"value":"autotopoff"}},{"key":"autotopoff","dropdown":{"value":"`+raw+`"}}]}`), &s); err != nil {
 			t.Fatal(err)
 		}
 		if got, err := s.topoffChosen(); err != nil || got != want {

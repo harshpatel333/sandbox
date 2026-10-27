@@ -502,10 +502,10 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 	if err = h.enrollInvoiceAccount(ctx, u.Team, nil); err != nil {
 		return "", err
 	}
-	return h.activateProUpgrade(ctx, u, params)
+	return h.activateProUpgrade(ctx, u, params, session)
 }
 
-func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params StripeCreateCheckoutSessionParams) (string, error) {
+func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params StripeCreateCheckoutSessionParams, session StripeRetrievedCheckoutSession) (string, error) {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return "", err
@@ -524,6 +524,9 @@ func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params 
 		return "", err
 	}
 	if err = h.DB.WithTx(tx).ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: u.Team, StripeGrantID: ""}); err != nil {
+		return "", err
+	}
+	if err = applyUpgradeTopoff(ctx, tx, u, params, session); err != nil {
 		return "", err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_signup_choice SET state='committed',offer_key=$2,generation=$3,actor_id=$4,base_price_id=$5,request_payload=$6,session_id=$7,subscription_id=$8,revision=revision+1,admission_source=(SELECT admission_source FROM billing_pro_upgrade WHERE id=$9),admission_epoch=(SELECT admission_epoch FROM billing_pro_upgrade WHERE id=$9) WHERE team_id=$1 AND state='selecting'`, u.Team, u.Offer, u.Quoted, u.Actor, params.BasePriceID, u.Payload, u.Session, u.Subscription, u.ID); err != nil {
@@ -667,4 +670,29 @@ func validateProUpgradeSubscription(u proUpgrade, p StripeCreateCheckoutSessionP
 		return time.Time{}, time.Time{}, err
 	}
 	return expectedStart, expectedEnd, nil
+}
+
+// applyUpgradeTopoff settles the funding of a prepaid-funded plan with the
+// top-off answer the customer gave at checkout, under the admission the
+// checkout accepted.
+func applyUpgradeTopoff(ctx context.Context, tx pgx.Tx, u proUpgrade, params StripeCreateCheckoutSessionParams, session StripeRetrievedCheckoutSession) error {
+	if params.PlanTerms == nil || params.PlanTerms.FundingPolicy != fundingPolicyPrepaid {
+		return nil
+	}
+	enabled := false
+	if params.Topoff != nil {
+		var err error
+		if enabled, err = session.topoffChosen(); err != nil {
+			return err
+		}
+	}
+	var admission pricingPublicState
+	var epoch *uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(admission_source,''),admission_epoch FROM billing_pro_upgrade WHERE id=$1`, u.ID).Scan(&admission.Source, &epoch); err != nil {
+		return err
+	}
+	if epoch != nil {
+		admission.Epoch = *epoch
+	}
+	return applyCheckoutTopoff(ctx, tx, u.Team, session.ID, enabled, admission)
 }

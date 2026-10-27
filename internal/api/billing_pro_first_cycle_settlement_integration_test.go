@@ -245,7 +245,7 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 				t.Fatalf("first-cycle enrolled account %+v enrolled=%v err=%v", enrolledAccount, enrolled, err)
 			}
 			a = enrolledAccount
-			if outcome, e := h.activateProUpgrade(t.Context(), u, params); e != nil || outcome != "active" {
+			if outcome, e := h.activateProUpgrade(t.Context(), u, params, session); e != nil || outcome != "active" {
 				t.Fatalf("activation: %s %v", outcome, e)
 			}
 			if grantCreates != 1 {

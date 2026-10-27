@@ -290,6 +290,9 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 	v2 := offer.Pricing == "v2"
 	if v2 && !resuming {
 		params.AllowPromotionCodes = true
+		if t := offer.Topoff; t != nil {
+			params.Topoff = &StripeCheckoutTopoff{AmountCents: t.AmountCents, DefaultEnabled: t.DefaultEnabled}
+		}
 		if _, err = frozenProOffer(offer.Key, params); err != nil {
 			respondErrorMsg(c, "service_unavailable", "Pro plan configuration requires verification", 503)
 			return

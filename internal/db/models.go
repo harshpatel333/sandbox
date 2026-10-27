@@ -874,14 +874,14 @@ type BillingMeterReconciliation struct {
 }
 
 type BillingNewTeamEnrollment struct {
-	TeamID               uuid.UUID `json:"team_id"`
-	Region               string    `json:"region"`
-	EnrollmentEpoch      uuid.UUID `json:"enrollment_epoch"`
-	InitialAssignmentID  uuid.UUID `json:"initial_assignment_id"`
-	InitialFreeVersionID uuid.UUID `json:"initial_free_version_id"`
-	CreatorUserID        uuid.UUID `json:"creator_user_id"`
-	Source               string    `json:"source"`
-	EnrolledAt           time.Time `json:"enrolled_at"`
+	TeamID               uuid.UUID   `json:"team_id"`
+	Region               string      `json:"region"`
+	EnrollmentEpoch      uuid.UUID   `json:"enrollment_epoch"`
+	InitialAssignmentID  pgtype.UUID `json:"initial_assignment_id"`
+	InitialFreeVersionID pgtype.UUID `json:"initial_free_version_id"`
+	CreatorUserID        uuid.UUID   `json:"creator_user_id"`
+	Source               string      `json:"source"`
+	EnrolledAt           time.Time   `json:"enrolled_at"`
 }
 
 type BillingNewTeamGate struct {

@@ -303,6 +303,21 @@ func TestNewTeamCohortFirstProUsesFullMonthAndRetainsAcceptedQuote(t *testing.T)
 	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade_setup SET state='expired' WHERE upgrade_id=$1`, accepted.ID); err != nil {
 		t.Fatal(err)
 	}
+	settled := accepted
+	settled.Start, settled.End = accepted.Anchor, accepted.End
+	tx, err := f.h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(t.Context(), `UPDATE billing_pro_upgrade SET state='credited',payment_evidence='{}',grant_id='credgr_local' WHERE id=$1`, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = retireFirstProCycleReportingPeriods(t.Context(), tx, settled); err != nil {
+		t.Fatalf("paid first month of a team waiting for payment cannot settle: %v", err)
+	}
+	if err = tx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	_, end, valid := billing.AnniversaryPeriod(now, now)
 	var frozen StripeCreateCheckoutSessionParams
 	_ = json.Unmarshal(accepted.Payload, &frozen)

@@ -10,10 +10,8 @@ import (
 
 // Free calendar buckets are reporting records, not a paid anniversary. Keep
 // their identity and usage history while allowing the first commercial month.
+// A team that was waiting for payment has no predecessor plan at all.
 func retireFirstProCycleReportingPeriods(ctx context.Context, tx pgx.Tx, u proUpgrade) error {
-	if u.InitialAssignment == nil {
-		return errors.New("first Pro month has no accepted Free predecessor")
-	}
 	if _, err := u.creditExpiry(); err != nil {
 		return err
 	}
@@ -27,12 +25,16 @@ func retireFirstProCycleReportingPeriods(ctx context.Context, tx pgx.Tx, u proUp
 	if _, err := tx.Exec(ctx, `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, u.Team); err != nil {
 		return err
 	}
-	var free bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE id=$1 AND team_id=$2 AND kind='free')`, u.InitialAssignment, u.Team).Scan(&free); err != nil {
+	var predecessor bool
+	if u.InitialAssignment == nil {
+		if err := tx.QueryRow(ctx, `SELECT billing_team_pending_payment($1)`, u.Team).Scan(&predecessor); err != nil {
+			return err
+		}
+	} else if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE id=$1 AND team_id=$2 AND kind='free')`, u.InitialAssignment, u.Team).Scan(&predecessor); err != nil {
 		return err
 	}
-	if !free {
-		return errors.New("first Pro month predecessor is not Free")
+	if !predecessor {
+		return errors.New("first Pro month predecessor is neither Free nor waiting for payment")
 	}
 	// Lock outstanding work before inspecting it, so a concurrent claim cannot
 	// pass the same boundary while these reporting records are being retired.

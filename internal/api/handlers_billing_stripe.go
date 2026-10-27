@@ -183,8 +183,8 @@ type StripeCheckoutTopoff struct {
 }
 
 const (
-	checkoutTopoffField = "auto_topoff"
-	checkoutTopoffOn    = "auto_topoff"
+	checkoutTopoffField = "autotopoff"
+	checkoutTopoffOn    = "autotopoff"
 	checkoutTopoffOff   = "off"
 )
 

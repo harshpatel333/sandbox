@@ -260,7 +260,7 @@ func testProUpgradeFutureCredit(t *testing.T, monthlyCredit int64) {
 	if _, _, e := h.planChangeSubscription(t.Context(), team, *u.Contract); e == nil {
 		t.Fatal("unactivated pending contract admitted for downgrade")
 	}
-	if outcome, e := h.activateProUpgrade(t.Context(), u, params); e != nil || outcome != "active" {
+	if outcome, e := h.activateProUpgrade(t.Context(), u, params, StripeRetrievedCheckoutSession{}); e != nil || outcome != "active" {
 		t.Fatalf("activation: %s %v", outcome, e)
 	}
 	conn, err = h.Pool.Acquire(t.Context())

@@ -41,6 +41,65 @@ CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS
  LEFT JOIN team_billing_account a USING(team_id);
 $$;
 
+-- A team waiting for payment has no plan, so it must not fall back to the
+-- legacy pay-as-you-go defaults for sandboxes or templates.
+CREATE OR REPLACE FUNCTION team_effective_limits(p_team uuid)
+RETURNS TABLE(max_concurrent integer, max_vcpu integer, max_memory_mib integer, max_disk_mib integer, max_templates integer)
+LANGUAGE sql STABLE AS $$
+    WITH base AS (
+        SELECT max_template_vcpu, max_template_memory_mib, max_template_disk_mib, max_templates
+        FROM billing_plan_version WHERE family = 'payg' AND pricing_version = 'legacy' AND kind = 'legacy_payg' AND state <> 'draft'
+        ORDER BY state = 'published' DESC, version DESC LIMIT 1
+    ), assigned AS (
+        SELECT (limits->>'max_templates')::integer AS max_templates FROM team_plan_assignment
+        WHERE team_id=p_team AND effective_to IS NULL
+    ), frozen AS (
+        SELECT l.max_templates FROM billing_commercial_contract c JOIN billing_contract_limits l ON l.contract_id = c.id
+        WHERE c.team_id = p_team AND c.status = 'active' ORDER BY c.starts_at DESC LIMIT 1
+    ), pending AS (
+        SELECT billing_team_pending_payment(p_team) AS pending
+    )
+    SELECT CASE WHEN p.pending THEN 0 ELSE t.max_sandboxes END,
+        COALESCE(t.max_template_vcpu, b.max_template_vcpu),
+        COALESCE(t.max_template_memory_mib, b.max_template_memory_mib),
+        COALESCE(t.max_template_disk_mib, b.max_template_disk_mib),
+        CASE WHEN p.pending THEN 0 ELSE COALESCE(t.max_templates, (SELECT max_templates FROM assigned), (SELECT max_templates FROM frozen), b.max_templates) END
+    FROM team t LEFT JOIN base b ON true CROSS JOIN pending p WHERE t.id = p_team;
+$$;
+
+-- Activating pricing v2 for every team must not hand a team waiting for
+-- payment a Free plan.
+CREATE OR REPLACE FUNCTION pricing_v2_activation_bucket(p_team uuid)
+RETURNS TABLE(bucket text, reason text, stripe_customer_id text)
+LANGUAGE sql STABLE AS $$
+ SELECT CASE
+    WHEN x.reason = 'already_assigned' THEN 'assigned'
+    WHEN x.reason = 'active_contract' THEN 'contract'
+    WHEN x.reason = 'abuse_blocked' THEN 'blocked'
+    WHEN x.reason IS NOT NULL THEN 'skipped'
+    WHEN x.subscription IS NOT NULL AND lower(COALESCE(x.status, '')) IN ('active','trialing','past_due','unpaid','paused') THEN 'legacy_payg'
+    WHEN x.customer IS NOT NULL OR x.subscription IS NOT NULL THEN 'lapsed'
+    ELSE 'free' END,
+  x.reason, x.customer
+ FROM (
+  SELECT a.stripe_customer_id AS customer, a.stripe_subscription_id AS subscription, a.stripe_subscription_status AS status,
+   CASE
+    WHEN EXISTS(SELECT 1 FROM team_plan_assignment pa WHERE pa.team_id = p_team AND pa.effective_to IS NULL) THEN 'already_assigned'
+    WHEN qm_team_managed_billing(p_team) THEN 'qm_managed_billing'
+    WHEN billing_team_pending_payment(p_team) THEN 'pending_payment'
+    WHEN EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id = p_team AND c.status='active') THEN 'active_contract'
+    WHEN EXISTS(SELECT 1 FROM billing_commercial_contract c WHERE c.team_id = p_team AND c.status='pending') THEN 'pending_contract'
+    WHEN a.checkout_initializing_at IS NOT NULL OR a.checkout_may_exist
+      OR EXISTS(SELECT 1 FROM billing_signup_choice c WHERE c.team_id=p_team AND c.state='pending' AND c.offer_key<>'free') THEN 'checkout_pending'
+    WHEN EXISTS(SELECT 1 FROM billing_yc_operation o WHERE o.team_id = p_team AND o.state <> 'ended') THEN 'yc_operation'
+    WHEN EXISTS(SELECT 1 FROM billing_sponsored_operation o WHERE o.team_id = p_team AND o.state NOT IN ('revoked','expired')) THEN 'sponsored_operation'
+    WHEN EXISTS(SELECT 1 FROM abuse_restrictions r WHERE r.subject_team_id = p_team AND r.released_at IS NULL
+                AND (r.expires_at IS NULL OR r.expires_at > now()) AND r.action IN ('create','resume')) THEN 'abuse_blocked'
+   END AS reason
+  FROM (SELECT p_team AS team_id) t LEFT JOIN team_billing_account a USING (team_id)
+ ) x;
+$$;
+
 CREATE OR REPLACE FUNCTION billing_team_pricing_state(p_team uuid)
 RETURNS TABLE(pricing_version text,admission_source text,entry_open boolean,epoch uuid,enrollment_epoch uuid)
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
