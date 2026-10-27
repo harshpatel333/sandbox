@@ -477,7 +477,8 @@ mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null
 mkdir -p /dev/.image-root
 if mount -o bind / /dev/.image-root 2>/dev/null; then
   for d in tmp run; do
-    set -- $(du -sk /dev/.image-root/$d 2>/dev/null)
+    # Through "/.", like the copy: either may be a symlink in the image.
+    set -- $(du -sk /dev/.image-root/$d/. 2>/dev/null)
     if [ -n "$1" ] && [ "$1" -le %d ]; then
       cp -a /dev/.image-root/$d/. /$d/ 2>/dev/null
     fi
