@@ -101,3 +101,55 @@ func (h *Handlers) beginLegacyCheckout(ctx context.Context, team, actor uuid.UUI
 	}
 	return account, tx.Commit(ctx)
 }
+
+// beginCohortPrepaidCheckout retains the ordinary identity/lease protocol but
+// binds a new enrolled-team lease to this exact Starter attempt. An old
+// accepted generation resumes before any fresh-admission requirement.
+func (h *Handlers) beginCohortPrepaidCheckout(ctx context.Context, team, actor uuid.UUID, req billingCheckoutSessionRequest, key string, attempt uuid.UUID, trusted bool) (db.TeamBillingAccount, error) {
+	var account db.TeamBillingAccount
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return account, err
+	}
+	defer tx.Rollback(ctx)
+	admission, err := lockTeamPricingEntry(ctx, tx, team)
+	if err != nil {
+		return account, err
+	}
+	if trusted && req.Decision == "publication_failed" {
+		_, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-user:' || $1::text)::bigint)`, actor)
+	} else {
+		_, err = tx.Exec(ctx, `SELECT lock_stripe_checkout_identity($1)`, actor)
+	}
+	if err != nil {
+		return account, err
+	}
+	var accepted bool
+	if err = tx.QueryRow(ctx, `SELECT checkout_initializing_at IS NOT NULL FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, team).Scan(&accepted); err != nil {
+		return account, err
+	}
+	if !accepted {
+		if admission.Version != "v2" || !admission.EntryOpen {
+			return account, errPricingV2Off
+		}
+		if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET checkout_admission_source=$2,checkout_admission_epoch=$3,checkout_admission_attempt=$4 WHERE team_id=$1`, team, pricingSource(admission), pricingEpoch(admission), attempt); err != nil {
+			return account, err
+		}
+	}
+	q := h.DB.WithTx(tx)
+	if trusted {
+		err = q.BeginStripeCheckoutWithPublicationDecision(ctx, db.BeginStripeCheckoutWithPublicationDecisionParams{TeamID: team, UserID: actor, OperationID: req.OperationID, HomeRegion: req.HomeRegion, RequestKey: key, Decision: req.Decision, AttemptID: attempt})
+		if err == nil {
+			account, err = q.GetTeamBillingCheckoutForRecovery(ctx, team)
+		}
+	} else {
+		account, err = q.BeginTeamBillingCheckout(ctx, db.BeginTeamBillingCheckoutParams{TeamID: team, ActorID: pgtype.UUID{Bytes: actor, Valid: true}, RequestKey: &key, AttemptID: attempt})
+		if errors.Is(err, pgx.ErrNoRows) {
+			account, err = q.ResumeTeamBillingCheckout(ctx, db.ResumeTeamBillingCheckoutParams{TeamID: team, ActorID: pgtype.UUID{Bytes: actor, Valid: true}, RequestKey: &key, AttemptID: attempt})
+		}
+	}
+	if err != nil {
+		return account, err
+	}
+	return account, tx.Commit(ctx)
+}

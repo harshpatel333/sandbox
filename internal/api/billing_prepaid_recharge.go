@@ -141,9 +141,9 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,payment_idempotency_key,credit_idempotency_key,payment_request)
+	_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,payment_idempotency_key,credit_idempotency_key,payment_request,admission_source,admission_epoch)
  SELECT a.team_id,b.stripe_customer_id,'auto_recharge',a.amount_cents,'','',
-  jsonb_build_object('customer',b.stripe_customer_id,'payment_method',f.payment_method_id,'amount_cents',a.amount_cents)`+selection+`
+  jsonb_build_object('customer',b.stripe_customer_id,'payment_method',f.payment_method_id,'amount_cents',a.amount_cents),a.admission_source,a.admission_epoch`+selection+`
  AND a.team_id=ANY($3) ON CONFLICT DO NOTHING`, prepaidLiveGrantLimit, prepaidPurchaseMaxCents, teams)
 	if err != nil {
 		return err

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -108,53 +109,38 @@ func purchasablePlans(cards []billingPlanCard) []billingPlan {
 	return plans
 }
 
-// GetPublicBillingPlans returns the live pricing model and its public plan
-// cards. Like public pricing it is unauthenticated so the website and signup
-// pages render from the catalog.
-func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
-	if h.Pool == nil {
-		respondErrorMsg(c, "service_unavailable", "plans are not available", http.StatusServiceUnavailable)
-		return
-	}
-	ctx := c.Request.Context()
-	state, err := h.publicPricingState(ctx)
+type billingCatalog struct {
+	PricingVersion string            `json:"pricing_version"`
+	Cards          []billingPlanCard `json:"cards"`
+	Plans          []billingPlan     `json:"plans"`
+}
+
+func (h *Handlers) billingCatalog(ctx context.Context, model string, open bool) (billingCatalog, error) {
+	out := billingCatalog{PricingVersion: model, Cards: []billingPlanCard{}, Plans: []billingPlan{}}
+	rows, err := h.Pool.Query(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE state='published' AND public AND pricing_version=$1 ORDER BY sort_order,family`, model)
 	if err != nil {
-		log.Error().Err(err).Msg("read pricing version failed")
-		respondError(c, ErrInternal)
-		return
+		return out, err
 	}
-	rows, err := h.Pool.Query(ctx, `SELECT `+planVersionColumns+` FROM billing_plan_version WHERE state='published' AND public AND pricing_version=$1 ORDER BY sort_order,family`, state.Version)
-	if err != nil {
-		log.Error().Err(err).Msg("list billing plans failed")
-		respondError(c, ErrInternal)
-		return
-	}
+	defer rows.Close()
 	var versions []planVersion
 	for rows.Next() {
 		v, err := scanPlanVersion(rows)
 		if err != nil {
-			rows.Close()
-			log.Error().Err(err).Msg("list billing plans failed")
-			respondError(c, ErrInternal)
-			return
+			return out, err
 		}
 		versions = append(versions, v)
 	}
 	if err = rows.Err(); err != nil {
-		log.Error().Err(err).Msg("list billing plans failed")
-		respondError(c, ErrInternal)
-		return
+		return out, err
 	}
-	cards := []billingPlanCard{}
+	rows.Close()
 	for _, v := range versions {
 		allowance, err := h.resolveAllowance(ctx, v.Allowance)
 		if err != nil {
-			log.Error().Err(err).Msg("price plan allowance failed")
-			respondError(c, ErrInternal)
-			return
+			return out, err
 		}
 		card := h.planCard(v, allowance)
-		if !state.EntryOpen && !state.LegacyOpen {
+		if !open {
 			if card.Monthly != nil {
 				card.Monthly.Available = false
 			}
@@ -162,8 +148,31 @@ func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
 				card.Annual.Available = false
 			}
 		}
-		cards = append(cards, card)
+		out.Cards = append(out.Cards, card)
+	}
+	out.Plans = purchasablePlans(out.Cards)
+	return out, nil
+}
+
+// GetPublicBillingPlans describes new signup offers, never an authenticated
+// team's commercial authority. Existing teams use /billing/capabilities.
+func (h *Handlers) GetPublicBillingPlans(c *gin.Context) {
+	if h.Pool == nil {
+		respondErrorMsg(c, "service_unavailable", "plans are not available", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := h.signupPricingState(c.Request.Context())
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	catalog, err := h.billingCatalog(c.Request.Context(), state.Version, state.EntryOpen || state.LegacyOpen)
+	if err != nil {
+		log.Error().Err(err).Msg("load public billing catalog failed")
+		respondError(c, ErrInternal)
+		return
 	}
 	c.Header("Cache-Control", "no-store")
-	c.JSON(http.StatusOK, gin.H{"pricing_version": state.Version, "cards": cards, "plans": purchasablePlans(cards)})
+	c.JSON(http.StatusOK, gin.H{"pricing_version": catalog.PricingVersion, "cards": catalog.Cards, "plans": catalog.Plans,
+		"signup_admission": gin.H{"schema_version": 1, "pricing_version": state.Version, "source": pricingSource(state), "entry_open": state.EntryOpen || state.LegacyOpen, "epoch": pricingEpoch(state)}})
 }

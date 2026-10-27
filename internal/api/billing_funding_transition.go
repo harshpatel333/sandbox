@@ -43,7 +43,7 @@ func (h *Handlers) commitFreeFundingPlan(ctx context.Context, team, actor uuid.U
 		return err
 	}
 	defer tx.Rollback(ctx)
-	rawPricing, entryOpen, err := lockPricingEntry(ctx, tx)
+	admission, err := lockTeamPricingEntry(ctx, tx, team)
 	if err != nil {
 		return err
 	}
@@ -101,10 +101,10 @@ func (h *Handlers) commitFreeFundingPlan(ctx context.Context, team, actor uuid.U
 		if offer != nil && *offer == "free" && choiceState == "committed" {
 			return tx.Commit(ctx)
 		}
-		if rawPricing == "v2" && !entryOpen {
+		if admission.Version == "v2" && !admission.EntryOpen {
 			return errFundingPlanTransition
 		}
-		if rawPricing == "v2" {
+		if admission.Version == "v2" {
 			var assigned, available bool
 			if err = tx.QueryRow(ctx, `SELECT to_regclass('team_plan_assignment') IS NOT NULL`).Scan(&available); err != nil {
 				return err

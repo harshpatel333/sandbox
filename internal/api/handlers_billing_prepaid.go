@@ -122,6 +122,18 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 			return
 		}
 	}
+
+	if !acceptedRedirects {
+		admission, admissionErr := h.teamPricingState(ctx, team)
+		if admissionErr != nil {
+			respondErrorMsg(c, "service_unavailable", "team plan admission requires verification", 503)
+			return
+		}
+		if admission.Version != "v2" || !admission.EntryOpen {
+			respondErrorMsg(c, "conflict", "new credit purchases are not available for this team", 409)
+			return
+		}
+	}
 	if !acceptedRedirects && !validNewPrepaidAmount(req.AmountCents) {
 		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 1000000", http.StatusBadRequest)
 		return
@@ -259,10 +271,9 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	var rawVersion string
-	var entryOpen bool
+	var admission pricingPublicState
 	if req.Enabled {
-		rawVersion, entryOpen, err = lockPricingEntry(ctx, tx)
+		admission, err = lockTeamPricingEntry(ctx, tx, team)
 		if err != nil {
 			respondError(c, ErrInternal)
 			return
@@ -281,12 +292,12 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-		if !replay && (rawVersion != "v2" || !entryOpen) {
+		if !replay && (admission.Version != "v2" || !admission.EntryOpen) {
 			respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 			return
 		}
 		if !replay {
-			if err = assertPrepaidEntry(ctx, tx); err != nil {
+			if err = assertPrepaidEntry(ctx, tx, team); err != nil {
 				if errors.Is(err, errPricingV2Off) {
 					respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 				} else {
@@ -312,9 +323,9 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 				respondErrorMsg(c, "conflict", "auto-recharge needs a card saved by an earlier credit purchase", http.StatusConflict)
 				return
 			}
-			_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,updated_by) VALUES($1,true,$2,$3,$4)
+			_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,updated_by,admission_source,admission_epoch) VALUES($1,true,$2,$3,$4,$5,$6)
  ON CONFLICT(team_id) DO UPDATE SET enabled=true,threshold_cents=$2,amount_cents=$3,updated_by=$4,updated_at=clock_timestamp(),
-  disabled_reason=NULL,disabled_at=NULL,disabled_by=NULL,notified_at=NULL`, team, req.ThresholdCents, req.AmountCents, actor)
+  disabled_reason=NULL,disabled_at=NULL,disabled_by=NULL,notified_at=NULL,admission_source=EXCLUDED.admission_source,admission_epoch=EXCLUDED.admission_epoch`, team, req.ThresholdCents, req.AmountCents, actor, pricingSource(admission), pricingEpoch(admission))
 		}
 	}
 	if err != nil {

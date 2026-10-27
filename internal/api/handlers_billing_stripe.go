@@ -1864,24 +1864,8 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 	}
 	if prepaid == nil {
 		checkoutAccount, err = h.beginLegacyCheckout(c.Request.Context(), teamID, actorID, req, requestKey, attemptID, trusted)
-	} else if trusted {
-		checkoutAccount, err = h.beginCheckoutWithPublicationDecision(c.Request.Context(), teamID, actorID, req, requestKey, attemptID)
 	} else {
-		checkoutAccount, err = h.DB.BeginTeamBillingCheckout(c.Request.Context(), db.BeginTeamBillingCheckoutParams{
-			TeamID:     teamID,
-			ActorID:    pgtype.UUID{Bytes: actorID, Valid: true},
-			RequestKey: stringPtr(requestKey),
-			AttemptID:  attemptID,
-		})
-		resumed := errors.Is(err, pgx.ErrNoRows)
-		if resumed {
-			checkoutAccount, err = h.DB.ResumeTeamBillingCheckout(c.Request.Context(), db.ResumeTeamBillingCheckoutParams{
-				TeamID:     teamID,
-				ActorID:    pgtype.UUID{Bytes: actorID, Valid: true},
-				RequestKey: stringPtr(requestKey),
-				AttemptID:  attemptID,
-			})
-		}
+		checkoutAccount, err = h.beginCohortPrepaidCheckout(c.Request.Context(), teamID, actorID, req, requestKey, attemptID, trusted)
 	}
 	if err != nil {
 		if errors.Is(err, errLegacyCheckoutPlan) {
