@@ -59,7 +59,7 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 		Region:            "region-a",
 		CapacityMemoryMib: 1024,
 		CapacityVcpus:     8,
-	}, server.URL+"/internal/hosts/host-a/heartbeat", "shared", server.URL+"/health", nil, zerolog.Nop())
+	}, server.URL+"/internal/hosts/host-a/heartbeat", "shared", &proxyHealthProbe{url: server.URL + "/health"}, nil, zerolog.Nop())
 
 	if gotPath != "/internal/hosts/host-a/heartbeat" {
 		t.Fatalf("path = %q", gotPath)
@@ -125,7 +125,7 @@ func TestSendHeartbeatAdvertisesTemplateBuildOnlyWhenReadyAndConfigured(t *testi
 				Token: tt.token, ControlPlaneURL: tt.controlURL,
 			}
 			ok, _ := sendHeartbeat(context.Background(), server.Client(), cfg,
-				server.URL+"/heartbeat", tt.token, server.URL+"/health", nil, zerolog.Nop())
+				server.URL+"/heartbeat", tt.token, &proxyHealthProbe{url: server.URL + "/health"}, nil, zerolog.Nop())
 			if !ok || !received {
 				t.Fatal("heartbeat was not received successfully")
 			}
@@ -271,7 +271,7 @@ func TestSendHeartbeatOmitsCapabilityForOldOrUnavailableProxy(t *testing.T) {
 			}))
 			defer server.Close()
 
-			sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a", LifecycleReady: func() bool { return true }, ResolverReady: func() bool { return true }}, server.URL+"/internal/hosts/host-a/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
+			sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a", LifecycleReady: func() bool { return true }, ResolverReady: func() bool { return true }}, server.URL+"/internal/hosts/host-a/heartbeat", "", &proxyHealthProbe{url: server.URL + "/health"}, nil, zerolog.Nop())
 			if !reflect.DeepEqual(got.Capabilities, tt.want) {
 				t.Fatalf("capabilities = %#v, want %#v", got.Capabilities, tt.want)
 			}
@@ -297,7 +297,7 @@ func TestSendHeartbeatOmitsLifecycleCapabilitiesBeforeReady(t *testing.T) {
 
 	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{
 		HostID: "host-a", LifecycleReady: func() bool { return false },
-	}, server.URL+"/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
+	}, server.URL+"/heartbeat", "", &proxyHealthProbe{url: server.URL + "/health"}, nil, zerolog.Nop())
 
 	if reflect.DeepEqual(got.Capabilities, []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots, capabilitySnapshotForks}) {
 		t.Fatalf("lifecycle capabilities = %#v, want omitted before readiness", got.Capabilities)
@@ -323,7 +323,7 @@ func TestSendHeartbeatKeepsLifecycleCapabilitiesWhenResolverIsNotReady(t *testin
 
 	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{
 		HostID: "host-a", LifecycleReady: func() bool { return true }, ResolverReady: func() bool { return false },
-	}, server.URL+"/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
+	}, server.URL+"/heartbeat", "", &proxyHealthProbe{url: server.URL + "/health"}, nil, zerolog.Nop())
 	want := []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots, capabilitySnapshotForks}
 	if !reflect.DeepEqual(got.Capabilities, want) {
 		t.Fatalf("capabilities = %#v, want %#v", got.Capabilities, want)
@@ -425,7 +425,7 @@ func TestSendHeartbeatOmitsStorageWhenNil(t *testing.T) {
 	}))
 	defer server.Close()
 
-	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a"}, server.URL+"/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
+	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a"}, server.URL+"/heartbeat", "", &proxyHealthProbe{url: server.URL + "/health"}, nil, zerolog.Nop())
 	if got.Storage != nil {
 		t.Fatalf("storage = %#v, want omitted", got.Storage)
 	}
@@ -454,7 +454,7 @@ func TestSendHeartbeatRetriesWithoutStorageOnCompatibilityError(t *testing.T) {
 	defer server.Close()
 
 	reportID := uuid.NewString()
-	ok, accepted := sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a", StorageReportID: reportID, LifecycleReady: func() bool { return true }, ResolverReady: func() bool { return true }}, server.URL+"/heartbeat", "", server.URL+"/health", []heartbeatStorageMeasurement{{SandboxID: "sandbox-a", AllocatedBytes: 1}}, zerolog.Nop())
+	ok, accepted := sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{HostID: "host-a", StorageReportID: reportID, LifecycleReady: func() bool { return true }, ResolverReady: func() bool { return true }}, server.URL+"/heartbeat", "", &proxyHealthProbe{url: server.URL + "/health"}, []heartbeatStorageMeasurement{{SandboxID: "sandbox-a", AllocatedBytes: 1}}, zerolog.Nop())
 	if !ok {
 		t.Fatal("heartbeat should succeed after retrying without storage")
 	}
@@ -1473,7 +1473,7 @@ func TestSendHeartbeatAdvertisesCapacityPressureWhenPublishing(t *testing.T) {
 
 		cfg.HostID = "host-a"
 		sendHeartbeat(context.Background(), server.Client(), cfg,
-			server.URL+"/internal/hosts/host-a/heartbeat", "shared", server.URL+"/health", nil, zerolog.Nop())
+			server.URL+"/internal/hosts/host-a/heartbeat", "shared", &proxyHealthProbe{url: server.URL + "/health"}, nil, zerolog.Nop())
 		return got.Capabilities
 	}
 
@@ -1617,5 +1617,51 @@ func TestHeartbeatPreservesInstalledIncarnation(t *testing.T) {
 	}
 	if attempts.Load() != 2 {
 		t.Fatalf("requests = %d, want 2 without an identity-less fallback", attempts.Load())
+	}
+}
+
+func TestSendHeartbeatKeepsProxyCapabilitiesForOneFailedProbe(t *testing.T) {
+	var healthy atomic.Bool
+	var got heartbeatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			if !healthy.Load() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`{"capabilities":["preview_ports_v1"],"resolver_ready":true}`))
+		case "/heartbeat":
+			got = heartbeatRequest{}
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Errorf("decode heartbeat: %v", err)
+			}
+		}
+	}))
+	defer server.Close()
+
+	cfg := HeartbeatConfig{HostID: "host-a", LifecycleReady: func() bool { return true }, ResolverReady: func() bool { return true }}
+	probe := &proxyHealthProbe{url: server.URL + "/health"}
+	beat := func() []string {
+		sendHeartbeat(context.Background(), server.Client(), cfg, server.URL+"/heartbeat", "", probe, nil, zerolog.Nop())
+		return got.Capabilities
+	}
+	hasProxy := func(caps []string) bool {
+		return slices.Contains(caps, preview.HostCapabilityPorts) && slices.Contains(caps, capabilityCanProxyTraffic)
+	}
+
+	if hasProxy(beat()) {
+		t.Fatal("advertised proxy capabilities before any successful probe")
+	}
+	healthy.Store(true)
+	if !hasProxy(beat()) {
+		t.Fatal("healthy probe did not advertise proxy capabilities")
+	}
+	healthy.Store(false)
+	if !hasProxy(beat()) {
+		t.Fatal("one failed probe withdrew proxy capabilities")
+	}
+	if hasProxy(beat()) {
+		t.Fatal("consecutive failed probes kept proxy capabilities")
 	}
 }
