@@ -406,3 +406,32 @@ func TestMirrorTransfers(t *testing.T) {
 		t.Errorf("stalled probe took %v, want it bounded by the per-fetch timeout", elapsed)
 	}
 }
+
+func TestRewriteAptSources_KeepsCachedListsUsable(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "etc/apt/sources.list"), ""+
+		"deb http://archive.ubuntu.com/ubuntu noble main\n"+
+		"deb http://security.ubuntu.com/ubuntu noble-security main\n")
+	lists := filepath.Join(root, "var/lib/apt/lists")
+	for _, name := range []string{
+		"archive.ubuntu.com_ubuntu_dists_noble_InRelease",
+		"security.ubuntu.com_ubuntu_dists_noble-security_main_binary-amd64_Packages",
+		"deb.debian.org_debian_dists_bookworm_InRelease",
+	} {
+		writeTestFile(t, filepath.Join(lists, name), name)
+	}
+
+	if err := rewriteAptSources(root, fixedMirror(fallbackAptMirror), nil); err != nil {
+		t.Fatalf("rewriteAptSources: %v", err)
+	}
+
+	for name, content := range map[string]string{
+		fallbackAptMirror + "_ubuntu_dists_noble_InRelease":                           "archive.ubuntu.com_ubuntu_dists_noble_InRelease",
+		fallbackAptMirror + "_ubuntu_dists_noble-security_main_binary-amd64_Packages": "security.ubuntu.com_ubuntu_dists_noble-security_main_binary-amd64_Packages",
+		"deb.debian.org_debian_dists_bookworm_InRelease":                              "deb.debian.org_debian_dists_bookworm_InRelease",
+	} {
+		if got := readTestFile(t, filepath.Join(lists, name)); got != content {
+			t.Errorf("%s = %q, want %q", name, got, content)
+		}
+	}
+}

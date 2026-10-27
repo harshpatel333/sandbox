@@ -160,26 +160,15 @@ func validateTemplateShape(teamID, systemTeamID uuid.UUID, limits teamLimits, vc
 	return ""
 }
 
-// validateBuildSpec enforces base-image policy and step-shape invariants.
-// Catches obvious problems (alpine, distroless, bad step shape) before we
-// persist a row or hand off to the builder.
+// validateBuildSpec enforces step-shape invariants before we persist a row or
+// hand off to the builder. Whether a base image can boot is decided after it
+// is pulled, from its contents: a name says nothing reliable about them.
 func validateBuildSpec(spec *buildSpec) error {
 	if spec == nil {
 		return fmt.Errorf("build_spec is required")
 	}
 	if strings.TrimSpace(spec.From) == "" {
 		return fmt.Errorf("build_spec.from is required")
-	}
-	// Permissive policy: allow any OCI ref, but reject known-incompatible
-	// bases up front so the user gets a fast clear error rather than a
-	// build-time mystery failure. Heuristic on the image name; the converter
-	// will do a stricter check post-pull.
-	low := strings.ToLower(spec.From)
-	if strings.Contains(low, "alpine") {
-		return fmt.Errorf("alpine bases are not supported (musl + non-systemd init); use a debian/ubuntu-based image")
-	}
-	if strings.Contains(low, "distroless") {
-		return fmt.Errorf("distroless bases are not supported (no shell for RUN steps)")
 	}
 	for i, step := range spec.Steps {
 		set := 0
