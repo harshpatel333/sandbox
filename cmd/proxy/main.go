@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -44,11 +45,14 @@ func run() error {
 		Str("service", "proxy").
 		Logger()
 
+	// Final flushes start with the drain so exit, which gates the next
+	// process on restart, is not held up by them.
+	var flushes []func()
 	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
 		if err := sentry.Init(sentry.ClientOptions{Dsn: dsn, EnableLogs: true}); err != nil {
 			log.Warn().Err(err).Msg("sentry.Init failed")
 		} else {
-			defer sentry.Flush(2 * time.Second)
+			flushes = append(flushes, func() { sentry.Flush(2 * time.Second) })
 		}
 	}
 
@@ -154,13 +158,11 @@ func run() error {
 			proxyHandler.WithTelemetry(rec)
 			routingRecorder = rec
 			peerTelemetry = proxy.RecorderPeerTelemetry{Recorder: rec, HostID: os.Getenv("HOST_ID"), Region: os.Getenv("HOST_REGION")}
-			defer func() {
-				// Bounded: a stalled collector must not hang proxy restarts
-				// on the final flush.
+			flushes = append(flushes, func() {
 				flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				defer cancel()
 				_ = rec.Shutdown(flushCtx)
-			}()
+			})
 			log.Info().Msg("otel metrics enabled")
 		}
 	}
@@ -171,8 +173,24 @@ func run() error {
 	if err != nil {
 		log.Fatal().Err(err).Msg("init analytics")
 	}
-	defer analyticsClient.Close()
+	flushes = append(flushes, analyticsClient.Close)
 	proxyHandler.WithAnalytics(analyticsClient)
+	flushed := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		var wg sync.WaitGroup
+		for _, flush := range flushes {
+			wg.Go(flush)
+		}
+		wg.Wait()
+		close(flushed)
+	}()
+	defer func() {
+		select {
+		case <-flushed:
+		case <-time.After(300 * time.Millisecond):
+		}
+	}()
 
 	// Data-plane auth — the HMAC seed is shared with the control plane.
 	// Both sides derive per-sandbox access tokens as HMAC-SHA256(seed, sandboxID).
@@ -229,7 +247,7 @@ func run() error {
 		}
 		defer peers.Close()
 	}
-	var routingReady func() bool
+	var routingReady, routingWarmed func() bool
 	router := proxy.NewRoutingHandler(domains, localHostID, ownership, peers, proxyHandler, log, routingRecorder)
 	if dbPool != nil && routingEnabled == "1" {
 		directory := &proxy.HostDirectory{}
@@ -245,13 +263,14 @@ func run() error {
 		revocations := &proxy.RoutingRevocations{}
 		revocations.Start(workCtx, backgroundPool, directory, log)
 		router.WithRoutingHints(directory, revocations)
-		routingReady = routingBootstrapGate(func() bool { return directory.Ready() && revocations.Ready() }, time.Second)
+		routingWarmed = func() bool { return directory.Ready() && revocations.Ready() }
+		routingReady = routingBootstrapGate(routingWarmed, time.Second)
 	}
 	log.Info().Bool("enabled", routingEnabled == "1").Msg("peer ownership routing configured")
 	var routingDataPlane http.Handler = router
 	var routingDependencies func(context.Context) bool
 	if dbPool != nil && routingEnabled == "1" {
-		routingDataPlane = withRoutingBootstrap(router, routingReady)
+		routingDataPlane = withRoutingBootstrap(router, routingReady, routingWarmed)
 		routingDependencies = func(ctx context.Context) bool {
 			ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 			defer cancel()
@@ -560,21 +579,27 @@ func routingBootstrapGate(fresh func() bool, warmup time.Duration) func() bool {
 const routingBootstrapPoll = 10 * time.Millisecond
 
 // withRoutingBootstrap holds requests during warmup instead of refusing them;
-// the gate opens by its deadline, which bounds the wait.
-func withRoutingBootstrap(next http.Handler, ready func() bool) http.Handler {
+// the gate opens by its deadline, which bounds the wait. A request held until
+// the deadline, with routing state still cold, is refused as before rather
+// than released into the ownership fallback with the rest of the backlog.
+func withRoutingBootstrap(next http.Handler, ready, warmed func() bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !ready() {
 			tick := time.NewTicker(routingBootstrapPoll)
 			defer tick.Stop()
-			for !ready() {
+			held := true
+			for held && !ready() {
 				select {
 				case <-r.Context().Done():
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusServiceUnavailable)
-					_, _ = w.Write([]byte(`{"error":{"code":"sandbox_unavailable","message":"proxy is warming routing state"}}`))
-					return
+					held = false
 				case <-tick.C:
 				}
+			}
+			if !held || !warmed() {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":{"code":"sandbox_unavailable","message":"proxy is warming routing state"}}`))
+				return
 			}
 		}
 		next.ServeHTTP(w, r)

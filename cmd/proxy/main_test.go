@@ -330,7 +330,7 @@ func TestRoutingBootstrapGate(t *testing.T) {
 
 func TestRoutingBootstrapHoldsDataPlaneUntilReady(t *testing.T) {
 	var ready, dispatched atomic.Bool
-	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched.Store(true) }), ready.Load)
+	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched.Store(true) }), ready.Load, ready.Load)
 
 	// A request arriving during warmup waits for the gate instead of failing.
 	done := make(chan struct{})
@@ -358,9 +358,32 @@ func TestRoutingBootstrapHoldsDataPlaneUntilReady(t *testing.T) {
 	}
 }
 
+func TestRoutingBootstrapRefusesHeldRequestWhenDeadlineOpensGate(t *testing.T) {
+	var ready, dispatched atomic.Bool
+	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched.Store(true) }), ready.Load, func() bool { return false })
+	done := make(chan struct{})
+	w := httptest.NewRecorder()
+	go func() {
+		gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/exec", nil))
+		close(done)
+	}()
+	time.Sleep(3 * routingBootstrapPoll)
+	ready.Store(true)
+	<-done
+	if dispatched.Load() || w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("held request after deadline dispatched=%v status=%d", dispatched.Load(), w.Code)
+	}
+	// Traffic arriving after the deadline still takes the ownership fallback.
+	w = httptest.NewRecorder()
+	gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/exec", nil))
+	if !dispatched.Load() {
+		t.Fatal("post-deadline request not dispatched")
+	}
+}
+
 func TestRoutingBootstrapRefusesCancelledWarmupRequest(t *testing.T) {
 	var dispatched atomic.Bool
-	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched.Store(true) }), func() bool { return false })
+	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched.Store(true) }), func() bool { return false }, func() bool { return false })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	w := httptest.NewRecorder()
