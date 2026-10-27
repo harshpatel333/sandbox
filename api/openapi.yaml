@@ -5818,6 +5818,39 @@ components:
               description: Whether this change is undoable through the current API channel. Customer reads return false for staff-originated changes.
             pauses_running:
               type: boolean
+        pro_checkout:
+          $ref: "#/components/schemas/BillingProCheckoutTerms"
+    BillingProCheckoutTerms:
+      type: object
+      required: [first_paid_pro_cycle, accepted]
+      description: First Pro checkout eligibility or the frozen terms of an accepted checkout. Optional terms are omitted when no checkout has been accepted.
+      properties:
+        first_paid_pro_cycle:
+          type: boolean
+          description: Whether the first-paid-Pro-cycle rules apply to the accepted checkout, or the current Free team is eligible for those rules before checkout.
+        accepted:
+          type: boolean
+          description: Whether these terms belong to an existing accepted checkout. This does not indicate that payment has completed.
+        period_start:
+          type: string
+          format: date-time
+          description: Start of the first checkout coverage, frozen at quote time. For prorated upgrades this can be later than the start of the existing commercial billing period.
+        period_end:
+          type: string
+          format: date-time
+          description: End of the accepted checkout coverage, at the applicable billing-period boundary.
+        credit_expires_at:
+          type: string
+          format: date-time
+          description: Expiration of the first credit grant; omitted when the credit does not expire.
+        first_payment_cents:
+          type: integer
+          format: int64
+          description: Quoted first payment in USD cents, before any checkout discount.
+        first_credit_cents:
+          type: integer
+          format: int64
+          description: First credit grant in USD cents under the accepted checkout terms.
     BillingPlanChange:
       type: object
       required: [id, target_plan_key, target_display_name, target_kind, effective_at, pauses_running, state, undoable, limits]

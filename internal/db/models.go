@@ -721,6 +721,19 @@ type BillingInvoiceCalendar struct {
 	CreatedAt          time.Time `json:"created_at"`
 }
 
+type BillingInvoiceCashAuthority struct {
+	InvoiceID      string    `json:"invoice_id"`
+	TeamID         uuid.UUID `json:"team_id"`
+	PeriodStart    time.Time `json:"period_start"`
+	PeriodEnd      time.Time `json:"period_end"`
+	CustomerID     string    `json:"customer_id"`
+	SubscriptionID string    `json:"subscription_id"`
+	PolicyVersion  int32     `json:"policy_version"`
+	Policy         string    `json:"policy"`
+	Evidence       []byte    `json:"evidence"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
 type BillingInvoiceClose struct {
 	TeamID            uuid.UUID          `json:"team_id"`
 	PeriodStart       time.Time          `json:"period_start"`
@@ -1122,6 +1135,23 @@ type BillingProClosedPurchase struct {
 	SessionID      string    `json:"session_id"`
 	SubscriptionID string    `json:"subscription_id"`
 	Evidence       []byte    `json:"evidence"`
+}
+
+type BillingProInvoiceCashAuthority struct {
+	InvoiceID          string    `json:"invoice_id"`
+	SettlementHash     string    `json:"settlement_hash"`
+	TeamID             uuid.UUID `json:"team_id"`
+	CustomerID         string    `json:"customer_id"`
+	SubscriptionID     string    `json:"subscription_id"`
+	UpgradeID          uuid.UUID `json:"upgrade_id"`
+	ContractID         uuid.UUID `json:"contract_id"`
+	AssignmentID       uuid.UUID `json:"assignment_id"`
+	ProtectedCents     int64     `json:"protected_cents"`
+	CreditAppliedCents int64     `json:"credit_applied_cents"`
+	FeeCents           int64     `json:"fee_cents"`
+	UsageNetCents      int64     `json:"usage_net_cents"`
+	Evidence           []byte    `json:"evidence"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 type BillingProInvoiceSeen struct {
