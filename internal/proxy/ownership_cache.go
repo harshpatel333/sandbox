@@ -39,7 +39,9 @@ type CachedOwnershipResolver struct {
 	entries map[string]*list.Element
 	lru     list.List
 	flights map[string]*ownershipFlight
-	now     func() time.Time
+	// freed is closed when a lookup finishes; created only while callers wait.
+	freed chan struct{}
+	now   func() time.Time
 }
 
 func NewCachedOwnershipResolver(ctx context.Context, source OwnershipResolver) *CachedOwnershipResolver {
@@ -55,23 +57,50 @@ func (c *CachedOwnershipResolver) ResolveSandbox(ctx context.Context, id string)
 	if err := ctx.Err(); err != nil {
 		return SandboxRoute{}, err
 	}
-	c.mu.Lock()
-	if e := c.entries[id]; e != nil {
-		entry := e.Value.(ownershipEntry)
-		if c.now().Before(entry.expires) {
-			c.lru.MoveToFront(e)
-			c.mu.Unlock()
-			return entry.route, entry.err
+	// A full lookup table waits for a slot rather than failing a burst; one
+	// lookup timeout bounds the wait, since a slot frees within it.
+	var waitLimit *time.Timer
+	var f *ownershipFlight
+	for {
+		c.mu.Lock()
+		if e := c.entries[id]; e != nil {
+			entry := e.Value.(ownershipEntry)
+			if c.now().Before(entry.expires) {
+				c.lru.MoveToFront(e)
+				c.mu.Unlock()
+				return entry.route, entry.err
+			}
+			c.lru.Remove(e)
+			delete(c.entries, id)
 		}
-		c.lru.Remove(e)
-		delete(c.entries, id)
-	}
-	f := c.flights[id]
-	if f == nil {
-		if len(c.flights) >= ownershipMaxLookups {
-			c.mu.Unlock()
+		f = c.flights[id]
+		if f != nil || len(c.flights) < ownershipMaxLookups {
+			break
+		}
+		if c.freed == nil {
+			c.freed = make(chan struct{})
+		}
+		freed := c.freed
+		c.mu.Unlock()
+		if waitLimit == nil {
+			waitLimit = time.NewTimer(ownershipLookupTimeout)
+		}
+		select {
+		case <-freed:
+		case <-waitLimit.C:
 			return SandboxRoute{}, errors.New("ownership lookup capacity exhausted")
+		case <-ctx.Done():
+			waitLimit.Stop()
+			return SandboxRoute{}, ctx.Err()
+		case <-c.ctx.Done():
+			waitLimit.Stop()
+			return SandboxRoute{}, c.ctx.Err()
 		}
+	}
+	if waitLimit != nil {
+		waitLimit.Stop()
+	}
+	if f == nil {
 		f = &ownershipFlight{done: make(chan struct{})}
 		c.flights[id] = f
 		started := c.now()
@@ -109,5 +138,9 @@ func (c *CachedOwnershipResolver) lookup(id string, f *ownershipFlight, started 
 		c.entries[id] = c.lru.PushFront(ownershipEntry{id: id, route: f.route, err: f.err, expires: expires})
 	}
 	delete(c.flights, id)
+	if c.freed != nil {
+		close(c.freed)
+		c.freed = nil
+	}
 	close(f.done)
 }

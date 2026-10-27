@@ -116,7 +116,18 @@ func TestOwnershipCacheBoundsDistinctLookupsAndEntries(t *testing.T) {
 	if _, err := cache.ResolveSandbox(ctx, uuid.NewString()); err == nil {
 		t.Fatal("unbounded distinct lookups")
 	}
+	// A caller over the bound waits for a slot instead of failing.
+	waited := make(chan error, 1)
+	go func() { _, err := cache.ResolveSandbox(ctx, uuid.NewString()); waited <- err }()
+	select {
+	case err := <-waited:
+		t.Fatalf("over-bound lookup returned before a slot freed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
 	close(release)
+	if err := <-waited; err != nil {
+		t.Fatalf("over-bound lookup failed after a slot freed: %v", err)
+	}
 	wg.Wait()
 	cache = NewCachedOwnershipResolver(ctx, RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) { return SandboxRoute{HostID: "owner"}, nil }))
 	cache.now = func() time.Time { return time.Unix(0, 0) }
@@ -147,5 +158,27 @@ func TestOwnershipCacheDoesNotExtendFreshnessByQueryTime(t *testing.T) {
 	cache.ResolveSandbox(context.Background(), id)
 	if calls != 2 {
 		t.Fatal("query duration extended cache freshness")
+	}
+}
+
+func TestOwnershipCacheServesBurstLargerThanLookupBound(t *testing.T) {
+	cache := NewCachedOwnershipResolver(context.Background(), RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+		time.Sleep(5 * time.Millisecond)
+		return SandboxRoute{HostID: "owner"}, nil
+	}))
+	var wg sync.WaitGroup
+	var failed atomic.Int32
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := cache.ResolveSandbox(context.Background(), uuid.NewString()); err != nil {
+				failed.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if failed.Load() != 0 {
+		t.Fatalf("%d of 100 distinct lookups failed", failed.Load())
 	}
 }
