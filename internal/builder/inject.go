@@ -411,6 +411,9 @@ const initScriptTemplate = `#!/bin/sh
 # PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
 
 set +e
+# The kernel starts init with no PATH; set the one the builder checked its
+# tools against, rather than leave the lookup to the shell's default.
+export PATH=%s
 mkdir -p /proc /sys /dev /run /tmp
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
@@ -463,7 +466,7 @@ func initScriptFor(freezeWorkload bool) string {
 	if freezeWorkload {
 		block += initFreezerBlock
 	}
-	return fmt.Sprintf(initScriptTemplate, block)
+	return fmt.Sprintf(initScriptTemplate, guestPathEnv(), block)
 }
 
 // copyFile copies src → dst, creating parent directories as needed. Overwrites

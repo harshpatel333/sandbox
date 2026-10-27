@@ -125,8 +125,17 @@ var errNoShell = errors.New("image has no /bin/sh")
 // freezer cgroup, and each build syncs the disk before the snapshot.
 var guestTools = []string{"mkdir", "mount", "chmod", "sync"}
 
-// guestPath is where those commands are looked up, as the guest's shell would.
+// guestPath is where those commands are looked up; the injected init exports
+// the same list as its PATH.
 var guestPath = []string{"usr/local/sbin", "usr/local/bin", "usr/sbin", "usr/bin", "sbin", "bin"}
+
+func guestPathEnv() string {
+	dirs := make([]string, len(guestPath))
+	for i, dir := range guestPath {
+		dirs[i] = "/" + dir
+	}
+	return strings.Join(dirs, ":")
+}
 
 // requireShell rejects a flattened image that cannot boot or build: one
 // whose /bin/sh is not an executable file, such as a distroless or
