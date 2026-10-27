@@ -46,7 +46,7 @@ func (h *Handlers) enqueueInvoiceCollection(ctx context.Context, p billing.Expor
 	if inv.Parent.SubscriptionDetails == nil {
 		return fmt.Errorf("collection invoice has no subscription")
 	}
-	cashAllowed, err := h.invoiceResidualCashAllowed(ctx, inv.ID, inv.Customer, inv.Parent.SubscriptionDetails.Subscription)
+	cashAllowed, err := h.invoiceCollectionCashAllowed(ctx, inv)
 	if err != nil {
 		return err
 	}
@@ -190,7 +190,7 @@ func (h *Handlers) collectInvoice(ctx context.Context, c *stripeHTTPClient, job 
 	if inv.CollectionMethod != "charge_automatically" || inv.Status != "open" || inv.AutoAdvance || inv.AmountRemaining == nil || *inv.AmountRemaining != inv.AmountDue || inv.AmountDue <= 0 {
 		return "review_required", "invoice is not held open with the verified amount due"
 	}
-	cashAllowed, err := h.invoiceResidualCashAllowed(ctx, job.Invoice, job.Customer, job.Subscription)
+	cashAllowed, err := h.invoiceCollectionCashAllowed(ctx, inv)
 	if err != nil {
 		return "review_required", "historical invoice cash authority unavailable"
 	}
@@ -216,6 +216,10 @@ func (h *Handlers) collectInvoice(ctx context.Context, c *stripeHTTPClient, job 
 	if err != nil {
 		return job.State, "subscription retrieval unavailable"
 	}
+	if err = h.verifyFirstProCycleProviderCalendar(ctx, h.Pool, sub); err != nil {
+		return "review_required", "first Pro month subscription calendar requires review"
+	}
+
 	if sub.CollectionMethod != "charge_automatically" || sub.Customer != job.Customer || sub.LiveMode != job.LiveMode || (sub.Status != "canceled" && (sub.PauseCollection == nil || sub.PauseCollection.Behavior != "keep_as_draft" || sub.PauseCollection.ResumesAt != 0)) {
 		return "review_required", "subscription collection method or hold changed"
 	}

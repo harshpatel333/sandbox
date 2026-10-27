@@ -166,5 +166,33 @@ class InvoiceCashAuthorityDefaultACLMigrationCLITest(MigrationCLITest):
         self.assert_no_pending_migrations()
 
 
+class ProInvoiceCashAuthorityDefaultACLMigrationCLITest(MigrationCLITest):
+    test_fresh_database = None
+
+    def test_component_authority_resets_backend_defaults(self):
+        self.sql("CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role")
+        self.sql("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO service_role; "
+                 "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO service_role")
+        self.copy_migrations()
+        self.push()
+        self.assertEqual(self.sql(
+            "SELECT relrowsecurity FROM pg_class WHERE oid='public.billing_pro_invoice_cash_authority'::regclass"), "t")
+        for role in ("anon", "authenticated", "service_role"):
+            for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"):
+                with self.subTest(role=role, privilege=privilege):
+                    expected = "t" if role == "service_role" and privilege in ("SELECT", "INSERT") else "f"
+                    self.assertEqual(self.sql(
+                        f"SELECT has_table_privilege('{role}','public.billing_pro_invoice_cash_authority','{privilege}')"), expected)
+            self.assertEqual(self.sql(
+                f"SELECT has_function_privilege('{role}','public.pro_invoice_cash_source_valid(text,text)','EXECUTE')"),
+                "t" if role == "service_role" else "f")
+        self.assertEqual(self.sql(
+            "SELECT count(*) FROM pg_proc p CROSS JOIN LATERAL "
+            "aclexplode(COALESCE(p.proacl,acldefault('f',p.proowner))) a "
+            "WHERE p.oid='public.pro_invoice_cash_source_valid(text,text)'::regprocedure "
+            "AND a.grantee=0 AND a.privilege_type='EXECUTE'"), "0")
+        self.assert_no_pending_migrations()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
