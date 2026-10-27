@@ -5,6 +5,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -138,15 +139,43 @@ func copyRegularFile(src, dst string) error {
 	return out.Close()
 }
 
-// resolveImageDir follows a symlinked /tmp or /run inside the image root,
-// refusing a link that would leave it.
+// resolveImageDir follows a symlinked /tmp or /run the way the guest sees it:
+// absolute links start over at the image root and ".." stops there.
 func resolveImageDir(root, name string) (string, error) {
-	resolved, err := filepath.EvalSymlinks(filepath.Join(root, name))
-	if err != nil {
-		return "", err
+	rel, pending := ".", name
+	for hops := 0; pending != ""; {
+		var part string
+		part, pending, _ = strings.Cut(pending, "/")
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			rel = path.Dir(rel)
+			continue
+		}
+		next := path.Join(rel, part)
+		info, err := os.Lstat(filepath.Join(root, next))
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			rel = next
+			continue
+		}
+		if hops++; hops > 40 {
+			return "", errors.New("too many links in image directory path")
+		}
+		target, err := os.Readlink(filepath.Join(root, next))
+		if err != nil {
+			return "", err
+		}
+		if path.IsAbs(target) {
+			rel = "."
+		}
+		pending = target + "/" + pending
 	}
-	if rel, err := filepath.Rel(root, resolved); err != nil || strings.HasPrefix(rel, "..") {
-		return "", errors.New("image directory leaves the image root")
+	if rel == "." {
+		return "", errors.New("image directory is the image root")
 	}
-	return resolved, nil
+	return filepath.Join(root, rel), nil
 }

@@ -98,4 +98,10 @@ func TestResolveImageDirStaysInside(t *testing.T) {
 	if _, err := resolveImageDir(resolvedRoot, "run"); err == nil {
 		t.Error("a link out of the image root was followed")
 	}
+	if err := os.Symlink("/var/tmp", filepath.Join(root, "abs")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := resolveImageDir(resolvedRoot, "abs"); err != nil || got != filepath.Join(resolvedRoot, "var/tmp") {
+		t.Errorf("an absolute link resolves to %q, %v", got, err)
+	}
 }
