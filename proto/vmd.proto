@@ -348,12 +348,12 @@ message ReshapeVMRequest {
   // egress config with no rules is the explicit statement that the
   // sandbox is unrestricted.
   SandboxNetworkConfig sandbox_network = 4;
-  // Re-injected after boot: a cold boot starts boxd with an empty context.
-  map<string, string> env_vars = 5;
-  string secrets_jwt = 6;
 }
 
 message ReshapeVMResponse {
+  // A cold boot starts boxd with an empty context: the caller re-injects
+  // env and secrets through InjectSandboxEnv, minting the secrets token
+  // for this address, which may differ from the one before the reshape.
   string host_ip = 1;
   uint32 vcpu = 2;
   uint32 mem_mib = 3;

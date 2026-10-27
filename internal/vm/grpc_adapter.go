@@ -907,16 +907,5 @@ func (a *GRPCAdapter) ReshapeVM(ctx context.Context, req *vmdpb.ReshapeVMRequest
 	inst.mu.RLock()
 	hostIP, vcpu, memMiB := inst.IP, inst.Config.VCPU, inst.Config.MemoryMiB
 	inst.mu.RUnlock()
-	if len(req.GetEnvVars()) > 0 || req.GetSecretsJwt() != "" {
-		if _, err := a.InjectSandboxEnv(ctx, &vmdpb.InjectSandboxEnvRequest{
-			VmId:       req.GetVmId(),
-			EnvVars:    req.GetEnvVars(),
-			SecretsJwt: req.GetSecretsJwt(),
-		}); err != nil {
-			// The VM is up at the new shape, so retrying ReshapeVM takes
-			// the idempotent path and injects again.
-			return nil, status.Errorf(codes.Internal, "reshaped but configuration injection failed: %v", err)
-		}
-	}
 	return &vmdpb.ReshapeVMResponse{HostIp: hostIP, Vcpu: vcpu, MemMib: memMiB}, nil
 }
