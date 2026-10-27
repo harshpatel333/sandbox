@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/rs/zerolog/log"
 )
@@ -119,14 +120,25 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 // every build step run under.
 var errNoShell = errors.New("image has no /bin/sh")
 
-// requireShell rejects a flattened image that cannot boot because it has no
-// shell, such as a distroless or scratch-based one. /bin may be a symlink to
-// /usr/bin, so the path is resolved inside the rootfs rather than on the host.
+// requireShell rejects a flattened image whose /bin/sh is not an executable
+// file, such as a distroless or scratch-based one. Extraction keeps every
+// symlink relative and inside the rootfs, so resolving one here cannot leave
+// it.
 func requireShell(rootfsDir string) error {
-	for _, p := range []string{"bin/sh", "usr/bin/sh"} {
-		if _, err := os.Lstat(filepath.Join(rootfsDir, p)); err == nil {
-			return nil
-		}
+	root, err := filepath.EvalSymlinks(rootfsDir)
+	if err != nil {
+		return fmt.Errorf("resolve rootfs: %w", err)
 	}
-	return errNoShell
+	resolved, err := filepath.EvalSymlinks(filepath.Join(root, "bin/sh"))
+	if err != nil {
+		return errNoShell
+	}
+	if rel, err := filepath.Rel(root, resolved); err != nil || strings.HasPrefix(rel, "..") {
+		return errNoShell
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return errNoShell
+	}
+	return nil
 }
