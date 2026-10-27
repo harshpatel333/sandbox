@@ -214,6 +214,11 @@ jobs:
           YC_AUTHORITY_TEST_MIGRATION: ${{ github.workspace }}/supabase/shared-auth-migrations/20261016070000_yc_company_activation_authority.sql
         run: go test -v -race -tags integration -count=1 -timeout 3m -run '^(TestYC|TestSponsored|TestEntitlement|TestInvoiceCredit|TestInvoiceCash|TestInvoiceDiscovery|TestEmptyCredit|TestMatchingCredit|TestPrepaid|TestPro|TestReleased|TestMRR|TestPlanTerms|TestPlanAssignment|TestStaffPlanAssignment|TestTeamPlanChange)' ./internal/api
 
+      - name: Run isolated new-team billing cohort API race contracts
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+        run: go test -v -race -tags integration -count=1 -timeout 3m -run '^TestNewTeamCohort' ./internal/api
+
       - name: Run retained storage API race contracts
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
