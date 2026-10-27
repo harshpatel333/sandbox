@@ -46,7 +46,11 @@ func (h *Handlers) enqueueInvoiceCollection(ctx context.Context, p billing.Expor
 	if inv.Parent.SubscriptionDetails == nil {
 		return fmt.Errorf("collection invoice has no subscription")
 	}
-	authorized = authorized && inv.CollectionMethod == "charge_automatically"
+	cashAllowed, err := h.invoiceResidualCashAllowed(ctx, inv.ID, inv.Customer, inv.Parent.SubscriptionDetails.Subscription)
+	if err != nil {
+		return err
+	}
+	authorized = authorized && inv.CollectionMethod == "charge_automatically" && cashAllowed
 	state := "pending"
 	if !authorized {
 		state = "review_required"
@@ -186,6 +190,13 @@ func (h *Handlers) collectInvoice(ctx context.Context, c *stripeHTTPClient, job 
 	if inv.CollectionMethod != "charge_automatically" || inv.Status != "open" || inv.AutoAdvance || inv.AmountRemaining == nil || *inv.AmountRemaining != inv.AmountDue || inv.AmountDue <= 0 {
 		return "review_required", "invoice is not held open with the verified amount due"
 	}
+	cashAllowed, err := h.invoiceResidualCashAllowed(ctx, job.Invoice, job.Customer, job.Subscription)
+	if err != nil {
+		return "review_required", "historical invoice cash authority unavailable"
+	}
+	if !cashAllowed {
+		return "review_required", "historical prepaid or ambiguous period requires review"
+	}
 	state, err := c.invoicePaymentState(ctx, inv)
 	if err != nil {
 		return job.State, "invoice payment evidence unavailable"
@@ -303,4 +314,13 @@ func (c *stripeHTTPClient) invoicePaymentState(ctx context.Context, inv StripeIn
 		}
 	}
 	return state, nil
+}
+
+// An auto-recharge setting authorizes its saved top-up, never arbitrary invoice
+// cash. Resolve once from the closed period and retain that immutable decision.
+func (h *Handlers) invoiceResidualCashAllowed(ctx context.Context, invoice, customer, subscription string) (bool, error) {
+	var allowed bool
+	err := h.Pool.QueryRow(ctx, `SELECT a.policy='residual_allowed' AND a.customer_id=$2 AND a.subscription_id=$3
+ FROM resolve_invoice_cash_authority($1) a`, invoice, customer, subscription).Scan(&allowed)
+	return allowed, err
 }
