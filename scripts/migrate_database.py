@@ -20,6 +20,9 @@ COMMAND_TIMEOUT = 60
 STARTUP_OPTIONS = "-c transaction_timeout=2s -c lock_timeout=250ms"
 EXECUTION_GUARD = """RESET ALL;
 DO $$ BEGIN
+ IF current_user <> 'postgres' OR session_user <> 'postgres' THEN
+  RAISE EXCEPTION 'Migration execution principal is unavailable';
+ END IF;
  IF current_setting('server_version_num')::int < 170000
  OR NOT EXISTS (SELECT FROM pg_settings WHERE name='transaction_timeout'
                 AND setting='2000' AND reset_val='2000')
@@ -148,6 +151,7 @@ ERROR_MARKERS = {
     "startup_parameter": ("unsupported startup parameter", "unrecognized configuration parameter"),
     "cli_usage": ("unknown flag", "unknown command"),
     "execution_settings": ("migration execution settings are unavailable",),
+    "execution_principal": ("migration execution principal is unavailable",),
 }
 
 
@@ -185,6 +189,8 @@ def query_rows(result, stage):
 
 
 PREFLIGHT_CHECKS = {
+    "current_user_ok": "current_user = 'postgres'",
+    "session_user_ok": "session_user = 'postgres'",
     "postgres_version_ok": "current_setting('server_version_num')::int >= 170000",
     "transaction_timeout_present": "EXISTS (SELECT FROM pg_settings WHERE name='transaction_timeout')",
     "transaction_timeout_setting_ok": "EXISTS (SELECT FROM pg_settings WHERE name='transaction_timeout' AND setting='2000')",
@@ -272,12 +278,13 @@ def migrate(target, action, database_url, root=ROOT, cli="supabase"):
         migrations = project / "supabase/migrations"
         migrations.mkdir(parents=True)
         (project / "supabase/config.toml").write_text('project_id = "regional-migrations"\n')
-        if action == "preflight":
+        if action in ("preflight", "push"):
             preflight(cli, database_url, project, deadline)
+        if action == "preflight":
             print(f"{target}: read-only connection preflight succeeded")
             return
         # This CLI hook runs on its migration session without a history row.
-        # Never copy repository roles: this file only verifies startup defaults.
+        # Never copy repository roles: verify the migration principal and startup defaults.
         (project / "supabase/roles.sql").write_text(EXECUTION_GUARD)
         versions = set()
         for source in sorted((root / "supabase/migrations").glob("*.sql")):

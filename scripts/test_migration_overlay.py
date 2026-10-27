@@ -102,6 +102,29 @@ class ConnectionIdentityTest(unittest.TestCase):
         self.assertEqual(preflight.call_args.args[1], expected)
         self.assertNotIn("private-example", output.getvalue())
 
+    def test_preflight_rejects_each_unexpected_principal(self):
+        for field in ("current_user_ok", "session_user_ok"):
+            checks = dict.fromkeys(migration.PREFLIGHT_CHECKS, True)
+            checks[field] = False
+            response = subprocess.CompletedProcess([], 0, json.dumps([checks]), "")
+            with self.subTest(field=field), patch.object(migration, "run_cli", return_value=response):
+                with self.assertRaisesRegex(migration.MigrationError, field + "=false"):
+                    migration.preflight(CLI, "unused", ROOT, None)
+
+    def test_push_rejects_preflight_before_history_or_any_write(self):
+        project = migration.PROJECTS["usw2"]
+        url = f"postgres://postgres:private-example@db.{project}.supabase.co/postgres"
+        version = subprocess.CompletedProcess([], 0, migration.CLI_VERSION, "")
+        with patch.object(migration, "run_cli", return_value=version), \
+                patch.object(migration, "preflight", side_effect=migration.MigrationError("principal rejected")) as preflight, \
+                patch.object(migration, "history_row") as history, \
+                patch.object(migration, "cli_run") as migration_command:
+            with self.assertRaisesRegex(migration.MigrationError, "principal rejected"):
+                migration.migrate("usw2", "push", url)
+        preflight.assert_called_once()
+        history.assert_not_called()
+        migration_command.assert_not_called()
+
     def test_migration_connection_rejects_input_before_conversion(self):
         project = migration.PROJECTS["usw2"]
         source = f"postgres://postgres.{project}:private-example@aws-0-us-west-1.pooler.supabase.com:5432/postgres"
