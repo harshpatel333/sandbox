@@ -45,8 +45,8 @@ func run() error {
 		Str("service", "proxy").
 		Logger()
 
-	// Final flushes start with the drain so exit, which gates the next
-	// process on restart, is not held up by them.
+	// Final flushes run in parallel under one short bound: exit gates the next
+	// process on restart.
 	var flushes []func()
 	if dsn := os.Getenv("SENTRY_DSN"); dsn != "" {
 		if err := sentry.Init(sentry.ClientOptions{Dsn: dsn, EnableLogs: true}); err != nil {
@@ -175,17 +175,16 @@ func run() error {
 	}
 	flushes = append(flushes, analyticsClient.Close)
 	proxyHandler.WithAnalytics(analyticsClient)
-	flushed := make(chan struct{})
-	go func() {
-		<-ctx.Done()
-		var wg sync.WaitGroup
-		for _, flush := range flushes {
-			wg.Go(flush)
-		}
-		wg.Wait()
-		close(flushed)
-	}()
 	defer func() {
+		flushed := make(chan struct{})
+		go func() {
+			var wg sync.WaitGroup
+			for _, flush := range flushes {
+				wg.Go(flush)
+			}
+			wg.Wait()
+			close(flushed)
+		}()
 		select {
 		case <-flushed:
 		case <-time.After(300 * time.Millisecond):
