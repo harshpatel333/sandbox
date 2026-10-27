@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestMapHostname(t *testing.T) {
@@ -58,18 +59,18 @@ func TestMapHostnameIsANoOpWhenMapped(t *testing.T) {
 	if err := mapHostname(path, "sandbox-b"); err != nil {
 		t.Fatal(err)
 	}
-	before, err := os.Stat(path)
-	if err != nil {
+	old := time.Unix(1_000_000_000, 0)
+	if err := os.Chtimes(path, old, old); err != nil {
 		t.Fatal(err)
 	}
 	if err := mapHostname(path, "sandbox-b"); err != nil {
 		t.Fatal(err)
 	}
-	after, err := os.Stat(path)
+	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !os.SameFile(before, after) {
+	if !info.ModTime().Equal(old) {
 		t.Fatal("hosts rewritten although the name was already mapped")
 	}
 }

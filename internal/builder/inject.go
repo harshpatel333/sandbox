@@ -450,9 +450,6 @@ options timeout:2 attempts:2
 //	to tini cleanly via exec (shell process is replaced, tini becomes PID 1).
 //
 // POSIX sh is assumed; all our allowed base images (debian, ubuntu) have it.
-// imageRunTmpMaxKiB bounds the /tmp or /run tree copied into memory at boot.
-const imageRunTmpMaxKiB = 64 * 1024
-
 const initScriptTemplate = `#!/bin/sh
 # Superserve template init — mounts essentials, then execs tini to become
 # PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
@@ -472,20 +469,6 @@ mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666 2>/dev/null
 # POSIX shared memory (Python multiprocessing locks, Chrome) needs /dev/shm.
 mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null
 
-# The tmpfs mounts hide what the image ships in /tmp and /run; copy it in, as
-# a container would show it. They are memory, so a large tree is left out.
-mkdir -p /dev/.image-root
-if mount -o bind / /dev/.image-root 2>/dev/null; then
-  for d in tmp run; do
-    # Through "/.", like the copy: either may be a symlink in the image.
-    set -- $(du -sk /dev/.image-root/$d/. 2>/dev/null)
-    if [ -n "$1" ] && [ "$1" -le %d ]; then
-      cp -a /dev/.image-root/$d/. /$d/ 2>/dev/null
-    fi
-  done
-  umount /dev/.image-root
-fi
-rmdir /dev/.image-root 2>/dev/null
 
 %s# Seed the kernel entropy pool. Firecracker VMs lack virtio-rng and
 # RDRAND, so getrandom() blocks until entropy is credited. The
@@ -528,7 +511,7 @@ func initScriptFor(freezeWorkload bool) string {
 	if freezeWorkload {
 		block += initFreezerBlock
 	}
-	return fmt.Sprintf(initScriptTemplate, guestPathEnv(), imageRunTmpMaxKiB, block)
+	return fmt.Sprintf(initScriptTemplate, guestPathEnv(), block)
 }
 
 // copyFile copies src → dst, creating parent directories as needed. Overwrites

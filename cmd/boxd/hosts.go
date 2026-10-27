@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -48,23 +47,8 @@ func mapHostname(path, name string) error {
 	kept = append(kept, "127.0.1.1\t"+name+"\t"+hostnameEntryMarker)
 	body := strings.TrimLeft(strings.Join(kept, "\n"), "\n") + "\n"
 
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".hosts-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.WriteString(body); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	// In place: /etc/hosts is a bind mount, which a rename cannot replace.
+	return os.WriteFile(path, []byte(body), 0o644)
 }
 
 func mapsName(line, name string) bool {

@@ -119,6 +119,7 @@ func main() {
 	if err := ensureStandardStreamLinks("/dev"); err != nil {
 		log.Printf("init: standard stream links: %v", err)
 	}
+	prepareGuestFiles()
 
 	mux := http.NewServeMux()
 
@@ -273,13 +274,11 @@ func handleInit(ctx *sandboxContext) http.HandlerFunc {
 				log.Printf("init: set hostname %q failed: %v", body.Hostname, err)
 			} else {
 				log.Printf("init: hostname set to %q", body.Hostname)
-				// Off the response: create waits for /init, and this is a
-				// second disk write that can stall right after a restore.
-				go func(name string) {
-					if err := mapHostname(etcHostsPath, name); err != nil {
-						log.Printf("init: map hostname %q in /etc/hosts failed: %v", name, err)
-					}
-				}(body.Hostname)
+				// Before the response, so the name resolves by the time user
+				// code runs; /etc/hosts is in memory (prepareGuestFiles).
+				if err := mapHostname(etcHostsPath, body.Hostname); err != nil {
+					log.Printf("init: map hostname %q in /etc/hosts failed: %v", body.Hostname, err)
+				}
 			}
 		}
 
