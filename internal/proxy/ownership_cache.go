@@ -44,10 +44,12 @@ type CachedOwnershipResolver struct {
 	entries map[string]*list.Element
 	lru     list.List
 	flights map[string]*ownershipFlight
-	// waiters queue callers for a free lookup slot in arrival order; each
-	// finished lookup wakes one, so a backlog drains without a wakeup storm.
-	waiters list.List
-	now     func() time.Time
+	// waiters queue callers for a free lookup slot in arrival order. A
+	// finished lookup hands its slot to the oldest waiter (reserved) so newer
+	// callers cannot overtake the backlog; each handoff wakes exactly one.
+	waiters  list.List
+	reserved int
+	now      func() time.Time
 }
 
 func NewCachedOwnershipResolver(ctx context.Context, source OwnershipResolver) *CachedOwnershipResolver {
@@ -63,49 +65,28 @@ func (c *CachedOwnershipResolver) ResolveSandbox(ctx context.Context, id string)
 	if err := ctx.Err(); err != nil {
 		return SandboxRoute{}, err
 	}
-	// A full lookup table waits for a slot rather than failing a burst; one
-	// lookup timeout bounds the wait, since a slot frees within it.
-	var waitLimit *time.Timer
-	var f *ownershipFlight
-	woken := false
-	for {
-		c.mu.Lock()
-		if e := c.entries[id]; e != nil {
-			entry := e.Value.(ownershipEntry)
-			if c.now().Before(entry.expires) {
-				c.lru.MoveToFront(e)
-				if woken {
-					c.wakeWaiterLocked()
-				}
-				c.mu.Unlock()
-				if waitLimit != nil {
-					waitLimit.Stop()
-				}
-				return entry.route, entry.err
-			}
-			c.lru.Remove(e)
-			delete(c.entries, id)
-		}
-		f = c.flights[id]
-		if f != nil || len(c.flights) < ownershipMaxLookups {
-			break
-		}
+	c.mu.Lock()
+	if entry, ok := c.cachedLocked(id); ok {
+		c.mu.Unlock()
+		return entry.route, entry.err
+	}
+	f := c.flights[id]
+	if f == nil && (len(c.flights)+c.reserved >= ownershipMaxLookups || c.waiters.Len() > 0) {
+		// A full lookup table holds the caller for a slot rather than failing
+		// a burst; one lookup timeout bounds the wait, since a slot frees within it.
 		if c.waiters.Len() >= ownershipMaxWaiters {
 			c.mu.Unlock()
-			if waitLimit != nil {
-				waitLimit.Stop()
-			}
 			return SandboxRoute{}, errOwnershipCapacity
 		}
 		wake := make(chan struct{}, 1)
 		queued := c.waiters.PushBack(wake)
 		c.mu.Unlock()
-		if waitLimit == nil {
-			waitLimit = time.NewTimer(ownershipLookupTimeout)
-		}
+		waitLimit := time.NewTimer(ownershipLookupTimeout)
+		granted := false
 		var waitErr error
 		select {
 		case <-wake:
+			granted = true
 		case <-waitLimit.C:
 			waitErr = errOwnershipCapacity
 		case <-ctx.Done():
@@ -113,34 +94,42 @@ func (c *CachedOwnershipResolver) ResolveSandbox(ctx context.Context, id string)
 		case <-c.ctx.Done():
 			waitErr = c.ctx.Err()
 		}
-		// A caller canceled while waiting must not take the freed slot.
+		waitLimit.Stop()
+		// A caller canceled while waiting must not take the slot.
 		if waitErr == nil {
 			waitErr = ctx.Err()
 		}
 		if waitErr == nil {
 			waitErr = c.ctx.Err()
 		}
-		if waitErr != nil {
-			c.mu.Lock()
-			c.waiters.Remove(queued)
-			// A wakeup that raced the failure passes its slot on.
+		c.mu.Lock()
+		c.waiters.Remove(queued)
+		if !granted {
 			select {
 			case <-wake:
-				c.wakeWaiterLocked()
+				granted = true
 			default:
 			}
+		}
+		if granted {
+			c.reserved--
+		}
+		if waitErr != nil {
+			if granted {
+				c.wakeWaiterLocked()
+			}
 			c.mu.Unlock()
-			waitLimit.Stop()
 			return SandboxRoute{}, waitErr
 		}
-		woken = true
-	}
-	if waitLimit != nil {
-		waitLimit.Stop()
-	}
-	if f != nil && woken {
-		// Joining an existing lookup leaves the freed slot for the next waiter.
-		c.wakeWaiterLocked()
+		if entry, ok := c.cachedLocked(id); ok {
+			c.wakeWaiterLocked()
+			c.mu.Unlock()
+			return entry.route, entry.err
+		}
+		if f = c.flights[id]; f != nil {
+			// Joining an existing lookup passes the slot to the next waiter.
+			c.wakeWaiterLocked()
+		}
 	}
 	if f == nil {
 		f = &ownershipFlight{done: make(chan struct{})}
@@ -188,6 +177,22 @@ func (c *CachedOwnershipResolver) lookup(id string, f *ownershipFlight, started 
 func (c *CachedOwnershipResolver) wakeWaiterLocked() {
 	if front := c.waiters.Front(); front != nil {
 		c.waiters.Remove(front)
+		c.reserved++
 		front.Value.(chan struct{}) <- struct{}{}
 	}
+}
+
+func (c *CachedOwnershipResolver) cachedLocked(id string) (ownershipEntry, bool) {
+	e := c.entries[id]
+	if e == nil {
+		return ownershipEntry{}, false
+	}
+	entry := e.Value.(ownershipEntry)
+	if c.now().Before(entry.expires) {
+		c.lru.MoveToFront(e)
+		return entry, true
+	}
+	c.lru.Remove(e)
+	delete(c.entries, id)
+	return ownershipEntry{}, false
 }
