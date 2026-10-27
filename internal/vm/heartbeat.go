@@ -129,6 +129,7 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger) 
 	if proxyHealthURL == "" {
 		proxyHealthURL = "http://127.0.0.1:5007/health"
 	}
+	proxyProbe := &proxyHealthProbe{url: proxyHealthURL}
 	client := &http.Client{Timeout: 30 * time.Second}
 	log.Info().Str("url", url).Str("proxy_health_url", proxyHealthURL).Dur("interval", interval).Msg("heartbeat started")
 
@@ -192,7 +193,7 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger) 
 	// can continue even if a host has a large number of sandboxes.
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	if ok, _ := sendHeartbeat(ctx, client, cfg, url, cfg.Token, proxyHealthURL, nil, log); ok {
+	if ok, _ := sendHeartbeat(ctx, client, cfg, url, cfg.Token, proxyProbe, nil, log); ok {
 		heartbeatAccepted()
 	}
 	storageWorkers.Add(1)
@@ -239,7 +240,7 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger) 
 			// mean an older control plane without the route).
 			// Bound VMDs publish storage through the separately acknowledged
 			// stream; legacy VMDs retain the compatibility field above.
-			ok, accepted := sendHeartbeat(ctx, client, heartbeatCfg, url, cfg.Token, proxyHealthURL, heartbeatStorage, log)
+			ok, accepted := sendHeartbeat(ctx, client, heartbeatCfg, url, cfg.Token, proxyProbe, heartbeatStorage, log)
 			if ok {
 				heartbeatAccepted()
 				if cfg.IncarnationID == "" && accepted {
@@ -1195,15 +1196,19 @@ func persistStorageReportVersion(path string, version uint64) error {
 	return persistStorageReportFile(path, []byte(strconv.FormatUint(version, 10)))
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token, proxyHealthURL string, storage []heartbeatStorageMeasurement, log zerolog.Logger) (bool, bool) {
+func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig, url, token string, proxyProbe *proxyHealthProbe, storage []heartbeatStorageMeasurement, log zerolog.Logger) (bool, bool) {
 	started := time.Now()
-	proxyState, err := proxyHealthCapabilities(ctx, client, proxyHealthURL)
-	if err != nil {
+	proxyState, proxyKnown, err := proxyProbe.probe(ctx, client)
+	if err != nil && proxyKnown {
+		log.Warn().Err(err).
+			Str("host_id", cfg.HostID).
+			Dur("duration", time.Since(started)).
+			Msg("proxy health probe failed; keeping the last proxy capabilities for this heartbeat")
+	} else if err != nil {
 		log.Warn().Err(err).
 			Str("host_id", cfg.HostID).
 			Dur("duration", time.Since(started)).
 			Msg("proxy health probe failed; advertising no proxy or file capabilities")
-		proxyState = proxyHealthState{}
 	}
 	capabilities := make([]string, 0, 8)
 	if cfg.TemplateBuildReady != nil && cfg.TemplateBuildReady() && cfg.Token != "" && cfg.ControlPlaneURL != "" {
@@ -1214,7 +1219,7 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 	if lifecycleReady {
 		capabilities = append(capabilities, capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots, capabilitySnapshotForks)
 	}
-	if err == nil {
+	if proxyKnown {
 		if resolverReady && proxyState.ResolverReady {
 			capabilities = append(capabilities, capabilityCanProxyTraffic)
 			if proxyState.FilesEnabled {
@@ -1420,6 +1425,26 @@ func measureOverlayStorage(runDir string) ([]heartbeatStorageMeasurement, error)
 func proxyPreviewCapabilities(ctx context.Context, client *http.Client, healthURL string) ([]string, error) {
 	state, err := proxyHealthCapabilities(ctx, client, healthURL)
 	return state.PreviewCapabilities, err
+}
+
+// proxyHealthProbe reuses the last successful probe for one failed probe, so
+// a proxy restart between beats does not withdraw the host's capabilities.
+type proxyHealthProbe struct {
+	url  string
+	last *proxyHealthState
+}
+
+func (p *proxyHealthProbe) probe(ctx context.Context, client *http.Client) (proxyHealthState, bool, error) {
+	state, err := proxyHealthCapabilities(ctx, client, p.url)
+	if err == nil {
+		p.last = &state
+		return state, true, nil
+	}
+	if p.last != nil {
+		state, p.last = *p.last, nil
+		return state, true, err
+	}
+	return proxyHealthState{}, false, err
 }
 
 func proxyHealthCapabilities(ctx context.Context, client *http.Client, healthURL string) (proxyHealthState, error) {
