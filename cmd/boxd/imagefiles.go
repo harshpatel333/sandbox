@@ -20,47 +20,58 @@ var errImageDirTooLarge = errors.New("image directory over the copy limit")
 
 // imageDirWithinLimits walks src, stopping as soon as it passes either limit.
 // Directories are read in batches, so even one huge directory is never read
-// whole.
+// whole, and one at a time, so a deep tree never holds many open.
 func imageDirWithinLimits(src string) error {
 	var bytes int64
 	entries := 0
-	var walk func(dir string) error
-	walk = func(dir string) error {
-		f, err := os.Open(dir)
+	pending := []string{src}
+	for len(pending) > 0 {
+		dir := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		subdirs, err := scanImageDir(dir, &entries, &bytes)
 		if err != nil {
 			return err
 		}
-		defer f.Close()
-		for {
-			batch, err := f.ReadDir(256)
-			for _, d := range batch {
-				if entries++; entries > imageDirMaxEntries {
-					return errImageDirTooLarge
-				}
-				switch {
-				case d.IsDir():
-					if err := walk(filepath.Join(dir, d.Name())); err != nil {
-						return err
-					}
-				case d.Type().IsRegular():
-					info, err := d.Info()
-					if err != nil {
-						return err
-					}
-					if bytes += info.Size(); bytes > imageDirMaxBytes {
-						return errImageDirTooLarge
-					}
-				}
+		pending = append(pending, subdirs...)
+	}
+	return nil
+}
+
+// scanImageDir counts one directory's entries toward the limits and returns
+// its subdirectories, closing the directory before they are read.
+func scanImageDir(dir string, entries *int, bytes *int64) ([]string, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var subdirs []string
+	for {
+		batch, err := f.ReadDir(256)
+		for _, d := range batch {
+			if *entries++; *entries > imageDirMaxEntries {
+				return nil, errImageDirTooLarge
 			}
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			if err != nil {
-				return err
+			switch {
+			case d.IsDir():
+				subdirs = append(subdirs, filepath.Join(dir, d.Name()))
+			case d.Type().IsRegular():
+				info, err := d.Info()
+				if err != nil {
+					return nil, err
+				}
+				if *bytes += info.Size(); *bytes > imageDirMaxBytes {
+					return nil, errImageDirTooLarge
+				}
 			}
 		}
+		if errors.Is(err, io.EOF) {
+			return subdirs, nil
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
-	return walk(src)
 }
 
 // copyImageDir copies src into dst, keeping modes, owners, symlinks, and file

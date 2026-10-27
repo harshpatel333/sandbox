@@ -99,3 +99,4 @@ func TestResolveImageDirStaysInside(t *testing.T) {
 		t.Error("a link out of the image root was followed")
 	}
 }
+
