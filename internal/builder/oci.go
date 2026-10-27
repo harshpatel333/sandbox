@@ -79,9 +79,9 @@ func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir
 	return digest.String(), nil
 }
 
-// validatePlatform rejects images that don't match the required OS/arch and
-// busybox-only bases early with a clear message. Catches configuration
-// mistakes before the slow mkfs.ext4 step.
+// validatePlatform rejects images that don't match the required OS/arch,
+// before the slow mkfs.ext4 step. Whether the image can boot is decided from
+// its contents once extracted (requireShell).
 func validatePlatform(img v1.Image, wantOS, wantArch string) error {
 	cfg, err := img.ConfigFile()
 	if err != nil {
@@ -92,16 +92,6 @@ func validatePlatform(img v1.Image, wantOS, wantArch string) error {
 	}
 	if cfg.Architecture != wantArch {
 		return fmt.Errorf("image architecture is %q, want %q", cfg.Architecture, wantArch)
-	}
-	// Heuristic: a busybox-only layout shows in the config's PATH. Cheap, so
-	// it runs before the layers are pulled.
-	for _, env := range cfg.Config.Env {
-		if strings.HasPrefix(strings.ToLower(env), "path=") {
-			if strings.Contains(env, "/sbin:/bin") && !strings.Contains(env, "/usr/sbin") {
-				// Busybox-style layout.
-				return fmt.Errorf("image appears to be busybox-only (PATH looks minimal)")
-			}
-		}
 	}
 	return nil
 }

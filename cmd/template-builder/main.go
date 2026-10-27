@@ -147,9 +147,6 @@ func classifyBuildError(err error) (code, userMsg string) {
 		}
 		return "unsupported_base", msg
 
-	case strings.Contains(raw, "image appears to be busybox-only"):
-		return "unsupported_base", "busybox-only base images are not supported; use an image with a standard userland"
-
 	case strings.Contains(raw, "tar entry escapes"),
 		strings.Contains(raw, "symlink target escapes"),
 		strings.Contains(raw, "hardlink target escapes"):
