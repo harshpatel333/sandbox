@@ -105,7 +105,7 @@ func legacyAdmissionRequest(trusted bool) billingCheckoutSessionRequest {
 	return req
 }
 
-func TestLegacyCheckoutRejectsAssignedPlansBeforeSideEffects(t *testing.T) {
+func TestPlanAssignmentLegacyCheckoutRejectsAssignedPlansBeforeSideEffects(t *testing.T) {
 	for _, kind := range []string{planKindFree, planKindPrepaid, planKindSubscription, planKindCustom} {
 		for _, trusted := range []bool{false, true} {
 			for _, offer := range []string{"", "free"} {
@@ -145,7 +145,7 @@ func stringBool(v bool) string {
 	return "ordinary"
 }
 
-func TestLegacyCheckoutAcceptedReplaySurvivesPlanChange(t *testing.T) {
+func TestPlanAssignmentLegacyCheckoutAcceptedReplaySurvivesPlanChange(t *testing.T) {
 	for _, trusted := range []bool{false, true} {
 		for _, lost := range []bool{false, true} {
 			name := stringBool(trusted)
@@ -206,7 +206,7 @@ func TestLegacyCheckoutAcceptedReplaySurvivesPlanChange(t *testing.T) {
 	}
 }
 
-func TestLegacyCheckoutUnassignedStillAllowed(t *testing.T) {
+func TestPlanAssignmentLegacyCheckoutUnassignedStillAllowed(t *testing.T) {
 	for _, trusted := range []bool{false, true} {
 		t.Run(stringBool(trusted), func(t *testing.T) {
 			f, actor := legacyAdmissionFixture(t, planKindLegacyPAYG)
@@ -218,7 +218,7 @@ func TestLegacyCheckoutUnassignedStillAllowed(t *testing.T) {
 	}
 }
 
-func TestLegacyCheckoutSerializesAssignmentBeforeFreshAdmission(t *testing.T) {
+func TestPlanAssignmentLegacyCheckoutSerializesAssignmentBeforeFreshAdmission(t *testing.T) {
 	for _, trusted := range []bool{false, true} {
 		for _, initial := range []bool{false, true} {
 			name := stringBool(trusted)
