@@ -14,7 +14,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -694,5 +696,26 @@ func applyUpgradeTopoff(ctx context.Context, tx pgx.Tx, u proUpgrade, params Str
 	if epoch != nil {
 		admission.Epoch = *epoch
 	}
-	return applyCheckoutTopoff(ctx, tx, u.Team, session.ID, enabled, admission)
+	if !enabled {
+		return applyCheckoutTopoff(ctx, tx, u.Team, session.ID, false, admission)
+	}
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	err = applyCheckoutTopoff(ctx, sp, u.Team, session.ID, true, admission)
+	if err == nil {
+		return sp.Commit(ctx)
+	}
+	if rollbackErr := sp.Rollback(ctx); rollbackErr != nil {
+		return rollbackErr
+	}
+	// A plan already paid for must still activate when entry closed after
+	// checkout; the top-off stays off, which the low-credit warnings cover.
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
+		return err
+	}
+	log.Warn().Err(err).Str("team_id", u.Team.String()).Msg("checkout top-off admission closed; activating with top-off off")
+	return applyCheckoutTopoff(ctx, tx, u.Team, session.ID, false, admission)
 }

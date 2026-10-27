@@ -315,6 +315,19 @@ func TestNewTeamCohortFirstProUsesFullMonthAndRetainsAcceptedQuote(t *testing.T)
 	if err = retireFirstProCycleReportingPeriods(t.Context(), tx, settled); err != nil {
 		t.Fatalf("paid first month of a team waiting for payment cannot settle: %v", err)
 	}
+	contract := uuid.New()
+	if _, err = tx.Exec(t.Context(), `INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'pro_monthly',$3,$4,'sub_local','price_local_pro',25000,1,25000,'monthly',$3)`, contract, f.team, accepted.Anchor, customer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(t.Context(), `UPDATE billing_pro_upgrade SET contract_id=$2 WHERE id=$1`, accepted.ID, contract); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = assignTeamPlan(t.Context(), tx, planAssignment{Team: f.team, Terms: terms, Source: planSourceCheckout, Actor: &f.actor, Reason: "paid checkout", ContractID: &contract, Key: "checkout:" + contract.String()}); err != nil {
+		t.Fatal(err)
+	}
+	if err = retireFirstProCycleReportingPeriods(t.Context(), tx, settled); err != nil {
+		t.Fatalf("settlement retry after the paid plan was assigned failed: %v", err)
+	}
 	if err = tx.Rollback(t.Context()); err != nil {
 		t.Fatal(err)
 	}
