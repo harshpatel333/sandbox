@@ -73,3 +73,16 @@ func TestMapHostnameIsANoOpWhenMapped(t *testing.T) {
 		t.Fatal("hosts rewritten although the name was already mapped")
 	}
 }
+
+func TestMapHostnameRejectsWhatIsNotAHostname(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"box\n10.0.0.7 attacker.example", "a b", "-a", "a..b", "#x", ""} {
+		path := filepath.Join(t.TempDir(), "hosts")
+		if err := mapHostname(path, name); err == nil {
+			t.Errorf("mapHostname(%q) = nil, want an error", name)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("mapHostname(%q) wrote the hosts file", name)
+		}
+	}
+}

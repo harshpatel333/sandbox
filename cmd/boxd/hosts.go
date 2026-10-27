@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,10 @@ var hostsMu sync.Mutex
 // line boxd owns is replaced rather than added to. A name already mapped is
 // left alone without a write.
 func mapHostname(path, name string) error {
+	// The name comes from /init and lands in a file every resolver reads.
+	if !validHostname(name) {
+		return fmt.Errorf("invalid hostname %q", name)
+	}
 	hostsMu.Lock()
 	defer hostsMu.Unlock()
 
@@ -73,4 +78,23 @@ func mapsName(line, name string) bool {
 		}
 	}
 	return false
+}
+
+// validHostname accepts an RFC 1123 hostname: dot-separated labels of
+// letters, digits, and inner hyphens, at most 253 characters.
+func validHostname(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
