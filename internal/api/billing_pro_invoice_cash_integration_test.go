@@ -62,8 +62,13 @@ func newProCashFixtureMode(t *testing.T, prior string, protectedSeconds, paidSec
 	exec(`INSERT INTO team_plan_assignment(id,team_id,plan_version_id,plan_key,kind,terms,limits,effective_from,source,reason,contract_id,idempotency_key) VALUES($1,$2,$3,'pro_monthly','subscription','{"kind":"subscription","pricing_version":"v2"}','{"max_concurrent":1}',$4,'checkout','verified diagnostic payment',$5::uuid,'checkout:'||($5::uuid)::text)`, assignment, team, version.VersionID, paidStart, contract)
 	params := StripeCreateCheckoutSessionParams{FirstPaidProCycle: prior == planKindFree, BasePriceID: "price_pro", ResourceTerms: []StripeCheckoutResourceTerms{{ResourceKey: "vcpu", PriceID: "price_cpu", UnitAmountDecimal: "3600", MeterID: "meter_cpu", EventName: "cpu"}, {ResourceKey: "memory_gib", PriceID: "price_memory", UnitAmountDecimal: "0", MeterID: "meter_memory", EventName: "memory"}}, PlanTerms: &StripeCheckoutPlanTerms{VersionID: version.VersionID, Amount: 25000, Months: 1, Credit: max(credit, 1)}}
 	payload, _ := json.Marshal(params)
-	exec(`INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,grant_id,contract_id)
- VALUES($1,$2,$3,$4,$5,'pro_monthly',$6,$7,$7,$8,$7,25000,'active','{"verified":true}',$9,$10)`, upgrade, team, uuid.New(), customer, sub, payload, f.start, f.end, "cred_"+upgrade.String(), contract)
+	var initialGrant *string
+	if credit > 0 {
+		id := "cred_" + upgrade.String()
+		initialGrant = &id
+	}
+	exec(`INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,grant_id,contract_id,bridge_credit_cents)
+ VALUES($1,$2,$3,$4,$5,'pro_monthly',$6,$7,$7,$8,$7,25000,'active','{"verified":true}',$9,$10,$11)`, upgrade, team, uuid.New(), customer, sub, payload, f.start, f.end, initialGrant, contract, credit)
 	exec(`INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_round','round','meter_round',$4)`, team, customer, sub, f.start.Add(-time.Hour))
 	exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, team, f.start, f.end)
 	sandbox := uuid.New()
@@ -114,6 +119,12 @@ func newProCashFixtureMode(t *testing.T, prior string, protectedSeconds, paidSec
 	var memoryLine StripeInvoiceAmountLine
 	_ = json.Unmarshal([]byte(fmt.Sprintf(`{"id":"il_memory","amount":0,"currency":"usd","period":{"start":%d,"end":%d},"pricing":{"unit_amount_decimal":"0","price_details":{"price":"price_memory"}},"parent":{"subscription_item_details":{"subscription":%q}}}`, f.start.Unix(), f.end.Unix(), sub)), &memoryLine)
 	f.invoice.Lines.Data = append(f.invoice.Lines.Data, memoryLine)
+	if credit == 0 {
+		f.invoice.PretaxCredits = nil
+		for i := range f.invoice.Lines.Data {
+			f.invoice.Lines.Data[i].PretaxCredits = nil
+		}
+	}
 	for _, mutate := range mutations {
 		mutate(&plan, &f.invoice)
 	}
@@ -183,7 +194,10 @@ func newProCashFixtureMode(t *testing.T, prior string, protectedSeconds, paidSec
 			fmt.Fprint(w, `{"data":[]}`)
 		case r.URL.Path == "/v1/billing/credit_grants":
 			if r.Method == http.MethodGet {
-				data := []any{grant}
+				data := []any{}
+				if credit > 0 {
+					data = append(data, grant)
+				}
 				if nextGrant != nil {
 					data = append(data, nextGrant)
 				}
@@ -562,5 +576,38 @@ func TestProFirstRenewalUnmarkedStarterCloseProducer(t *testing.T) {
 	state, reason := f.h.collectInvoice(t.Context(), f.client, &j)
 	if state != "unknown" || f.pays.Load() != 1 {
 		t.Fatalf("actual Starter close producer did not collect renewal: state=%s reason=%s pays=%d", state, reason, f.pays.Load())
+	}
+}
+
+func TestProFirstRenewalZeroRoundedUnmarkedBridge(t *testing.T) {
+	f, upgrade := newProCashFixtureMode(t, planKindPrepaid, 0, 1, 0, true)
+	var monthly, bridge int64
+	var grant *string
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT (request_payload#>>'{PlanTerms,Credit}')::bigint,bridge_credit_cents,grant_id FROM billing_pro_upgrade WHERE id=$1`, upgrade).Scan(&monthly, &bridge, &grant); err != nil {
+		t.Fatal(err)
+	}
+	if monthly != 1 || bridge != 0 || grant != nil {
+		t.Fatal("not the accepted positive-configured zero-rounded bridge", monthly, bridge, grant)
+	}
+	if rounded, err := proratedProAmount(monthly, f.start, f.end, f.end.Add(-time.Hour)); err != nil || rounded != 0 {
+		t.Fatal("legitimate proration did not round to zero", rounded, err)
+	}
+	if err := f.h.enqueueInvoiceCollection(t.Context(), billing.ExportPeriod{TeamID: f.team, Start: f.start, End: f.end}, f.invoice, true); err != nil {
+		t.Fatal(err)
+	}
+	j := f.claim(t)
+	state, reason := f.h.collectInvoice(t.Context(), f.client, &j)
+	if state != "unknown" || f.pays.Load() != 1 {
+		t.Fatal("zero bridge with only authorized Pro usage held", state, reason, f.pays.Load())
+	}
+
+	account, ok, err := f.h.invoiceAccount(t.Context(), f.team)
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	later := billing.ExportPeriod{TeamID: f.team, Start: f.end, End: f.end.AddDate(0, 1, 0)}
+	handled, err := f.h.prepareFirstProCycleCredits(t.Context(), later, account, "in_next", &billing.InvoiceClosePlan{}, f.client)
+	if err != nil || handled {
+		t.Fatalf("later recurring allowance must bypass old bridge: handled=%v err=%v", handled, err)
 	}
 }
