@@ -19,27 +19,48 @@ const (
 var errImageDirTooLarge = errors.New("image directory over the copy limit")
 
 // imageDirWithinLimits walks src, stopping as soon as it passes either limit.
+// Directories are read in batches, so even one huge directory is never read
+// whole.
 func imageDirWithinLimits(src string) error {
 	var bytes int64
 	entries := 0
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+	var walk func(dir string) error
+	walk = func(dir string) error {
+		f, err := os.Open(dir)
 		if err != nil {
 			return err
 		}
-		if entries++; entries > imageDirMaxEntries {
-			return errImageDirTooLarge
-		}
-		if d.Type().IsRegular() {
-			info, err := d.Info()
+		defer f.Close()
+		for {
+			batch, err := f.ReadDir(256)
+			for _, d := range batch {
+				if entries++; entries > imageDirMaxEntries {
+					return errImageDirTooLarge
+				}
+				switch {
+				case d.IsDir():
+					if err := walk(filepath.Join(dir, d.Name())); err != nil {
+						return err
+					}
+				case d.Type().IsRegular():
+					info, err := d.Info()
+					if err != nil {
+						return err
+					}
+					if bytes += info.Size(); bytes > imageDirMaxBytes {
+						return errImageDirTooLarge
+					}
+				}
+			}
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
 			if err != nil {
 				return err
 			}
-			if bytes += info.Size(); bytes > imageDirMaxBytes {
-				return errImageDirTooLarge
-			}
 		}
-		return nil
-	})
+	}
+	return walk(src)
 }
 
 // copyImageDir copies src into dst, keeping modes, owners, symlinks, and file

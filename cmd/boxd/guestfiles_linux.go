@@ -17,18 +17,20 @@ import (
 const imageRootMount = "/dev/.image-root"
 
 // memoryHostsPath backs /etc/hosts in memory, as a container runtime keeps it,
-// so the hostname can be mapped on the /init path without a disk write.
-const memoryHostsPath = "/run/hosts"
+// so the hostname can be mapped on the /init path without a disk write. It is
+// created before the image's /run is copied in, which never overwrites a
+// path, so nothing from the image can take its place.
+const memoryHostsPath = "/run/.boxd/hosts"
 
 // prepareGuestFiles runs once per boot, before boxd serves anything. A
 // sandbox resumed or created from a snapshot keeps the result in memory, so
 // it runs only when a template is built and when a sandbox boots cold.
 func prepareGuestFiles() {
-	if err := restoreImageDirs(); err != nil {
-		log.Printf("init: restore the image's /tmp and /run: %v", err)
-	}
 	if err := keepHostsInMemory(); err != nil {
 		log.Printf("init: keep /etc/hosts in memory: %v", err)
+	}
+	if err := restoreImageDirs(); err != nil {
+		log.Printf("init: restore the image's /tmp and /run: %v", err)
 	}
 }
 
@@ -78,7 +80,18 @@ func keepHostsInMemory() error {
 			return err
 		}
 	}
-	if err := os.WriteFile(memoryHostsPath, data, 0o644); err != nil {
+	if err := os.Mkdir(filepath.Dir(memoryHostsPath), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(memoryHostsPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	return unix.Mount(memoryHostsPath, etcHostsPath, "", unix.MS_BIND, "")

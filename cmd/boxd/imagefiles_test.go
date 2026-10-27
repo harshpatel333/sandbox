@@ -32,6 +32,7 @@ func TestImageDirWithinLimits(t *testing.T) {
 		t.Fatalf("large file: %v, want errImageDirTooLarge", err)
 	}
 
+	// One flat directory: the limit must hold without reading it whole.
 	many := t.TempDir()
 	for i := 0; i <= imageDirMaxEntries; i++ {
 		if err := os.WriteFile(filepath.Join(many, "f"+strconv.Itoa(i)), nil, 0o644); err != nil {
