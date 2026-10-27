@@ -216,3 +216,55 @@ func TestOwnershipCacheBoundsCallersWaitingForSlots(t *testing.T) {
 	close(release)
 	wg.Wait()
 }
+
+func TestOwnershipCacheTimedOutWaiterUsesResultCachedMeanwhile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	target := uuid.NewString()
+	// Other lookups outlast their own timeout so no slot frees on its own.
+	cache := NewCachedOwnershipResolver(ctx, RouteLookupFunc(func(_ context.Context, id string) (SandboxRoute, error) {
+		if id == target {
+			return SandboxRoute{HostID: "owner"}, nil
+		}
+		<-release
+		return SandboxRoute{HostID: "other"}, nil
+	}))
+	defer close(release)
+	queued := func(n int) {
+		t.Helper()
+		for {
+			cache.mu.Lock()
+			ok := len(cache.flights) == ownershipMaxLookups && cache.waiters.Len() == n
+			cache.mu.Unlock()
+			if ok {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	for i := 0; i < ownershipMaxLookups; i++ {
+		go cache.ResolveSandbox(ctx, uuid.NewString())
+	}
+	queued(0)
+	go cache.ResolveSandbox(ctx, target)
+	queued(1)
+	for i := 0; i < 8; i++ {
+		go cache.ResolveSandbox(ctx, uuid.NewString())
+	}
+	queued(9)
+	// The duplicate sits behind other waiters and outlasts its wait limit.
+	duplicate := make(chan error, 1)
+	go func() {
+		route, err := cache.ResolveSandbox(ctx, target)
+		if err == nil && route.HostID != "owner" {
+			err = errors.New("unexpected route " + route.HostID)
+		}
+		duplicate <- err
+	}()
+	queued(10)
+	release <- struct{}{}
+	if err := <-duplicate; err != nil {
+		t.Fatalf("duplicate waiter: %v", err)
+	}
+}

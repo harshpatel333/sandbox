@@ -83,24 +83,18 @@ func (c *CachedOwnershipResolver) ResolveSandbox(ctx context.Context, id string)
 		c.mu.Unlock()
 		waitLimit := time.NewTimer(ownershipLookupTimeout)
 		granted := false
-		var waitErr error
+		var cancelErr error
 		select {
 		case <-wake:
 			granted = true
 		case <-waitLimit.C:
-			waitErr = errOwnershipCapacity
 		case <-ctx.Done():
-			waitErr = ctx.Err()
 		case <-c.ctx.Done():
-			waitErr = c.ctx.Err()
 		}
 		waitLimit.Stop()
 		// A caller canceled while waiting must not take the slot.
-		if waitErr == nil {
-			waitErr = ctx.Err()
-		}
-		if waitErr == nil {
-			waitErr = c.ctx.Err()
+		if cancelErr = ctx.Err(); cancelErr == nil {
+			cancelErr = c.ctx.Err()
 		}
 		c.mu.Lock()
 		c.waiters.Remove(queued)
@@ -114,21 +108,29 @@ func (c *CachedOwnershipResolver) ResolveSandbox(ctx context.Context, id string)
 		if granted {
 			c.reserved--
 		}
-		if waitErr != nil {
+		if cancelErr != nil {
 			if granted {
 				c.wakeWaiterLocked()
 			}
 			c.mu.Unlock()
-			return SandboxRoute{}, waitErr
+			return SandboxRoute{}, cancelErr
 		}
+		// The wait may have outlasted a lookup for the same sandbox.
 		if entry, ok := c.cachedLocked(id); ok {
-			c.wakeWaiterLocked()
+			if granted {
+				c.wakeWaiterLocked()
+			}
 			c.mu.Unlock()
 			return entry.route, entry.err
 		}
 		if f = c.flights[id]; f != nil {
 			// Joining an existing lookup passes the slot to the next waiter.
-			c.wakeWaiterLocked()
+			if granted {
+				c.wakeWaiterLocked()
+			}
+		} else if !granted {
+			c.mu.Unlock()
+			return SandboxRoute{}, errOwnershipCapacity
 		}
 	}
 	if f == nil {
