@@ -1773,6 +1773,16 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 		respondErrorMsg(c, "bad_request", "success_url and cancel_url are required", http.StatusBadRequest)
 		return
 	}
+	if prepaid == nil {
+		if err := h.checkLegacyCheckoutPlan(c.Request.Context(), teamID); err != nil {
+			if errors.Is(err, errLegacyCheckoutPlan) {
+				respondErrorMsg(c, "conflict", err.Error(), http.StatusConflict)
+			} else {
+				respondError(c, ErrInternal)
+			}
+			return
+		}
+	}
 	var err error
 	successURL, cancelURL := req.SuccessURL, req.CancelURL
 	if prepaid == nil || !prepaid.acceptedRedirects {
@@ -1812,6 +1822,10 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 		return
 	}
 	if billingAccountHasEstablishedSubscription(account) {
+		if prepaid != nil && prepaid.acceptedLease != nil {
+			c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: prepaid.acceptedLease.PurchaseID, State: "pending"})
+			return
+		}
 		respondErrorMsg(c, "conflict", "team already has an active Stripe subscription; use the customer portal", http.StatusConflict)
 		return
 	}
@@ -1851,26 +1865,18 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 	var checkoutAccount db.TeamBillingAccount
 	if trusted {
 		requestKey += ":intent:" + req.OperationID.String()
-		checkoutAccount, err = h.beginCheckoutWithPublicationDecision(c.Request.Context(), teamID, actorID, req, requestKey, attemptID)
+	}
+	if prepaid == nil {
+		checkoutAccount, err = h.beginLegacyCheckout(c.Request.Context(), teamID, actorID, req, requestKey, attemptID, trusted)
 	} else {
-		checkoutAccount, err = h.DB.BeginTeamBillingCheckout(c.Request.Context(), db.BeginTeamBillingCheckoutParams{
-			TeamID:     teamID,
-			ActorID:    pgtype.UUID{Bytes: actorID, Valid: true},
-			RequestKey: stringPtr(requestKey),
-			AttemptID:  attemptID,
-		})
-		resumed := errors.Is(err, pgx.ErrNoRows)
-		if resumed {
-			checkoutAccount, err = h.DB.ResumeTeamBillingCheckout(c.Request.Context(), db.ResumeTeamBillingCheckoutParams{
-				TeamID:     teamID,
-				ActorID:    pgtype.UUID{Bytes: actorID, Valid: true},
-				RequestKey: stringPtr(requestKey),
-				AttemptID:  attemptID,
-			})
-		}
+		checkoutAccount, err = h.beginCohortPrepaidCheckout(c.Request.Context(), teamID, actorID, req, requestKey, attemptID, trusted, prepaid.acceptedLease)
 	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) || isCheckoutPublicationConflict(err) {
+		if errors.Is(err, errLegacyCheckoutPlan) {
+			respondErrorMsg(c, "conflict", err.Error(), http.StatusConflict)
+			return
+		}
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, errPricingV2Off) || isCheckoutPublicationConflict(err) {
 			respondErrorMsg(c, "conflict", "another checkout is already in progress or the intent is closed", http.StatusConflict)
 			return
 		}

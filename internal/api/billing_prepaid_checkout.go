@@ -19,6 +19,7 @@ type prepaidCheckoutLine struct {
 	OperationID       uuid.UUID
 	AmountCents       int64
 	acceptedRedirects bool
+	acceptedLease     *implicitPrepaidLease
 }
 
 // Stripe requires at least 30 minutes at creation; equality leaves no dispatch
@@ -58,6 +59,12 @@ func prepaidCheckoutPurchaseID(team uuid.UUID, lease time.Time, amount int64) uu
 
 func prepaidCheckoutOneTimeLine(id uuid.UUID, amount int64) StripeCheckoutOneTimeLine {
 	return StripeCheckoutOneTimeLine{AmountCents: amount, Name: "Superserve prepaid credit", Metadata: map[string]string{"prepaid_purchase_id": id.String()}}
+}
+
+const prepaidPurchaseMaxCents int64 = 1000000
+
+func validNewPrepaidAmount(amount int64) bool {
+	return validPrepaidAmount(amount) && amount <= prepaidPurchaseMaxCents
 }
 
 func validPrepaidAmount(amount int64) bool {

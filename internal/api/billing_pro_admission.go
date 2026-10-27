@@ -15,6 +15,9 @@ import (
 var errProEntryClosed = errors.New("new paid entry is closed")
 
 func lockProAdmission(ctx context.Context, tx pgx.Tx, expected pricingPublicState) error {
+	if expected.Team != uuid.Nil {
+		return assertTeamAdmission(ctx, tx, expected)
+	}
 	if expected.EntryOpen {
 		var epoch uuid.UUID
 		return tx.QueryRow(ctx, `SELECT billing_assert_pricing_entry_open($1,$2)`, expected.Epoch, expected.Version).Scan(&epoch)

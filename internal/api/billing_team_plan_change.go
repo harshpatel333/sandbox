@@ -225,6 +225,14 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 		return teamPlanChange{}, err
 	}
 	defer tx.Rollback(ctx)
+	admission, err := lockTeamPricingEntry(ctx, tx, req.Team)
+	if err != nil {
+		return teamPlanChange{}, err
+	}
+	if admission.EnrollmentEpoch != nil && !admission.EntryOpen {
+		return teamPlanChange{}, teamPlanChangeConflict("new plan selection is temporarily closed")
+	}
+
 	var now time.Time
 	if err = tx.QueryRow(ctx, `SELECT clock_timestamp() FROM team WHERE id=$1 FOR NO KEY UPDATE`, req.Team).Scan(&now); err != nil {
 		return teamPlanChange{}, err
@@ -299,9 +307,9 @@ func (h *Handlers) scheduleTeamPlanChangeTo(ctx context.Context, req teamPlanCha
 		return teamPlanChange{}, err
 	}
 	c, err := scanTeamPlanChange(tx.QueryRow(ctx, `INSERT INTO team_plan_change(team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,
-        subscription_id,requested_by,requested_via,reason,idempotency_key,next_check_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,CASE WHEN $9::text IS NULL THEN $7 ELSE clock_timestamp() END) RETURNING `+teamPlanChangeColumns,
-		req.Team, current.ID, req.Target, terms.Kind, frozen, limits, effective, terms.Kind == planKindFree, subscription, req.Actor, req.Via, req.Reason, req.Key))
+        subscription_id,requested_by,requested_via,reason,idempotency_key,next_check_at,admission_source,admission_epoch)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,CASE WHEN $9::text IS NULL THEN $7 ELSE clock_timestamp() END,$14,$15) RETURNING `+teamPlanChangeColumns,
+		req.Team, current.ID, req.Target, terms.Kind, frozen, limits, effective, terms.Kind == planKindFree, subscription, req.Actor, req.Via, req.Reason, req.Key, pricingSource(admission), pricingEpoch(admission)))
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		return teamPlanChange{}, teamPlanChangeConflict("the team already has a pending plan change; wait for it to finish or undo it")
@@ -732,9 +740,9 @@ func (h *Handlers) restorePlanChangeRenewal(ctx context.Context, c teamPlanChang
 				ended = time.Unix(sub.EndedAt, 0)
 			}
 			if _, err = tx.Exec(ctx, `INSERT INTO team_plan_change(team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,
-                subscription_id,requested_by,requested_via,reason,idempotency_key,terminal_undo_of)
+                subscription_id,requested_by,requested_via,reason,idempotency_key,terminal_undo_of,admission_source,admission_epoch)
                 SELECT team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,$2,pauses_running,subscription_id,requested_by,requested_via,
-                'the subscription ended before renewal could be restored','terminal-undo:'||gen_random_uuid()::text,id FROM team_plan_change WHERE id=$1
+                'the subscription ended before renewal could be restored','terminal-undo:'||gen_random_uuid()::text,id,admission_source,admission_epoch FROM team_plan_change WHERE id=$1
                 ON CONFLICT(terminal_undo_of) DO NOTHING`, c.ID, ended); err != nil {
 				return err
 			}

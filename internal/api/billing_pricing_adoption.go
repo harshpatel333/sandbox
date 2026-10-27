@@ -8,10 +8,13 @@ import (
 )
 
 type pricingPublicState struct {
-	Version    string
-	EntryOpen  bool
-	LegacyOpen bool
-	Epoch      uuid.UUID
+	Team            uuid.UUID
+	Source          string
+	EnrollmentEpoch *uuid.UUID
+	Version         string
+	EntryOpen       bool
+	LegacyOpen      bool
+	Epoch           uuid.UUID
 }
 
 func (h *Handlers) publicPricingState(ctx context.Context) (pricingPublicState, error) {

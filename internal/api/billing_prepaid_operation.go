@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +40,56 @@ func (h *Handlers) acceptedPrepaidCheckoutOperation(ctx context.Context, team, a
 		return false, errPrepaidOperationConflict
 	}
 	return accepted, nil
+}
+
+// The optional-operation legacy route derives purchase identity from its accepted
+// lease. Only the exact original request can pass fresh-entry checks on replay;
+// the ordinary locked lease and frozen-purchase checks still run before dispatch.
+type implicitPrepaidLease struct {
+	PurchaseID           uuid.UUID
+	Generation           time.Time
+	Customer, RequestKey string
+}
+
+func (h *Handlers) acceptedImplicitPrepaidLease(ctx context.Context, team, actor uuid.UUID, req prepaidCheckoutBody) (*implicitPrepaidLease, error) {
+	account, err := h.DB.GetTeamBillingCheckoutForRecovery(ctx, team)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !account.CheckoutInitializingAt.Valid || !account.StripeCheckoutActorID.Valid || uuid.UUID(account.StripeCheckoutActorID.Bytes) != actor || account.CheckoutRequestKey == nil || derefString(account.StripeCustomerID) == "" {
+		return nil, nil
+	}
+	success, err := h.validateBillingRedirectURL(req.SuccessURL)
+	if err != nil {
+		return nil, nil
+	}
+	cancel, err := h.validateBillingRedirectURL(req.CancelURL)
+	if err != nil {
+		return nil, nil
+	}
+	storage, err := h.billingStorageBillingEnabled(ctx, team)
+	if err != nil {
+		return nil, err
+	}
+	prices, err := billingCheckoutPriceIDs(h.billingResourceStates(storage))
+	if err != nil {
+		return nil, err
+	}
+	prices = append(prices, "prepaid:"+strconv.FormatInt(req.AmountCents, 10))
+	key := checkoutSessionIdempotencyKey(team, derefString(account.StripeCustomerID), success, cancel, prices)
+	if *account.CheckoutRequestKey != key {
+		return nil, nil
+	}
+	purchase := prepaidCheckoutPurchaseID(team, account.CheckoutInitializingAt.Time, req.AmountCents)
+	var accepted bool
+	err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE id=$1 AND team_id=$2 AND actor_id=$3 AND customer_id=$4 AND amount_cents=$5 AND source='checkout')`, purchase, team, actor, derefString(account.StripeCustomerID), req.AmountCents).Scan(&accepted)
+	if err != nil || !accepted {
+		return nil, err
+	}
+	return &implicitPrepaidLease{PurchaseID: purchase, Generation: account.CheckoutInitializingAt.Time, Customer: derefString(account.StripeCustomerID), RequestKey: key}, nil
 }
 
 func (h *Handlers) bindPrepaidCheckoutOperation(ctx context.Context, team, actor uuid.UUID, req prepaidCheckoutBody) error {

@@ -267,7 +267,7 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 		respondError(c, ErrInternal)
 		return
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,initial_assignment_id,bridge_credit_cents) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, id, team, actor, params.CustomerID, a.StripeSubscriptionID, offer.Key, payload, anchor, start, end, now, amount, initial, credit)
+	_, err = tx.Exec(ctx, `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,initial_assignment_id,bridge_credit_cents,admission_source,admission_epoch) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, id, team, actor, params.CustomerID, a.StripeSubscriptionID, offer.Key, payload, anchor, start, end, now, amount, initial, credit, pricingSource(admission), pricingEpoch(admission))
 	if err == nil {
 		err = tx.Commit(ctx)
 	}
@@ -521,7 +521,7 @@ func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params 
 	if err = h.DB.WithTx(tx).ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: u.Team, StripeGrantID: ""}); err != nil {
 		return "", err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE billing_signup_choice SET state='committed',offer_key=$2,generation=$3,actor_id=$4,base_price_id=$5,request_payload=$6,session_id=$7,subscription_id=$8,revision=revision+1 WHERE team_id=$1 AND state='selecting'`, u.Team, u.Offer, u.Quoted, u.Actor, params.BasePriceID, u.Payload, u.Session, u.Subscription); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE billing_signup_choice SET state='committed',offer_key=$2,generation=$3,actor_id=$4,base_price_id=$5,request_payload=$6,session_id=$7,subscription_id=$8,revision=revision+1,admission_source=(SELECT admission_source FROM billing_pro_upgrade WHERE id=$9),admission_epoch=(SELECT admission_epoch FROM billing_pro_upgrade WHERE id=$9) WHERE team_id=$1 AND state='selecting'`, u.Team, u.Offer, u.Quoted, u.Actor, params.BasePriceID, u.Payload, u.Session, u.Subscription, u.ID); err != nil {
 		return "", err
 	}
 	if err = tx.Commit(ctx); err != nil {
