@@ -182,3 +182,37 @@ func TestOwnershipCacheServesBurstLargerThanLookupBound(t *testing.T) {
 		t.Fatalf("%d of 100 distinct lookups failed", failed.Load())
 	}
 }
+
+func TestOwnershipCacheBoundsCallersWaitingForSlots(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	cache := NewCachedOwnershipResolver(ctx, RouteLookupFunc(func(ctx context.Context, _ string) (SandboxRoute, error) {
+		select {
+		case <-release:
+			return SandboxRoute{HostID: "owner"}, nil
+		case <-ctx.Done():
+			return SandboxRoute{}, ctx.Err()
+		}
+	}))
+	var wg sync.WaitGroup
+	for i := 0; i < ownershipMaxLookups+ownershipMaxWaiters; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); cache.ResolveSandbox(ctx, uuid.NewString()) }()
+	}
+	for {
+		cache.mu.Lock()
+		held := len(cache.flights) == ownershipMaxLookups && cache.waiters == ownershipMaxWaiters
+		cache.mu.Unlock()
+		if held {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	started := time.Now()
+	if _, err := cache.ResolveSandbox(ctx, uuid.NewString()); !errors.Is(err, errOwnershipCapacity) || time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("caller over the waiter bound: err=%v after %v", err, time.Since(started))
+	}
+	close(release)
+	wg.Wait()
+}

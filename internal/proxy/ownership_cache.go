@@ -14,7 +14,12 @@ const (
 	ownershipCacheTTL   = time.Second
 	ownershipCacheSize  = 4096
 	ownershipMaxLookups = 32
+	// Callers held for a slot are bounded too, so a backlog or random IDs still
+	// shed load; 256 is several rounds of lookups within one lookup timeout.
+	ownershipMaxWaiters = 256
 )
+
+var errOwnershipCapacity = errors.New("ownership lookup capacity exhausted")
 
 type ownershipEntry struct {
 	id      string
@@ -40,8 +45,9 @@ type CachedOwnershipResolver struct {
 	lru     list.List
 	flights map[string]*ownershipFlight
 	// freed is closed when a lookup finishes; created only while callers wait.
-	freed chan struct{}
-	now   func() time.Time
+	freed   chan struct{}
+	waiters int
+	now     func() time.Time
 }
 
 func NewCachedOwnershipResolver(ctx context.Context, source OwnershipResolver) *CachedOwnershipResolver {
@@ -77,24 +83,38 @@ func (c *CachedOwnershipResolver) ResolveSandbox(ctx context.Context, id string)
 		if f != nil || len(c.flights) < ownershipMaxLookups {
 			break
 		}
+		if c.waiters >= ownershipMaxWaiters {
+			c.mu.Unlock()
+			if waitLimit != nil {
+				waitLimit.Stop()
+			}
+			return SandboxRoute{}, errOwnershipCapacity
+		}
 		if c.freed == nil {
 			c.freed = make(chan struct{})
 		}
 		freed := c.freed
+		c.waiters++
 		c.mu.Unlock()
 		if waitLimit == nil {
 			waitLimit = time.NewTimer(ownershipLookupTimeout)
 		}
+		var waitErr error
 		select {
 		case <-freed:
 		case <-waitLimit.C:
-			return SandboxRoute{}, errors.New("ownership lookup capacity exhausted")
+			waitErr = errOwnershipCapacity
 		case <-ctx.Done():
-			waitLimit.Stop()
-			return SandboxRoute{}, ctx.Err()
+			waitErr = ctx.Err()
 		case <-c.ctx.Done():
+			waitErr = c.ctx.Err()
+		}
+		c.mu.Lock()
+		c.waiters--
+		c.mu.Unlock()
+		if waitErr != nil {
 			waitLimit.Stop()
-			return SandboxRoute{}, c.ctx.Err()
+			return SandboxRoute{}, waitErr
 		}
 	}
 	if waitLimit != nil {
