@@ -75,18 +75,19 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 		// without it, and a retry may carry a corrected policy.
 		if st == StatusRunning && !unverified && curVCPU == vcpu && curMem == memMiB &&
 			filepath.Dir(revivedDisk) == stageDir && !m.vmConfirmedAtRest(ctx, vmID) {
-			if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
-				return nil, status.Errorf(codes.Internal, "reapply network rules on idempotent reshape: %v", err)
-			}
-			// DestroyVM bypasses the op lock; report it rather than a
-			// stale success, as revive's idempotent path does.
+			// DestroyVM bypasses the op lock but holds the record-owner lock
+			// for its whole run; holding it across the reapply keeps a
+			// destroy from recycling the slot under these rules.
 			unlockOwner := m.lockRecordOwner(vmID)
+			defer unlockOwner()
 			m.mu.RLock()
 			_, tracked := m.vms[vmID]
 			m.mu.RUnlock()
-			unlockOwner()
-			if !tracked {
+			if _, destroying := m.destroying.Load(vmID); !tracked || destroying {
 				return nil, status.Errorf(codes.Aborted, "vm %s was destroyed during the reshape retry", vmID)
+			}
+			if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
+				return nil, status.Errorf(codes.Internal, "reapply network rules on idempotent reshape: %v", err)
 			}
 			return inst, nil
 		}
