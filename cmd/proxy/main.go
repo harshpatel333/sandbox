@@ -557,13 +557,25 @@ func routingBootstrapGate(fresh func() bool, warmup time.Duration) func() bool {
 	}
 }
 
+const routingBootstrapPoll = 10 * time.Millisecond
+
+// withRoutingBootstrap holds requests during warmup instead of refusing them;
+// the gate opens by its deadline, which bounds the wait.
 func withRoutingBootstrap(next http.Handler, ready func() bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !ready() {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"error":{"code":"sandbox_unavailable","message":"proxy is warming routing state"}}`))
-			return
+			tick := time.NewTicker(routingBootstrapPoll)
+			defer tick.Stop()
+			for !ready() {
+				select {
+				case <-r.Context().Done():
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte(`{"error":{"code":"sandbox_unavailable","message":"proxy is warming routing state"}}`))
+					return
+				case <-tick.C:
+				}
+			}
 		}
 		next.ServeHTTP(w, r)
 	})

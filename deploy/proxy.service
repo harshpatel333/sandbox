@@ -22,6 +22,8 @@ Environment=PEER_PROXY_KEY_FILE=/etc/superserve/peer/tls.key
 Environment=PEER_PROXY_CA_FILE=/etc/superserve/peer/ca.crt
 Environment=PEER_PROXY_SPIFFE_URI=
 Environment=VMD_ADDR=http://127.0.0.1:9090
+# New connections wait in the socket queue until this process has drained.
+Environment=PROXY_DRAIN_GRACE=5s
 # Load host-local overrides (SANDBOX_ACCESS_TOKEN_SEED, PROXY_ALLOWED_ORIGINS,
 # REQUIRE_DATA_PLANE) from an env file. Leading `-` makes the file optional —
 # the proxy still starts without it, but data-plane endpoints will be disabled.
