@@ -103,12 +103,12 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		return handled || resumeErr != nil
 	}
 	acceptedRedirects := false
-	if req.OperationID != uuid.Nil {
-		for _, raw := range []*string{&req.SuccessURL, &req.CancelURL} {
-			if parsed, parseErr := url.Parse(strings.TrimSpace(*raw)); parseErr == nil {
-				*raw = parsed.String()
-			}
+	for _, raw := range []*string{&req.SuccessURL, &req.CancelURL} {
+		if parsed, parseErr := url.Parse(strings.TrimSpace(*raw)); parseErr == nil {
+			*raw = parsed.String()
 		}
+	}
+	if req.OperationID != uuid.Nil {
 		acceptedRedirects, err = h.acceptedPrepaidCheckoutOperation(ctx, team, actor, req)
 		if err != nil {
 			if errors.Is(err, errPrepaidOperationConflict) {
@@ -212,7 +212,7 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		return
 	}
 	if !billingAccountHasEstablishedSubscription(account) {
-		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, OperationID: req.OperationID, acceptedRedirects: acceptedRedirects, acceptedLease: acceptedLease})
+		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, OperationID: req.OperationID, acceptedRedirects: acceptedRedirects || acceptedLease != nil, acceptedLease: acceptedLease})
 		return
 	}
 	// An accepted first-purchase retry cannot turn into a second payment if

@@ -393,8 +393,18 @@ func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
 	if calls != 1 {
 		t.Fatal("different request contacted provider")
 	}
-	for range 2 {
-		rec := prepaidOperationPost(r, req)
+	// Retained acceptance survives removed and temporarily unavailable redirect
+	// policy; only the original canonical URLs may recover its frozen lease.
+	for _, origins := range [][]string{{"https://new-console.example.com"}, nil} {
+		f.h.Config.AppAllowedOrigins = origins
+		altered := req
+		altered.SuccessURL += "?changed=1"
+		if rec := prepaidOperationPost(r, altered); rec.Code != http.StatusConflict {
+			t.Fatalf("policy change admitted altered redirects: %d %s", rec.Code, rec.Body)
+		}
+		replay := req
+		replay.SuccessURL = "  " + replay.SuccessURL + "  "
+		rec := prepaidOperationPost(r, replay)
 		var got billingSessionResponse
 		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.ID != "cs_implicit" {
 			t.Fatalf("implicit replay %d %s", rec.Code, rec.Body)
@@ -436,6 +446,15 @@ func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
 	if _, err := f.h.Pool.Exec(t.Context(), `SELECT billing_release_new_team_gate('use',$1,$2,'test','same verified disposable writers',$3)`, uuid.MustParse(f.h.Config.SystemTeamID), epoch, evidence); err != nil {
 		t.Fatal(err)
 	}
+	fresh := req
+	fresh.OperationID = uuid.New()
+	if rec := prepaidOperationPost(r, fresh); rec.Code != http.StatusBadRequest || calls != 3 {
+		t.Fatalf("fresh operation bypassed unavailable redirect policy: %d %s", rec.Code, rec.Body)
+	}
+	var freshOperations int
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM billing_prepaid_checkout_operation WHERE id=$1`, fresh.OperationID).Scan(&freshOperations); err != nil || freshOperations != 0 {
+		t.Fatalf("rejected fresh operation persisted: %d/%v", freshOperations, err)
+	}
 	proof, err := f.h.acceptedImplicitPrepaidLease(t.Context(), f.team, f.actor, req)
 	if err != nil || proof == nil {
 		t.Fatalf("accepted proof missing: %v", err)
@@ -450,6 +469,46 @@ func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
 	account, err := f.h.DB.GetTeamBillingCheckoutForRecovery(t.Context(), f.team)
 	if err != nil || account.CheckoutInitializingAt.Valid || calls != 3 {
 		t.Fatalf("stale proof produced effects: %+v/%d/%v", account.CheckoutInitializingAt, calls, err)
+	}
+}
+
+func TestNewTeamCohortImplicitRedirectDelimiterCannotBypassPolicy(t *testing.T) {
+	f := newTeamCohortTestFixture(t)
+	f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
+	f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
+	original := prepaidCheckoutBody{AmountCents: 500, SuccessURL: "https://console.example.com/ok?x=a", CancelURL: "https://console.example.com/cancel?x=b|https://evil.example/out"}
+	altered := original
+	altered.SuccessURL += "|https://console.example.com/cancel?x=b"
+	altered.CancelURL = "https://evil.example/out"
+	prices, err := billingCheckoutPriceIDs(f.h.billingResourceStates(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prices = append(prices, "prepaid:500")
+	key := checkoutSessionIdempotencyKey(f.team, "cus_delimiter", original.SuccessURL, original.CancelURL, prices)
+	if key != checkoutSessionIdempotencyKey(f.team, "cus_delimiter", altered.SuccessURL, altered.CancelURL, prices) {
+		t.Fatal("fixture must reproduce the legacy delimiter collision")
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,stripe_customer_id,checkout_initializing_at,stripe_checkout_actor_id,checkout_request_key) VALUES($1,'cus_delimiter',clock_timestamp(),$2,$3)`, f.team, f.actor, key); err != nil {
+		t.Fatal(err)
+	}
+	account, err := f.h.DB.GetTeamBillingCheckoutForRecovery(t.Context(), f.team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	purchase := prepaidCheckoutPurchaseID(f.team, account.CheckoutInitializingAt.Time, original.AmountCents)
+	if err = f.h.recordCheckoutPurchase(t.Context(), purchase, f.team, "cus_delimiter", f.actor, original.AmountCents, ""); err != nil {
+		t.Fatal(err)
+	}
+	if proof, err := f.h.acceptedImplicitPrepaidLease(t.Context(), f.team, f.actor, original); err != nil || proof == nil {
+		t.Fatalf("original allowed lease must be accepted: %+v/%v", proof, err)
+	}
+	f.close(t)
+	for _, origins := range [][]string{{"https://console.example.com"}, nil} {
+		f.h.Config.AppAllowedOrigins = origins
+		if proof, err := f.h.acceptedImplicitPrepaidLease(t.Context(), f.team, f.actor, altered); err != nil || proof != nil {
+			t.Fatalf("colliding URLs bypassed redirect admission: %+v/%v", proof, err)
+		}
 	}
 }
 

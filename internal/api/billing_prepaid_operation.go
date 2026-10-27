@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -62,13 +63,23 @@ func (h *Handlers) acceptedImplicitPrepaidLease(ctx context.Context, team, actor
 	if !account.CheckoutInitializingAt.Valid || !account.StripeCheckoutActorID.Valid || uuid.UUID(account.StripeCheckoutActorID.Bytes) != actor || account.CheckoutRequestKey == nil || derefString(account.StripeCustomerID) == "" {
 		return nil, nil
 	}
-	success, err := h.validateBillingRedirectURL(req.SuccessURL)
+	success, err := url.Parse(strings.TrimSpace(req.SuccessURL))
 	if err != nil {
 		return nil, nil
 	}
-	cancel, err := h.validateBillingRedirectURL(req.CancelURL)
+	cancel, err := url.Parse(strings.TrimSpace(req.CancelURL))
 	if err != nil {
 		return nil, nil
+	}
+	// Legacy request keys delimit URL fields with a literal pipe. Such URLs
+	// cannot prove their field boundaries, so retain their admission policy.
+	if strings.Contains(success.String(), "|") || strings.Contains(cancel.String(), "|") {
+		if _, err := h.validateBillingRedirectURL(success.String()); err != nil {
+			return nil, nil
+		}
+		if _, err := h.validateBillingRedirectURL(cancel.String()); err != nil {
+			return nil, nil
+		}
 	}
 	storage, err := h.billingStorageBillingEnabled(ctx, team)
 	if err != nil {
@@ -79,7 +90,7 @@ func (h *Handlers) acceptedImplicitPrepaidLease(ctx context.Context, team, actor
 		return nil, err
 	}
 	prices = append(prices, "prepaid:"+strconv.FormatInt(req.AmountCents, 10))
-	key := checkoutSessionIdempotencyKey(team, derefString(account.StripeCustomerID), success, cancel, prices)
+	key := checkoutSessionIdempotencyKey(team, derefString(account.StripeCustomerID), success.String(), cancel.String(), prices)
 	if *account.CheckoutRequestKey != key {
 		return nil, nil
 	}
