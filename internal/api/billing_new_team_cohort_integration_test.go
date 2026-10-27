@@ -452,3 +452,36 @@ func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
 		t.Fatalf("stale proof produced effects: %+v/%d/%v", account.CheckoutInitializingAt, calls, err)
 	}
 }
+
+func TestNewTeamCohortFirstCheckoutClosureRaceIsConflict(t *testing.T) {
+	f := newTeamCohortTestFixture(t)
+	f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
+	f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
+	for _, sql := range []string{`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_closed_race')`, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)`} {
+		if _, err := f.h.Pool.Exec(t.Context(), sql, f.team); err != nil {
+			t.Fatal(err)
+		}
+	}
+	calls := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; http.Error(w, "must not dispatch", 500) }))
+	t.Cleanup(provider.Close)
+	f.h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client()}
+	r := gin.New()
+	r.POST("/checkout", func(c *gin.Context) {
+		state, err := f.h.teamPricingState(c.Request.Context(), f.team)
+		if err != nil || !state.EntryOpen {
+			t.Fatalf("descriptive admission unavailable: %+v/%v", state, err)
+		}
+		f.close(t)
+		f.h.createPAYGCheckout(c, f.team, f.actor, billingCheckoutSessionRequest{SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}, false, &prepaidCheckoutLine{AmountCents: 500})
+	})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/checkout", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("closure race should be conflict: %d %s", rec.Code, rec.Body)
+	}
+	var clean bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT checkout_initializing_at IS NULL AND cardinality(checkout_pending_attempt_ids)=0 AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE team_id=$1) FROM team_billing_account WHERE team_id=$1`, f.team).Scan(&clean); err != nil || !clean || calls != 0 {
+		t.Fatalf("closed admission produced financial effects: %v/%v/%d", clean, err, calls)
+	}
+}

@@ -1876,7 +1876,7 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 			respondErrorMsg(c, "conflict", err.Error(), http.StatusConflict)
 			return
 		}
-		if errors.Is(err, pgx.ErrNoRows) || isCheckoutPublicationConflict(err) {
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, errPricingV2Off) || isCheckoutPublicationConflict(err) {
 			respondErrorMsg(c, "conflict", "another checkout is already in progress or the intent is closed", http.StatusConflict)
 			return
 		}
