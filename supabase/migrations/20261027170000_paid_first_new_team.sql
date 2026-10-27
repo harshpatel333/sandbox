@@ -7,6 +7,14 @@ ALTER TABLE billing_new_team_enrollment
  ADD CONSTRAINT billing_new_team_enrollment_initial_free_pair
   CHECK((initial_assignment_id IS NULL)=(initial_free_version_id IS NULL));
 
+-- Paid-first signup sends every new team to a self-serve subscription, so it
+-- applies only while both are sellable. Until then signups keep Free.
+CREATE FUNCTION billing_paid_first_sellable() RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+ SELECT count(DISTINCT family)=2 FROM billing_plan_version WHERE family IN ('developer','pro') AND pricing_version='v2' AND state='published'
+  AND kind='subscription' AND public AND self_serve AND NOT display_only AND monthly_fee_cents>0;
+$$;
+
 CREATE FUNCTION billing_team_pending_payment(p_team uuid) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
  SELECT EXISTS(SELECT 1 FROM billing_new_team_enrollment e WHERE e.team_id=p_team AND e.initial_assignment_id IS NULL)
@@ -65,7 +73,7 @@ END $$;
 
 CREATE OR REPLACE FUNCTION billing_insert_signup_team(p_id uuid,p_name text,p_actor uuid,p_region text,p_source text)
 RETURNS team LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE g billing_new_team_gate; result team;
+DECLARE g billing_new_team_gate; f billing_plan_version; result team;
 BEGIN
  IF p_id IS NULL OR p_actor IS NULL OR p_region IS NULL OR p_region NOT IN ('use','usw') OR p_source IS NULL OR p_source NOT IN ('trusted_signup','trusted_creation_attempt') THEN
   RAISE EXCEPTION 'trusted signup identity required' USING ERRCODE='22023';
@@ -79,8 +87,15 @@ BEGIN
   IF p_region<>g.region OR p_id=g.system_team_id OR qm_team_managed_billing(p_id) THEN
    RAISE EXCEPTION 'signup region or identity does not match new-team cell' USING ERRCODE='55000';
   END IF;
-  INSERT INTO billing_new_team_enrollment(team_id,region,enrollment_epoch,creator_user_id,source)
-   VALUES(p_id,p_region,g.epoch,p_actor,p_source);
+  PERFORM 1 FROM billing_plan_version WHERE family IN ('developer','pro','free') AND pricing_version='v2' AND state='published' FOR SHARE;
+  IF billing_paid_first_sellable() THEN
+   INSERT INTO billing_new_team_enrollment(team_id,region,enrollment_epoch,creator_user_id,source)
+    VALUES(p_id,p_region,g.epoch,p_actor,p_source);
+  ELSE
+   SELECT * INTO STRICT f FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published';
+   INSERT INTO billing_new_team_enrollment(team_id,region,enrollment_epoch,initial_assignment_id,initial_free_version_id,creator_user_id,source)
+    VALUES(p_id,p_region,g.epoch,gen_random_uuid(),f.id,p_actor,p_source);
+  END IF;
  END IF;
  INSERT INTO team(id,name,home_region) VALUES(p_id,p_name,p_region) RETURNING * INTO result;
  RETURN result;
@@ -144,8 +159,6 @@ BEGIN
  RETURN NULL;
 END $$;
 
--- Paid-first signup sends every new team to a self-serve subscription, so the
--- gate opens only while both are sellable.
 CREATE OR REPLACE FUNCTION billing_release_new_team_gate(p_region text,p_system uuid,p_epoch uuid,p_actor text,p_reason text,p_evidence jsonb)
 RETURNS uuid LANGUAGE plpgsql SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE g billing_new_team_gate; raw text;
@@ -159,8 +172,7 @@ BEGIN
  END IF;
  g.evidence:=p_evidence;
  IF NOT billing_new_team_evidence_valid(g) THEN RAISE EXCEPTION 'verified cohort-contract writer and schema evidence required' USING ERRCODE='55000'; END IF;
- IF (SELECT count(DISTINCT family) FROM billing_plan_version WHERE family IN ('developer','pro') AND pricing_version='v2' AND state='published'
-   AND kind='subscription' AND public AND self_serve AND NOT display_only AND monthly_fee_cents>0)<>2 THEN
+ IF NOT billing_paid_first_sellable() THEN
   RAISE EXCEPTION 'published self-serve Developer and Pro subscriptions required' USING ERRCODE='55000';
  END IF;
  IF to_regprocedure('billing_lock_team_pricing_state(uuid)') IS NULL OR to_regprocedure('billing_team_pending_payment(uuid)') IS NULL
@@ -172,15 +184,26 @@ BEGIN
  RETURN g.epoch;
 END $$;
 
-DROP TRIGGER cohort_free_catalog_retained ON billing_plan_version;
-DROP FUNCTION billing_keep_cohort_free_catalog();
-
-DO $$ DECLARE r text; BEGIN
- REVOKE ALL ON FUNCTION billing_team_pending_payment(uuid) FROM PUBLIC;
- FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
-  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON FUNCTION billing_team_pending_payment(uuid) FROM %I',r); END IF;
- END LOOP;
- IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
-  GRANT EXECUTE ON FUNCTION billing_team_pending_payment(uuid) TO service_role;
+-- Signups fall back to Free while either subscription is unsellable, so Free
+-- stays required only until both are.
+CREATE OR REPLACE FUNCTION billing_keep_cohort_free_catalog() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+BEGIN
+ IF (billing_new_team_ready() OR EXISTS(SELECT 1 FROM billing_new_team_enrollment)) AND NOT billing_paid_first_sellable()
+  AND NOT EXISTS(SELECT 1 FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published'
+   AND v.kind='free' AND v.max_templates=0 AND v.allowance_period='day_window' AND v.allowance_on_exhausted='pause'
+   AND v.allowance_compute_seconds>0 AND v.allowance_compute_vcpu>0 AND v.allowance_compute_memory_gib>0) THEN
+  RAISE EXCEPTION 'enrolled teams require a usable published Free catalog or sellable Developer and Pro; replace atomically' USING ERRCODE='55000';
  END IF;
+ RETURN NULL;
+END $$;
+
+DO $$ DECLARE r text; f text; BEGIN
+ FOREACH f IN ARRAY ARRAY['billing_paid_first_sellable()','billing_team_pending_payment(uuid)'] LOOP
+  EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC',f);
+  FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I',f,r); END IF;
+  END LOOP;
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO service_role',f); END IF;
+ END LOOP;
 END $$;

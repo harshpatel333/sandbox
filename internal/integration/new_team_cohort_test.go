@@ -238,12 +238,37 @@ func TestIntegration_NewTeamCohortServiceRPCAndDeferredIntegrity(t *testing.T) {
 	}
 }
 
-func TestIntegration_NewTeamCohortReleaseRequiresSellableSubscriptions(t *testing.T) {
-	pool, system, _ := cohortFixture(t)
-	rolloutExec(t, pool, `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family='developer' AND pricing_version='v2' AND state='published'),NULL)`)
+func TestIntegration_NewTeamCohortPaidFirstNeedsSellableSubscriptions(t *testing.T) {
+	pool, system, actor := cohortFixture(t)
+	retire := `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family=$1 AND pricing_version='v2' AND state='published'),NULL)`
+	rolloutExec(t, pool, retire, "developer")
 	if _, err := cohortTryRelease(t, pool, system); pgCode(err) != "55000" {
 		t.Fatalf("gate opened without a sellable Developer plan: %v", err)
 	}
 	cohortPublishSubscription(t, pool, "developer")
 	cohortRelease(t, pool, system)
+	rolloutExec(t, pool, retire, "developer")
+	onFree := cohortCreate(t, pool, actor)
+	var kind string
+	var pending bool
+	if err := pool.QueryRow(t.Context(), `SELECT a.kind,billing_team_pending_payment($1) FROM team_plan_assignment a WHERE a.team_id=$1 AND a.effective_to IS NULL`, onFree).Scan(&kind, &pending); err != nil || kind != "free" || pending {
+		t.Fatalf("signup without a sellable Developer plan was not kept on Free: %s %v %v", kind, pending, err)
+	}
+	if _, err := pool.Exec(t.Context(), retire, "free"); pgCode(err) != "55000" {
+		t.Fatalf("Free retired while signups still fall back to it: %v", err)
+	}
+	cohortPublishSubscription(t, pool, "developer")
+	rolloutExec(t, pool, retire, "free")
+	if !cohortPending(t, pool, cohortCreate(t, pool, actor)) {
+		t.Fatal("signup with sellable plans and no Free was not pending")
+	}
+}
+
+func cohortPending(t *testing.T, pool *pgxpool.Pool, team uuid.UUID) bool {
+	t.Helper()
+	var pending bool
+	if err := pool.QueryRow(t.Context(), `SELECT billing_team_pending_payment($1)`, team).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	return pending
 }
