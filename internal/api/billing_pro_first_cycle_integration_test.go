@@ -44,7 +44,7 @@ func TestProFirstCycleQuoteIgnoresFreeUsageCalendar(t *testing.T) {
 			}
 			status, err := customerProCheckoutTerms(t.Context(), h.Pool, team, true, false)
 			wire, _ := json.Marshal(status)
-			if err != nil || !status.Accepted || !status.FirstPaidProCycle || status.CreditExpiresAt == nil || !status.CreditExpiresAt.Equal(wantEnd) || status.FirstCreditCents == nil || *status.FirstCreditCents != offer.Credit || status.FirstPaymentCents == nil || *status.FirstPaymentCents != offer.Amount || !strings.Contains(string(wire), `"first_paid_pro_cycle":true`) {
+			if err != nil || !status.Accepted || !status.FirstPaidProCycle || status.PeriodStart == nil || !status.PeriodStart.Equal(now) || status.PeriodEnd == nil || !status.PeriodEnd.Equal(wantEnd) || status.CreditExpiresAt == nil || !status.CreditExpiresAt.Equal(wantEnd) || status.FirstCreditCents == nil || *status.FirstCreditCents != offer.Credit || status.FirstPaymentCents == nil || *status.FirstPaymentCents != offer.Amount || !strings.Contains(string(wire), `"first_paid_pro_cycle":true`) {
 				t.Fatalf("accepted quote contract: %s %v", wire, err)
 			}
 			// Even across a calendar boundary, an accepted checkout keeps its exact quote.
@@ -55,6 +55,48 @@ func TestProFirstCycleQuoteIgnoresFreeUsageCalendar(t *testing.T) {
 				t.Fatalf("accepted operation repriced: %+v %v", replay, err)
 			}
 		})
+	}
+}
+
+func TestProCheckoutResponsePreservesProratedCoverageQuote(t *testing.T) {
+	now := time.Date(2026, 10, 16, 0, 0, 0, 0, time.UTC)
+	h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
+	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("starter", planKindPrepaid, 2, nil), Source: "staff", Reason: "existing Starter checkout coverage regression"}); err != nil {
+		t.Fatal(err)
+	}
+	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+	u, err := h.proUpgrade(t.Context(), team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end := billing.CurrentBillingPeriod(now)
+	if !u.Start.Equal(start) || !u.Quoted.Equal(now) || !u.Start.Before(u.Quoted) || !u.End.Equal(end) || u.Amount <= 0 || u.Amount >= offer.Amount {
+		t.Fatalf("fixture must contain an accepted mid-period Starter upgrade: %+v", u)
+	}
+	// Read after time advances: the accepted response must keep the quote's
+	// coverage and payment, rather than the enclosing period start or read time.
+	h.Now = func() time.Time { return now.Add(24 * time.Hour) }
+	terms, err := customerProCheckoutTerms(t.Context(), h.Pool, team, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := json.Marshal(terms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		Accepted          bool      `json:"accepted"`
+		FirstPaidProCycle bool      `json:"first_paid_pro_cycle"`
+		Start             time.Time `json:"period_start"`
+		End               time.Time `json:"period_end"`
+		Payment           int64     `json:"first_payment_cents"`
+		Credit            int64     `json:"first_credit_cents"`
+	}
+	if err := json.Unmarshal(wire, &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Accepted || response.FirstPaidProCycle || !response.Start.Equal(now) || response.Start.Equal(start) || !response.End.Equal(end) || response.Payment != u.Amount || response.Credit != u.bridgeCreditAmount() {
+		t.Fatalf("accepted response lost frozen prorated coverage/payment: %s; billing start=%s", wire, start)
 	}
 }
 

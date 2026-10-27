@@ -5831,11 +5831,11 @@ components:
         period_start:
           type: string
           format: date-time
-          description: Start of the accepted checkout's first billing period.
+          description: Start of the first checkout coverage, frozen at quote time. For prorated upgrades this can be later than the start of the existing commercial billing period.
         period_end:
           type: string
           format: date-time
-          description: End of the accepted checkout's first billing period.
+          description: End of the accepted checkout coverage, at the applicable billing-period boundary.
         credit_expires_at:
           type: string
           format: date-time
