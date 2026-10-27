@@ -1012,6 +1012,96 @@ paths:
           description: Prepaid plans are not active, the plan cannot buy credit, too many purchases are unspent, or operation_id is bound to a different authenticated team, actor, amount, or return URL.
         "503":
           description: Prepaid credit is temporarily at capacity.
+  /billing/prepaid/checkout/recover:
+    post:
+      operationId: recoverPendingStarterCheckout
+      tags: [Billing]
+      summary: Recover or explicitly cancel the original Starter checkout
+      description: |
+        Requires `billing:write` and the original checkout actor on the authenticated team.
+        Send an empty object to discover the Starter purchase holding the current checkout
+        fence, including purchases created without operation_id. Discovery returns its
+        purchase_id, amount_cents and checkout_generation, but no provider URL.
+        Send that exact purchase_id and checkout_generation together with cancel false
+        to resume the same recorded session. Set cancel true only after an explicit
+        customer request to cancel the unpaid checkout. The provider session must be
+        verified expired and unpaid before the original local fence can be released.
+        Recovery remains available when new-entry flags or redirect policy change.
+        Paid, mismatched or uncertain provider outcomes retain the fence and return
+        payment_confirmation_pending. Neither no_pending_starter_checkout nor retryable
+        proves that the current plan is Free; refresh the plan and ordinary offer APIs
+        before starting another purchase. A verified original non-Starter Pro fence
+        returns no_pending_starter_checkout without changing it; use the Pro recovery
+        flow for that purchase. Cancellation retries are idempotent.
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              description: purchase_id and checkout_generation must either both be omitted or both be supplied. Cancellation requires both.
+              properties:
+                purchase_id:
+                  type: string
+                  format: uuid
+                checkout_generation:
+                  type: string
+                  format: date-time
+                cancel:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: Original purchase discovered or resumed, verified expiration released the fence, no original fence remains, or payment confirmation is pending.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [outcome]
+                properties:
+                  outcome:
+                    type: string
+                    enum: [pending_starter_checkout, recovered, retryable, no_pending_starter_checkout, payment_confirmation_pending]
+                  purchase_id:
+                    type: string
+                    format: uuid
+                    description: Present for discovery and matched actions; omitted when no original Starter fence remains.
+                  amount_cents:
+                    type: integer
+                    format: int64
+                  checkout_generation:
+                    type: string
+                    format: date-time
+                  url:
+                    type: string
+                    format: uri
+                    description: Present only for recovered, and identifies the same recorded provider session.
+        "202":
+          description: Provider verification, payment reconciliation, or exact tuple revalidation remains uncertain. Retain the original purchase and do not start another checkout.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [outcome]
+                properties:
+                  outcome:
+                    type: string
+                    enum: [payment_confirmation_pending]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: checkout_recovery_unavailable; the requested purchase or generation no longer matches the original Starter checkout.
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Provider checkout recovery is not configured.
   /billing/prepaid/auto-recharge:
     put:
       operationId: putPrepaidAutoRecharge
@@ -4858,7 +4948,8 @@ components:
             OCI image reference for the base. Examples: `python:3.11`,
             `node:22-slim`, `ghcr.io/myorg/foo:v1`. Resolved to a digest at
             build time and recorded for reproducibility. Must be a Linux/amd64
-            image. Alpine and distroless bases are rejected at validation.
+            image with a shell at `/bin/sh` and the `mkdir`, `mount`,
+            `chmod`, and `sync` commands.
           example: python:3.11
         steps:
           type: array
@@ -5724,6 +5815,39 @@ components:
               description: Whether this change is undoable through the current API channel. Customer reads return false for staff-originated changes.
             pauses_running:
               type: boolean
+        pro_checkout:
+          $ref: "#/components/schemas/BillingProCheckoutTerms"
+    BillingProCheckoutTerms:
+      type: object
+      required: [first_paid_pro_cycle, accepted]
+      description: First Pro checkout eligibility or the frozen terms of an accepted checkout. Optional terms are omitted when no checkout has been accepted.
+      properties:
+        first_paid_pro_cycle:
+          type: boolean
+          description: Whether the first-paid-Pro-cycle rules apply to the accepted checkout, or the current Free team is eligible for those rules before checkout.
+        accepted:
+          type: boolean
+          description: Whether these terms belong to an existing accepted checkout. This does not indicate that payment has completed.
+        period_start:
+          type: string
+          format: date-time
+          description: Start of the first checkout coverage, frozen at quote time. For prorated upgrades this can be later than the start of the existing commercial billing period.
+        period_end:
+          type: string
+          format: date-time
+          description: End of the accepted checkout coverage, at the applicable billing-period boundary.
+        credit_expires_at:
+          type: string
+          format: date-time
+          description: Expiration of the first credit grant; omitted when the credit does not expire.
+        first_payment_cents:
+          type: integer
+          format: int64
+          description: Quoted first payment in USD cents, before any checkout discount.
+        first_credit_cents:
+          type: integer
+          format: int64
+          description: First credit grant in USD cents under the accepted checkout terms.
     BillingPlanChange:
       type: object
       required: [id, target_plan_key, target_display_name, target_kind, effective_at, pauses_running, state, undoable, limits]

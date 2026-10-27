@@ -10,7 +10,7 @@ Before executing:
 
 1. Deploy and verify the console that accepts `max_templates: 0` in the public
    catalog, plan and effective-limit views. Old console parsers reject zero.
-2. Apply `20261026213000_free_assignment_continuity.sql` through the normal
+2. Apply `20261027060000_free_assignment_continuity.sql` through the normal
    reviewed migration process. Replace all API and worker consumers as required
    by the surrounding billing rollout. Keep public paid entry closed until the
    combined rollout passes acceptance.

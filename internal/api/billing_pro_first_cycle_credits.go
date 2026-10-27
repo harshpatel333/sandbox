@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -17,14 +18,22 @@ import (
 // The recurring contract begins next month. Its paid predecessor operation,
 // rather than a fabricated recurring payment, authorizes this first allowance.
 func firstProCycleAuthority(ctx context.Context, reader db.DBTX, team uuid.UUID, a invoiceAccount) (proUpgrade, bool, error) {
-	u, err := scanProUpgrade(reader.QueryRow(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND request_payload->>'FirstPaidProCycle'='true' ORDER BY quoted_at DESC LIMIT 1`, team, a.Customer, a.Subscription))
+	return proUpgradeBridgeAuthority(ctx, reader, team, a, true, nil)
+}
+
+// Unmarked paid bridges keep their accepted amount, expiry and calendar. They
+// still authorize the first close before the recurring contract starts.
+func proUpgradeBridgeAuthority(ctx context.Context, reader db.DBTX, team uuid.UUID, a invoiceAccount, markedOnly bool, periodStart *time.Time) (proUpgrade, bool, error) {
+	// Later recurring periods use their own entitlement, even if an old bridge
+	// has no grant because its accepted prorated credit rounded to zero.
+	u, err := scanProUpgrade(reader.QueryRow(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE team_id=$1 AND customer_id=$2 AND subscription_id=$3 AND (NOT $4 OR request_payload->>'FirstPaidProCycle'='true') AND ($5::timestamptz IS NULL OR period_end>$5) ORDER BY quoted_at DESC LIMIT 1`, team, a.Customer, a.Subscription, markedOnly, periodStart))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return u, false, nil
 	}
 	if err != nil {
 		return u, true, err
 	}
-	if u.Contract == nil || (u.State != "credited" && u.State != "active" && u.State != "ended") || u.Grant == nil || len(u.Evidence) == 0 || !json.Valid(u.Evidence) {
+	if u.Contract == nil || (u.State != "credited" && u.State != "active" && u.State != "ended") || (u.bridgeCreditAmount() > 0 && derefString(u.Grant) == "") || len(u.Evidence) == 0 || !json.Valid(u.Evidence) {
 		return u, true, errors.New("first Pro month payment or allowance is unresolved")
 	}
 	var p StripeCreateCheckoutSessionParams
@@ -153,7 +162,7 @@ func (h *Handlers) preflightFirstProCycleCredits(ctx context.Context, team uuid.
 }
 
 func (h *Handlers) prepareFirstProCycleCredits(ctx context.Context, p billing.ExportPeriod, a invoiceAccount, invoiceID string, plan *billing.InvoiceClosePlan, client *stripeHTTPClient) (bool, error) {
-	u, found, err := firstProCycleAuthority(ctx, h.Pool, p.TeamID, a)
+	u, found, err := proUpgradeBridgeAuthority(ctx, h.Pool, p.TeamID, a, false, &p.Start)
 	if err != nil || !found {
 		return found, err
 	}
@@ -163,9 +172,12 @@ func (h *Handlers) prepareFirstProCycleCredits(ctx context.Context, p billing.Ex
 	if !p.Start.Equal(u.Start) || !p.End.Equal(u.End) || plan.InvoiceEnd != u.End.Unix() {
 		return true, errors.New("first Pro month invoice differs from the paid service period")
 	}
-	g, err := verifyFirstProCycleGrant(ctx, u, client)
-	if err != nil {
-		return true, err
+	var g entitlementGrant
+	if u.bridgeCreditAmount() > 0 {
+		g, err = verifyFirstProCycleGrant(ctx, u, client)
+		if err != nil {
+			return true, err
+		}
 	}
 	if err = h.fundingCreditInventoryReady(ctx, *u.Contract, a.Customer, client); err != nil {
 		return true, err
@@ -180,9 +192,12 @@ func (h *Handlers) prepareFirstProCycleCredits(ctx context.Context, p billing.Ex
 	if err != nil {
 		return true, err
 	}
-	balance, err := client.grantLedgerBalance(ctx, a.Customer, g.ID)
-	if err != nil {
-		return true, err
+	var balance int64
+	if u.bridgeCreditAmount() > 0 {
+		balance, err = client.grantLedgerBalance(ctx, a.Customer, g.ID)
+		if err != nil {
+			return true, err
+		}
 	}
 	promised := balance == 0
 	plan.CreditBeforeCents = 0
