@@ -253,11 +253,52 @@ func rewriteAptSources(rootfsDir string, mirror func() string, logger *zerolog.L
 			}
 		}
 	}
-	if len(rewritten) > 0 && logger != nil {
+	if len(rewritten) == 0 {
+		return nil
+	}
+	if err := renameCachedAptLists(rootfsDir, mirror()); err != nil {
+		return fmt.Errorf("rename cached apt lists: %w", err)
+	}
+	if logger != nil {
 		logger.Info().
 			Str("mirror", mirror()).
 			Strs("files", rewritten).
 			Msg("rewrote apt sources to alternate Ubuntu mirror")
+	}
+	return nil
+}
+
+// renameCachedAptLists keeps the package lists an image cached usable after
+// its sources move to mirror. apt names each list after its source's host,
+// so without the rename "apt install" with no "apt update" first finds
+// nothing. The mirror serves the same archive, so the lists stay valid.
+func renameCachedAptLists(rootfsDir, mirror string) error {
+	listsDir := filepath.Join(rootfsDir, "var/lib/apt/lists")
+	entries, err := os.ReadDir(listsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		for _, host := range canonicalUbuntuMirrors {
+			rest, ok := strings.CutPrefix(e.Name(), host+"_")
+			if !ok {
+				continue
+			}
+			target := filepath.Join(listsDir, mirror+"_"+rest)
+			if _, err := os.Lstat(target); err == nil {
+				break
+			}
+			if err := os.Rename(filepath.Join(listsDir, e.Name()), target); err != nil {
+				return err
+			}
+			break
+		}
 	}
 	return nil
 }
@@ -370,6 +411,9 @@ const initScriptTemplate = `#!/bin/sh
 # PID 1 proper. See docs/INIT_STRATEGY.md for why this exists.
 
 set +e
+# The kernel starts init with no PATH; set the one the builder checked its
+# tools against, rather than leave the lookup to the shell's default.
+export PATH=%s
 mkdir -p /proc /sys /dev /run /tmp
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
@@ -422,7 +466,7 @@ func initScriptFor(freezeWorkload bool) string {
 	if freezeWorkload {
 		block += initFreezerBlock
 	}
-	return fmt.Sprintf(initScriptTemplate, block)
+	return fmt.Sprintf(initScriptTemplate, guestPathEnv(), block)
 }
 
 // copyFile copies src → dst, creating parent directories as needed. Overwrites

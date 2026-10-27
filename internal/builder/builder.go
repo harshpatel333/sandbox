@@ -2,8 +2,11 @@ package builder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/rs/zerolog/log"
 )
@@ -82,6 +85,10 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 	}
 	logger.Info().Str("digest", digest).Msg("image flattened")
 
+	if err := requireShell(scratch); err != nil {
+		return BuildRootfsResult{}, err
+	}
+
 	boxdBytes, err := injectGuestAgent(ctx, scratch, b.cfg.BoxdBinaryPath, b.cfg.FreezeWorkload, &logger)
 	if err != nil {
 		return BuildRootfsResult{}, fmt.Errorf("inject boxd: %w", err)
@@ -107,4 +114,70 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 		ResolvedDigest: digest,
 		SizeBytes:      info.Size(),
 	}, nil
+}
+
+// errNoShell marks a base image without /bin/sh, which the guest init and
+// every build step run under.
+var errNoShell = errors.New("image has no /bin/sh")
+
+// guestTools are the commands every boot and build runs whatever the build
+// spec says: the injected init creates and mounts its filesystems and its
+// freezer cgroup, and each build syncs the disk before the snapshot.
+var guestTools = []string{"mkdir", "mount", "chmod", "sync"}
+
+// guestPath is where those commands are looked up; the injected init exports
+// the same list as its PATH.
+var guestPath = []string{"usr/local/sbin", "usr/local/bin", "usr/sbin", "usr/bin", "sbin", "bin"}
+
+func guestPathEnv() string {
+	dirs := make([]string, len(guestPath))
+	for i, dir := range guestPath {
+		dirs[i] = "/" + dir
+	}
+	return strings.Join(dirs, ":")
+}
+
+// requireShell rejects a flattened image that cannot boot or build: one
+// whose /bin/sh is not an executable file, such as a distroless or
+// scratch-based image, or one missing a command in guestTools.
+func requireShell(rootfsDir string) error {
+	root, err := filepath.EvalSymlinks(rootfsDir)
+	if err != nil {
+		return fmt.Errorf("resolve rootfs: %w", err)
+	}
+	if !isExecutable(root, "bin/sh") {
+		return errNoShell
+	}
+	var missing []string
+	for _, tool := range guestTools {
+		found := false
+		for _, dir := range guestPath {
+			if isExecutable(root, filepath.Join(dir, tool)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, tool)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("image is missing required commands: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// isExecutable reports whether rel names an executable regular file inside
+// root. Extraction keeps every symlink relative and inside the rootfs, so
+// resolving one here cannot leave it.
+func isExecutable(root, rel string) bool {
+	resolved, err := filepath.EvalSymlinks(filepath.Join(root, rel))
+	if err != nil {
+		return false
+	}
+	if r, err := filepath.Rel(root, resolved); err != nil || strings.HasPrefix(r, "..") {
+		return false
+	}
+	info, err := os.Stat(resolved)
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }

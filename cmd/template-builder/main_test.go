@@ -118,6 +118,16 @@ func TestClassifyBuildError(t *testing.T) {
 			wantCode: "build_failed",
 		},
 		{
+			name:     "base image without a shell",
+			err:      "build rootfs: image has no /bin/sh",
+			wantCode: "unsupported_base",
+		},
+		{
+			name:     "base image without the commands every build runs",
+			err:      "build rootfs: image is missing required commands: mount, sync",
+			wantCode: "unsupported_base",
+		},
+		{
 			name:     "registry pull failure still classified as pull",
 			err:      "build rootfs: pull python:3.12: manifest unknown",
 			wantCode: "image_pull_failed",
