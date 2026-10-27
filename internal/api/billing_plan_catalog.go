@@ -250,6 +250,15 @@ func (v planVersion) validate() error {
 			return errors.New("v2 Free requires a daily allowance that pauses on exhaustion and every sandbox shape limit")
 		}
 	}
+	if v.FundingPolicy != "" && v.FundingPolicy != fundingPolicyPrepaid && v.FundingPolicy != fundingPolicyPostpaid {
+		return errors.New("funding policy must be prepaid or postpaid")
+	}
+	if v.prepaidFunded() && v.Kind != "subscription" {
+		return errors.New("only subscription plans take a prepaid funding policy")
+	}
+	if t := v.Topoff; t != nil && (!v.prepaidFunded() || !validNewPrepaidAmount(t.AmountCents) || !validNewPrepaidAmount(t.ThresholdCents)) {
+		return errors.New("top-off needs a prepaid funding policy, and its amount and threshold must be multiples of $5 up to $10,000")
+	}
 	if v.DisplayOnly {
 		if v.hasFee() || v.SelfServe || len(v.CreditSchedule) != 0 || v.Matching != nil || v.Allowance != nil {
 			return errors.New("display-only plans carry no fees, credits, matching, allowance or self-serve checkout")
@@ -267,15 +276,6 @@ func (v planVersion) validate() error {
 	}
 	if v.Limits.MaxConcurrent == nil && v.Kind != "custom" {
 		return errors.New("max running sandboxes is required")
-	}
-	if v.FundingPolicy != "" && v.FundingPolicy != fundingPolicyPrepaid && v.FundingPolicy != fundingPolicyPostpaid {
-		return errors.New("funding policy must be prepaid or postpaid")
-	}
-	if v.prepaidFunded() && v.Kind != "subscription" {
-		return errors.New("only subscription plans take a prepaid funding policy")
-	}
-	if t := v.Topoff; t != nil && (!v.prepaidFunded() || !validNewPrepaidAmount(t.AmountCents) || !validNewPrepaidAmount(t.ThresholdCents)) {
-		return errors.New("top-off needs a prepaid funding policy, and its amount and threshold must be multiples of $5 up to $10,000")
 	}
 	if v.Kind == "custom" && !v.hasFee() && len(v.CreditSchedule) == 0 && v.Matching == nil && v.Allowance == nil && v.Limits.MaxConcurrent == nil {
 		return errors.New("a custom plan needs a fee, credits, matching, an allowance or limits")

@@ -74,7 +74,7 @@ func (h *Handlers) planCard(v planVersion, allowance *planAllowance) billingPlan
 	card := billingPlanCard{Family: v.Family, Version: v.Version, Kind: v.Kind, Name: v.DisplayName, PriceLabel: v.PriceLabel, Tagline: v.Tagline,
 		Features: v.Features, DisplayOnly: v.DisplayOnly, CreditSummary: planCreditSummary(v.CreditSchedule), Matching: v.Matching, Limits: v.Limits,
 		FundingPolicy: fundingPolicyPostpaid, Topoff: v.Topoff}
-	if v.prepaidFunded() {
+	if v.prepaidFunded() || v.Kind == planKindPrepaid {
 		card.FundingPolicy = fundingPolicyPrepaid
 	}
 	if allowance != nil {

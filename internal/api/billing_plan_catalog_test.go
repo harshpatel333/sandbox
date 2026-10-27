@@ -149,6 +149,13 @@ func TestPlanVersionValidate(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
+	display := planVersion{PricingVersion: "v2", Family: "enterprise", Kind: "custom", DisplayName: "Enterprise", DisplayOnly: true, FundingPolicy: fundingPolicyPrepaid}
+	if display.validate() == nil {
+		t.Fatal("display-only plan accepted a funding policy the database rejects")
+	}
+	if card := (&Handlers{}).planCard(planVersion{Kind: planKindPrepaid}, nil); card.FundingPolicy != fundingPolicyPrepaid {
+		t.Fatal("prepaid plan card reported", card.FundingPolicy)
+	}
 	starter := planVersion{PricingVersion: "v2", Family: "starter", Kind: "prepaid", DisplayName: "Starter", Limits: planLimits{MaxConcurrent: int32p(1)}, FundingPolicy: fundingPolicyPrepaid}
 	if starter.validate() == nil {
 		t.Fatal("prepaid funding policy accepted outside a subscription")
