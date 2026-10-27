@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -94,5 +95,25 @@ func TestReshapeVMRequiresTheEgressPolicy(t *testing.T) {
 		if status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("sandbox_network %v: err = %v, want InvalidArgument without an egress policy", net, err)
 		}
+	}
+}
+
+// A paused record whose stop was never confirmed may still have a guest
+// writing its disk; nothing is staged from it.
+func TestReshapeVMRefusesADiskNotAtRest(t *testing.T) {
+	dir := t.TempDir()
+	snap := touch(t, filepath.Join(dir, "snapshots", "vm-1", "vmstate.snap"))
+	mem := touch(t, filepath.Join(dir, "snapshots", "vm-1", "mem.snap"))
+	disk := touch(t, filepath.Join(dir, "run", "vm-1", "rootfs.ext4"))
+	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, unitDead: func(context.Context, string) bool { return false }}
+	m.cfg = ManagerConfig{RunDir: filepath.Join(dir, "run"), SnapshotDir: filepath.Join(dir, "snapshots")}
+	m.vms = map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusPaused, SnapshotPath: snap, MemFilePath: mem, DiskPath: disk, Config: VMConfig{VCPU: 1, MemoryMiB: 1024}}}
+
+	_, err := m.ReshapeVM(context.Background(), "vm-1", 2, 2048, &sandboxNetworkRules{})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "at rest") {
+		t.Fatalf("err = %v, want the at-rest refusal", err)
+	}
+	if _, serr := os.Stat(m.reshapeStageDir("vm-1")); !os.IsNotExist(serr) {
+		t.Fatalf("staging dir exists (%v); nothing may be staged from a disk not at rest", serr)
 	}
 }

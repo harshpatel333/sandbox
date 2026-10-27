@@ -119,12 +119,20 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 	stagedMap := ""
 	start := time.Now()
 	if mem != "" && pauseArtifactsPresent(snap, mem, baseMem, disk, base) {
+		// A pause whose stop was never confirmed still records Paused; a
+		// clone taken while the guest may still write would boot torn.
+		if !m.vmConfirmedAtRest(ctx, vmID) {
+			return nil, status.Errorf(codes.FailedPrecondition, "vm %s is not confirmed at rest; its disk cannot be staged", vmID)
+		}
 		// The paused disk is authoritative; any copy left by an earlier
 		// failed attempt predates it and is replaced.
 		if err := os.RemoveAll(stageDir); err != nil {
 			return nil, status.Errorf(codes.Internal, "clear reshape staging: %v", err)
 		}
 		if err := os.MkdirAll(stageDir, 0o700); err != nil {
+			return nil, status.Errorf(codes.Internal, "reshape staging: %v", err)
+		}
+		if err := syncDir(filepath.Dir(stageDir)); err != nil {
 			return nil, status.Errorf(codes.Internal, "reshape staging: %v", err)
 		}
 		if err := stageReshapeFile(ctx, disk, stagedDisk); err != nil {
@@ -189,10 +197,24 @@ func (m *Manager) stateRecord(vmID string) (*VMRecord, error) {
 
 // stageReshapeFile reflinks src to dst through a temporary name, so a
 // crash mid-copy never leaves a partial file under the name a retry boots.
+// The copy is synced before it is named: the revival teardown deletes the
+// source next, and after a power loss the copy is all a retry has.
 func stageReshapeFile(ctx context.Context, src, dst string) error {
 	tmp := dst + ".tmp"
 	if err := reflinkFileExact(ctx, src, tmp); err != nil {
 		return err
 	}
-	return os.Rename(tmp, dst)
+	f, err := os.Open(tmp)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	f.Close()
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(dst))
 }
