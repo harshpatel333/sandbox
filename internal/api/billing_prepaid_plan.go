@@ -10,11 +10,11 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-func assertPrepaidEntry(ctx context.Context, tx pgx.Tx) error {
+func assertPrepaidEntry(ctx context.Context, tx pgx.Tx, team uuid.UUID) error {
 	var epoch uuid.UUID
-	err := tx.QueryRow(ctx, `SELECT billing_assert_pricing_entry_open()`).Scan(&epoch)
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "55000" {
+	err := tx.QueryRow(ctx, `SELECT billing_assert_team_pricing_entry($1)`, team).Scan(&epoch)
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && pe.Code == "55000" {
 		return errPricingV2Off
 	}
 	return err
@@ -27,7 +27,7 @@ type prepaidPurchasePlan struct {
 }
 
 func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, team uuid.UUID, customer string, actor uuid.UUID, amount int64) error {
-	raw, entryOpen, err := lockPricingEntry(ctx, tx)
+	admission, err := lockTeamPricingEntry(ctx, tx, team)
 	if err != nil {
 		return err
 	}
@@ -41,6 +41,11 @@ func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, te
 	if exists {
 		return nil
 	}
+	// Existing purchases retain their accepted amount; every new record is capped
+	// under the same team lock, including stale HTTP recovery attempts.
+	if !validNewPrepaidAmount(amount) {
+		return errPrepaidOperationConflict
+	}
 	live, err := prepaidUnspentPurchases(ctx, tx, team)
 	if err != nil {
 		return err
@@ -48,10 +53,10 @@ func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, te
 	if live >= prepaidLiveGrantLimit {
 		return errPrepaidTooManyUnspent
 	}
-	if raw != "v2" || !entryOpen {
+	if admission.Version != "v2" || !admission.EntryOpen {
 		return errPricingV2Off
 	}
-	if err := assertPrepaidEntry(ctx, tx); err != nil {
+	if err := assertPrepaidEntry(ctx, tx, team); err != nil {
 		return err
 	}
 	current, ok, err := currentTeamPlan(ctx, tx, team)
@@ -61,7 +66,7 @@ func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, te
 	if !ok || (current.Kind != planKindFree && current.Kind != planKindPrepaid) {
 		return errors.New("this team's plan cannot buy prepaid credit")
 	}
-	terms, err := h.planTermsForPricingVersion(ctx, "starter", raw, tx)
+	terms, err := h.planTermsForPricingVersion(ctx, "starter", admission.Version, tx)
 	if err != nil {
 		return err
 	}
@@ -72,8 +77,8 @@ func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, te
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key,plan_snapshot)
- VALUES($1,$2,$3,'checkout',$4,$5,'','',$6)`, id, team, customer, amount, actor, snapshot)
+	_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key,plan_snapshot,admission_source,admission_epoch)
+ VALUES($1,$2,$3,'checkout',$4,$5,'','',$6,$7,$8)`, id, team, customer, amount, actor, snapshot, pricingSource(admission), pricingEpoch(admission))
 	return err
 }
 

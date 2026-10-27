@@ -123,6 +123,40 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /billing/capabilities:
+    get:
+      operationId: getBillingCapabilities
+      tags: [Billing]
+      summary: Get this team's billing admission and matching catalog
+      description: |
+        Requires billing:read for the authenticated team. This response is
+        uncached and scoped to the actual team, never a query parameter.
+        Fresh-entry booleans describe admission support, not billing write
+        permission or current-plan/payment eligibility. Accepted payment
+        recovery, cancellation/undo and recharge disable remain independent
+        of fresh admission. A closed enrolled team retains pricing_version=v2.
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: Current team capabilities and catalog
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingCapabilitiesResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          description: Team billing authority requires verification
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /billing/summary:
     get:
       operationId: getBillingSummary
@@ -975,6 +1009,7 @@ paths:
                 amount_cents:
                   type: integer
                   format: int64
+                  description: New purchases are limited to 1000000 cents ($10,000). Previously accepted operations retain their original amount when replayed.
                   minimum: 500
                   multipleOf: 500
                 success_url:
@@ -1123,11 +1158,13 @@ paths:
                 threshold_cents:
                   type: integer
                   format: int64
+                  maximum: 1000000
                   minimum: 500
                   multipleOf: 500
                 amount_cents:
                   type: integer
                   format: int64
+                  maximum: 1000000
                   minimum: 500
                   multipleOf: 500
       responses:
@@ -5547,10 +5584,83 @@ components:
           type: string
           description: Prefix-shaped sample of the proxy token issued for this provider (e.g. `sk-ant-api03-...`).
 
+    BillingCapabilitiesResponse:
+      type: object
+      required: [schema_version, team_id, pricing_version, admission_source, entry_open, epoch, enrollment_epoch, fresh_entry, actions, catalog]
+      properties:
+        schema_version:
+          type: integer
+          enum: [1]
+        team_id:
+          type: string
+          format: uuid
+        pricing_version:
+          type: string
+          enum: [legacy, v2]
+        admission_source:
+          type: string
+          enum: [legacy, all_teams, new_team]
+        entry_open:
+          type: boolean
+        epoch:
+          type: string
+          format: uuid
+          nullable: true
+          description: Current admission epoch; checked again by the server on acceptance.
+        enrollment_epoch:
+          type: string
+          format: uuid
+          nullable: true
+          description: Immutable original cohort epoch, retained across gate rotation and plan changes.
+        fresh_entry:
+          type: object
+          required: [starter, pro, auto_recharge, choose_free]
+          properties:
+            starter:
+              type: boolean
+            pro:
+              type: boolean
+            auto_recharge:
+              type: boolean
+            choose_free:
+              type: boolean
+        actions:
+          type: object
+          required: [recover_payment, disable_auto_recharge]
+          properties:
+            recover_payment:
+              type: boolean
+            disable_auto_recharge:
+              type: boolean
+        catalog:
+          $ref: "#/components/schemas/BillingPlansResponse"
+
+    BillingSignupAdmission:
+      type: object
+      required: [schema_version, pricing_version, source, entry_open, epoch]
+      properties:
+        schema_version:
+          type: integer
+          enum: [1]
+        pricing_version:
+          type: string
+          enum: [legacy, v2]
+        source:
+          type: string
+          enum: [legacy, all_teams, new_team]
+        entry_open:
+          type: boolean
+        epoch:
+          type: string
+          format: uuid
+          nullable: true
+
     BillingPlansResponse:
       type: object
       required: [pricing_version, cards, plans]
       properties:
+        signup_admission:
+          $ref: "#/components/schemas/BillingSignupAdmission"
         pricing_version:
           type: string
           enum: [legacy, v2]
@@ -5815,6 +5925,39 @@ components:
               description: Whether this change is undoable through the current API channel. Customer reads return false for staff-originated changes.
             pauses_running:
               type: boolean
+        pro_checkout:
+          $ref: "#/components/schemas/BillingProCheckoutTerms"
+    BillingProCheckoutTerms:
+      type: object
+      required: [first_paid_pro_cycle, accepted]
+      description: First Pro checkout eligibility or the frozen terms of an accepted checkout. Optional terms are omitted when no checkout has been accepted.
+      properties:
+        first_paid_pro_cycle:
+          type: boolean
+          description: Whether the first-paid-Pro-cycle rules apply to the accepted checkout, or the current Free team is eligible for those rules before checkout.
+        accepted:
+          type: boolean
+          description: Whether these terms belong to an existing accepted checkout. This does not indicate that payment has completed.
+        period_start:
+          type: string
+          format: date-time
+          description: Start of the first checkout coverage, frozen at quote time. For prorated upgrades this can be later than the start of the existing commercial billing period.
+        period_end:
+          type: string
+          format: date-time
+          description: End of the accepted checkout coverage, at the applicable billing-period boundary.
+        credit_expires_at:
+          type: string
+          format: date-time
+          description: Expiration of the first credit grant; omitted when the credit does not expire.
+        first_payment_cents:
+          type: integer
+          format: int64
+          description: Quoted first payment in USD cents, before any checkout discount.
+        first_credit_cents:
+          type: integer
+          format: int64
+          description: First credit grant in USD cents under the accepted checkout terms.
     BillingPlanChange:
       type: object
       required: [id, target_plan_key, target_display_name, target_kind, effective_at, pauses_running, state, undoable, limits]

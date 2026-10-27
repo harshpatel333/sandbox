@@ -352,6 +352,10 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	if err == nil {
 		pending, err = pendingCustomerPlanChange(ctx, tx, team, "customer")
 	}
+	var proCheckout customerProCheckout
+	if err == nil {
+		proCheckout, err = customerProCheckoutTerms(ctx, tx, team, assigned && current.Kind == planKindFree, anchor.Valid)
+	}
 	if err == nil {
 		err = tx.Commit(ctx)
 	}
@@ -369,6 +373,7 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 		"plan":           plan,
 		"period":         customerBillingPeriod{Start: start, End: end},
 		"pending_change": pending,
+		"pro_checkout":   proCheckout,
 	})
 }
 
@@ -438,7 +443,7 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 	var assigned bool
 	var pricing pricingPublicState
 	if err == nil {
-		pricing, err = h.publicPricingState(ctx)
+		pricing, err = h.teamPricingState(ctx, team)
 	}
 	if err == nil {
 		current, assigned, err = currentTeamPlan(ctx, h.Pool, team)
@@ -451,6 +456,8 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 	kind := terms.Kind
 	preview := customerPlanChangePreview{TargetPlanKey: target, TargetDisplayName: terms.DisplayName, TargetKind: kind, Limits: terms.Limits}
 	switch {
+	case pricing.EnrollmentEpoch != nil && !pricing.EntryOpen:
+		preview.Blocked = "new plan selection is temporarily closed"
 	case !assigned:
 		preview.Blocked = "plan changes are not available for this team yet"
 	case terms.Retired:
@@ -568,7 +575,7 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 		return teamPlan{}, err
 	}
 	defer tx.Rollback(ctx)
-	version, entryOpen, err := lockPricingEntry(ctx, tx)
+	admission, err := lockTeamPricingEntry(ctx, tx, team)
 	if err != nil {
 		return teamPlan{}, err
 	}
@@ -585,7 +592,7 @@ func (h *Handlers) assignStaffPlan(ctx context.Context, team, actor uuid.UUID, b
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return teamPlan{}, err
 	}
-	if version != "v2" || !entryOpen {
+	if admission.Version != "v2" || !admission.EntryOpen {
 		return teamPlan{}, errPricingV2Off
 	}
 	// The team lock also fences checkout activation and plan-change workers.

@@ -176,7 +176,7 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		respondError(c, ErrInternal)
 		return
 	}
-	admission, err := h.publicPricingState(c.Request.Context())
+	admission, err := h.teamPricingState(c.Request.Context(), team)
 	if err != nil {
 		respondError(c, ErrInternal)
 		return
@@ -395,9 +395,9 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		params.Metadata = map[string]string{"activation_user_id": actor.String(), "checkout_generation": generation.Format(time.RFC3339Nano), "commercial_offer": offer.Key}
 		params.IdempotencyKey = "pro:" + checkoutSessionIdempotencyKeyForLease(team, customer, success, cancelURL, append(append([]string{}, prices...), offer.Price), generation)
 		payload, _ := json.Marshal(params)
-		_, err = tx.Exec(ctx, `UPDATE billing_signup_choice SET state='pending',offer_key=$2,base_price_id=$3,generation=$4,actor_id=$5,request_payload=$6,revision=revision+1,next_check_at=now() WHERE team_id=$1`, team, offer.Key, offer.Price, generation, actor, payload)
+		_, err = tx.Exec(ctx, `UPDATE billing_signup_choice SET state='pending',offer_key=$2,base_price_id=$3,generation=$4,actor_id=$5,request_payload=$6,revision=revision+1,next_check_at=now(),admission_source=$7,admission_epoch=$8 WHERE team_id=$1`, team, offer.Key, offer.Price, generation, actor, payload, pricingSource(admission), pricingEpoch(admission))
 		if err == nil {
-			_, err = tx.Exec(ctx, `UPDATE team_billing_account SET checkout_initializing_at=$2,checkout_request_key=$3,checkout_pending_attempt_ids=ARRAY[$4::uuid],checkout_may_exist=false,stripe_checkout_actor_id=$5,stripe_checkout_actor_claimed_at=$2,checkout_anchor_snapshot=commercial_billing_anchor WHERE team_id=$1`, team, generation, params.IdempotencyKey, attempt, actor)
+			_, err = tx.Exec(ctx, `UPDATE team_billing_account SET checkout_initializing_at=$2,checkout_request_key=$3,checkout_pending_attempt_ids=ARRAY[$4::uuid],checkout_may_exist=false,stripe_checkout_actor_id=$5,stripe_checkout_actor_claimed_at=$2,checkout_anchor_snapshot=commercial_billing_anchor,checkout_admission_source=$6,checkout_admission_epoch=$7,checkout_admission_attempt=$4 WHERE team_id=$1`, team, generation, params.IdempotencyKey, attempt, actor, pricingSource(admission), pricingEpoch(admission))
 		}
 		choice = proChoice{Team: team, Offer: offer.Key, Price: offer.Price, Actor: actor, Generation: generation, Payload: payload}
 	} else {

@@ -38,8 +38,11 @@ const prepaidPurchaseJSON = `jsonb_build_object('id',p.id,'team_id',p.team_id,'s
      'revoke_closed_unexecuted',d.revoked_at IS NULL AND d.revoke_retry_after IS NOT DISTINCT FROM 'infinity') ORDER BY d.version),'[]') FROM billing_prepaid_reversal_decision d WHERE d.purchase_id=r.purchase_id))
   FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id))`
 
-const prepaidAutoRechargeJSON = `jsonb_build_object('enabled',COALESCE(a.enabled,false),'threshold_cents',a.threshold_cents,'amount_cents',a.amount_cents,
- 'disabled_reason',a.disabled_reason,'disabled_at',a.disabled_at,
+const prepaidAutoRechargeCapExceededSQL = `(a.amount_cents>1000000 OR a.threshold_cents>1000000)`
+const prepaidAutoRechargeEnabledSQL = `(COALESCE(a.enabled,false) AND NOT ` + prepaidAutoRechargeCapExceededSQL + `)`
+
+const prepaidAutoRechargeJSON = `jsonb_build_object('enabled',` + prepaidAutoRechargeEnabledSQL + `,'threshold_cents',a.threshold_cents,'amount_cents',a.amount_cents,
+ 'disabled_reason',CASE WHEN a.enabled AND ` + prepaidAutoRechargeCapExceededSQL + ` THEN '` + prepaidAutoRechargeCapReason + `' ELSE a.disabled_reason END,'disabled_at',a.disabled_at,
  'in_flight',EXISTS(SELECT 1 FROM billing_prepaid_purchase q WHERE q.team_id=t.team_id AND q.source='auto_recharge' AND q.payment_state IN ('pending','uncertain','processing')))`
 
 func (h *Handlers) prepaidSummary(ctx context.Context, team uuid.UUID, purchases int) ([]byte, error) {
@@ -47,7 +50,7 @@ func (h *Handlers) prepaidSummary(ctx context.Context, team uuid.UUID, purchases
 	err := h.Pool.QueryRow(ctx, `SELECT jsonb_build_object(
  'checkout_idempotency_supported',true,
  'balance_cents',CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END,
- 'low_balance',(CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END)<500 AND NOT COALESCE(a.enabled,false),
+ 'low_balance',(CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END)<500 AND NOT `+prepaidAutoRechargeEnabledSQL+`,
  'auto_recharge',`+prepaidAutoRechargeJSON+`,
  'has_saved_card',COALESCE(f.payment_method_ready,false),
  'purchases',(SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.created_at DESC),'[]') FROM
@@ -86,7 +89,7 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 	}
 	var req prepaidCheckoutBody
 	if err = c.ShouldBindJSON(&req); err != nil || !validPrepaidAmount(req.AmountCents) {
-		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 100000000", http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 1000000", http.StatusBadRequest)
 		return
 	}
 	ctx := c.Request.Context()
@@ -100,12 +103,12 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		return handled || resumeErr != nil
 	}
 	acceptedRedirects := false
-	if req.OperationID != uuid.Nil {
-		for _, raw := range []*string{&req.SuccessURL, &req.CancelURL} {
-			if parsed, parseErr := url.Parse(strings.TrimSpace(*raw)); parseErr == nil {
-				*raw = parsed.String()
-			}
+	for _, raw := range []*string{&req.SuccessURL, &req.CancelURL} {
+		if parsed, parseErr := url.Parse(strings.TrimSpace(*raw)); parseErr == nil {
+			*raw = parsed.String()
 		}
+	}
+	if req.OperationID != uuid.Nil {
 		acceptedRedirects, err = h.acceptedPrepaidCheckoutOperation(ctx, team, actor, req)
 		if err != nil {
 			if errors.Is(err, errPrepaidOperationConflict) {
@@ -118,6 +121,60 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		if acceptedRedirects && recoverOperation() {
 			return
 		}
+	}
+
+	var acceptedLease *implicitPrepaidLease
+	if req.OperationID == uuid.Nil {
+		acceptedLease, err = h.acceptedImplicitPrepaidLease(ctx, team, actor, req)
+		if err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if acceptedLease == nil {
+			retained, statusErr := h.retainedImplicitPrepaidPurchase(ctx, team, actor, req)
+			if statusErr != nil {
+				respondError(c, ErrInternal)
+				return
+			}
+			if retained != nil {
+				// A historical request hash cannot distinguish changed provider
+				// prices from changed URLs. Expose status without replay authority.
+				c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: retained.PurchaseID, State: "pending"})
+				return
+			}
+		}
+	}
+	// A proven first-purchase lease resumes its accepted payment before policies
+	// that only admit new purchases. The dispatch path rechecks the locked lease.
+	if acceptedLease != nil {
+		var managed, proPending bool
+		if err = h.Pool.QueryRow(ctx, `SELECT qm_team_managed_billing($1),EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers+`)`, team).Scan(&managed, &proPending); err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		// Conflicting managed or Pro authority retains the original payment
+		// status without bypassing the subscription-account SQL guards.
+		if managed || proPending || client == nil {
+			c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: acceptedLease.PurchaseID, State: "pending"})
+			return
+		}
+		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, acceptedRedirects: true, acceptedLease: acceptedLease})
+		return
+	}
+	if !acceptedRedirects && acceptedLease == nil {
+		admission, admissionErr := h.teamPricingState(ctx, team)
+		if admissionErr != nil {
+			respondErrorMsg(c, "service_unavailable", "team plan admission requires verification", 503)
+			return
+		}
+		if admission.Version != "v2" || !admission.EntryOpen {
+			respondErrorMsg(c, "conflict", "new credit purchases are not available for this team", 409)
+			return
+		}
+	}
+	if !acceptedRedirects && acceptedLease == nil && !validNewPrepaidAmount(req.AmountCents) {
+		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 1000000", http.StatusBadRequest)
+		return
 	}
 	// Managed billing and other entry policies govern new dispatch, while an
 	// already accepted payment remains recoverable under its immutable identity.
@@ -185,7 +242,13 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		return
 	}
 	if !billingAccountHasEstablishedSubscription(account) {
-		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, OperationID: req.OperationID, acceptedRedirects: acceptedRedirects})
+		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, OperationID: req.OperationID, acceptedRedirects: acceptedRedirects || acceptedLease != nil, acceptedLease: acceptedLease})
+		return
+	}
+	// An accepted first-purchase retry cannot turn into a second payment if
+	// subscription completion races the read-only lease proof.
+	if acceptedLease != nil {
+		c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: acceptedLease.PurchaseID, State: "pending"})
 		return
 	}
 	successURL, cancelURL := req.SuccessURL, req.CancelURL
@@ -240,8 +303,8 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 		return
 	}
 	if req.Enabled {
-		if !validPrepaidAmount(req.ThresholdCents) || !validPrepaidAmount(req.AmountCents) {
-			respondErrorMsg(c, "bad_request", "threshold_cents and amount_cents must be multiples of 500 between 500 and 100000000", http.StatusBadRequest)
+		if !validNewPrepaidAmount(req.ThresholdCents) || !validNewPrepaidAmount(req.AmountCents) {
+			respondErrorMsg(c, "bad_request", "threshold_cents and amount_cents must be multiples of 500 between 500 and 1000000", http.StatusBadRequest)
 			return
 		}
 	}
@@ -252,10 +315,9 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	var rawVersion string
-	var entryOpen bool
+	var admission pricingPublicState
 	if req.Enabled {
-		rawVersion, entryOpen, err = lockPricingEntry(ctx, tx)
+		admission, err = lockTeamPricingEntry(ctx, tx, team)
 		if err != nil {
 			respondError(c, ErrInternal)
 			return
@@ -274,12 +336,12 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-		if !replay && (rawVersion != "v2" || !entryOpen) {
+		if !replay && (admission.Version != "v2" || !admission.EntryOpen) {
 			respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 			return
 		}
 		if !replay {
-			if err = assertPrepaidEntry(ctx, tx); err != nil {
+			if err = assertPrepaidEntry(ctx, tx, team); err != nil {
 				if errors.Is(err, errPricingV2Off) {
 					respondErrorMsg(c, "conflict", "pricing v2 entry is not released", http.StatusConflict)
 				} else {
@@ -305,9 +367,9 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 				respondErrorMsg(c, "conflict", "auto-recharge needs a card saved by an earlier credit purchase", http.StatusConflict)
 				return
 			}
-			_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,updated_by) VALUES($1,true,$2,$3,$4)
+			_, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,updated_by,admission_source,admission_epoch) VALUES($1,true,$2,$3,$4,$5,$6)
  ON CONFLICT(team_id) DO UPDATE SET enabled=true,threshold_cents=$2,amount_cents=$3,updated_by=$4,updated_at=clock_timestamp(),
-  disabled_reason=NULL,disabled_at=NULL,disabled_by=NULL,notified_at=NULL`, team, req.ThresholdCents, req.AmountCents, actor)
+  disabled_reason=NULL,disabled_at=NULL,disabled_by=NULL,notified_at=NULL,admission_source=EXCLUDED.admission_source,admission_epoch=EXCLUDED.admission_epoch`, team, req.ThresholdCents, req.AmountCents, actor, pricingSource(admission), pricingEpoch(admission))
 		}
 	}
 	if err != nil {

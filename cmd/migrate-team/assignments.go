@@ -76,7 +76,11 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, spec tableSp
 	if err := tx.QueryRow(ctx, `SELECT pricing_version FROM billing_pricing_switch WHERE singleton FOR SHARE`).Scan(&pricing); err != nil {
 		return 0, 0, err
 	}
-	if pricing == "v2" {
+	var newCohortOpen bool
+	if err := tx.QueryRow(ctx, `SELECT billing_new_team_ready()`).Scan(&newCohortOpen); err != nil {
+		return 0, 0, err
+	}
+	if pricing == "v2" || newCohortOpen {
 		return 0, 0, fmt.Errorf("regional team import is unavailable while pricing v2 is active")
 	}
 	payload, count, err := assignmentSnapshot(ctx, src, team)

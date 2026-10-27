@@ -312,7 +312,7 @@ WHERE team_billing_account.team_id = $4
       SELECT 1 FROM stripe_promotion_migration_fence f
       WHERE f.team_id = $4
   )
-RETURNING team_billing_account.team_id, team_billing_account.stripe_customer_id, team_billing_account.stripe_subscription_id, team_billing_account.stripe_subscription_status, team_billing_account.current_period_start, team_billing_account.current_period_end, team_billing_account.cancel_at_period_end, team_billing_account.created_at, team_billing_account.updated_at, team_billing_account.stripe_invoice_status, team_billing_account.stripe_subscription_event_at, team_billing_account.trial_ended_at, team_billing_account.stripe_activation_credit_granted_at, team_billing_account.stripe_activation_credit_grant_id, team_billing_account.commercial_billing_anchor, team_billing_account.checkout_initializing_at, team_billing_account.checkout_anchor_snapshot, team_billing_account.checkout_session_id, team_billing_account.checkout_subscription_id, team_billing_account.checkout_completed_at, team_billing_account.checkout_request_key, team_billing_account.checkout_pending_attempt_ids, team_billing_account.checkout_may_exist, team_billing_account.stripe_activation_user_id, team_billing_account.stripe_activation_credit_reserved_at, team_billing_account.stripe_activation_credit_reservation_event_id, team_billing_account.stripe_checkout_actor_id, team_billing_account.stripe_checkout_actor_claimed_at, team_billing_account.stripe_activation_identity_key, team_billing_account.stripe_checkout_identity_evidence_version, team_billing_account.stripe_activation_identity_evidence_version
+RETURNING team_billing_account.team_id, team_billing_account.stripe_customer_id, team_billing_account.stripe_subscription_id, team_billing_account.stripe_subscription_status, team_billing_account.current_period_start, team_billing_account.current_period_end, team_billing_account.cancel_at_period_end, team_billing_account.created_at, team_billing_account.updated_at, team_billing_account.stripe_invoice_status, team_billing_account.stripe_subscription_event_at, team_billing_account.trial_ended_at, team_billing_account.stripe_activation_credit_granted_at, team_billing_account.stripe_activation_credit_grant_id, team_billing_account.commercial_billing_anchor, team_billing_account.checkout_initializing_at, team_billing_account.checkout_anchor_snapshot, team_billing_account.checkout_session_id, team_billing_account.checkout_subscription_id, team_billing_account.checkout_completed_at, team_billing_account.checkout_request_key, team_billing_account.checkout_pending_attempt_ids, team_billing_account.checkout_may_exist, team_billing_account.stripe_activation_user_id, team_billing_account.stripe_activation_credit_reserved_at, team_billing_account.stripe_activation_credit_reservation_event_id, team_billing_account.stripe_checkout_actor_id, team_billing_account.stripe_checkout_actor_claimed_at, team_billing_account.stripe_activation_identity_key, team_billing_account.stripe_checkout_identity_evidence_version, team_billing_account.stripe_activation_identity_evidence_version, team_billing_account.checkout_admission_source, team_billing_account.checkout_admission_epoch, team_billing_account.checkout_admission_attempt
 `
 
 type BeginTeamBillingCheckoutParams struct {
@@ -362,6 +362,9 @@ func (q *Queries) BeginTeamBillingCheckout(ctx context.Context, arg BeginTeamBil
 		&i.StripeActivationIdentityKey,
 		&i.StripeCheckoutIdentityEvidenceVersion,
 		&i.StripeActivationIdentityEvidenceVersion,
+		&i.CheckoutAdmissionSource,
+		&i.CheckoutAdmissionEpoch,
+		&i.CheckoutAdmissionAttempt,
 	)
 	return i, err
 }
@@ -1512,7 +1515,7 @@ func (q *Queries) GetTeamBillingChargeableUsage(ctx context.Context, arg GetTeam
 }
 
 const getTeamBillingCheckoutForRecovery = `-- name: GetTeamBillingCheckoutForRecovery :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, checkout_subscription_id, checkout_completed_at, checkout_request_key, checkout_pending_attempt_ids, checkout_may_exist, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_identity_key, stripe_checkout_identity_evidence_version, stripe_activation_identity_evidence_version FROM team_billing_account WHERE team_id = $1
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, checkout_subscription_id, checkout_completed_at, checkout_request_key, checkout_pending_attempt_ids, checkout_may_exist, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_identity_key, stripe_checkout_identity_evidence_version, stripe_activation_identity_evidence_version, checkout_admission_source, checkout_admission_epoch, checkout_admission_attempt FROM team_billing_account WHERE team_id = $1
 `
 
 func (q *Queries) GetTeamBillingCheckoutForRecovery(ctx context.Context, teamID uuid.UUID) (TeamBillingAccount, error) {
@@ -1550,6 +1553,9 @@ func (q *Queries) GetTeamBillingCheckoutForRecovery(ctx context.Context, teamID 
 		&i.StripeActivationIdentityKey,
 		&i.StripeCheckoutIdentityEvidenceVersion,
 		&i.StripeActivationIdentityEvidenceVersion,
+		&i.CheckoutAdmissionSource,
+		&i.CheckoutAdmissionEpoch,
+		&i.CheckoutAdmissionAttempt,
 	)
 	return i, err
 }
@@ -3094,7 +3100,7 @@ func (q *Queries) LockStripeWebhookProcessingLease(ctx context.Context, arg Lock
 }
 
 const lockTeamBillingCheckoutForRecovery = `-- name: LockTeamBillingCheckoutForRecovery :one
-SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, checkout_subscription_id, checkout_completed_at, checkout_request_key, checkout_pending_attempt_ids, checkout_may_exist, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_identity_key, stripe_checkout_identity_evidence_version, stripe_activation_identity_evidence_version FROM team_billing_account
+SELECT team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, checkout_subscription_id, checkout_completed_at, checkout_request_key, checkout_pending_attempt_ids, checkout_may_exist, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_identity_key, stripe_checkout_identity_evidence_version, stripe_activation_identity_evidence_version, checkout_admission_source, checkout_admission_epoch, checkout_admission_attempt FROM team_billing_account
 WHERE team_id = $1
   AND stripe_checkout_actor_id = $2
   AND checkout_initializing_at = $3
@@ -3160,6 +3166,9 @@ func (q *Queries) LockTeamBillingCheckoutForRecovery(ctx context.Context, arg Lo
 		&i.StripeActivationIdentityKey,
 		&i.StripeCheckoutIdentityEvidenceVersion,
 		&i.StripeActivationIdentityEvidenceVersion,
+		&i.CheckoutAdmissionSource,
+		&i.CheckoutAdmissionEpoch,
+		&i.CheckoutAdmissionAttempt,
 	)
 	return i, err
 }
@@ -3875,7 +3884,7 @@ WHERE team_billing_account.team_id = $2
   -- Keep replays within Stripe's idempotency retention and leave at least
   -- 30 minutes before expires_at, even if request validation runs again.
   AND checkout_initializing_at > now() - interval '23 hours'
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, checkout_subscription_id, checkout_completed_at, checkout_request_key, checkout_pending_attempt_ids, checkout_may_exist, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_identity_key, stripe_checkout_identity_evidence_version, stripe_activation_identity_evidence_version
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, checkout_subscription_id, checkout_completed_at, checkout_request_key, checkout_pending_attempt_ids, checkout_may_exist, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_identity_key, stripe_checkout_identity_evidence_version, stripe_activation_identity_evidence_version, checkout_admission_source, checkout_admission_epoch, checkout_admission_attempt
 `
 
 type ResumeTeamBillingCheckoutParams struct {
@@ -3925,6 +3934,9 @@ func (q *Queries) ResumeTeamBillingCheckout(ctx context.Context, arg ResumeTeamB
 		&i.StripeActivationIdentityKey,
 		&i.StripeCheckoutIdentityEvidenceVersion,
 		&i.StripeActivationIdentityEvidenceVersion,
+		&i.CheckoutAdmissionSource,
+		&i.CheckoutAdmissionEpoch,
+		&i.CheckoutAdmissionAttempt,
 	)
 	return i, err
 }
@@ -4252,7 +4264,7 @@ VALUES ($1, $2)
 ON CONFLICT (team_id) DO UPDATE
 SET stripe_customer_id = EXCLUDED.stripe_customer_id,
     updated_at = now()
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, checkout_subscription_id, checkout_completed_at, checkout_request_key, checkout_pending_attempt_ids, checkout_may_exist, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_identity_key, stripe_checkout_identity_evidence_version, stripe_activation_identity_evidence_version
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, checkout_subscription_id, checkout_completed_at, checkout_request_key, checkout_pending_attempt_ids, checkout_may_exist, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_identity_key, stripe_checkout_identity_evidence_version, stripe_activation_identity_evidence_version, checkout_admission_source, checkout_admission_epoch, checkout_admission_attempt
 `
 
 type UpsertTeamBillingAccountCustomerParams struct {
@@ -4295,6 +4307,9 @@ func (q *Queries) UpsertTeamBillingAccountCustomer(ctx context.Context, arg Upse
 		&i.StripeActivationIdentityKey,
 		&i.StripeCheckoutIdentityEvidenceVersion,
 		&i.StripeActivationIdentityEvidenceVersion,
+		&i.CheckoutAdmissionSource,
+		&i.CheckoutAdmissionEpoch,
+		&i.CheckoutAdmissionAttempt,
 	)
 	return i, err
 }
@@ -4335,7 +4350,7 @@ SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_acco
     commercial_billing_anchor = COALESCE(team_billing_account.commercial_billing_anchor, EXCLUDED.commercial_billing_anchor),
     cancel_at_period_end = COALESCE($10, team_billing_account.cancel_at_period_end),
     updated_at = now()
-RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, checkout_subscription_id, checkout_completed_at, checkout_request_key, checkout_pending_attempt_ids, checkout_may_exist, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_identity_key, stripe_checkout_identity_evidence_version, stripe_activation_identity_evidence_version
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, checkout_subscription_id, checkout_completed_at, checkout_request_key, checkout_pending_attempt_ids, checkout_may_exist, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at, stripe_activation_identity_key, stripe_checkout_identity_evidence_version, stripe_activation_identity_evidence_version, checkout_admission_source, checkout_admission_epoch, checkout_admission_attempt
 `
 
 type UpsertTeamBillingAccountSubscriptionParams struct {
@@ -4397,6 +4412,9 @@ func (q *Queries) UpsertTeamBillingAccountSubscription(ctx context.Context, arg 
 		&i.StripeActivationIdentityKey,
 		&i.StripeCheckoutIdentityEvidenceVersion,
 		&i.StripeActivationIdentityEvidenceVersion,
+		&i.CheckoutAdmissionSource,
+		&i.CheckoutAdmissionEpoch,
+		&i.CheckoutAdmissionAttempt,
 	)
 	return i, err
 }

@@ -140,6 +140,24 @@ CREATE EVENT TRIGGER delay_index_build ON ddl_command_start
             with self.assertRaises(migration.MigrationError):
                 self.invoke("preflight")
 
+    def test_unexpected_native_principal_cannot_create_history_or_effect(self):
+        self.sql("CREATE ROLE migration_guard_test LOGIN SUPERUSER")
+        wrong_url = self.url.replace("postgres@", "migration_guard_test@")
+        (self.source / "20990101000001_effect.sql").write_text("CREATE TABLE forbidden_effect(id int);")
+        with patch.object(migration, "verify_connection_identity"), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(migration.MigrationError, "current_user_ok=false.*session_user_ok=false"):
+                migration.migrate("staging", "push", wrong_url, root=self.root, cli=cli_test.CLI)
+        self.assertEqual(self.sql("SELECT to_regclass('forbidden_effect') IS NULL AND "
+                                  "to_regclass('supabase_migrations.schema_migrations') IS NULL"), "t")
+        # Independently exercise the CLI's actual migration-session guard.
+        (self.project / "supabase/roles.sql").write_text(migration.EXECUTION_GUARD)
+        (self.migrations / "20990101000001_effect.sql").write_text("CREATE TABLE forbidden_effect(id int);")
+        with self.assertRaisesRegex(migration.MigrationError, "execution_principal"):
+            migration.cli_run(cli_test.CLI, migration.bounded_url(wrong_url), self.project,
+                              ["db", "push", "--yes", "--include-roles"])
+        self.assertEqual(self.sql("SELECT to_regclass('forbidden_effect') IS NULL AND "
+                                  "to_regclass('supabase_migrations.schema_migrations') IS NULL"), "t")
+
     def test_timeout_releases_reader_and_preserves_committed_prefix(self):
         self.sql("CREATE TABLE guard(id int)")
         (self.source / "20990101000001_prefix.sql").write_text("CREATE TABLE committed_prefix(id int);")

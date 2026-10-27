@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +41,76 @@ func (h *Handlers) acceptedPrepaidCheckoutOperation(ctx context.Context, team, a
 		return false, errPrepaidOperationConflict
 	}
 	return accepted, nil
+}
+
+// The optional-operation legacy route derives purchase identity from its accepted
+// lease. Only the exact original request may replay provider dispatch; a weaker
+// retained-purchase proof exposes status without granting dispatch authority.
+type implicitPrepaidLease struct {
+	PurchaseID           uuid.UUID
+	Generation           time.Time
+	Customer, RequestKey string
+}
+
+// This proves an existing purchase for status only. Provider dispatch also
+// requires the complete request-key proof in acceptedImplicitPrepaidLease.
+func (h *Handlers) retainedImplicitPrepaidPurchase(ctx context.Context, team, actor uuid.UUID, req prepaidCheckoutBody) (*implicitPrepaidLease, error) {
+	account, err := h.DB.GetTeamBillingCheckoutForRecovery(ctx, team)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !account.CheckoutInitializingAt.Valid || !account.StripeCheckoutActorID.Valid || uuid.UUID(account.StripeCheckoutActorID.Bytes) != actor || account.CheckoutRequestKey == nil || derefString(account.StripeCustomerID) == "" {
+		return nil, nil
+	}
+	purchase := prepaidCheckoutPurchaseID(team, account.CheckoutInitializingAt.Time, req.AmountCents)
+	var accepted bool
+	err = h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE id=$1 AND team_id=$2 AND actor_id=$3 AND customer_id=$4 AND amount_cents=$5 AND source='checkout')`, purchase, team, actor, derefString(account.StripeCustomerID), req.AmountCents).Scan(&accepted)
+	if err != nil || !accepted {
+		return nil, err
+	}
+	return &implicitPrepaidLease{PurchaseID: purchase, Generation: account.CheckoutInitializingAt.Time, Customer: derefString(account.StripeCustomerID), RequestKey: *account.CheckoutRequestKey}, nil
+}
+
+func (h *Handlers) acceptedImplicitPrepaidLease(ctx context.Context, team, actor uuid.UUID, req prepaidCheckoutBody) (*implicitPrepaidLease, error) {
+	retained, err := h.retainedImplicitPrepaidPurchase(ctx, team, actor, req)
+	if err != nil || retained == nil {
+		return nil, err
+	}
+	success, err := url.Parse(strings.TrimSpace(req.SuccessURL))
+	if err != nil {
+		return nil, nil
+	}
+	cancel, err := url.Parse(strings.TrimSpace(req.CancelURL))
+	if err != nil {
+		return nil, nil
+	}
+	// Legacy request keys delimit URL fields with a literal pipe. Such URLs
+	// cannot prove their field boundaries, so retain their admission policy.
+	if strings.Contains(success.String(), "|") || strings.Contains(cancel.String(), "|") {
+		if _, err := h.validateBillingRedirectURL(success.String()); err != nil {
+			return nil, nil
+		}
+		if _, err := h.validateBillingRedirectURL(cancel.String()); err != nil {
+			return nil, nil
+		}
+	}
+	storage, err := h.billingStorageBillingEnabled(ctx, team)
+	if err != nil {
+		return nil, err
+	}
+	prices, err := billingCheckoutPriceIDs(h.billingResourceStates(storage))
+	if err != nil {
+		return nil, nil
+	}
+	prices = append(prices, "prepaid:"+strconv.FormatInt(req.AmountCents, 10))
+	key := checkoutSessionIdempotencyKey(team, retained.Customer, success.String(), cancel.String(), prices)
+	if retained.RequestKey != key {
+		return nil, nil
+	}
+	return retained, nil
 }
 
 func (h *Handlers) bindPrepaidCheckoutOperation(ctx context.Context, team, actor uuid.UUID, req prepaidCheckoutBody) error {
