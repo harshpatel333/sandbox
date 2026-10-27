@@ -86,7 +86,7 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 	}
 	var req prepaidCheckoutBody
 	if err = c.ShouldBindJSON(&req); err != nil || !validPrepaidAmount(req.AmountCents) {
-		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 100000000", http.StatusBadRequest)
+		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 1000000", http.StatusBadRequest)
 		return
 	}
 	ctx := c.Request.Context()
@@ -118,6 +118,10 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		if acceptedRedirects && recoverOperation() {
 			return
 		}
+	}
+	if !acceptedRedirects && !validNewPrepaidAmount(req.AmountCents) {
+		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 1000000", http.StatusBadRequest)
+		return
 	}
 	// Managed billing and other entry policies govern new dispatch, while an
 	// already accepted payment remains recoverable under its immutable identity.
@@ -240,8 +244,8 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 		return
 	}
 	if req.Enabled {
-		if !validPrepaidAmount(req.ThresholdCents) || !validPrepaidAmount(req.AmountCents) {
-			respondErrorMsg(c, "bad_request", "threshold_cents and amount_cents must be multiples of 500 between 500 and 100000000", http.StatusBadRequest)
+		if !validNewPrepaidAmount(req.ThresholdCents) || !validNewPrepaidAmount(req.AmountCents) {
+			respondErrorMsg(c, "bad_request", "threshold_cents and amount_cents must be multiples of 500 between 500 and 1000000", http.StatusBadRequest)
 			return
 		}
 	}

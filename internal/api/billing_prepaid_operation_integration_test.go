@@ -710,3 +710,96 @@ func TestPrepaidManagedFirstSubscriptionPreservesPaidHoldingBoundary(t *testing.
 		t.Fatalf("held checkout produced new effects: sessions=%d grants=%d", sessions, grants)
 	}
 }
+
+func TestPrepaidCheckoutNewAmountCapPreservesAcceptedOperation(t *testing.T) {
+	f := newPrepaidFixture(t)
+	actor := uuid.New()
+	r := prepaidOperationRouter(t, f, f.team, actor)
+	req := prepaidCheckoutBody{OperationID: uuid.New(), AmountCents: 1000500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+	if rec := prepaidOperationPost(r, req); rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized new checkout: %d %s", rec.Code, rec.Body)
+	}
+	if len(f.rows()) != 0 || len(f.sessions) != 0 {
+		t.Fatal("rejected request created purchase or provider session")
+	}
+	// The same amount can have been accepted before the cap changed. Its frozen
+	// operation must remain recoverable rather than creating another payment.
+	if err := f.h.bindPrepaidCheckoutOperation(t.Context(), f.team, actor, req); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := f.h.startPrepaidPaymentCheckout(t.Context(), f.client, f.team, actor, f.customer, req.AmountCents, req.SuccessURL, req.CancelURL, req.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := prepaidOperationPost(r, req)
+	var got prepaidOperationResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.ID != saved.ID || got.PurchaseID != req.OperationID {
+		t.Fatalf("accepted oversized replay: %d %s", rec.Code, rec.Body)
+	}
+	if len(f.rows()) != 1 || len(f.sessions) != 1 {
+		t.Fatal("replay created another purchase or session")
+	}
+}
+
+func TestPrepaidCheckoutMaximumIsInclusive(t *testing.T) {
+	f := newPrepaidFixture(t)
+	actor := uuid.New()
+	r := prepaidOperationRouter(t, f, f.team, actor)
+	req := prepaidCheckoutBody{OperationID: uuid.New(), AmountCents: 1000000, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+	rec := prepaidOperationPost(r, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("maximum checkout: %d %s", rec.Code, rec.Body)
+	}
+	if rows := f.rows(); len(rows) != 1 || rows[0].Amount != 1000000 {
+		t.Fatalf("wrong purchase: %+v", rows)
+	}
+}
+
+func TestPrepaidAutoRechargeSettingsMaximumAndDisable(t *testing.T) {
+	f := newPrepaidFixture(t)
+	actor := uuid.New()
+	r := prepaidOperationRouter(t, f, f.team, actor)
+	r.PUT("/billing/prepaid/auto-recharge", func(c *gin.Context) {
+		c.Set("team_id", f.team.String())
+		c.Set("actor_id", actor)
+		f.h.PutPrepaidAutoRecharge(c)
+	})
+	put := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/billing/prepaid/auto-recharge", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+	for _, body := range []string{`{"enabled":true,"threshold_cents":500,"amount_cents":1000500}`, `{"enabled":true,"threshold_cents":1000500,"amount_cents":500}`} {
+		rec := put(body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("oversized settings: %d %s", rec.Code, rec.Body)
+		}
+	}
+	if rec := put(`{"enabled":true,"threshold_cents":500,"amount_cents":1000000}`); rec.Code != http.StatusOK {
+		t.Fatalf("inclusive settings maximum: %d %s", rec.Code, rec.Body)
+	}
+	f.enableAutoRecharge(500, 1000500)
+	if rec := put(`{"enabled":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("disable oversized settings: %d %s", rec.Code, rec.Body)
+	}
+	var enabled bool
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT enabled FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&enabled); err != nil || enabled {
+		t.Fatal("disable failed", err)
+	}
+}
+
+func TestPrepaidAcceptedOversizedAutoRechargeStillSettles(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(2000, 1000500)
+	f.observe(1500, true)
+	f.exec(`INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,payment_idempotency_key,credit_idempotency_key,payment_request)
+ VALUES($1,$2,'auto_recharge',1000500,'','',jsonb_build_object('customer',$2::text,'payment_method','pm_example','amount_cents',1000500))`, f.team, f.customer)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if rows := f.rows(); len(rows) != 1 || rows[0].Payment != "succeeded" || rows[0].Credit != "issued" || rows[0].Amount != 1000500 {
+		t.Fatalf("accepted oversized auto charge changed: %+v", rows)
+	}
+}

@@ -1783,3 +1783,36 @@ func TestPrepaidEnforcementRejectsUnboundPostGrantZero(t *testing.T) {
 		})
 	}
 }
+
+func TestPrepaidAutoRechargeAmountCapPreservesAcceptedPayment(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(2000, 1000500)
+	f.observe(1500, true)
+	if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.rows()) != 0 {
+		t.Fatal("oversized saved settings created a new charge")
+	}
+	var enabled bool
+	var amount int64
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT enabled,amount_cents FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&enabled, &amount); err != nil || !enabled || amount != 1000500 {
+		t.Fatal("existing settings were rewritten", err)
+	}
+	f.enableAutoRecharge(2000, 1000000)
+	if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if rows := f.rows(); len(rows) != 1 || rows[0].Amount != 1000000 {
+		t.Fatalf("inclusive cap charge: %+v", rows)
+	}
+	// An immutable charge accepted under earlier settings must still settle even
+	// when the current setting exceeds the new-entry limit.
+	f.enableAutoRecharge(2000, 1000500)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if rows := f.rows(); len(rows) != 1 || rows[0].Payment != "succeeded" || rows[0].Credit != "issued" || rows[0].Amount != 1000000 {
+		t.Fatalf("accepted charge recovery: %+v", rows)
+	}
+}
