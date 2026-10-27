@@ -360,14 +360,19 @@ func TestRoutingBootstrapHoldsDataPlaneUntilReady(t *testing.T) {
 
 func TestRoutingBootstrapRefusesHeldRequestWhenDeadlineOpensGate(t *testing.T) {
 	var ready, dispatched atomic.Bool
-	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched.Store(true) }), ready.Load, func() bool { return false })
+	var checks atomic.Int32
+	readyCheck := func() bool { checks.Add(1); return ready.Load() }
+	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched.Store(true) }), readyCheck, func() bool { return false })
 	done := make(chan struct{})
 	w := httptest.NewRecorder()
 	go func() {
 		gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/exec", nil))
 		close(done)
 	}()
-	time.Sleep(3 * routingBootstrapPoll)
+	// The second check comes from the shared poller, so the request is held.
+	for checks.Load() < 2 {
+		time.Sleep(time.Millisecond)
+	}
 	ready.Store(true)
 	<-done
 	if dispatched.Load() || w.Code != http.StatusServiceUnavailable {
