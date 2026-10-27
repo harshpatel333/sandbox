@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type legacyAdmissionStripe struct {
@@ -279,5 +280,35 @@ func TestPlanAssignmentLegacyCheckoutSerializesAssignmentBeforeFreshAdmission(t 
 				}
 			})
 		}
+	}
+}
+
+func TestPlanAssignmentLegacyCheckoutTrustedLockTimeout(t *testing.T) {
+	f, actor := legacyAdmissionFixture(t, planKindLegacyPAYG)
+	tx, err := f.h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err = tx.Exec(t.Context(), `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-user:' || $1::text)::bigint)`, actor); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	_, err = f.h.beginLegacyCheckout(ctx, f.team, actor, legacyAdmissionRequest(true), "fixture-timeout", uuid.New(), true)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("trusted contention did not use lock timeout: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 8*time.Second {
+		t.Fatalf("trusted lock wait exceeded timeout: %v", elapsed)
+	}
+	if err = tx.Rollback(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var fresh bool
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT checkout_initializing_at IS NULL AND checkout_request_key IS NULL FROM team_billing_account WHERE team_id=$1`, f.team).Scan(&fresh); err != nil || !fresh {
+		t.Fatalf("timed out checkout left a fence: %v", err)
 	}
 }

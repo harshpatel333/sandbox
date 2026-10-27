@@ -40,6 +40,11 @@ func (h *Handlers) beginLegacyCheckout(ctx context.Context, team, actor uuid.UUI
 		return account, err
 	}
 	defer tx.Rollback(ctx)
+	if trusted {
+		if _, err = tx.Exec(ctx, `SET LOCAL lock_timeout = '5s'`); err != nil {
+			return account, err
+		}
+	}
 	// Keep the identity -> account lock order of both existing checkout writers.
 	if trusted && req.Decision == "publication_failed" {
 		_, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-user:' || $1::text)::bigint)`, actor)
