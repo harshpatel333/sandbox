@@ -347,3 +347,58 @@ func TestPrepaidFundedSubscriptionUpgradeGrantStartsEnforcement(t *testing.T) {
 		t.Fatal("an observed first-cycle upgrade grant did not start enforcement", prepaid, err)
 	}
 }
+
+func TestProInvoiceCashFundedUpgradeCollectsDespiteSettledTopoff(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		funded bool
+		source string
+		valid  bool
+	}{
+		{"funded top-off", true, "auto_recharge", true},
+		{"funded checkout purchase", true, "checkout", false},
+		{"postpaid top-off", false, "auto_recharge", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, _ := newProCashFixtureMode(t, planKindPrepaid, 2, 30000, 25000, true)
+			f.quiescePrepaidPurchases(t)
+			if tc.funded {
+				conn, err := f.h.Pool.Acquire(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Assignments are immutable; the fixture's paid plan just needs the funded policy.
+				if _, err = conn.Exec(t.Context(), `SET session_replication_role=replica`); err != nil {
+					t.Fatal(err)
+				}
+				_, err = conn.Exec(t.Context(), `UPDATE team_plan_assignment SET terms=terms||'{"funding_policy":"prepaid"}' WHERE team_id=$1 AND kind='subscription'`, f.team)
+				_, _ = conn.Exec(context.WithoutCancel(t.Context()), `RESET session_replication_role`)
+				conn.Release()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if allowed, err := f.h.freezeProInvoiceCash(t.Context(), f.invoice); err != nil || !allowed {
+				t.Fatal("component proof unavailable", allowed, err)
+			}
+			id := insertProCashFundingPurchase(t, f.h, f.team, f.invoice.Customer, tc.source, "succeeded", f.start.Add(time.Hour))
+			request, err := prepaidCreditRequest(id, f.invoice.Customer, 500, tc.source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, q := range []string{
+				`UPDATE billing_prepaid_purchase SET credit_state='pending',credit_request=$2 WHERE id=$1`,
+				`UPDATE billing_prepaid_purchase SET credit_state='uncertain',credit_first_attempt_at=clock_timestamp() WHERE id=$1 AND $2::jsonb IS NOT NULL`,
+				`UPDATE billing_prepaid_purchase SET credit_state='issued',stripe_credit_grant_id='cg_'||id::text,credit_evidence=credit_request||jsonb_build_object('id','cg_'||id::text),credited_at=clock_timestamp() WHERE id=$1 AND $2::jsonb IS NOT NULL`,
+			} {
+				if _, err = f.h.Pool.Exec(t.Context(), q, id, request); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var valid bool
+			if err = f.h.Pool.QueryRow(t.Context(), `SELECT pro_invoice_cash_source_valid($1,$2)`, f.invoice.ID, invoiceSettlementHash(f.invoice)).Scan(&valid); err != nil || valid != tc.valid {
+				t.Fatalf("component proof valid=%v, want %v (%v)", valid, tc.valid, err)
+			}
+		})
+	}
+}
