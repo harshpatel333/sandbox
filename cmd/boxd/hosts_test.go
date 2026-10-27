@@ -29,6 +29,10 @@ func TestMapHostname(t *testing.T) {
 			before: "not-an-ip\tsandbox-b\n",
 			want:   "not-an-ip\tsandbox-b\n127.0.1.1\tsandbox-b\t# sandbox hostname\n",
 		},
+		"replaces a malformed owned line": {
+			before: "not-an-ip\tsandbox-b\t# sandbox hostname\n",
+			want:   "127.0.1.1\tsandbox-b\t# sandbox hostname\n",
+		},
 		"creates a missing file": {
 			before: "",
 			want:   "127.0.1.1\tsandbox-b\t# sandbox hostname\n",

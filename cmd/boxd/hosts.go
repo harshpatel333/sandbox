@@ -35,7 +35,7 @@ func mapHostname(path, name string) error {
 	var kept []string
 	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
 		if strings.HasSuffix(line, hostnameEntryMarker) {
-			if f := strings.Fields(line); len(f) > 1 && f[1] == name {
+			if mapsName(line, name) {
 				return nil
 			}
 			continue
