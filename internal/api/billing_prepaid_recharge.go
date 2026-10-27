@@ -73,9 +73,41 @@ func (h *Handlers) prepaidTick(ctx context.Context, client *stripeHTTPClient) er
 	)
 }
 
+const prepaidAutoRechargeCapReason = "the recharge amount or threshold exceeds the $10,000 limit; update your settings before enabling it again"
+
+func (h *Handlers) disableOversizedAutoRecharges(ctx context.Context) error {
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `SELECT t.id FROM team t JOIN billing_prepaid_auto_recharge a ON a.team_id=t.id
+ WHERE a.enabled AND (a.amount_cents>$1 OR a.threshold_cents>$1)
+ ORDER BY t.id LIMIT 50 FOR NO KEY UPDATE OF t SKIP LOCKED`, prepaidPurchaseMaxCents)
+	if err != nil {
+		return err
+	}
+	teams, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return err
+	}
+	// Recheck after taking the same team lock as settings edits. Never disable a
+	// corrected setting or reset a prior disable notification.
+	_, err = tx.Exec(ctx, `UPDATE billing_prepaid_auto_recharge SET enabled=false,
+ disabled_reason=$1,disabled_at=clock_timestamp(),disabled_by=NULL,notified_at=NULL,updated_at=clock_timestamp()
+ WHERE team_id=ANY($2) AND enabled AND (amount_cents>$3 OR threshold_cents>$3)`, prepaidAutoRechargeCapReason, teams, prepaidPurchaseMaxCents)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // A charge is created only from a balance observed after the team's latest
 // credit, so a purchase the observation has not yet seen never triggers another.
 func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
+	if err := h.disableOversizedAutoRecharges(ctx); err != nil {
+		return err
+	}
 	if _, err := h.Pool.Exec(ctx, `UPDATE billing_prepaid_auto_recharge a SET enabled=false,disabled_reason=$1,disabled_at=clock_timestamp(),notified_at=NULL
  WHERE a.enabled AND (SELECT count(*) FROM billing_prepaid_purchase p WHERE p.team_id=a.team_id AND p.source='auto_recharge' AND p.created_at>clock_timestamp()-interval '24 hours')>=$2`,
 		fmt.Sprintf("more than %d automatic recharges in 24 hours", prepaidAutoRechargeDailyCap), prepaidAutoRechargeDailyCap); err != nil {

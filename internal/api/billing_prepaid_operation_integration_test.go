@@ -3,8 +3,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -796,10 +798,137 @@ func TestPrepaidAcceptedOversizedAutoRechargeStillSettles(t *testing.T) {
 	f.observe(1500, true)
 	f.exec(`INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,payment_idempotency_key,credit_idempotency_key,payment_request)
  VALUES($1,$2,'auto_recharge',1000500,'','',jsonb_build_object('customer',$2::text,'payment_method','pm_example','amount_cents',1000500))`, f.team, f.customer)
+	var id uuid.UUID
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT id FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	f.loseIntent = true
+	if err := f.h.chargeAutoRecharge(t.Context(), f.client, id); err == nil {
+		t.Fatal("expected lost provider response")
+	}
 	if err := f.tick(); err != nil {
 		t.Fatal(err)
 	}
+	if len(f.intentByKey) != 1 {
+		t.Fatal("recovery created another provider payment")
+	}
 	if rows := f.rows(); len(rows) != 1 || rows[0].Payment != "succeeded" || rows[0].Credit != "issued" || rows[0].Amount != 1000500 {
 		t.Fatalf("accepted oversized auto charge changed: %+v", rows)
+	}
+}
+
+func TestPrepaidOversizedAutoRechargeSafetyDisableNotifiesOnce(t *testing.T) {
+	f := newPrepaidFixture(t)
+	actor := uuid.New()
+	_ = prepaidOperationRouter(t, f, f.team, actor)
+	f.enableAutoRecharge(2000, 1000500)
+	f.observe(100, true)
+	checkSummary := func() {
+		t.Helper()
+		raw, err := f.h.prepaidSummary(t.Context(), f.team, 20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			LowBalance bool `json:"low_balance"`
+			Auto       struct {
+				Enabled bool   `json:"enabled"`
+				Reason  string `json:"disabled_reason"`
+			} `json:"auto_recharge"`
+		}
+		if err = json.Unmarshal(raw, &got); err != nil || !got.LowBalance || got.Auto.Enabled || !strings.Contains(got.Auto.Reason, "$10,000") {
+			t.Fatalf("misleading ineffective recharge summary: %s %v", raw, err)
+		}
+	}
+	checkSummary()
+	if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	checkSummary()
+	var disabledAt time.Time
+	var threshold, amount int64
+	var notified *time.Time
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT disabled_at,threshold_cents,amount_cents,notified_at FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&disabledAt, &threshold, &amount, &notified); err != nil || threshold != 2000 || amount != 1000500 || notified != nil {
+		t.Fatal("safety disable changed monetary terms or did not queue notification", err)
+	}
+	srv := startSMTPTestServer(t, nil)
+	f.h.EmailTransport = EmailTransport{SMTPAddr: srv.addr}
+	t.Setenv("QUOTA_EMAIL_FROM", "billing@example.com")
+	// Other synthetic teams can already be queued; drain through the normal bounded worker.
+	for range 20 {
+		if err := f.h.notifyDisabledAutoRecharges(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.h.Pool.QueryRow(t.Context(), `SELECT notified_at FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&notified); err != nil {
+			t.Fatal(err)
+		}
+		if notified != nil {
+			break
+		}
+	}
+	if notified == nil {
+		t.Fatal("normal notifier did not acknowledge cap disable")
+	}
+	if err := f.h.recordAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.h.notifyDisabledAutoRecharges(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var after time.Time
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT disabled_at FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&after); err != nil || !after.Equal(disabledAt) {
+		t.Fatal("repeated sweep reset disable identity", err)
+	}
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	count := 0
+	for _, message := range srv.messages {
+		if strings.Contains(string(message), actor.String()+"@example.com") {
+			count++
+			if !strings.Contains(string(message), "$10,000") {
+				t.Fatal("notification omitted cap explanation")
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("cap disable notifications: got %d want 1", count)
+	}
+	if len(f.rows()) != 0 {
+		t.Fatal("oversized setting created a charge")
+	}
+}
+
+func TestPrepaidCapSafetyDisableDoesNotOverwriteConcurrentSettings(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("enabled_%v", enabled), func(t *testing.T) {
+			f := newPrepaidFixture(t)
+			f.enableAutoRecharge(1000500, 1000500)
+			tx, err := f.h.Pool.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.WithoutCancel(t.Context()))
+			if _, err = tx.Exec(t.Context(), `SELECT id FROM team WHERE id=$1 FOR NO KEY UPDATE`, f.team); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(t.Context(), `UPDATE billing_prepaid_auto_recharge SET enabled=$2,threshold_cents=500,amount_cents=1000000 WHERE team_id=$1`, f.team, enabled); err != nil {
+				t.Fatal(err)
+			}
+			if err = f.h.disableOversizedAutoRecharges(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err = tx.Commit(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err = f.h.disableOversizedAutoRecharges(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			var got bool
+			var amount, threshold int64
+			var reason *string
+			if err = f.h.Pool.QueryRow(t.Context(), `SELECT enabled,amount_cents,threshold_cents,disabled_reason FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&got, &amount, &threshold, &reason); err != nil || got != enabled || amount != 1000000 || threshold != 500 || reason != nil {
+				t.Fatal("concurrent valid edit or disable was overwritten", got, amount, threshold, reason, err)
+			}
+		})
 	}
 }
