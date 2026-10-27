@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -327,18 +328,73 @@ func TestRoutingBootstrapGate(t *testing.T) {
 	}
 }
 
-func TestRoutingBootstrapGatesDataPlane(t *testing.T) {
-	ready, dispatched := false, false
-	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched = true }), func() bool { return ready })
+func TestRoutingBootstrapHoldsDataPlaneUntilReady(t *testing.T) {
+	var ready, dispatched atomic.Bool
+	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched.Store(true) }), ready.Load, ready.Load)
+
+	// A request arriving during warmup waits for the gate instead of failing.
+	done := make(chan struct{})
 	w := httptest.NewRecorder()
-	gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/exec", nil))
-	if dispatched || w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), `"sandbox_unavailable"`) {
-		t.Fatalf("cold request dispatched=%v status=%d body=%s", dispatched, w.Code, w.Body)
+	go func() {
+		gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/exec", nil))
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatalf("cold request returned before the gate opened: status=%d body=%s", w.Code, w.Body)
+	case <-time.After(5 * routingBootstrapPoll):
 	}
-	ready = true
-	gate.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/exec", nil))
-	if !dispatched {
-		t.Fatal("warm request was not dispatched")
+	if dispatched.Load() {
+		t.Fatal("cold request dispatched before the gate opened")
+	}
+	ready.Store(true)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("held request not released once the gate opened")
+	}
+	if !dispatched.Load() || w.Code != http.StatusOK {
+		t.Fatalf("released request dispatched=%v status=%d", dispatched.Load(), w.Code)
+	}
+}
+
+func TestRoutingBootstrapRefusesHeldRequestWhenDeadlineOpensGate(t *testing.T) {
+	var ready, dispatched atomic.Bool
+	var checks atomic.Int32
+	readyCheck := func() bool { checks.Add(1); return ready.Load() }
+	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched.Store(true) }), readyCheck, func() bool { return false })
+	done := make(chan struct{})
+	w := httptest.NewRecorder()
+	go func() {
+		gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/exec", nil))
+		close(done)
+	}()
+	// The second check comes from the shared poller, so the request is held.
+	for checks.Load() < 2 {
+		time.Sleep(time.Millisecond)
+	}
+	ready.Store(true)
+	<-done
+	if dispatched.Load() || w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("held request after deadline dispatched=%v status=%d", dispatched.Load(), w.Code)
+	}
+	// Traffic arriving after the deadline still takes the ownership fallback.
+	w = httptest.NewRecorder()
+	gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/exec", nil))
+	if !dispatched.Load() {
+		t.Fatal("post-deadline request not dispatched")
+	}
+}
+
+func TestRoutingBootstrapRefusesCancelledWarmupRequest(t *testing.T) {
+	var dispatched atomic.Bool
+	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched.Store(true) }), func() bool { return false }, func() bool { return false })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w := httptest.NewRecorder()
+	gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/exec", nil).WithContext(ctx))
+	if dispatched.Load() || w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), `"sandbox_unavailable"`) {
+		t.Fatalf("cancelled request dispatched=%v status=%d body=%s", dispatched.Load(), w.Code, w.Body)
 	}
 }
 
