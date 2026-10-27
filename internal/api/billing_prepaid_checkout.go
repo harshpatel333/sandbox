@@ -19,6 +19,7 @@ type prepaidCheckoutLine struct {
 	OperationID       uuid.UUID
 	AmountCents       int64
 	acceptedRedirects bool
+	acceptedLease     *implicitPrepaidLease
 }
 
 // Stripe requires at least 30 minutes at creation; equality leaves no dispatch

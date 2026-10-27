@@ -1822,6 +1822,10 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 		return
 	}
 	if billingAccountHasEstablishedSubscription(account) {
+		if prepaid != nil && prepaid.acceptedLease != nil {
+			c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: prepaid.acceptedLease.PurchaseID, State: "pending"})
+			return
+		}
 		respondErrorMsg(c, "conflict", "team already has an active Stripe subscription; use the customer portal", http.StatusConflict)
 		return
 	}
@@ -1865,7 +1869,7 @@ func (h *Handlers) createPAYGCheckout(c *gin.Context, teamID, actorID uuid.UUID,
 	if prepaid == nil {
 		checkoutAccount, err = h.beginLegacyCheckout(c.Request.Context(), teamID, actorID, req, requestKey, attemptID, trusted)
 	} else {
-		checkoutAccount, err = h.beginCohortPrepaidCheckout(c.Request.Context(), teamID, actorID, req, requestKey, attemptID, trusted)
+		checkoutAccount, err = h.beginCohortPrepaidCheckout(c.Request.Context(), teamID, actorID, req, requestKey, attemptID, trusted, prepaid.acceptedLease)
 	}
 	if err != nil {
 		if errors.Is(err, errLegacyCheckoutPlan) {

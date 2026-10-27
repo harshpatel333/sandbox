@@ -41,6 +41,11 @@ func (h *Handlers) preparePrepaidPurchase(ctx context.Context, tx pgx.Tx, id, te
 	if exists {
 		return nil
 	}
+	// Existing purchases retain their accepted amount; every new record is capped
+	// under the same team lock, including stale HTTP recovery attempts.
+	if !validNewPrepaidAmount(amount) {
+		return errPrepaidOperationConflict
+	}
 	live, err := prepaidUnspentPurchases(ctx, tx, team)
 	if err != nil {
 		return err

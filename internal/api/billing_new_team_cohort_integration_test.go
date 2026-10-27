@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -307,5 +308,147 @@ func TestNewTeamCohortRechargeSchedulerKeepsAcceptedConsentAfterClose(t *testing
 	}
 	if count != 1 || source != "new_team" || epoch != f.epoch {
 		t.Fatalf("saved consent duplicated or re-admitted: %d/%s/%s", count, source, epoch)
+	}
+}
+
+func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
+	f := newTeamCohortTestFixture(t)
+	f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
+	f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
+	for _, sql := range []string{`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_implicit')`, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)`} {
+		if _, err := f.h.Pool.Exec(t.Context(), sql, f.team); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var calls int
+	var firstKey, firstExpiry string
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/checkout/sessions" {
+			t.Errorf("unexpected provider request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", 500)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+		}
+		calls++
+		if calls == 1 {
+			firstKey = r.Header.Get("Idempotency-Key")
+			firstExpiry = r.Form.Get("expires_at")
+			http.Error(w, "lost response", 503)
+			return
+		}
+		if r.Header.Get("Idempotency-Key") != firstKey || r.Form.Get("expires_at") != firstExpiry {
+			t.Error("recovery changed provider identity or expiration")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cs_implicit","url":"https://checkout.stripe.com/implicit"}`))
+	}))
+	t.Cleanup(provider.Close)
+	f.h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+	actor := f.actor
+	r := gin.New()
+	r.POST("/billing/prepaid/checkout", func(c *gin.Context) {
+		c.Set("team_id", f.team.String())
+		c.Set("actor_id", actor)
+		f.h.CreatePrepaidCheckout(c)
+	})
+	req := prepaidCheckoutBody{AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"}
+	if rec := prepaidOperationPost(r, req); rec.Code != 502 {
+		t.Fatalf("initial lost reply %d %s", rec.Code, rec.Body)
+	}
+	var before []byte
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_object('id',id,'actor',actor_id,'amount',amount_cents,'snapshot',plan_snapshot,'epoch',admission_epoch,'payment_key',payment_idempotency_key,'credit_key',credit_idempotency_key) FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	var evidence []byte
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT evidence FROM billing_new_team_gate WHERE singleton`).Scan(&evidence); err != nil {
+		t.Fatal(err)
+	}
+	f.close(t)
+	for _, change := range []func(*prepaidCheckoutBody){func(p *prepaidCheckoutBody) { p.AmountCents = 1000 }, func(p *prepaidCheckoutBody) { p.SuccessURL += "?other=1" }, func(p *prepaidCheckoutBody) { p.CancelURL += "?other=1" }, func(p *prepaidCheckoutBody) { p.OperationID = uuid.New() }} {
+		bad := req
+		change(&bad)
+		if rec := prepaidOperationPost(r, bad); rec.Code != 409 {
+			t.Fatalf("different request bypassed closed gate %d %s", rec.Code, rec.Body)
+		}
+	}
+	otherActor := uuid.New()
+	for _, sql := range []string{`INSERT INTO profile(id,email) VALUES($1,'other-cohort@example.invalid')`, `INSERT INTO team_memberships(team_id,user_id,status) VALUES($2,$1,'active')`, `INSERT INTO user_role_assignments(user_id,role_id,scope_type,team_id) SELECT $1,id,'team',$2 FROM roles WHERE name='team_owner'`} {
+		var err error
+		if strings.Contains(sql, "$2") {
+			_, err = f.h.Pool.Exec(t.Context(), sql, otherActor, f.team)
+		} else {
+			_, err = f.h.Pool.Exec(t.Context(), sql, otherActor)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	actor = otherActor
+	if rec := prepaidOperationPost(r, req); rec.Code != 409 {
+		t.Fatalf("different authorized actor bypassed closed gate %d %s", rec.Code, rec.Body)
+	}
+	actor = f.actor
+	if calls != 1 {
+		t.Fatal("different request contacted provider")
+	}
+	for range 2 {
+		rec := prepaidOperationPost(r, req)
+		var got billingSessionResponse
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &got) != nil || got.ID != "cs_implicit" {
+			t.Fatalf("implicit replay %d %s", rec.Code, rec.Body)
+		}
+	}
+	var after []byte
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_object('id',id,'actor',actor_id,'amount',amount_cents,'snapshot',plan_snapshot,'epoch',admission_epoch,'payment_key',payment_idempotency_key,'credit_key',credit_idempotency_key) FROM billing_prepaid_purchase WHERE team_id=$1`, f.team).Scan(&after); err != nil || string(before) != string(after) {
+		t.Fatalf("recovery changed frozen purchase: %v", err)
+	}
+	if calls != 3 || firstKey == "" || firstExpiry == "" {
+		t.Fatalf("provider replay evidence %d/%s/%s", calls, firstKey, firstExpiry)
+	}
+	// Subscription completion can become visible while its original lease is
+	// still retained. Recover that purchase, never start a payment-only top-up.
+	if _, err := f.h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_subscription_id='sub_completed',stripe_subscription_status='active' WHERE team_id=$1`, f.team); err != nil {
+		t.Fatal(err)
+	}
+	rec := prepaidOperationPost(r, req)
+	var pending prepaidOperationResponse
+	if rec.Code != http.StatusAccepted || json.Unmarshal(rec.Body.Bytes(), &pending) != nil || pending.PurchaseID == uuid.Nil || calls != 3 {
+		t.Fatalf("completed subscription became fresh payment: %d %s", rec.Code, rec.Body)
+	}
+	if _, err := f.h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL WHERE team_id=$1`, f.team); err != nil {
+		t.Fatal(err)
+	}
+	// Reopen admission, then let ordinary checkout completion clear the lease
+	// between read-only recovery proof and locked admission. The stale proof must
+	// not be reused for a fresh generation even when fresh entry is open again.
+	var epoch uuid.UUID
+	if err := f.h.Pool.QueryRow(t.Context(), `SELECT billing_prepare_new_team_gate('use',$1,'test','reopen for stale-proof regression')`, uuid.MustParse(f.h.Config.SystemTeamID)).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	var released map[string]any
+	if err := json.Unmarshal(evidence, &released); err != nil {
+		t.Fatal(err)
+	}
+	released["epoch"] = epoch
+	evidence, _ = json.Marshal(released)
+	if _, err := f.h.Pool.Exec(t.Context(), `SELECT billing_release_new_team_gate('use',$1,$2,'test','same verified disposable writers',$3)`, uuid.MustParse(f.h.Config.SystemTeamID), epoch, evidence); err != nil {
+		t.Fatal(err)
+	}
+	proof, err := f.h.acceptedImplicitPrepaidLease(t.Context(), f.team, f.actor, req)
+	if err != nil || proof == nil {
+		t.Fatalf("accepted proof missing: %v", err)
+	}
+	if err = f.h.DB.FinishTeamBillingCheckout(t.Context(), f.team); err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.h.beginCohortPrepaidCheckout(t.Context(), f.team, f.actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, proof.RequestKey, uuid.New(), false, proof)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("stale proof created a new generation: %v", err)
+	}
+	account, err := f.h.DB.GetTeamBillingCheckoutForRecovery(t.Context(), f.team)
+	if err != nil || account.CheckoutInitializingAt.Valid || calls != 3 {
+		t.Fatalf("stale proof produced effects: %+v/%d/%v", account.CheckoutInitializingAt, calls, err)
 	}
 }

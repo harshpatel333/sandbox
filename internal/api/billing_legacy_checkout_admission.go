@@ -105,7 +105,7 @@ func (h *Handlers) beginLegacyCheckout(ctx context.Context, team, actor uuid.UUI
 // beginCohortPrepaidCheckout retains the ordinary identity/lease protocol but
 // binds a new enrolled-team lease to this exact Starter attempt. An old
 // accepted generation resumes before any fresh-admission requirement.
-func (h *Handlers) beginCohortPrepaidCheckout(ctx context.Context, team, actor uuid.UUID, req billingCheckoutSessionRequest, key string, attempt uuid.UUID, trusted bool) (db.TeamBillingAccount, error) {
+func (h *Handlers) beginCohortPrepaidCheckout(ctx context.Context, team, actor uuid.UUID, req billingCheckoutSessionRequest, key string, attempt uuid.UUID, trusted bool, retained ...*implicitPrepaidLease) (db.TeamBillingAccount, error) {
 	var account db.TeamBillingAccount
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
@@ -127,6 +127,16 @@ func (h *Handlers) beginCohortPrepaidCheckout(ctx context.Context, team, actor u
 	var accepted bool
 	if err = tx.QueryRow(ctx, `SELECT checkout_initializing_at IS NOT NULL FROM team_billing_account WHERE team_id=$1 FOR UPDATE`, team).Scan(&accepted); err != nil {
 		return account, err
+	}
+	if len(retained) > 0 && retained[0] != nil {
+		proof := retained[0]
+		current, readErr := h.DB.WithTx(tx).GetTeamBillingCheckoutForRecovery(ctx, team)
+		if readErr != nil {
+			return account, readErr
+		}
+		if !current.CheckoutInitializingAt.Valid || !current.CheckoutInitializingAt.Time.Equal(proof.Generation) || derefString(current.StripeCustomerID) != proof.Customer || derefString(current.CheckoutRequestKey) != proof.RequestKey || key != proof.RequestKey || !current.StripeCheckoutActorID.Valid || uuid.UUID(current.StripeCheckoutActorID.Bytes) != actor {
+			return account, pgx.ErrNoRows
+		}
 	}
 	if !accepted {
 		if admission.Version != "v2" || !admission.EntryOpen {

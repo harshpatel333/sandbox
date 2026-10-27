@@ -123,7 +123,15 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		}
 	}
 
-	if !acceptedRedirects {
+	var acceptedLease *implicitPrepaidLease
+	if req.OperationID == uuid.Nil {
+		acceptedLease, err = h.acceptedImplicitPrepaidLease(ctx, team, actor, req)
+		if err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+	}
+	if !acceptedRedirects && acceptedLease == nil {
 		admission, admissionErr := h.teamPricingState(ctx, team)
 		if admissionErr != nil {
 			respondErrorMsg(c, "service_unavailable", "team plan admission requires verification", 503)
@@ -134,7 +142,7 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 			return
 		}
 	}
-	if !acceptedRedirects && !validNewPrepaidAmount(req.AmountCents) {
+	if !acceptedRedirects && acceptedLease == nil && !validNewPrepaidAmount(req.AmountCents) {
 		respondErrorMsg(c, "bad_request", "amount_cents must be a multiple of 500 between 500 and 1000000", http.StatusBadRequest)
 		return
 	}
@@ -204,7 +212,13 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		return
 	}
 	if !billingAccountHasEstablishedSubscription(account) {
-		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, OperationID: req.OperationID, acceptedRedirects: acceptedRedirects})
+		h.createPAYGCheckout(c, team, actor, billingCheckoutSessionRequest{SuccessURL: req.SuccessURL, CancelURL: req.CancelURL}, false, &prepaidCheckoutLine{AmountCents: req.AmountCents, OperationID: req.OperationID, acceptedRedirects: acceptedRedirects, acceptedLease: acceptedLease})
+		return
+	}
+	// An accepted first-purchase retry cannot turn into a second payment if
+	// subscription completion races the read-only lease proof.
+	if acceptedLease != nil {
+		c.JSON(http.StatusAccepted, prepaidOperationResponse{PurchaseID: acceptedLease.PurchaseID, State: "pending"})
 		return
 	}
 	successURL, cancelURL := req.SuccessURL, req.CancelURL

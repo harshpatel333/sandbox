@@ -729,6 +729,21 @@ func TestPrepaidCheckoutNewAmountCapPreservesAcceptedOperation(t *testing.T) {
 	if err := f.h.bindPrepaidCheckoutOperation(t.Context(), f.team, actor, req); err != nil {
 		t.Fatal(err)
 	}
+	// Even a stale upstream recovery exemption cannot create a fresh oversized row.
+	if _, err := f.h.startPrepaidPaymentCheckout(t.Context(), f.client, f.team, actor, f.customer, req.AmountCents, req.SuccessURL, req.CancelURL, req.OperationID); !errors.Is(err, errPrepaidOperationConflict) {
+		t.Fatalf("fresh internal amount cap: %v", err)
+	}
+	terms, err := f.h.planTermsForPricingVersion(t.Context(), "starter", "v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := json.Marshal(prepaidPurchasePlan{Terms: terms, Retain: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model an immutable historical acceptance, rather than submitting a new
+	// oversized purchase through today's now-capped preparation function.
+	f.exec(`INSERT INTO billing_prepaid_purchase(id,team_id,customer_id,source,amount_cents,actor_id,payment_idempotency_key,credit_idempotency_key,plan_snapshot,admission_source,admission_epoch) SELECT $1,$2,$3,'checkout',$4,$5,'','',$6,'all_teams',epoch FROM billing_pricing_adoption WHERE singleton`, req.OperationID, f.team, f.customer, req.AmountCents, actor, snapshot)
 	saved, err := f.h.startPrepaidPaymentCheckout(t.Context(), f.client, f.team, actor, f.customer, req.AmountCents, req.SuccessURL, req.CancelURL, req.OperationID)
 	if err != nil {
 		t.Fatal(err)
