@@ -1030,7 +1030,9 @@ paths:
         Paid, mismatched or uncertain provider outcomes retain the fence and return
         payment_confirmation_pending. Neither no_pending_starter_checkout nor retryable
         proves that the current plan is Free; refresh the plan and ordinary offer APIs
-        before starting another purchase. Cancellation retries are idempotent.
+        before starting another purchase. A verified original non-Starter Pro fence
+        returns no_pending_starter_checkout without changing it; use the Pro recovery
+        flow for that purchase. Cancellation retries are idempotent.
       security:
         - apiKey: []
       requestBody:

@@ -314,3 +314,136 @@ func TestPrepaidPendingStarterRecoveryRejectsInvalidAction(t *testing.T) {
 		})
 	}
 }
+
+// A historical hosted Pro session shares the account fence but has no prepaid
+// purchase identity. Exercise the real provider transport and accepted-Pro
+// replay, not a mocked Starter response or a newly sold v2 Pro upgrade.
+func TestPrepaidDiscoveryPreservesAcceptedLegacyPro(t *testing.T) {
+	for _, scenario := range []string{"known", "provider_actor", "provider_generation", "provider_customer", "provider_session", "provider_offer", "provider_mode", "local_session", "frozen_actor", "frozen_prepaid", "frozen_unknown_family", "present_valid_prepaid", "present_invalid_prepaid", "present_empty_prepaid", "unknown_family"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newPrepaidFixture(t)
+			actor := uuid.New()
+			router := prepaidOperationRouter(t, f, f.team, actor)
+			generation := time.Now().Truncate(time.Microsecond)
+			session, key := "cs_legacy_"+strings.ReplaceAll(uuid.NewString(), "-", ""), "pro:legacy:"+uuid.NewString()
+			metadata := map[string]string{"activation_user_id": actor.String(), "checkout_generation": generation.Format(time.RFC3339Nano), "commercial_offer": "pro_monthly"}
+			params := StripeCreateCheckoutSessionParams{CustomerID: f.customer, ClientReferenceID: f.team.String(), IdempotencyKey: key, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel", BasePriceID: "price_legacy", Metadata: metadata}
+			switch scenario {
+			case "frozen_actor":
+				params.Metadata["activation_user_id"] = uuid.NewString()
+			case "frozen_prepaid":
+				params.Metadata["prepaid_purchase_id"] = uuid.NewString()
+			case "frozen_unknown_family":
+				params.PlanTerms = &StripeCheckoutPlanTerms{Amount: 120000, Months: 1, Credit: 100000, Family: "unknown"}
+			}
+			payload, _ := json.Marshal(params)
+			f.exec(`UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL,checkout_initializing_at=$2,checkout_session_id=$3,checkout_request_key=$4,checkout_may_exist=true,checkout_pending_attempt_ids='{}',stripe_checkout_actor_id=$5,stripe_checkout_actor_claimed_at=$2 WHERE team_id=$1`, f.team, generation, session, key, actor)
+			f.exec(`INSERT INTO billing_signup_choice(team_id,state,offer_key,base_price_id,generation,actor_id,request_payload,session_id) VALUES($1,'pending','pro_monthly','price_legacy',$2,$3,$4,$5) ON CONFLICT(team_id) DO UPDATE SET state=excluded.state,offer_key=excluded.offer_key,base_price_id=excluded.base_price_id,generation=excluded.generation,actor_id=excluded.actor_id,request_payload=excluded.request_payload,session_id=excluded.session_id,subscription_id=NULL`, f.team, generation, actor, payload, session)
+			if scenario == "local_session" {
+				f.exec(`UPDATE billing_signup_choice SET session_id=$2 WHERE team_id=$1`, f.team, "cs_different")
+			}
+			// Unknown metadata must not be reclassified merely because no prepaid row exists.
+			providerMetadata := map[string]string{"activation_user_id": actor.String(), "checkout_generation": generation.Format(time.RFC3339Nano), "commercial_offer": "pro_monthly"}
+			providerSession := StripeRetrievedCheckoutSession{ID: session, CustomerID: f.customer, ClientReferenceID: f.team.String(), Mode: "subscription", Status: "open", PaymentStatus: "unpaid", URL: "https://checkout.stripe.com/original-legacy", Metadata: providerMetadata}
+			switch scenario {
+			case "provider_actor":
+				providerMetadata["activation_user_id"] = uuid.NewString()
+			case "provider_generation":
+				providerMetadata["checkout_generation"] = generation.Add(time.Second).Format(time.RFC3339Nano)
+			case "provider_customer":
+				providerSession.CustomerID = "cus_foreign"
+			case "provider_session":
+				providerSession.ID = "cs_foreign"
+			case "provider_offer", "unknown_family":
+				providerMetadata["commercial_offer"] = "unknown"
+			case "provider_mode":
+				providerSession.Mode = "setup"
+			case "present_valid_prepaid":
+				providerMetadata["prepaid_purchase_id"] = uuid.NewString()
+			case "present_invalid_prepaid":
+				providerMetadata["prepaid_purchase_id"] = "malformed"
+			case "present_empty_prepaid":
+				providerMetadata["prepaid_purchase_id"] = ""
+			}
+			writes, reads := 0, 0
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					writes++
+					t.Errorf("Starter/Pro recovery created or cancelled a provider object: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(500)
+					return
+				}
+				if r.URL.Path != "/v1/checkout/sessions/"+session {
+					t.Errorf("unexpected provider GET %s", r.URL.Path)
+					w.WriteHeader(500)
+					return
+				}
+				reads++
+				_ = json.NewEncoder(w).Encode(providerSession)
+			}))
+			defer provider.Close()
+			f.h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+			snapshot := func() string {
+				var raw string
+				err := f.h.Pool.QueryRow(t.Context(), `SELECT jsonb_build_object('account',to_jsonb(a),'choice',to_jsonb(c),'purchases',(SELECT count(*) FROM billing_prepaid_purchase WHERE team_id=$1),'contracts',(SELECT count(*) FROM billing_commercial_contract WHERE team_id=$1))::text FROM team_billing_account a JOIN billing_signup_choice c USING(team_id) WHERE a.team_id=$1`, f.team).Scan(&raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return raw
+			}
+			before := snapshot()
+			router.POST("/billing/prepaid/checkout/recover", func(c *gin.Context) {
+				c.Set("team_id", f.team.String())
+				c.Set("actor_id", actor)
+				f.h.RecoverPendingStarterCheckout(c)
+			})
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/billing/prepaid/checkout/recover", strings.NewReader(`{}`)))
+			if scenario == "known" {
+				if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"no_pending_starter_checkout"`) {
+					t.Fatalf("known legacy Pro classification: %d %s", rec.Code, rec.Body)
+				}
+			} else if rec.Code != 500 {
+				t.Fatalf("uncertain legacy identity escaped: %d %s", rec.Code, rec.Body)
+			}
+			if before != snapshot() {
+				t.Fatal("Starter discovery mutated the Pro fence, choice, or financial state")
+			}
+			if writes != 0 || reads != 1 {
+				t.Fatalf("unexpected discovery transport reads=%d writes=%d", reads, writes)
+			}
+			if scenario != "known" {
+				return
+			}
+			account, err := f.h.DB.GetTeamBillingCheckoutForRecovery(t.Context(), f.team)
+			if err != nil {
+				t.Fatal(err)
+			}
+			differentKey := "pro:different-original-request"
+			account.CheckoutRequestKey = &differentKey
+			if known, err := f.h.pendingStarterIsKnownPro(t.Context(), providerSession, pendingStarterCheckout{Account: account}, actor); err != nil || known {
+				t.Fatalf("different original request classified as known Pro: %v %v", known, err)
+			}
+			// Even an explicit Starter cancellation cannot cancel this Pro session.
+			rec = httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/billing/prepaid/checkout/recover", strings.NewReader(fmt.Sprintf(`{"purchase_id":%q,"checkout_generation":%q,"cancel":true}`, uuid.NewString(), generation.Format(time.RFC3339Nano)))))
+			if rec.Code != 200 || before != snapshot() || writes != 0 {
+				t.Fatalf("Starter action changed Pro authority: %d %s", rec.Code, rec.Body)
+			}
+			// Entry can close/change pricing while this older accepted checkout remains
+			// recoverable through the original Pro status and frozen-parameter replay.
+			f.exec(`UPDATE team_feature_flag SET enabled=false WHERE team_id=$1 AND key='billing_export_enabled'`, f.team)
+			outcome, err := f.h.reconcileProCheckout(t.Context(), f.team, false)
+			if err != nil || outcome != "payment_confirmation_pending" {
+				t.Fatalf("legacy Pro status lost: %s %v", outcome, err)
+			}
+			rec = httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/stripe/pro-checkout", nil)
+			f.h.createProCheckout(c, f.team, actor, billingCheckoutSessionRequest{Offer: "pro_monthly", SuccessURL: params.SuccessURL, CancelURL: params.CancelURL})
+			if rec.Code != 200 || !strings.Contains(rec.Body.String(), providerSession.URL) || writes != 0 {
+				t.Fatalf("original Pro replay lost or created a new checkout: %d %s writes=%d", rec.Code, rec.Body, writes)
+			}
+		})
+	}
+}

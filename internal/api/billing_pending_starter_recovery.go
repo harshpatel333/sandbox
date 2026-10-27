@@ -58,6 +58,17 @@ func (h *Handlers) loadPendingStarter(ctx context.Context, team, actor uuid.UUID
 	if err != nil {
 		return p, err
 	}
+	if _, hasPrepaidIdentity := s.Metadata["prepaid_purchase_id"]; !hasPrepaidIdentity {
+		knownPro, err := h.pendingStarterIsKnownPro(ctx, s, p, actor)
+		if err != nil {
+			return p, err
+		}
+		if knownPro {
+			// This says only that this original fence is not a Starter purchase.
+			// Pro recovery retains exclusive authority over its unchanged fence.
+			return p, pgx.ErrNoRows
+		}
+	}
 	p.Purchase, err = uuid.Parse(s.Metadata["prepaid_purchase_id"])
 	if err != nil || !pendingStarterIdentity(s, p, actor) {
 		return p, errors.New("Starter checkout purchase identity differs")
@@ -67,6 +78,38 @@ func (h *Handlers) loadPendingStarter(ctx context.Context, team, actor uuid.UUID
 		return p, errors.New("Starter checkout purchase association is unavailable")
 	}
 	return p, err
+}
+
+func (h *Handlers) pendingStarterIsKnownPro(ctx context.Context, s StripeRetrievedCheckoutSession, p pendingStarterCheckout, actor uuid.UUID) (bool, error) {
+	choice, err := h.getProChoice(ctx, p.Account.TeamID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var params StripeCreateCheckoutSessionParams
+	if json.Unmarshal(choice.Payload, &params) != nil {
+		return false, nil
+	}
+	offer, err := choice.frozenOffer()
+	if err != nil || (offer.Family != "" && offer.Family != "pro") || (offer.Family == "" && choice.Offer != "pro_monthly" && choice.Offer != "pro_annual") {
+		return false, nil
+	}
+	a := p.Account
+	providerGeneration, providerErr := time.Parse(time.RFC3339Nano, s.Metadata["checkout_generation"])
+	frozenGeneration, frozenErr := time.Parse(time.RFC3339Nano, params.Metadata["checkout_generation"])
+	_, frozenPrepaid := params.Metadata["prepaid_purchase_id"]
+	return !frozenPrepaid && providerErr == nil && frozenErr == nil &&
+		(choice.State == "pending" || choice.State == "committed") && choice.Actor == actor &&
+		a.CheckoutInitializingAt.Valid && choice.Generation.Equal(a.CheckoutInitializingAt.Time) &&
+		providerGeneration.Equal(choice.Generation) && frozenGeneration.Equal(choice.Generation) &&
+		a.CheckoutSessionID != nil && choice.Session != nil && s.ID == *a.CheckoutSessionID && s.ID == *choice.Session &&
+		a.StripeCustomerID != nil && s.CustomerID == *a.StripeCustomerID && s.CustomerID == params.CustomerID &&
+		a.CheckoutRequestKey != nil && params.IdempotencyKey != "" && params.IdempotencyKey == *a.CheckoutRequestKey &&
+		s.Mode == "subscription" && s.ClientReferenceID == choice.Team.String() && params.ClientReferenceID == choice.Team.String() &&
+		s.Metadata["activation_user_id"] == actor.String() && params.Metadata["activation_user_id"] == actor.String() &&
+		s.Metadata["commercial_offer"] == choice.Offer && params.Metadata["commercial_offer"] == choice.Offer, nil
 }
 
 func pendingStarterIdentity(s StripeRetrievedCheckoutSession, p pendingStarterCheckout, actor uuid.UUID) bool {
