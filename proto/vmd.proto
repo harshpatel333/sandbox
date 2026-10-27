@@ -343,13 +343,13 @@ message ReshapeVMRequest {
   string vm_id = 1;
   uint32 vcpu = 2;
   uint32 mem_mib = 3;
-  // Same as ReviveVMRequest: the cold boot comes up open and with an
-  // empty boxd context unless the caller supplies these again.
-  repeated string allowed_cidrs = 4;
-  repeated string denied_cidrs = 5;
-  repeated string allowed_domains = 6;
-  map<string, string> env_vars = 7;
-  string secrets_jwt = 8;
+  // Required: the host does not record egress policy and a cold boot
+  // comes up open, so the request must restate it. An empty egress
+  // config is the explicit statement that the sandbox is unrestricted.
+  SandboxNetworkConfig sandbox_network = 4;
+  // Re-injected after boot: a cold boot starts boxd with an empty context.
+  map<string, string> env_vars = 5;
+  string secrets_jwt = 6;
 }
 
 message ReshapeVMResponse {

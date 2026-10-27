@@ -8,6 +8,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/superserve-ai/sandbox/internal/network"
 )
 
 // Firecracker refuses more vCPUs than this; checked before the teardown,
@@ -24,7 +26,10 @@ const (
 // The disk and block map are staged outside the run directory first,
 // because the revival teardown removes it. A failed boot leaves the
 // sandbox paused with its artifacts gone and the staged copy in place;
-// a retry boots from that copy.
+// a retry boots from that copy, including after a vmd restart.
+//
+// rules is required: the host does not record egress policy, so a nil
+// policy would bring a restricted sandbox back open.
 func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
 	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
 		return nil, status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
@@ -35,41 +40,81 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 	if memMiB < reshapeMinMemMiB {
 		return nil, status.Errorf(codes.InvalidArgument, "mem_mib must be at least %d", reshapeMinMemMiB)
 	}
+	if rules == nil {
+		return nil, status.Error(codes.InvalidArgument, "egress policy is required")
+	}
 	unlock, err := m.lockVMOp(ctx, vmID)
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
 
-	inst, err := m.getInstance(vmID)
-	if err != nil {
-		return nil, err
-	}
-	inst.mu.RLock()
-	st, unverified := inst.Status, inst.Unverified
-	curVCPU, curMem := inst.Config.VCPU, inst.Config.MemoryMiB
-	snap, mem, baseMem, base := inst.SnapshotPath, inst.MemFilePath, inst.BaseMemPath, inst.Config.BasePath
-	teamID, ownerID := inst.TeamID, inst.OwnerID
-	inst.mu.RUnlock()
+	var (
+		st                       VMStatus
+		unverified               bool
+		curVCPU, curMem          uint32
+		snap, mem, baseMem, base string
+		teamID, ownerID          string
+		disk                     string
+	)
+	inst, ierr := m.getInstance(vmID)
+	if ierr == nil {
+		inst.mu.RLock()
+		st, unverified = inst.Status, inst.Unverified
+		curVCPU, curMem = inst.Config.VCPU, inst.Config.MemoryMiB
+		snap, mem, baseMem, base = inst.SnapshotPath, inst.MemFilePath, inst.BaseMemPath, inst.Config.BasePath
+		teamID, ownerID = inst.TeamID, inst.OwnerID
+		netInfo := &network.VMNetInfo{HostIP: inst.IP, TAPDevice: inst.TAPDevice, Namespace: inst.Namespace}
+		inst.mu.RUnlock()
+		disk = m.instanceDiskPath(inst)
 
-	// A retry after a lost response finds its own work done.
-	if st == StatusRunning && !unverified && curVCPU == vcpu && curMem == memMiB {
-		return inst, nil
+		// A retry after a lost response finds its own work done. Policy is
+		// reapplied: a vmd restart in between reattaches the VM without it,
+		// and a retry may carry a corrected policy.
+		if st == StatusRunning && !unverified && curVCPU == vcpu && curMem == memMiB {
+			if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
+				return nil, status.Errorf(codes.Internal, "reapply network rules on idempotent reshape: %v", err)
+			}
+			// DestroyVM bypasses the op lock; report it rather than a
+			// stale success, as revive's idempotent path does.
+			unlockOwner := m.lockRecordOwner(vmID)
+			m.mu.RLock()
+			_, tracked := m.vms[vmID]
+			m.mu.RUnlock()
+			unlockOwner()
+			if !tracked {
+				return nil, status.Errorf(codes.Aborted, "vm %s was destroyed during the reshape retry", vmID)
+			}
+			return inst, nil
+		}
+	}
+
+	stageDir := filepath.Join(m.cfg.SnapshotDir, vmID, "reshape")
+	if ierr != nil || st == StatusError {
+		// A failed or interrupted attempt leaves the durable record as the
+		// anchor (marked RevivalPending) and the staged disk beside it.
+		rec, gerr := m.stateRecord(vmID)
+		if gerr != nil || !rec.RevivalPending {
+			if ierr != nil {
+				return nil, ierr
+			}
+			return nil, status.Errorf(codes.FailedPrecondition, "vm %s must be paused to reshape", vmID)
+		}
+		st, snap, base, teamID, ownerID = StatusPaused, rec.SnapshotPath, rec.BasePath, rec.TeamID, rec.OwnerID
+		curVCPU, curMem = rec.VCPU, rec.MemoryMiB
+		mem, disk = "", ""
 	}
 	if st != StatusPaused || snap == "" {
 		return nil, status.Errorf(codes.FailedPrecondition, "vm %s must be paused to reshape", vmID)
 	}
 
-	stageDir := filepath.Join(m.cfg.SnapshotDir, vmID, "reshape")
 	diskName := "rootfs.ext4"
 	if base != "" {
 		diskName = "overlay.ext4"
 	}
 	stagedDisk := filepath.Join(stageDir, diskName)
 	stagedMap := ""
-
-	disk := m.instanceDiskPath(inst)
-	if pauseArtifactsPresent(snap, mem, baseMem, disk, base) {
+	if mem != "" && pauseArtifactsPresent(snap, mem, baseMem, disk, base) {
 		// The paused disk is authoritative; any copy left by an earlier
 		// failed attempt predates it and is replaced.
 		if err := os.RemoveAll(stageDir); err != nil {
@@ -98,6 +143,9 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 	start := time.Now()
 	revived, err := m.reviveVMLocked(ctx, vmID, stagedDisk, base, stagedMap, false, false, true, teamID, ownerID, vcpu, memMiB, rules, "")
 	if err != nil {
+		// Revival put the paused record back; memory must follow it or
+		// the retry finds no paused VM to boot from.
+		m.restorePausedAnchor(vmID)
 		return nil, err
 	}
 	_ = os.RemoveAll(stageDir)
@@ -107,6 +155,20 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 		Dur("total", time.Since(start)).
 		Msg("sandbox reshaped")
 	return revived, nil
+}
+
+// stateRecord reads vmID's durable record directly: the on-demand loader
+// parks a record whose revival is pending while this caller holds the op
+// lock.
+func (m *Manager) stateRecord(vmID string) (*VMRecord, error) {
+	if m.state == nil {
+		return nil, status.Error(codes.NotFound, "no state store")
+	}
+	rec, err := m.state.Get(vmID)
+	if err != nil || rec == nil {
+		return nil, status.Errorf(codes.NotFound, "vm %s has no durable record", vmID)
+	}
+	return rec, nil
 }
 
 // stageReshapeFile reflinks src to dst through a temporary name, so a
