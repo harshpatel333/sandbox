@@ -140,6 +140,13 @@ func classifyBuildError(err error) (code, userMsg string) {
 	case strings.Contains(raw, "image has no /bin/sh"):
 		return "unsupported_base", "base image has no shell at /bin/sh; use an image that ships one"
 
+	case strings.Contains(raw, "image is missing required commands"):
+		msg := raw
+		if idx := strings.Index(msg, "image is missing"); idx >= 0 {
+			msg = "base " + msg[idx:]
+		}
+		return "unsupported_base", msg
+
 	case strings.Contains(raw, "image appears to be busybox-only"):
 		return "unsupported_base", "busybox-only base images are not supported; use an image with a standard userland"
 

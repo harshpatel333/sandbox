@@ -120,25 +120,55 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 // every build step run under.
 var errNoShell = errors.New("image has no /bin/sh")
 
-// requireShell rejects a flattened image whose /bin/sh is not an executable
-// file, such as a distroless or scratch-based one. Extraction keeps every
-// symlink relative and inside the rootfs, so resolving one here cannot leave
-// it.
+// guestTools are the commands every boot and build runs whatever the build
+// spec says: the injected init creates and mounts its filesystems and its
+// freezer cgroup, and each build syncs the disk before the snapshot.
+var guestTools = []string{"mkdir", "mount", "chmod", "sync"}
+
+// guestPath is where those commands are looked up, as the guest's shell would.
+var guestPath = []string{"usr/local/sbin", "usr/local/bin", "usr/sbin", "usr/bin", "sbin", "bin"}
+
+// requireShell rejects a flattened image that cannot boot or build: one
+// whose /bin/sh is not an executable file, such as a distroless or
+// scratch-based image, or one missing a command in guestTools.
 func requireShell(rootfsDir string) error {
 	root, err := filepath.EvalSymlinks(rootfsDir)
 	if err != nil {
 		return fmt.Errorf("resolve rootfs: %w", err)
 	}
-	resolved, err := filepath.EvalSymlinks(filepath.Join(root, "bin/sh"))
-	if err != nil {
+	if !isExecutable(root, "bin/sh") {
 		return errNoShell
 	}
-	if rel, err := filepath.Rel(root, resolved); err != nil || strings.HasPrefix(rel, "..") {
-		return errNoShell
+	var missing []string
+	for _, tool := range guestTools {
+		found := false
+		for _, dir := range guestPath {
+			if isExecutable(root, filepath.Join(dir, tool)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, tool)
+		}
 	}
-	info, err := os.Stat(resolved)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return errNoShell
+	if len(missing) > 0 {
+		return fmt.Errorf("image is missing required commands: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+// isExecutable reports whether rel names an executable regular file inside
+// root. Extraction keeps every symlink relative and inside the rootfs, so
+// resolving one here cannot leave it.
+func isExecutable(root, rel string) bool {
+	resolved, err := filepath.EvalSymlinks(filepath.Join(root, rel))
+	if err != nil {
+		return false
+	}
+	if r, err := filepath.Rel(root, resolved); err != nil || strings.HasPrefix(r, "..") {
+		return false
+	}
+	info, err := os.Stat(resolved)
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0
 }

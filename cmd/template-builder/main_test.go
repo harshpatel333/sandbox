@@ -123,6 +123,11 @@ func TestClassifyBuildError(t *testing.T) {
 			wantCode: "unsupported_base",
 		},
 		{
+			name:     "base image without the commands every build runs",
+			err:      "build rootfs: image is missing required commands: mount, sync",
+			wantCode: "unsupported_base",
+		},
+		{
 			name:     "busybox-style base reported as unsupported, not as a pull failure",
 			err:      "build rootfs: pull busybox: image appears to be busybox-only (PATH looks minimal)",
 			wantCode: "unsupported_base",
