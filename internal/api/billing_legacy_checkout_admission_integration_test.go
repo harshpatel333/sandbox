@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -172,6 +173,25 @@ func TestPlanAssignmentLegacyCheckoutAcceptedReplaySurvivesPlanChange(t *testing
 				if _, err = assignInTx(t, f.h, planAssignment{Team: f.team, Terms: testPlanTerms("free", planKindFree, 1, nil), Source: planSourcePlanChange, Reason: "fixture changed after accepted checkout"}); err != nil {
 					t.Fatal(err)
 				}
+				busy, err := f.h.Pool.Begin(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = busy.Exec(t.Context(), `SELECT id FROM team WHERE id=$1 FOR UPDATE`, f.team); err != nil {
+					busy.Rollback(t.Context())
+					t.Fatal(err)
+				}
+				blocked := legacyAdmissionPost(t, f, actor, trusted, req)
+				if err = busy.Rollback(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if blocked.Code != http.StatusConflict {
+					t.Fatalf("accepted contention: %d %s", blocked.Code, blocked.Body)
+				}
+				retained, err := f.h.DB.GetTeamBillingCheckoutForRecovery(t.Context(), f.team)
+				if err != nil || !reflect.DeepEqual(before, retained) {
+					t.Fatalf("contention changed accepted fence: %v", err)
+				}
 				replay := legacyAdmissionPost(t, f, actor, trusted, req)
 				if replay.Code != 200 || (!lost && replay.Body.String() != first.Body.String()) {
 					t.Fatalf("accepted replay: %d %s", replay.Code, replay.Body)
@@ -252,27 +272,25 @@ func TestPlanAssignmentLegacyCheckoutSerializesAssignmentBeforeFreshAdmission(t 
 					_, err := f.h.beginLegacyCheckout(t.Context(), f.team, actor, legacyAdmissionRequest(trusted), "fixture-key", uuid.New(), trusted)
 					done <- err
 				}()
-				// Observe the actual database lock wait, not a scheduling-dependent sleep.
-				deadline := time.Now().Add(3 * time.Second)
-				for {
-					var waiting bool
-					err = f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT id FROM team WHERE id=%FOR UPDATE%')`).Scan(&waiting)
-					if err != nil {
-						t.Fatal(err)
+				select {
+				case err = <-done:
+					if !errors.Is(err, pgx.ErrNoRows) {
+						t.Fatalf("busy assignment did not reject fresh checkout: %v", err)
 					}
-					if waiting {
-						break
-					}
-					if time.Now().After(deadline) {
-						t.Fatal("checkout did not wait for assignment")
-					}
-					time.Sleep(10 * time.Millisecond)
+				case <-time.After(3 * time.Second):
+					t.Fatal("checkout waited on team while holding the billing account")
+				}
+				// This is the opposite lock order used by sponsored/YC operations.
+				// A failed checkout must release the account for that writer to finish.
+				if _, err = f.h.DB.WithTx(tx).LockTeamBillingAccount(t.Context(), f.team); err != nil {
+					t.Fatal(err)
 				}
 				if err = tx.Commit(t.Context()); err != nil {
 					t.Fatal(err)
 				}
-				if err = <-done; !errors.Is(err, errLegacyCheckoutPlan) {
-					t.Fatalf("concurrent assignment bypassed: %v", err)
+				_, err = f.h.beginLegacyCheckout(t.Context(), f.team, actor, legacyAdmissionRequest(trusted), "fixture-key", uuid.New(), trusted)
+				if !errors.Is(err, errLegacyCheckoutPlan) {
+					t.Fatalf("retry bypassed committed assignment: %v", err)
 				}
 				var fresh bool
 				if err = f.h.Pool.QueryRow(t.Context(), `SELECT checkout_initializing_at IS NULL AND checkout_request_key IS NULL FROM team_billing_account WHERE team_id=$1`, f.team).Scan(&fresh); err != nil || !fresh {

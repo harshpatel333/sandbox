@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -60,8 +61,14 @@ func (h *Handlers) beginLegacyCheckout(ctx context.Context, team, actor uuid.UUI
 	}
 	// Assignment INSERT takes KEY SHARE; plan changes take NO KEY UPDATE. UPDATE
 	// conflicts with both, including a first assignment absent at our first read.
+	// Billing writers use both team/account lock orders. Do not wait on the team
+	// while holding the account: contention is retried without a new lease.
 	var lockedTeam uuid.UUID
-	if err = tx.QueryRow(ctx, `SELECT id FROM team WHERE id=$1 FOR UPDATE`, team).Scan(&lockedTeam); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT id FROM team WHERE id=$1 FOR UPDATE NOWAIT`, team).Scan(&lockedTeam); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+			return account, pgx.ErrNoRows
+		}
 		return account, err
 	}
 	var denied bool
