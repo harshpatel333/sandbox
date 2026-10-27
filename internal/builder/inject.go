@@ -162,7 +162,25 @@ func ensureLocalhost(path string) error {
 	if hostsMaps(string(data), "localhost") {
 		return nil
 	}
-	return os.WriteFile(path, []byte(localhostEntries+string(data)), 0o644)
+	// A new file renamed into place, so a hardlink the image made from
+	// /etc/hosts to another file is broken rather than written through.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".hosts-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(localhostEntries + string(data)); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // hostsMaps reports whether an /etc/hosts body maps name to an address.

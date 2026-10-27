@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -26,6 +27,8 @@ const memoryHostsPath = "/run/.boxd/hosts"
 // sandbox resumed or created from a snapshot keeps the result in memory, so
 // it runs only when a template is built and when a sandbox boots cold.
 func prepareGuestFiles() {
+	start := time.Now()
+	defer func() { log.Printf("init: guest files prepared in %s", time.Since(start)) }()
 	if err := keepHostsInMemory(); err != nil {
 		log.Printf("init: keep /etc/hosts in memory: %v", err)
 	}

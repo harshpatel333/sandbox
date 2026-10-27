@@ -485,3 +485,22 @@ func TestEnsureLocalhostReplacesASymlink(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+func TestEnsureLocalhostBreaksAHardlink(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	other, path := filepath.Join(dir, "passwd"), filepath.Join(dir, "hosts")
+	writeTestFile(t, other, "root:x:0:0::/root:/bin/sh\n")
+	if err := os.Link(other, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureLocalhost(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := readTestFile(t, other); got != "root:x:0:0::/root:/bin/sh\n" {
+		t.Fatalf("the hardlinked file was rewritten: %q", got)
+	}
+	if !strings.HasPrefix(readTestFile(t, path), localhostEntries) {
+		t.Fatal("hosts lacks the localhost entries")
+	}
+}
