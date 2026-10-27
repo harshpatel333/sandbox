@@ -55,6 +55,8 @@ type billingPlanCard struct {
 	Allowance          *billingPlanAllowance `json:"allowance"`
 	Matching           *planMatching         `json:"matching"`
 	Limits             planLimits            `json:"limits"`
+	FundingPolicy      string                `json:"funding_policy"`
+	Topoff             *planTopoff           `json:"topoff"`
 }
 
 func allowanceSummary(a *planAllowance) string {
@@ -70,7 +72,11 @@ func allowanceSummary(a *planAllowance) string {
 
 func (h *Handlers) planCard(v planVersion, allowance *planAllowance) billingPlanCard {
 	card := billingPlanCard{Family: v.Family, Version: v.Version, Kind: v.Kind, Name: v.DisplayName, PriceLabel: v.PriceLabel, Tagline: v.Tagline,
-		Features: v.Features, DisplayOnly: v.DisplayOnly, CreditSummary: planCreditSummary(v.CreditSchedule), Matching: v.Matching, Limits: v.Limits}
+		Features: v.Features, DisplayOnly: v.DisplayOnly, CreditSummary: planCreditSummary(v.CreditSchedule), Matching: v.Matching, Limits: v.Limits,
+		FundingPolicy: fundingPolicyPostpaid, Topoff: v.Topoff}
+	if v.prepaidFunded() {
+		card.FundingPolicy = fundingPolicyPrepaid
+	}
 	if allowance != nil {
 		card.Allowance = &billingPlanAllowance{planAllowance: *allowance, Summary: allowanceSummary(allowance)}
 	}
@@ -107,6 +113,43 @@ func purchasablePlans(cards []billingPlanCard) []billingPlan {
 		}
 	}
 	return plans
+}
+
+// billingOffer is one checkout offer: a plan family at one billing interval.
+type billingOffer struct {
+	OfferKey            string      `json:"offer_key"`
+	Family              string      `json:"family"`
+	DisplayName         string      `json:"display_name"`
+	PriceCents          int64       `json:"price_cents"`
+	IntervalMonths      int32       `json:"interval_months"`
+	IncludedCreditCents int64       `json:"included_credit_cents"`
+	FundingPolicy       string      `json:"funding_policy"`
+	Topoff              *planTopoff `json:"topoff"`
+	Sellable            bool        `json:"sellable"`
+}
+
+// catalogOffers lists every priced interval of the catalog's cards, sellable
+// or not, so clients render offers without knowing plan names.
+func catalogOffers(cards []billingPlanCard) []billingOffer {
+	offers := []billingOffer{}
+	for _, card := range cards {
+		for _, price := range []*billingPlanPrice{card.Monthly, card.Annual} {
+			if price == nil {
+				continue
+			}
+			months := int32(1)
+			if price == card.Annual {
+				months = 12
+			}
+			offer := billingOffer{OfferKey: price.OfferKey, Family: card.Family, DisplayName: card.Name, PriceCents: price.PriceCents, IntervalMonths: months,
+				FundingPolicy: card.FundingPolicy, Topoff: card.Topoff, Sellable: price.Available}
+			if card.MonthlyCreditCents != nil {
+				offer.IncludedCreditCents = *card.MonthlyCreditCents
+			}
+			offers = append(offers, offer)
+		}
+	}
+	return offers
 }
 
 type billingCatalog struct {

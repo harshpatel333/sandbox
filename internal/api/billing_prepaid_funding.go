@@ -50,17 +50,22 @@ func prepaidUnspentPurchases(ctx context.Context, q db.DBTX, team uuid.UUID) (in
 
 // A fresh observation after grant issuance starts prepaid enforcement even at
 // zero: consumed credit or provider lag must not leave legacy PAYG access open.
+// A prepaid-funded subscription may never buy credit, so its issued monthly
+// grant counts as issuance too.
+const prepaidEnforcementDue = ` f.observe AND NOT f.prepaid AND f.observed_generation=f.generation AND f.credit_usd>=0 AND f.credit_valid_until>clock_timestamp()
+ AND EXISTS(SELECT 1 FROM team_plan_assignment a WHERE a.team_id=f.team_id AND a.effective_to IS NULL AND billing_assignment_prepaid_funded(a))
+ AND EXISTS(SELECT 1 FROM team_billing_account a WHERE a.team_id=f.team_id AND f.customer_id=a.stripe_customer_id AND f.subscription_id IS NOT DISTINCT FROM a.stripe_subscription_id
+  AND (EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=f.team_id AND p.credit_state='issued' AND p.customer_id=a.stripe_customer_id AND f.credit_checked_at>p.credited_at)
+   OR EXISTS(SELECT 1 FROM billing_usage_entitlement e JOIN team_plan_assignment s ON s.contract_id=e.contract_id AND s.effective_to IS NULL
+    WHERE e.team_id=f.team_id AND s.team_id=f.team_id AND s.kind='subscription' AND e.state='issued' AND f.credit_checked_at>e.issued_at)))`
+
 func (h *Handlers) startPrepaidEnforcement(ctx context.Context) error {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT t.id FROM team t JOIN billing_funding_account f ON f.team_id=t.id
- WHERE f.observe AND NOT f.prepaid AND f.observed_generation=f.generation AND f.credit_usd>=0 AND f.credit_valid_until>clock_timestamp()
- AND EXISTS(SELECT 1 FROM team_plan_assignment a WHERE a.team_id=t.id AND a.effective_to IS NULL AND a.kind='prepaid')
- AND EXISTS(SELECT 1 FROM billing_prepaid_purchase p JOIN team_billing_account a USING(team_id)
-  WHERE p.team_id=f.team_id AND p.credit_state='issued' AND p.customer_id=a.stripe_customer_id AND f.customer_id=a.stripe_customer_id AND f.subscription_id IS NOT DISTINCT FROM a.stripe_subscription_id AND f.credit_checked_at>p.credited_at)
+	rows, err := tx.Query(ctx, `SELECT t.id FROM team t JOIN billing_funding_account f ON f.team_id=t.id WHERE`+prepaidEnforcementDue+`
  ORDER BY t.id LIMIT 20 FOR NO KEY UPDATE OF t SKIP LOCKED`)
 	if err != nil {
 		return err
@@ -69,11 +74,7 @@ func (h *Handlers) startPrepaidEnforcement(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `UPDATE billing_funding_account f SET enforce=true,prepaid=true
- WHERE f.team_id=ANY($1) AND EXISTS(SELECT 1 FROM team_plan_assignment a WHERE a.team_id=f.team_id AND a.effective_to IS NULL AND a.kind='prepaid')
- AND f.observe AND NOT f.prepaid AND f.observed_generation=f.generation AND f.credit_usd>=0 AND f.credit_valid_until>clock_timestamp()
-  AND EXISTS(SELECT 1 FROM billing_prepaid_purchase p JOIN team_billing_account a USING(team_id)
-   WHERE p.team_id=f.team_id AND p.credit_state='issued' AND p.customer_id=a.stripe_customer_id AND f.customer_id=a.stripe_customer_id AND f.subscription_id IS NOT DISTINCT FROM a.stripe_subscription_id AND f.credit_checked_at>p.credited_at)`, teams)
+	_, err = tx.Exec(ctx, `UPDATE billing_funding_account f SET enforce=true,prepaid=true WHERE f.team_id=ANY($1) AND`+prepaidEnforcementDue, teams)
 	if err != nil {
 		return err
 	}

@@ -354,7 +354,7 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 				respondError(c, ErrInternal)
 				return
 			}
-			if !ok || plan.Kind != planKindPrepaid {
+			if !ok || !plan.prepaidFunded() {
 				respondErrorMsg(c, "conflict", "auto-recharge requires a prepaid plan", http.StatusConflict)
 				return
 			}

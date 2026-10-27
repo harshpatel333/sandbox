@@ -157,6 +157,8 @@ type planDraftRequest struct {
 	Matching        *planMatching  `json:"matching"`
 	Allowance       *planAllowance `json:"allowance"`
 	Limits          planLimits     `json:"limits"`
+	FundingPolicy   string         `json:"funding_policy"`
+	Topoff          *planTopoff    `json:"topoff"`
 	Reason          string         `json:"reason"`
 }
 
@@ -164,7 +166,7 @@ func (r planDraftRequest) version() planVersion {
 	v := planVersion{PricingVersion: r.PricingVersion, Family: strings.TrimSpace(r.Family), Kind: r.Kind, Public: r.Public, DisplayName: strings.TrimSpace(r.DisplayName),
 		PriceLabel: strings.TrimSpace(r.PriceLabel), Tagline: strings.TrimSpace(r.Tagline), Features: r.Features, SortOrder: r.SortOrder, DisplayOnly: r.DisplayOnly,
 		SelfServe: r.SelfServe, MonthlyFeeCents: r.MonthlyFeeCents, AnnualFeeCents: r.AnnualFeeCents, CreditSchedule: r.CreditSchedule, Matching: r.Matching,
-		Allowance: r.Allowance, Limits: r.Limits}
+		Allowance: r.Allowance, Limits: r.Limits, FundingPolicy: r.FundingPolicy, Topoff: r.Topoff}
 	if v.PricingVersion == "" {
 		v.PricingVersion = "legacy"
 	}
@@ -201,6 +203,10 @@ func (v planVersion) contentKey() string {
 	v.ID, v.Version, v.State = uuid.Nil, 0, ""
 	v.CreatedBy, v.PublishedBy, v.RetiredBy = nil, nil, nil
 	v.CreatedAt, v.UpdatedAt, v.PublishedAt, v.RetiredAt = time.Time{}, time.Time{}, nil, nil
+	// Editors that predate funding policies send none; that is postpaid.
+	if v.FundingPolicy == "" {
+		v.FundingPolicy = fundingPolicyPostpaid
+	}
 	if v.Features == nil {
 		v.Features = []string{}
 	}
@@ -234,7 +240,8 @@ func bindCatalogReason(c *gin.Context) (string, bool) {
 // planWriteColumns are the columns a draft sets, in planVersionArgs order.
 const planWriteColumns = `public,display_name,price_label,tagline,features,sort_order,display_only,self_serve,monthly_fee_cents,annual_fee_cents,
 credit_schedule,matching_bps,cap_cents,allowance_period,allowance_on_exhausted,allowance_cents,allowance_compute_seconds,allowance_compute_vcpu,
-allowance_compute_memory_gib,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates`
+allowance_compute_memory_gib,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates,
+funding_policy,topoff_amount_cents,topoff_threshold_cents,topoff_default_enabled`
 
 func planVersionArgs(v planVersion) []any {
 	schedule, _ := json.Marshal(v.CreditSchedule)
@@ -253,9 +260,19 @@ func planVersionArgs(v planVersion) []any {
 			allowanceCents = &a.AmountCents
 		}
 	}
+	var topoffAmount, topoffThreshold *int64
+	var topoffDefault *bool
+	policy := fundingPolicyPostpaid
+	if v.prepaidFunded() {
+		policy = fundingPolicyPrepaid
+	}
+	if t := v.Topoff; t != nil {
+		topoffAmount, topoffThreshold, topoffDefault = &t.AmountCents, &t.ThresholdCents, &t.DefaultEnabled
+	}
 	return []any{v.Public, v.DisplayName, v.PriceLabel, v.Tagline, v.Features, v.SortOrder, v.DisplayOnly, v.SelfServe, v.MonthlyFeeCents, v.AnnualFeeCents,
 		schedule, bps, capCents, period, onExhausted, allowanceCents, seconds, vcpu, memory,
-		v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB, v.Limits.MaxTemplates}
+		v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB, v.Limits.MaxTemplates,
+		policy, topoffAmount, topoffThreshold, topoffDefault}
 }
 
 // placeholders returns "$from,...,$to".

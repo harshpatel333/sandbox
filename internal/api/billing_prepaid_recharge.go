@@ -123,7 +123,7 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
  JOIN billing_funding_account f USING(team_id)
  JOIN team_billing_account b USING(team_id)
  WHERE a.enabled AND a.amount_cents BETWEEN 500 AND $2 AND a.amount_cents%500=0
- AND a.threshold_cents BETWEEN 500 AND $2 AND a.threshold_cents%500=0 AND EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=a.team_id AND p.effective_to IS NULL AND p.kind='prepaid')
+ AND a.threshold_cents BETWEEN 500 AND $2 AND a.threshold_cents%500=0 AND EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=a.team_id AND p.effective_to IS NULL AND billing_assignment_prepaid_funded(p))
  AND f.observe AND f.payment_method_ready AND f.payment_method_id IS NOT NULL
   AND f.observed_generation=f.generation AND f.customer_id=b.stripe_customer_id
   AND f.credit_checked_at>clock_timestamp()-interval '2 minutes' AND f.credit_usd*100<a.threshold_cents
@@ -149,6 +149,48 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+var errTopoffNotOffered = errors.New("the team's plan does not offer Auto Topoff")
+
+// applyCheckoutTopoff records the Auto Topoff choice made at checkout for a
+// prepaid-funded subscription, inside the caller's settlement transaction and
+// with the admission that checkout accepted. Amount and threshold come from
+// the plan's frozen terms. Replaying a session changes nothing, so a later
+// change by the customer survives settlement retries. It also queues the team
+// for funding observation, which retryPrepaidEnrolment completes outside tx
+// because the observation cohort may be full.
+func applyCheckoutTopoff(ctx context.Context, tx pgx.Tx, team uuid.UUID, session string, enabled bool, admission pricingPublicState) error {
+	if strings.TrimSpace(session) == "" {
+		return errors.New("checkout top-off needs the checkout session")
+	}
+	plan, ok, err := currentTeamPlan(ctx, tx, team)
+	if err != nil {
+		return err
+	}
+	if !ok || plan.Kind != planKindSubscription || !plan.prepaidFunded() || (enabled && plan.Terms.Topoff == nil) {
+		return errTopoffNotOffered
+	}
+	var amount, threshold *int64
+	if t := plan.Terms.Topoff; t != nil {
+		amount, threshold = &t.AmountCents, &t.ThresholdCents
+	}
+	// Turning it off keeps the saved admission: only consent may change it.
+	if _, err = tx.Exec(ctx, `INSERT INTO billing_prepaid_auto_recharge(team_id,enabled,threshold_cents,amount_cents,checkout_session_id,admission_source,admission_epoch)
+ VALUES($1,$2,$3,$4,$5,$6,$7)
+ ON CONFLICT(team_id) DO UPDATE SET enabled=EXCLUDED.enabled,threshold_cents=EXCLUDED.threshold_cents,amount_cents=EXCLUDED.amount_cents,
+  checkout_session_id=EXCLUDED.checkout_session_id,updated_by=NULL,updated_at=clock_timestamp(),
+  disabled_reason=NULL,disabled_at=NULL,disabled_by=NULL,notified_at=NULL,
+  admission_source=CASE WHEN EXCLUDED.enabled THEN EXCLUDED.admission_source ELSE billing_prepaid_auto_recharge.admission_source END,
+  admission_epoch=CASE WHEN EXCLUDED.enabled THEN EXCLUDED.admission_epoch ELSE billing_prepaid_auto_recharge.admission_epoch END
+ WHERE billing_prepaid_auto_recharge.checkout_session_id IS DISTINCT FROM EXCLUDED.checkout_session_id`,
+		team, enabled, threshold, amount, session, pricingSource(admission), pricingEpoch(admission)); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO billing_funding_account(team_id,prepaid_enrolment_due_at) VALUES($1,clock_timestamp())
+ ON CONFLICT(team_id) DO UPDATE SET prepaid_enrolment_due_at=COALESCE(billing_funding_account.prepaid_enrolment_due_at,clock_timestamp())
+ WHERE NOT billing_funding_account.observe`, team)
+	return err
 }
 
 func (h *Handlers) settleDuePrepaidPurchases(ctx context.Context, client *stripeHTTPClient) error {
@@ -278,7 +320,7 @@ func (h *Handlers) chargeAutoRecharge(ctx context.Context, client *stripeHTTPCli
 		if err != nil {
 			return err
 		}
-		if !enabled || !ok || plan.Kind != planKindPrepaid {
+		if !enabled || !ok || !plan.prepaidFunded() {
 			if _, err = tx.Exec(ctx, `UPDATE billing_prepaid_purchase SET payment_state='failed',failure_reason='auto-recharge is disabled or the team has left prepaid before dispatch' WHERE id=$1 AND payment_state='pending'`, id); err != nil {
 				return err
 			}

@@ -28,5 +28,5 @@ func (h *Handlers) GetBillingCapabilities(c *gin.Context) {
 		"admission_source": pricingSource(state), "entry_open": state.EntryOpen || state.LegacyOpen,
 		"epoch": pricingEpoch(state), "enrollment_epoch": state.EnrollmentEpoch,
 		"fresh_entry": gin.H{"starter": fresh, "pro": fresh, "auto_recharge": fresh, "choose_free": fresh},
-		"actions":     gin.H{"recover_payment": true, "disable_auto_recharge": true}, "catalog": catalog})
+		"actions":     gin.H{"recover_payment": true, "disable_auto_recharge": true}, "catalog": catalog, "offers": catalogOffers(catalog.Cards)})
 }

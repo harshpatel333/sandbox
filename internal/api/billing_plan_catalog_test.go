@@ -117,7 +117,15 @@ func TestPlanVersionValidate(t *testing.T) {
 		"unsellable self-serve": func(v *planVersion) {
 			v.SelfServe, v.Public, v.Matching = true, true, &planMatching{MatchingBps: 1, CapCents: 1}
 		},
-		"NUL in name": func(v *planVersion) { v.DisplayName = "Pr\x00o" },
+		"NUL in name":            func(v *planVersion) { v.DisplayName = "Pr\x00o" },
+		"unknown funding policy": func(v *planVersion) { v.FundingPolicy = "credit" },
+		"top-off while postpaid": func(v *planVersion) { v.Topoff = &planTopoff{AmountCents: 500, ThresholdCents: 500} },
+		"top-off checkout refuses": func(v *planVersion) {
+			v.FundingPolicy, v.Topoff = fundingPolicyPrepaid, &planTopoff{AmountCents: 750, ThresholdCents: 500}
+		},
+		"top-off over the cap": func(v *planVersion) {
+			v.FundingPolicy, v.Topoff = fundingPolicyPrepaid, &planTopoff{AmountCents: 500, ThresholdCents: prepaidPurchaseMaxCents + 500}
+		},
 	} {
 		v := valid
 		v.CreditSchedule = append([]planGrant{}, valid.CreditSchedule...)
@@ -134,10 +142,16 @@ func TestPlanVersionValidate(t *testing.T) {
 			Allowance: &planAllowance{Period: "day_window", OnExhausted: "pause", Compute: &planCompute{Seconds: 7200, VCPU: 1, MemoryGiB: 1}}},
 		"starter":       {PricingVersion: "v2", Family: "starter", Kind: "prepaid", Public: true, DisplayName: "Starter", Limits: planLimits{MaxConcurrent: int32p(100)}},
 		"matching deal": {PricingVersion: "v2", Family: "custom_example", Kind: "custom", DisplayName: "Example", Matching: &planMatching{MatchingBps: 10000, CapCents: 8000000}},
+		"prepaid-funded subscription": {PricingVersion: "v2", Family: "funded", Kind: "subscription", DisplayName: "Funded", MonthlyFeeCents: int64p(700),
+			Limits: planLimits{MaxConcurrent: int32p(3)}, FundingPolicy: fundingPolicyPrepaid, Topoff: &planTopoff{AmountCents: 1500, ThresholdCents: 1000}},
 	} {
 		if err := v.validate(); err != nil {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+	starter := planVersion{PricingVersion: "v2", Family: "starter", Kind: "prepaid", DisplayName: "Starter", Limits: planLimits{MaxConcurrent: int32p(1)}, FundingPolicy: fundingPolicyPrepaid}
+	if starter.validate() == nil {
+		t.Fatal("prepaid funding policy accepted outside a subscription")
 	}
 	sellable := valid
 	sellable.SelfServe, sellable.Public = true, true
