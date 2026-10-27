@@ -89,6 +89,9 @@ func (m *Manager) ReshapeVM(ctx context.Context, vmID string, vcpu, memMiB uint3
 			if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
 				return nil, status.Errorf(codes.Internal, "reapply network rules on idempotent reshape: %v", err)
 			}
+			// A crash after the commit skips the normal cleanup; the staged
+			// clone would pin the pre-reshape disk for the sandbox's life.
+			_ = os.RemoveAll(stageDir)
 			return inst, nil
 		}
 	}
