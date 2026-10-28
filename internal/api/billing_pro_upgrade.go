@@ -627,15 +627,36 @@ func (h *Handlers) expireProUpgrade(ctx context.Context, conn *pgxpool.Conn, u p
  WHERE team_id=$1 AND stripe_customer_id=$2 AND stripe_subscription_id=$3`, u.Team, u.Customer, subscription, u.Anchor); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, `UPDATE team_billing_period SET status='finalized',blocked_reason='reporting_only_calendar_period',gross_charges_usd=0,credits_applied_usd=0,net_invoice_amount_usd=0,finalized_at=clock_timestamp(),updated_at=clock_timestamp()
- WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='open' AND exported_at IS NULL AND approved_at IS NULL AND finalized_at IS NULL
-  AND NOT EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$1 AND commercial_billing_anchor IS NOT NULL)
-  AND NOT EXISTS(SELECT 1 FROM billing_invoice_account WHERE team_id=$1)
-  AND NOT EXISTS(SELECT 1 FROM billing_incremental_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3)`, u.Team, u.Start, u.End); err != nil {
-			return err
-		}
+		h.retireAbandonedFirstCyclePeriod(ctx, tx, u)
 	}
 	return tx.Commit(ctx)
+}
+
+// The abandoned month's reporting period is retired only while nothing has
+// touched it, and in a savepoint: the provider cancellation has already
+// happened, so a refusal here leaves the period open rather than undoing expiry.
+func (h *Handlers) retireAbandonedFirstCyclePeriod(ctx context.Context, tx pgx.Tx, u proUpgrade) {
+	sp, err := tx.Begin(ctx)
+	if err == nil {
+		_, err = sp.Exec(ctx, `UPDATE team_billing_period SET status='finalized',blocked_reason='reporting_only_calendar_period',gross_charges_usd=0,credits_applied_usd=0,net_invoice_amount_usd=0,finalized_at=clock_timestamp(),updated_at=clock_timestamp()
+ WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='open' AND exported_at IS NULL AND approved_at IS NULL AND finalized_at IS NULL AND blocked_at IS NULL
+  AND COALESCE(gross_charges_usd,0)=0 AND COALESCE(credits_applied_usd,0)=0 AND COALESCE(net_invoice_amount_usd,0)=0
+  AND NOT EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$1 AND commercial_billing_anchor IS NOT NULL)
+  AND NOT EXISTS(SELECT 1 FROM billing_invoice_account WHERE team_id=$1)
+  AND NOT EXISTS(SELECT 1 FROM billing_incremental_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3)
+  AND NOT EXISTS(SELECT 1 FROM billing_period_close_work WHERE team_id=$1 AND period_start=$2 AND period_end=$3)
+  AND NOT EXISTS(SELECT 1 FROM billing_usage_export WHERE team_id=$1 AND period_start=$2 AND period_end=$3)
+  AND NOT EXISTS(SELECT 1 FROM billing_export_allocation WHERE team_id=$1 AND period_start=$2 AND period_end=$3)`, u.Team, u.Start, u.End)
+		if err == nil {
+			err = sp.Commit(ctx)
+		}
+	}
+	if err != nil {
+		if sp != nil {
+			_ = sp.Rollback(ctx)
+		}
+		log.Warn().Err(err).Str("team_id", u.Team.String()).Str("pro_upgrade_id", u.ID.String()).Msg("abandoned first paid month reporting period left open")
+	}
 }
 
 // cancelUnpaidUpgradeSubscription cancels the subscription created for the
