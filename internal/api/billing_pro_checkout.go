@@ -48,8 +48,9 @@ var legacyProOffers = map[string]proOffer{
 	"pro_annual":  {Key: "pro_annual", Amount: 1200000, Months: 12, Credit: 100000},
 }
 
-// paidPlanOffers matches every offer_key in the self-serve plan catalog.
-const paidPlanOffers = "(SELECT offer_key FROM billing_plan)"
+// paidPlanOffers matches every paid offer_key: the legacy offer rows and every
+// offer a v2 subscription version has sold.
+const paidPlanOffers = "(SELECT billing_paid_offer_keys())"
 
 var errOfferUnavailable = errors.New("plan is not available")
 
@@ -290,6 +291,9 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 	v2 := offer.Pricing == "v2"
 	if v2 && !resuming {
 		params.AllowPromotionCodes = true
+		if t := offer.Topoff; t != nil {
+			params.Topoff = &StripeCheckoutTopoff{AmountCents: t.AmountCents, DefaultEnabled: t.DefaultEnabled}
+		}
 		if _, err = frozenProOffer(offer.Key, params); err != nil {
 			respondErrorMsg(c, "service_unavailable", "Pro plan configuration requires verification", 503)
 			return
@@ -610,7 +614,9 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 		return false, upgradeErr
 	}
 	var released bool
-	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE customer_id=$1 AND (subscription_id=$2 OR previous_choice->>'session_id'=$3))`, obj.Customer, subscription, obj.ID).Scan(&released); err != nil {
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE customer_id=$1 AND (subscription_id=$2 OR previous_choice->>'session_id'=$3))
+ OR EXISTS(SELECT 1 FROM billing_pro_upgrade u WHERE u.customer_id=$1 AND u.state='expired' AND u.payment_evidence IS NULL AND u.request_payload->>'FirstPaidProCycle'='true'
+  AND (u.subscription_id=$2 OR u.session_id=$3) AND NOT EXISTS(SELECT 1 FROM team_billing_account a WHERE a.stripe_customer_id=$1 AND a.stripe_subscription_id=u.subscription_id))`, obj.Customer, subscription, obj.ID).Scan(&released); err != nil {
 		return false, err
 	}
 	if released {
