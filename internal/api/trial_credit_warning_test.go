@@ -464,58 +464,52 @@ func TestTrialCreditWarningSuppressesInactiveTrialStates(t *testing.T) {
 	}
 }
 
-func TestTrialCreditWarningProcessingDoesNotSendForInactiveTrials(t *testing.T) {
-	for _, state := range []string{"exhausted", "ended_by_billing_activation"} {
-		t.Run(state, func(t *testing.T) {
-			sent := false
-			if err := sendTrialCreditWarningIfEligible(false, state, func() error {
-				sent = true
-				return nil
-			}); err != nil {
-				t.Fatalf("unexpected processing error: %v", err)
-			}
-			if sent {
-				t.Fatal("inactive trial must not invoke the warning sender")
+func TestCreditWarningOpenByKind(t *testing.T) {
+	usd := func(cents int64) pgtype.Numeric { return pgtype.Numeric{Int: big.NewInt(cents), Exp: -2, Valid: true} }
+	for _, tc := range []struct {
+		name string
+		row  db.GetTeamTrialBalanceRow
+		want bool
+	}{
+		{"legacy active trial", db.GetTeamTrialBalanceRow{Kind: "legacy_trial", State: "active", Eligible: true, RemainingUsd: usd(100)}, true},
+		{"legacy exhausted trial", db.GetTeamTrialBalanceRow{Kind: "legacy_trial", State: "exhausted", RemainingUsd: usd(0)}, false},
+		{"legacy trial ended by billing", db.GetTeamTrialBalanceRow{Kind: "legacy_trial", State: "ended_by_billing_activation", RemainingUsd: usd(0)}, false},
+		{"trial still running", db.GetTeamTrialBalanceRow{Kind: creditWarningTrial, State: "active", Eligible: true, RemainingUsd: usd(1), LowCreditThresholdUsd: usd(3)}, false},
+		{"trial ended", db.GetTeamTrialBalanceRow{Kind: creditWarningTrial, State: "exhausted", RemainingUsd: usd(0)}, true},
+		{"trial never granted", db.GetTeamTrialBalanceRow{Kind: creditWarningTrial, State: "no_grant", RemainingUsd: usd(0)}, false},
+		{"prepaid above threshold", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "active", Eligible: true, RemainingUsd: usd(700), LowCreditThresholdUsd: usd(700)}, false},
+		{"prepaid below threshold", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "active", Eligible: true, RemainingUsd: usd(699), LowCreditThresholdUsd: usd(700)}, true},
+		{"prepaid used up", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "exhausted", RemainingUsd: usd(0), LowCreditThresholdUsd: usd(700)}, true},
+		{"prepaid with auto top-off", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "auto_topoff", RemainingUsd: usd(100), LowCreditThresholdUsd: usd(700)}, false},
+		{"prepaid unobserved", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "unknown", RemainingUsd: usd(0), LowCreditThresholdUsd: usd(700)}, false},
+		{"prepaid without a threshold", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "active", Eligible: true, RemainingUsd: usd(1)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, got := creditWarningOpen(tc.row); got != tc.want {
+				t.Fatalf("creditWarningOpen = %v, want %v", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestTrialCreditWarningDeliveryPropagatesProviderOutcome(t *testing.T) {
-	called := 0
-	want := errors.New("provider rejected request")
-	if err := sendTrialCreditWarningIfEligible(true, "active", func() error {
-		called++
-		return want
-	}); !errors.Is(err, want) {
-		t.Fatalf("provider error = %v, want %v", err, want)
+func TestCreditWarningEmailCopyIsPlanNeutral(t *testing.T) {
+	for _, kind := range []string{"legacy_trial", creditWarningTrial, creditWarningPrepaid} {
+		subject, body := creditWarningEmail(kind, "example-team", 1.234)
+		if subject == "" || !strings.Contains(body, "example-team") || !strings.Contains(body, emailConsoleURL) {
+			t.Fatalf("%s email missing subject, team or console link: %q %s", kind, subject, body)
+		}
+		if strings.Contains(body, "$95") || strings.Contains(body, "payment method") {
+			t.Fatalf("%s email names a plan-specific offer: %s", kind, body)
+		}
+		if kind != creditWarningTrial && (strings.Contains(strings.ToLower(subject+body), "trial") || !strings.Contains(body, "$1.23")) {
+			t.Fatalf("%s low-credit email must be plan-neutral and quote the balance: %q %s", kind, subject, body)
+		}
 	}
-	if called != 1 {
-		t.Fatalf("provider calls = %d, want 1", called)
-	}
-
-	called = 0
-	if err := sendTrialCreditWarningIfEligible(true, "active", func() error {
-		called++
-		return nil
-	}); err != nil {
-		t.Fatalf("accepted provider outcome = %v", err)
-	}
-	if called != 1 {
-		t.Fatalf("provider calls after acceptance = %d, want 1", called)
-	}
-}
-
-func TestTrialCreditWarningDeliverySkipsProviderForIneligibleState(t *testing.T) {
-	called := 0
-	if err := sendTrialCreditWarningIfEligible(false, "ended_by_billing_activation", func() error {
-		called++
-		return errors.New("must not send")
-	}); err != nil {
-		t.Fatalf("ineligible delivery = %v, want nil", err)
-	}
-	if called != 0 {
-		t.Fatalf("provider calls for ended trial = %d, want 0", called)
+	_, ended := creditWarningEmail(creditWarningTrial, "example-team", 0)
+	for _, want := range []string{"paused", "Nothing has been deleted", "Choose a plan"} {
+		if !strings.Contains(ended, want) {
+			t.Fatalf("trial ended email missing %q: %s", want, ended)
+		}
 	}
 }
 

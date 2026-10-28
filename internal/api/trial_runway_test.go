@@ -73,7 +73,7 @@ func TestBillingTrialRunwayFreshnessAndJSON(t *testing.T) {
 			}
 			for key := range fields {
 				switch key {
-				case "grant_usd", "consumed_usd", "remaining_usd", "state", "eligible", "runway_state", "runway_observed_at":
+				case "grant_usd", "consumed_usd", "remaining_usd", "state", "eligible", "runway_state", "runway_observed_at", "low_credit_threshold_usd":
 				default:
 					t.Fatalf("unexpected public field %s", key)
 				}

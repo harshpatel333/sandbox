@@ -1445,13 +1445,14 @@ type BillingTeamPauseTarget struct {
 }
 
 type BillingTrialPolicy struct {
-	Singleton    bool           `json:"singleton"`
-	CreditUsd    pgtype.Numeric `json:"credit_usd"`
-	MaxSandboxes *int32         `json:"max_sandboxes"`
-	MaxVcpu      *int32         `json:"max_vcpu"`
-	MaxMemoryMib *int32         `json:"max_memory_mib"`
-	MaxDiskMib   *int32         `json:"max_disk_mib"`
-	UpdatedAt    time.Time      `json:"updated_at"`
+	Singleton             bool           `json:"singleton"`
+	CreditUsd             pgtype.Numeric `json:"credit_usd"`
+	MaxSandboxes          *int32         `json:"max_sandboxes"`
+	MaxVcpu               *int32         `json:"max_vcpu"`
+	MaxMemoryMib          *int32         `json:"max_memory_mib"`
+	MaxDiskMib            *int32         `json:"max_disk_mib"`
+	UpdatedAt             time.Time      `json:"updated_at"`
+	LowCreditThresholdUsd pgtype.Numeric `json:"low_credit_threshold_usd"`
 }
 
 type BillingUsageEntitlement struct {
