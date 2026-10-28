@@ -932,3 +932,37 @@ func TestNewTeamCohortTrialTeamCannotBuyPrepaidCredit(t *testing.T) {
 		}
 	}
 }
+
+func TestNewTeamCohortTrialTeamIsNotOfferedFree(t *testing.T) {
+	f := newTeamCohortTestFixture(t)
+	get := func(path string, handle gin.HandlerFunc, team uuid.UUID) map[string]any {
+		t.Helper()
+		r := gin.New()
+		r.GET(path, func(c *gin.Context) {
+			c.Set("team_id", team.String())
+			c.Set("actor_id", f.actor)
+			handle(c)
+		})
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		var v map[string]any
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &v) != nil {
+			t.Fatalf("%s: %d %s", path, rec.Code, rec.Body)
+		}
+		return v
+	}
+	fresh := get("/cap", f.h.GetBillingCapabilities, f.team)["fresh_entry"].(map[string]any)
+	if fresh["choose_free"] != false || fresh["starter"] != false || fresh["auto_recharge"] != false || fresh["pro"] != true {
+		t.Fatalf("trial team offers: %+v", fresh)
+	}
+	plan := get("/summary", f.h.GetBillingSummary, f.team)["plan"].(map[string]any)
+	if plan["key"] != "trial" || plan["name"] != "Free trial" || plan["status"] != entryTrial {
+		t.Fatalf("trial team summary plan: %+v", plan)
+	}
+	if _, err := f.h.Pool.Exec(t.Context(), `UPDATE team_trial_eligibility_cache SET eligible=false WHERE team_id=$1`, f.team); err != nil {
+		t.Fatal(err)
+	}
+	if plan = get("/summary", f.h.GetBillingSummary, f.team)["plan"].(map[string]any); plan["status"] != entryTrialEnded {
+		t.Fatalf("ended trial summary plan: %+v", plan)
+	}
+}
