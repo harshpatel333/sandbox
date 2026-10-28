@@ -76,7 +76,7 @@ type teamPlanChange struct {
 
 // Undoable reports whether the change can still be undone.
 func (c teamPlanChange) Undoable(now time.Time) bool {
-	return c.State == "scheduled" && now.Before(c.EffectiveAt.Add(-planChangeUndoCutoff))
+	return c.State == "scheduled" && !c.ProviderEnded && now.Before(c.EffectiveAt.Add(-planChangeUndoCutoff))
 }
 
 func (c teamPlanChange) needsUndoReconciliation() bool {
@@ -506,8 +506,9 @@ func subscriptionWillEnd(sub invoiceSubscription) bool {
 	return subscriptionEnded(sub) || sub.CancelAtPeriodEnd || sub.CancelAt != 0
 }
 
-// subscriptionStopAt is when a live subscription stops: its cancellation
-// time when one is set before the period ends, otherwise the period end.
+// subscriptionStopAt is when a live subscription stops within its current
+// period: its cancellation time when one falls before the period ends,
+// otherwise the period end.
 func subscriptionStopAt(sub invoiceSubscription) time.Time {
 	end := subscriptionPeriodEnd(sub)
 	if sub.CancelAt != 0 && time.Unix(sub.CancelAt, 0).Before(end) {
@@ -586,7 +587,7 @@ func (h *Handlers) advanceTeamPlanChange(ctx context.Context, c teamPlanChange) 
 	switch {
 	case c.State == "undone":
 		return now, h.restorePlanChangeRenewal(ctx, c)
-	case c.State == "scheduled" && c.Subscription != nil && (c.ProviderCancelAt == nil || now.Before(c.EffectiveAt)):
+	case c.State == "scheduled" && c.Subscription != nil && (c.ProviderEnded || c.ProviderCancelAt == nil || now.Before(c.EffectiveAt)):
 		next, err := h.stopPlanChangeRenewal(ctx, c, now)
 		if err != nil {
 			return now, err
@@ -596,6 +597,9 @@ func (h *Handlers) advanceTeamPlanChange(ctx context.Context, c teamPlanChange) 
 			c, err = getTeamPlanChange(ctx, h.Pool, c.ID)
 			if err != nil {
 				return now, err
+			}
+			if c.State != "scheduled" {
+				return now, nil
 			}
 			c.lease = lease
 			return h.applyTeamPlanChange(ctx, c)
@@ -609,6 +613,15 @@ func (h *Handlers) advanceTeamPlanChange(ctx context.Context, c teamPlanChange) 
 	case c.State == "scheduled":
 		return h.applyTeamPlanChange(ctx, c)
 	case c.State == "applied":
+		if c.TargetKind == planKindFree && c.Subscription != nil {
+			client, ok := h.Stripe.(*stripeHTTPClient)
+			if !ok {
+				return now, errors.New("plan changes require the Stripe provider")
+			}
+			if err := voidUnspentBridgeCredit(ctx, h.Pool, client, c.Team, *c.Subscription); err != nil {
+				return now, err
+			}
+		}
 		if err := h.waitForPlanChangePauses(ctx, c.Team); err != nil {
 			return now, err
 		}
@@ -671,11 +684,14 @@ func (h *Handlers) stopPlanChangeRenewal(ctx context.Context, c teamPlanChange, 
 	if c.terminalUndoOf != nil && !subscriptionEnded(sub) {
 		return now, errors.New("terminal undo settlement cannot cancel a live subscription")
 	}
-	if c.ProviderEnded && !subscriptionWillEnd(sub) {
-		if err = fencedPlanChangeUpdate(ctx, tx, c, `state='undone',undone_at=clock_timestamp(),undo_reason='the subscription resumed in Stripe',provider_renewed_at=clock_timestamp()`); err != nil {
+	if c.ProviderEnded && (!subscriptionWillEnd(sub) || !subscriptionEnded(sub) && !subscriptionStopAt(sub).Equal(c.EffectiveAt)) {
+		if err = fencedPlanChangeUpdate(ctx, tx, c, `state='undone',undone_at=clock_timestamp(),undo_reason='the subscription cancellation changed in Stripe',provider_renewed_at=clock_timestamp()`); err != nil {
 			return now, err
 		}
-		return now, tx.Commit(ctx)
+		if err = tx.Commit(ctx); err != nil {
+			return now, err
+		}
+		return now, h.scheduleProviderEndedFreeChange(ctx, sub.Customer, sub.ID)
 	}
 	if !subscriptionEnded(sub) {
 		end := subscriptionStopAt(sub)
@@ -822,9 +838,6 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 		if !closed {
 			_, err = h.Pool.Exec(ctx, `UPDATE billing_signup_choice SET next_check_at=LEAST(next_check_at,clock_timestamp()) WHERE team_id=$1 AND subscription_id=$2`, c.Team, sub.ID)
 			return now.Add(time.Minute), err
-		}
-		if err = voidUnspentBridgeCredit(ctx, h.Pool, client, c.Team, sub.ID); err != nil {
-			return now, err
 		}
 		terminal = sub
 	}

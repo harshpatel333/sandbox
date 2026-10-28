@@ -178,3 +178,51 @@ func TestProviderEndedWebhookSchedulesTheMoveToFree(t *testing.T) {
 		t.Fatalf("a Stripe deletion did not schedule the move to Free: %+v %v %v", c, ok, err)
 	}
 }
+
+func TestProviderEndedChangeTracksLaterStripeCancellations(t *testing.T) {
+	f := newPlanChangeV2Fixture(t, planKindSubscription)
+	schedule := func() teamPlanChange {
+		t.Helper()
+		if err := f.h.scheduleProviderEndedFreeChange(t.Context(), f.stripe.customer, f.stripe.sub); err != nil {
+			t.Fatal(err)
+		}
+		c, ok, err := pendingTeamPlanChange(t.Context(), f.h.Pool, f.team)
+		if err != nil || !ok {
+			t.Fatalf("no move to Free scheduled: %v", err)
+		}
+		return c
+	}
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = s.periodEnd.AddDate(0, 2, 0).Unix() })
+	if err := f.h.scheduleProviderEndedFreeChange(t.Context(), f.stripe.customer, f.stripe.sub); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := pendingTeamPlanChange(t.Context(), f.h.Pool, f.team); err != nil || ok {
+		t.Fatalf("a cancellation beyond the current period was scheduled before its renewal: %v %v", ok, err)
+	}
+	inPeriod := f.stripe.periodEnd.Add(-time.Hour)
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = inPeriod.Unix() })
+	c := schedule()
+	f.tick(t)
+	if c = f.reload(t, c.ID); c.State != "scheduled" || !c.EffectiveAt.Equal(inPeriod) || c.Failures != 0 {
+		t.Fatalf("a cancellation within the period was not followed: %+v", c)
+	}
+	earlier := f.stripe.periodEnd.Add(-2 * time.Hour)
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = earlier.Unix() })
+	f.tick(t)
+	moved, ok, err := pendingTeamPlanChange(t.Context(), f.h.Pool, f.team)
+	if c = f.reload(t, c.ID); err != nil || !ok || c.State != "undone" || moved.ID == c.ID || !moved.EffectiveAt.Equal(earlier) {
+		t.Fatalf("an earlier Stripe cancellation was not rescheduled: old=%+v new=%+v %v", c, moved, err)
+	}
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = 0 })
+	f.tick(t)
+	if _, ok, err = pendingTeamPlanChange(t.Context(), f.h.Pool, f.team); err != nil || ok {
+		t.Fatalf("a resumed subscription kept a move to Free: %v %v", ok, err)
+	}
+	f.stripe.set(func(s *renewalStripe) { s.status, s.endedAt = "canceled", time.Now().Add(-time.Minute).Unix() })
+	final := schedule()
+	f.tick(t)
+	f.tick(t)
+	if final = f.reload(t, final.ID); final.State == "scheduled" || f.plan(t).Kind != planKindFree || len(f.stripe.writes) != 0 {
+		t.Fatalf("cancelling again after a resume did not move the team to Free: %+v %+v %v", final, f.plan(t), f.stripe.writes)
+	}
+}

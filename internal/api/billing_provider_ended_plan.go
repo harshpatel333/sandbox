@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -27,7 +29,8 @@ func (h *Handlers) scheduleProviderEndedFreeChange(ctx context.Context, customer
   (SELECT actor_id FROM billing_signup_choice WHERE team_id=p.team_id AND subscription_id=$2))
  FROM team_plan_assignment p JOIN billing_commercial_contract k ON k.id=p.contract_id
  WHERE p.effective_to IS NULL AND k.customer_id=$1 AND k.subscription_id=$2 AND k.offer_key IN `+paidPlanOffers+`
-  AND NOT EXISTS(SELECT 1 FROM team_plan_change c WHERE c.team_id=p.team_id AND c.state='scheduled')`, customer, subscription).Scan(&current.ID, &current.TeamID, &actor)
+  AND NOT EXISTS(SELECT 1 FROM team_plan_change c WHERE c.team_id=p.team_id
+   AND (c.state='scheduled' OR (c.state='undone' AND c.subscription_id IS NOT NULL AND c.provider_renewed_at IS NULL)))`, customer, subscription).Scan(&current.ID, &current.TeamID, &actor)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -40,6 +43,16 @@ func (h *Handlers) scheduleProviderEndedFreeChange(ctx context.Context, customer
 	}
 	if !subscriptionWillEnd(sub) {
 		return nil
+	}
+	// A cancellation beyond the current period is scheduled by the renewal
+	// that brings it into the period.
+	if !subscriptionEnded(sub) && sub.CancelAt != 0 && time.Unix(sub.CancelAt, 0).After(subscriptionPeriodEnd(sub)) {
+		return nil
+	}
+	// Each cancellation after a withdrawn one is a new change of its own.
+	var attempt int
+	if err = h.Pool.QueryRow(ctx, `SELECT count(*) FROM team_plan_change WHERE team_id=$1 AND from_assignment_id=$2 AND provider_ended`, current.TeamID, current.ID).Scan(&attempt); err != nil {
+		return err
 	}
 	ready, err := planChangePausesReady(ctx, h.Pool)
 	if err != nil {
@@ -63,16 +76,19 @@ func (h *Handlers) scheduleProviderEndedFreeChange(ctx context.Context, customer
 	_, err = h.Pool.Exec(ctx, `INSERT INTO team_plan_change(team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,
   subscription_id,requested_by,requested_via,reason,idempotency_key,next_check_at,provider_ended)
  VALUES($1,$2,'free',$3,$4,$5,$6,true,$7,$8,'staff','The subscription was cancelled in Stripe',$9,clock_timestamp(),true) ON CONFLICT DO NOTHING`,
-		current.TeamID, current.ID, terms.Kind, frozen, limits, effective, subscription, actor, "provider-ended:"+subscription+":"+current.ID.String())
+		current.TeamID, current.ID, terms.Kind, frozen, limits, effective, subscription, actor, "provider-ended:"+subscription+":"+current.ID.String()+":"+strconv.Itoa(attempt))
 	return err
 }
 
-// verifiedContractInvoices lists the subscription's invoices whose payment
-// was verified for its contract, so an upgrade's renewals count as closed.
+// verifiedContractInvoices lists the subscription's invoices whose payment was
+// verified for its contract or collected by the invoice worker, so an
+// upgrade's renewals and usage invoices count as closed.
 func verifiedContractInvoices(ctx context.Context, q db.DBTX, team uuid.UUID, subscription string) ([]string, error) {
 	rows, err := q.Query(ctx, `SELECT p.invoice_id FROM billing_contract_payment p JOIN billing_commercial_contract k ON k.id=p.contract_id
  WHERE k.team_id=$1 AND k.subscription_id=$2
-  AND NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND v.review_required)`, team, subscription)
+  AND NOT EXISTS(SELECT 1 FROM billing_pro_payment_verification v WHERE v.invoice_id=p.invoice_id AND v.review_required)
+ UNION SELECT c.invoice_id FROM billing_invoice_collection c JOIN team_billing_account a ON a.stripe_customer_id=c.customer_id
+ WHERE a.team_id=$1 AND c.subscription_id=$2 AND c.state='paid'`, team, subscription)
 	if err != nil {
 		return nil, err
 	}
@@ -80,10 +96,10 @@ func verifiedContractInvoices(ctx context.Context, q db.DBTX, team uuid.UUID, su
 }
 
 // voidUnspentBridgeCredit voids the non-expiring credit an upgrade issued for
-// the rest of a billing month once the plan is released, so an unspent
+// the rest of a billing month once the team has moved to Free, so an unspent
 // remainder cannot offset a later purchase on the same customer.
 func voidUnspentBridgeCredit(ctx context.Context, q db.DBTX, c *stripeHTTPClient, team uuid.UUID, subscription string) error {
-	rows, err := q.Query(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE team_id=$1 AND subscription_id=$2 AND grant_id IS NOT NULL AND state IN ('credited','active')`, team, subscription)
+	rows, err := q.Query(ctx, `SELECT `+proUpgradeColumns+` FROM billing_pro_upgrade WHERE team_id=$1 AND subscription_id=$2 AND grant_id IS NOT NULL AND state IN ('active','ended')`, team, subscription)
 	if err != nil {
 		return err
 	}
