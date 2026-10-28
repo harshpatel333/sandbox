@@ -64,7 +64,7 @@ LANGUAGE sql STABLE SECURITY INVOKER SET search_path=pg_catalog,public,pg_temp A
     AND (p.credit_state<>'issued' OR p.credited_at>=period.checked) AND NOT billing_prepaid_credit_withheld(p))
    AND (period.granted
     OR EXISTS(SELECT 1 FROM billing_invoice_close c JOIN billing_invoice_collection j ON j.invoice_id=c.invoice_id
-     WHERE c.team_id=p_team AND c.period_end=period.started AND j.state IN ('requires_payment_method','review_required','uncollectible','void'))
+     WHERE c.team_id=p_team AND c.period_end=period.started AND j.state IN ('requires_action','requires_payment_method','review_required','uncollectible','void'))
     OR period.started+(SELECT low_credit_grant_grace FROM billing_funding_policy WHERE singleton)<period.checked)),false)
  FROM period;
 $$;
