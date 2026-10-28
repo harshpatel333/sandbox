@@ -3566,9 +3566,13 @@ components:
         balance_cents:
           type: integer
           format: int64
+          description: The observed balance; 0 when `balance_observed` is false.
+        balance_observed:
+          type: boolean
+          description: Whether `balance_cents` is a current observation. It is false before funding observation starts, once the observation is stale, and beyond the observation capacity; a 0 balance then means unknown, not used up.
         low_balance:
           type: boolean
-          description: Balance is below $5 and auto-recharge is off.
+          description: The observed balance is below $5 and auto-recharge is off. Never true while `balance_observed` is false.
         has_saved_card:
           type: boolean
         auto_recharge:
@@ -4168,9 +4172,15 @@ components:
           format: double
         state:
           type: string
-          enum: [no_grant, active, exhausted, expired, ended_by_billing_activation]
+          enum: [no_grant, active, exhausted, expired, ended_by_billing_activation, auto_topoff, unknown]
+          description: "On a prepaid-funded plan this describes the funded credit: `auto_topoff` while Auto Topoff is on, `unknown` while the balance is not freshly observed. A trial awaiting its first plan is `exhausted` once it has ended."
         eligible:
           type: boolean
+        low_credit_threshold_usd:
+          type: number
+          format: double
+          nullable: true
+          description: Remaining credit below which it is shown as low (or a trial as almost used up). It is the plan's top-off threshold on a prepaid-funded plan and the trial setting on a trial awaiting its first plan; null where no setting applies.
 
     BillingExportPreviewItem:
       type: object
@@ -5956,7 +5966,7 @@ components:
         plan:
           type: object
           nullable: true
-          required: [plan_key, kind, display_name, limits, effective_from]
+          required: [plan_key, kind, display_name, limits, effective_from, funding_policy, topoff]
           properties:
             plan_key:
               type: string
@@ -5970,6 +5980,10 @@ components:
             effective_from:
               type: string
               format: date-time
+            funding_policy:
+              $ref: "#/components/schemas/BillingFundingPolicy"
+            topoff:
+              $ref: "#/components/schemas/BillingPlanTopoff"
         period:
           type: object
           required: [start, end]

@@ -1142,12 +1142,45 @@ WHERE team_id = sqlc.arg(team_id)
   AND (expires_at IS NULL OR expires_at > now());
 
 -- name: GetTeamTrialBalance :one
-SELECT trial.grant_usd::numeric AS grant_usd,
-       trial.consumed_usd::numeric AS consumed_usd,
-       trial.remaining_usd::numeric AS remaining_usd,
-       trial.state::text AS state,
-       trial.eligible::boolean AS eligible
-FROM get_team_trial_balance(sqlc.arg(team_id)) AS trial;
+-- Teams on a prepaid-funded subscription report their funded credit instead
+-- of a trial: eligible only while it is observed, positive and not topped up
+-- automatically. A trial awaiting its first plan reports exhausted once the
+-- trial has ended. low_credit_threshold_usd is where messaging calls the
+-- credit low; it is null where no setting applies.
+WITH plan AS (
+    SELECT a.terms FROM team_plan_assignment a
+    WHERE a.team_id = sqlc.arg(team_id) AND a.effective_to IS NULL
+      AND a.kind = 'subscription' AND a.terms->>'funding_policy' = 'prepaid'
+), funding AS (
+    SELECT COALESCE(f.observe AND f.observed_generation = f.generation AND f.credit_valid_until > now(), false) AS fresh,
+           GREATEST(COALESCE(f.credit_usd, 0), 0) AS credit,
+           COALESCE(r.enabled AND r.amount_cents <= 1000000 AND r.threshold_cents <= 1000000, false) AS topoff
+    FROM (SELECT sqlc.arg(team_id)::uuid AS team_id) t
+    LEFT JOIN billing_funding_account f USING (team_id)
+    LEFT JOIN billing_prepaid_auto_recharge r USING (team_id)
+), cohort AS (
+    SELECT billing_team_awaiting_plan(sqlc.arg(team_id)) AS awaiting,
+           billing_team_trial_active(sqlc.arg(team_id)) AS active
+)
+SELECT 0::numeric AS grant_usd,
+       0::numeric AS consumed_usd,
+       (CASE WHEN funding.fresh THEN round(funding.credit, 6) ELSE 0 END)::numeric AS remaining_usd,
+       (CASE WHEN funding.topoff THEN 'auto_topoff' WHEN NOT funding.fresh THEN 'unknown'
+             WHEN funding.credit > 0 THEN 'active' ELSE 'exhausted' END)::text AS state,
+       (NOT funding.topoff AND funding.fresh AND funding.credit > 0)::boolean AS eligible,
+       'prepaid'::text AS kind,
+       ((plan.terms->'topoff'->>'threshold_cents')::numeric / 100)::numeric AS low_credit_threshold_usd
+FROM plan, funding
+UNION ALL
+SELECT trial.grant_usd::numeric,
+       trial.consumed_usd::numeric,
+       (CASE WHEN cohort.awaiting AND NOT cohort.active THEN 0 ELSE trial.remaining_usd END)::numeric,
+       (CASE WHEN cohort.awaiting AND NOT cohort.active AND trial.state <> 'no_grant' THEN 'exhausted' ELSE trial.state END)::text,
+       (trial.eligible AND NOT (cohort.awaiting AND NOT cohort.active))::boolean,
+       (CASE WHEN cohort.awaiting THEN 'trial' ELSE 'legacy_trial' END)::text,
+       (CASE WHEN cohort.awaiting THEN (SELECT p.low_credit_threshold_usd FROM billing_trial_policy p WHERE p.singleton) END)::numeric
+FROM get_team_trial_balance(sqlc.arg(team_id)) AS trial, cohort
+WHERE NOT EXISTS (SELECT 1 FROM plan);
 -- name: HasSignupTrialCredit :one
 SELECT EXISTS (
     SELECT 1
@@ -1364,7 +1397,7 @@ WITH trial_teams AS MATERIALIZED (
 ), candidates AS MATERIALIZED (
     SELECT team_id, storage_billing_activated(team_id) AS storage_active
     FROM trial_teams
-)
+), running AS (
 SELECT c.team_id
 FROM candidates c
 WHERE EXISTS (
@@ -1380,7 +1413,39 @@ WHERE EXISTS (
         WHERE i.team_id = c.team_id AND i.ended_at IS NULL AND i.started_at < now()
         ORDER BY i.started_at LIMIT 1) IS NOT NULL
 ))
-ORDER BY c.team_id
+), ended_trials AS (
+    -- Trials awaiting a first plan are warned once, when they end. Their
+    -- sandboxes are paused by then, so they are found without running work.
+    SELECT e.team_id
+    FROM billing_new_team_enrollment e
+    WHERE e.initial_assignment_id IS NULL
+      AND e.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+      AND billing_team_awaiting_plan(e.team_id)
+      AND EXISTS (SELECT 1 FROM team_credit_grant g WHERE g.team_id = e.team_id AND g.reason = 'signup trial credit')
+      AND NOT billing_team_trial_active(e.team_id)
+      AND NOT EXISTS (
+          SELECT 1 FROM trial_credit_warning_state w
+          WHERE w.team_id = e.team_id AND w.lifecycle_key = trial_credit_warning_lifecycle(e.team_id) AND w.status <> 'pending')
+), low_prepaid AS (
+    -- Only observed accounts have a balance to warn about. Automatic top-off
+    -- keeps them funded, so it suppresses the warning.
+    SELECT f.team_id
+    FROM billing_funding_account f
+    JOIN team_plan_assignment a ON a.team_id = f.team_id AND a.effective_to IS NULL
+     AND a.kind = 'subscription' AND a.terms->>'funding_policy' = 'prepaid'
+    LEFT JOIN billing_prepaid_auto_recharge r ON r.team_id = f.team_id
+    WHERE f.observe AND f.observed_generation = f.generation AND f.credit_valid_until > now()
+      AND f.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+      AND f.credit_usd * 100 < (a.terms->'topoff'->>'threshold_cents')::numeric
+      AND NOT COALESCE(r.enabled AND r.amount_cents <= 1000000 AND r.threshold_cents <= 1000000, false)
+      AND NOT EXISTS (
+          SELECT 1 FROM trial_credit_warning_state w
+          WHERE w.team_id = f.team_id AND w.lifecycle_key = trial_credit_warning_lifecycle(f.team_id) AND w.status <> 'pending')
+)
+SELECT team_id FROM running
+UNION SELECT team_id FROM ended_trials
+UNION SELECT team_id FROM low_prepaid
+ORDER BY team_id
 LIMIT sqlc.arg(batch_limit);
 
 -- name: ListTeamsWithBillingPauseDue :many

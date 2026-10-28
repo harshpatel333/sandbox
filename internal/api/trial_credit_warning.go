@@ -37,8 +37,63 @@ func dedupeWarningRecipients(addresses []string) []string {
 	return out
 }
 
+// Warning kinds other than the legacy signup trial, as reported by
+// GetTeamTrialBalance. A trial awaiting its first plan is warned once when it
+// ends; a prepaid-funded subscription when its credit falls below its plan's
+// top-off threshold.
+const (
+	creditWarningTrial   = "trial"
+	creditWarningPrepaid = "prepaid"
+)
+
 func trialCreditWarningHTML(teamName string, remaining float64) string {
-	return emailShell("Less than 24 hours of trial credit remaining", fmt.Sprintf("<h1>Less than 24 hours of trial credit remaining</h1><p>Based on your recent usage, your trial credit may run out within the next 24 hours.</p><p>Team: %s</p><p>Remaining trial credit: $%.2f</p>", html.EscapeString(teamName), remaining))
+	return lowCreditHTML("Less than 24 hours of credit remaining", "Based on your recent usage, your credit may run out within the next 24 hours.", teamName, remaining)
+}
+
+func prepaidLowCreditHTML(teamName string, remaining float64) string {
+	return lowCreditHTML("Your credit is running low", "Your remaining credit is low and Auto Topoff is off.", teamName, remaining)
+}
+
+func lowCreditHTML(title, reason, teamName string, remaining float64) string {
+	return emailShell(title, fmt.Sprintf("<h1>%s</h1><p>%s</p><p>When credit runs out, running sandboxes are paused. Nothing is deleted.</p><p>Team: %s</p><p>Remaining credit: $%.2f</p>%s",
+		title, reason, html.EscapeString(teamName), remaining, emailButton("Add credit", emailConsoleURL+"/plan-usage/")))
+}
+
+func trialEndedHTML(teamName string) string {
+	const title = "Your free trial has ended"
+	return emailShell(title, fmt.Sprintf("<h1>%s</h1><p>Your trial credit is used up, so your sandboxes are paused. Nothing has been deleted.</p><p>Choose a plan to resume where you left off.</p><p>Team: %s</p>%s",
+		title, html.EscapeString(teamName), emailButton("Choose a plan", emailConsoleURL+"/")))
+}
+
+// creditWarningEmail renders the message for the warning kind GetTeamTrialBalance reported.
+func creditWarningEmail(kind, teamName string, remaining float64) (subject, body string) {
+	switch kind {
+	case creditWarningTrial:
+		return "Your Superserve free trial has ended", trialEndedHTML(teamName)
+	case creditWarningPrepaid:
+		return "Your Superserve credit is running low", prepaidLowCreditHTML(teamName, remaining)
+	default:
+		return "Your Superserve credit may run out soon", trialCreditWarningHTML(teamName, remaining)
+	}
+}
+
+// creditWarningOpen reports whether a warning may still be delivered for the
+// latest balance, and the remaining credit to quote. The legacy trial's
+// runway forecast is checked separately before its claim.
+func creditWarningOpen(b db.GetTeamTrialBalanceRow) (float64, bool) {
+	remaining, err := numericFloat(b.RemainingUsd)
+	if err != nil {
+		return 0, false
+	}
+	switch b.Kind {
+	case creditWarningTrial:
+		return remaining, b.State == "exhausted"
+	case creditWarningPrepaid:
+		threshold, err := numericFloat(b.LowCreditThresholdUsd)
+		return remaining, err == nil && (b.State == "active" || b.State == "exhausted") && remaining < threshold
+	default:
+		return remaining, trialCreditWarningLifecycleEligible(b.Eligible, b.State) && remaining > 0
+	}
 }
 
 const trialCreditWarningTimeout = 30 * time.Second
@@ -206,12 +261,9 @@ func (s *EmailTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Conte
 		if err != nil {
 			return err
 		}
-		remaining, err = numericFloat(balance.RemainingUsd)
-		if err != nil {
-			return err
-		}
-		if !trialCreditWarningLifecycleEligible(balance.Eligible, balance.State) || remaining <= 0 {
-			return errors.New("trial credit warning trial is no longer active")
+		var open bool
+		if remaining, open = creditWarningOpen(balance); !open {
+			return errors.New("credit warning no longer applies")
 		}
 		current, err := s.queries.IsTrialCreditWarningClaimCurrent(ctx, db.IsTrialCreditWarningClaimCurrentParams{
 			TeamID: teamID, ClaimToken: pgtype.UUID{Bytes: claimToken, Valid: true},
@@ -223,11 +275,12 @@ func (s *EmailTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Conte
 			return errors.New("trial credit warning lifecycle changed after claim")
 		}
 		// Persisted recipient outcomes suppress repeats across new claims.
+		subject, body := creditWarningEmail(balance.Kind, team.Name, remaining)
 		if err := s.sender.SendEmail(ctx, EmailMessage{
 			From:           s.from,
 			To:             recipient,
-			Subject:        "Your trial credit may run out soon",
-			HTML:           trialCreditWarningHTML(team.Name, remaining),
+			Subject:        subject,
+			HTML:           body,
 			IdempotencyKey: trialCreditWarningIdempotencyKey(claimToken, recipient),
 		}); err != nil {
 			var rejected *rejectedEmailError
@@ -385,11 +438,17 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("trial runway lifecycle read failed")
 		return
 	}
+	b, balanceErr := h.DB.GetTeamTrialBalance(ctx, teamID)
+	if balanceErr == nil && (b.Kind == creditWarningTrial || b.Kind == creditWarningPrepaid) {
+		if _, open := creditWarningOpen(b); open && h.TrialWarningSender != nil {
+			h.deliverCreditWarning(ctx, teamID, cached.LifecycleKey, creditWarningOpen)
+		}
+		return
+	}
 	state := "unknown"
 	var remaining float64
 	var sample trialBurnSample
 	s, sampleErr := h.DB.GetRecentTrialBurnSample(ctx, teamID)
-	b, balanceErr := h.DB.GetTeamTrialBalance(ctx, teamID)
 	if sampleErr != nil || balanceErr != nil {
 		log.Error().Err(errors.Join(sampleErr, balanceErr)).Str("team_id", teamID.String()).Msg("trial runway inputs read failed")
 	} else if trialCreditWarningLifecycleEligible(b.Eligible, b.State) {
@@ -413,8 +472,20 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 	if state != "under_24h" || h.TrialWarningSender == nil {
 		return
 	}
+	h.deliverCreditWarning(ctx, teamID, cached.LifecycleKey, func(latest db.GetTeamTrialBalanceRow) (float64, bool) {
+		if !trialCreditWarningLifecycleEligible(latest.Eligible, latest.State) {
+			return 0, false
+		}
+		latestRemaining, err := numericFloat(latest.RemainingUsd)
+		return latestRemaining, err == nil && trialCreditWarningEligible(latestRemaining, time.Now(), sample)
+	})
+}
+
+// deliverCreditWarning claims the lifecycle's single warning and sends it if
+// the latest balance, read after the claim, still calls for it.
+func (h *Handlers) deliverCreditWarning(ctx context.Context, teamID uuid.UUID, lifecycleKey string, open func(db.GetTeamTrialBalanceRow) (float64, bool)) {
 	claimToken, err := h.DB.ClaimTrialCreditWarningForLifecycle(ctx, db.ClaimTrialCreditWarningForLifecycleParams{
-		TeamID: teamID, LifecycleKey: cached.LifecycleKey,
+		TeamID: teamID, LifecycleKey: lifecycleKey,
 	})
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -423,29 +494,26 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 		return
 	}
 	// Claiming is deliberately separate from the balance read. Re-read the
-	// authoritative trial state immediately before provider submission so an
-	// expiry, exhaustion, or Stripe transition racing the forecast cannot emit
-	// a warning for a no-longer-active trial.
+	// authoritative state immediately before provider submission so an
+	// expiry, exhaustion, top-up or plan change racing the decision cannot
+	// emit a warning that no longer applies.
 	latest, err := h.DB.GetTeamTrialBalance(ctx, teamID)
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("trial credit warning final balance read failed")
-	}
-	if err != nil || !trialCreditWarningLifecycleEligible(latest.Eligible, latest.State) {
 		h.releaseTrialCreditWarning(teamID, claimToken)
 		return
 	}
-	latestRemaining, err := numericFloat(latest.RemainingUsd)
-	if err != nil || !trialCreditWarningEligible(latestRemaining, time.Now(), sample) {
+	remaining, ok := open(latest)
+	if !ok {
 		h.releaseTrialCreditWarning(teamID, claimToken)
 		return
 	}
-	remaining = latestRemaining
-	if err = sendTrialCreditWarningIfEligible(latest.Eligible, latest.State, func() error {
-		if sender, ok := h.TrialWarningSender.(trialCreditWarningIdempotentSender); ok {
-			return sender.SendTrialCreditWarningWithKey(ctx, teamID, remaining, uuid.UUID(claimToken.Bytes))
-		}
-		return h.TrialWarningSender.SendTrialCreditWarning(ctx, teamID, remaining)
-	}); err != nil {
+	if sender, ok := h.TrialWarningSender.(trialCreditWarningIdempotentSender); ok {
+		err = sender.SendTrialCreditWarningWithKey(ctx, teamID, remaining, uuid.UUID(claimToken.Bytes))
+	} else {
+		err = h.TrialWarningSender.SendTrialCreditWarning(ctx, teamID, remaining)
+	}
+	if err != nil {
 		var unknown *unknownEmailOutcomeError
 		if errors.As(err, &unknown) {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -473,14 +541,6 @@ func (h *Handlers) releaseTrialCreditWarning(teamID uuid.UUID, claimToken pgtype
 	if err := h.DB.ReleaseTrialCreditWarning(ctx, db.ReleaseTrialCreditWarningParams{TeamID: teamID, ClaimToken: claimToken}); err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("trial credit warning claim release failed")
 	}
-}
-
-// Gate delivery on the latest observed authoritative lifecycle state.
-func sendTrialCreditWarningIfEligible(eligible bool, state string, send func() error) error {
-	if !trialCreditWarningLifecycleEligible(eligible, state) {
-		return nil
-	}
-	return send()
 }
 
 func trialCreditWarningLifecycleEligible(eligible bool, state string) bool {
