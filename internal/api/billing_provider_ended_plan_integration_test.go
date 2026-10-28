@@ -213,6 +213,11 @@ func TestProviderEndedChangeTracksLaterStripeCancellations(t *testing.T) {
 	if c = f.reload(t, c.ID); err != nil || !ok || c.State != "undone" || moved.ID == c.ID || !moved.EffectiveAt.Equal(earlier) {
 		t.Fatalf("an earlier Stripe cancellation was not rescheduled: old=%+v new=%+v %v", c, moved, err)
 	}
+	f.stripe.set(func(s *renewalStripe) { s.cancelAt = s.periodEnd.AddDate(0, 3, 0).Unix() })
+	f.tick(t)
+	if postponed, ok, err := pendingTeamPlanChange(t.Context(), f.h.Pool, f.team); err != nil || ok {
+		t.Fatalf("a cancellation postponed beyond the period kept a pending move to Free: %+v %v", postponed, err)
+	}
 	f.stripe.set(func(s *renewalStripe) { s.cancelAt = 0 })
 	f.tick(t)
 	if _, ok, err = pendingTeamPlanChange(t.Context(), f.h.Pool, f.team); err != nil || ok {

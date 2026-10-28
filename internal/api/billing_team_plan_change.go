@@ -684,7 +684,7 @@ func (h *Handlers) stopPlanChangeRenewal(ctx context.Context, c teamPlanChange, 
 	if c.terminalUndoOf != nil && !subscriptionEnded(sub) {
 		return now, errors.New("terminal undo settlement cannot cancel a live subscription")
 	}
-	if c.ProviderEnded && (!subscriptionWillEnd(sub) || !subscriptionEnded(sub) && !subscriptionStopAt(sub).Equal(c.EffectiveAt)) {
+	if c.ProviderEnded && (!subscriptionWillEnd(sub) || !subscriptionEnded(sub) && (!subscriptionStopAt(sub).Equal(c.EffectiveAt) || !subscriptionStopsBy(sub, c.EffectiveAt))) {
 		if err = fencedPlanChangeUpdate(ctx, tx, c, `state='undone',undone_at=clock_timestamp(),undo_reason='the subscription cancellation changed in Stripe',provider_renewed_at=clock_timestamp()`); err != nil {
 			return now, err
 		}
