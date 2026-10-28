@@ -495,6 +495,8 @@ BEGIN
 END $$;
 CREATE CONSTRAINT TRIGGER cohort_trial_policy_retained AFTER UPDATE ON billing_trial_policy
  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION billing_keep_cohort_free_catalog();
+CREATE TRIGGER billing_trial_policy_singleton_guard BEFORE TRUNCATE OR DELETE ON billing_trial_policy
+ FOR EACH STATEMENT EXECUTE FUNCTION guard_billing_catalog_append_only();
 
 DO $$ DECLARE r text; f text; BEGIN
  FOREACH f IN ARRAY ARRAY['billing_paid_offer_keys()','billing_paid_first_sellable()','billing_trial_configured()','billing_team_awaiting_plan(uuid)','billing_team_trial_active(uuid)','billing_team_entry_state(uuid)'] LOOP

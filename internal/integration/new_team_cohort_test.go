@@ -466,4 +466,9 @@ func TestIntegration_NewTeamCohortFallbackChecksSerialize(t *testing.T) {
 	if _, err = pool.Exec(t.Context(), `UPDATE billing_trial_policy SET credit_usd=NULL WHERE singleton`); pgCode(err) != "55000" {
 		t.Fatalf("trial cleared after Free was retired: %v", err)
 	}
+	for _, sql := range []string{`DELETE FROM billing_trial_policy`, `TRUNCATE billing_trial_policy`} {
+		if _, err = pool.Exec(t.Context(), sql); err == nil {
+			t.Fatalf("%s removed the trial policy after Free was retired", sql)
+		}
+	}
 }

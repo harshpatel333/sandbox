@@ -3938,8 +3938,8 @@ components:
       type: object
       description: >-
         The team's commercial plan. Separate from pricing_tier, which is the
-        usage rate card every plan shares. Teams without a paid plan are Free.
-        Remaining credit, including Pro's included usage, is reported by the
+        usage rate card every plan shares. Teams without a paid plan are Free,
+        except new teams on the free trial, which report key trial. Remaining credit, including Pro's included usage, is reported by the
         Stripe credit fields.
       required:
         - key
@@ -3953,15 +3953,18 @@ components:
       properties:
         key:
           type: string
-          description: free, a plan catalog offer key such as pro_annual, or a managed offer such as yc_2026.
+          description: free, trial, a plan catalog offer key such as pro_annual, or a managed offer such as yc_2026.
           example: pro_annual
         name:
           type: string
           example: Pro Annual
         status:
           type: string
-          enum: [active, pending]
-          description: pending until the plan's first payment is confirmed.
+          enum: [active, pending, trial, trial_ended, payment_failed]
+          description: >-
+            pending until the plan's first payment is confirmed. A new team
+            that has not bought a plan reports key trial with its entry state:
+            trial, trial_ended or payment_failed.
         price_usd:
           type: number
           format: double
