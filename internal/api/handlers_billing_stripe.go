@@ -2064,8 +2064,10 @@ func (h *Handlers) EstablishBillingCutover(c *gin.Context) {
 }
 
 // portalWithoutCancellation selects teams with a live contract for a catalog
-// plan. Managed offers such as YC and sponsored usage are not catalog plans.
-const portalWithoutCancellation = `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND status<>'ended' AND offer_key IN ` + paidPlanOffers + `)`
+// plan, or a paid upgrade still committing one. Managed offers such as YC and
+// sponsored usage are not catalog plans.
+const portalWithoutCancellation = `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND status<>'ended' AND offer_key IN ` + paidPlanOffers + `)
+ OR EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state IN ('paid','credited','active'))`
 
 func (h *Handlers) CreateStripeCustomerPortalSession(c *gin.Context) {
 	teamID, err := customerContextTeamID(c)

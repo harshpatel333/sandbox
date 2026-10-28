@@ -200,9 +200,6 @@ func Load() (*Config, error) {
 		BackupGCServiceAccount:        strings.TrimSpace(os.Getenv("BACKUP_GC_SERVICE_ACCOUNT")),
 	}
 	cfg.StripePortalNoCancelConfiguration = strings.TrimSpace(os.Getenv("STRIPE_PORTAL_NO_CANCEL_CONFIGURATION"))
-	if cfg.StripeSecretKey != "" && cfg.StripePortalNoCancelConfiguration == "" {
-		log.Error().Msg("STRIPE_PORTAL_NO_CANCEL_CONFIGURATION unset — teams on a catalog plan cannot open the Stripe customer portal")
-	}
 	if cfg.ComputeRestrictionsSource != "file" && cfg.ComputeRestrictionsSource != "database" {
 		return nil, fmt.Errorf("COMPUTE_RESTRICTIONS_SOURCE must be file or database")
 	}
