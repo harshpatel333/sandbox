@@ -3,8 +3,12 @@
 Launching Developer and Pro is configuration: catalog publishes through the
 staff catalog API (`catalog.md`), the trial settings row, and a Stripe
 promotion code. No step here is a migration, and no value below is in code.
-Run everything in staging first, then repeat in production only with explicit
-authorization after the staging test passes.
+
+Rehearse in a disposable dev environment, then configure both production
+regions with explicit authorization. Staging gets no operator SQL or
+migrations outside normal deploys; after each deploy, only sanity-check it
+(the API is healthy and `GET /billing/plans` renders the catalog). Problems
+found after go-live are fixed forward; there is no rollback step.
 
 ## Inputs
 
@@ -35,52 +39,46 @@ record `<trial_vcpu>`, `<trial_memory_mib>` and `<trial_disk_mib>`.
 
 ## Regions
 
-Production has two regions with separate databases. Every step below (S0,
-trial settings, publish, retire) runs in both, and both must end with the same
-version ids. The console's admin plan page writes to every region with one
-minted version id; when using the API directly, send the same `id` and
-`version` in each region's draft. Before creating a YC code, check the version
-ids match:
+Production has two regions with separate databases. Every production step
+below runs in both, and both must end with the same version ids. The console's
+admin plan page writes to every region with one minted version id; when using
+the API directly, send the same `id` and `version` in each region's draft.
+Before creating a YC code, check the version ids match:
 
 ```sql
 SELECT family, version, id FROM billing_plan_version
 WHERE pricing_version = 'v2' AND state = 'published' ORDER BY family;
 ```
 
-## Staging
+## Configure
 
-**S0. Compare catalogs.** Run in staging and in each production region and diff
-the output.
+In the dev environment, then in both production regions:
 
-```sql
-SELECT family, version, state,
-       to_jsonb(v) - ARRAY['id','version','created_by','created_at','updated_at','published_by','published_at','retired_by','retired_at'] AS terms
-FROM billing_plan_version v WHERE pricing_version = 'v2' ORDER BY family, version;
-SELECT pricing_version FROM billing_pricing_switch;
-```
-
-**S1. Free templates.** Run `free-zero-templates.md` against staging's published
-v2 Free (dry run, then `COMMIT`). It publishes a catalog version only; no teams
-move.
-
-**S2. Pro.** Confirm from S0 that staging's published Pro matches production.
-
-**S3. Configure and publish,** after the funding-policy, trial signup and
-messaging changes are deployed:
-
-1. Set the trial settings (below).
+1. Set the trial settings (below), before or together with publishing
+   Developer. Until Developer is published, signups keep getting Free.
 2. Publish a Pro version with the launch terms: a draft copying the published
    Pro, with the inputs above, then publish.
 3. Publish Developer the same way. Check the published row has
    `funding_policy = 'prepaid'` and its top-off columns set; an editor that
-   does not send them publishes a postpaid plan.
+   does not send them publishes a postpaid plan. In production, publishing
+   Developer is the go-live: from then on every new signup gets the trial.
 4. Run the internal limits checklist (below).
 5. Check `SELECT billing_paid_first_sellable(), billing_trial_configured();`
-   returns `t, t`, then release the staging new-team gate with the usual
-   release procedure.
-6. Create the staging YC promotion code (below) for the Pro version from step 2.
+   returns `t, t`.
+6. Check the version ids match across regions, then create the YC coupon and
+   promotion code (below) for the Pro version from step 2.
 
-**S4. End-to-end test.**
+Production preconditions:
+
+- The end-to-end test passed in the dev environment and the publish is
+  authorized.
+- The catalog carries snapshot caps, and the Developer and Pro drafts set them.
+- The catalog accepts the Developer top-off threshold (whole dollars from $1).
+
+## End-to-end test
+
+Run in the dev environment before production, and the checks that need no new
+signups again in both production regions after go-live:
 
 - A new signup starts on the trial with the configured credit and one sandbox,
   and `GET /billing/plan` reports `entry_state: trial`.
@@ -100,40 +98,18 @@ messaging changes are deployed:
   its current plan correctly, each can upgrade to Developer and to Pro, and
   nothing else about their billing or sandboxes changes.
 - Free teams see the upgrade banner and both plans.
-- Canceling Pro stops the team's sandboxes and the console lands on plan
-  selection.
-- Downgrading from Pro to Developer works and the team ends up on Developer's
-  terms.
+- Cancellation (support-only at launch): staff switch a Developer or Pro team to Free
+  with `POST /internal/teams/{team_id}/billing/plan-changes`
+  (`target_plan` `free`, `idempotency_key`, `reason`). Check the request is
+  accepted and scheduled for the period end, and that at the period end the
+  team is on Free with its sandboxes paused, Auto Topoff off and no further
+  charges.
 - Try the YC code from a Free team that already paid a $0 invoice: Stripe may
   treat it as a returning customer and reject `first_time_transaction`. Record
   the result; such teams need a separate path.
 
-## Production
-
-Preconditions:
-
-- S4 passed and the publish is authorized.
-- The catalog carries snapshot caps, and the Developer and Pro drafts set them.
-- The catalog accepts the Developer top-off threshold (whole dollars from $1).
-- Each region has a usable published v2 Free with `max_templates = 0`, so a
-  rollback has somewhere to send new signups.
-
-Then, in both regions:
-
-1. Re-run S0.
-2. Set the trial settings. Until Developer is published, signups keep getting
-   Free.
-3. Publish the Pro launch version, then Developer. Publishing Developer is the
-   go-live: from then on every new signup gets the trial.
-4. Run the internal limits checklist (below).
-5. Check the published version ids match across regions, then create the
-   production YC coupon and promotion code for the final Pro version.
-
-Rollback is retiring Developer in both regions
-(`POST /internal/billing/catalog/plans/{version_id}/retire`). New signups then
-fall back to Free. Teams already on any plan, including early Free teams, keep
-their frozen terms. Teams already in `trial` or `trial_ended` follow the
-signup flow's rollback rules; check them against that flow before retiring.
+Customer-facing Pro cancellation and the Pro to Developer downgrade ship after
+go-live and are tested then.
 
 ## Trial settings
 
@@ -157,7 +133,7 @@ signups.
 
 ## Internal limits checklist
 
-Run in staging and in each production region after publishing. The snapshot-cap
+Run in the dev environment and in each production region after publishing. The snapshot-cap
 change must be deployed first, since it adds `max_snapshots`. Every column
 must be non-null; fix any null with a new catalog version or trial settings
 edit before going live.
@@ -195,10 +171,12 @@ accepts the Pro monthly fee price (`commercial_offer` `pro_monthly`, licensed,
 monthly, positive amount).
 
 ```bash
-python3 scripts/billing/yc_promotion_code.py --environment staging \
+python3 scripts/billing/yc_promotion_code.py --environment production \
   --expected-account <acct_id> --plan-version-id <pro_version_id> \
   --code <CODE> --max-redemptions <cap> [--apply]
 ```
+
+In the dev environment, use `--environment staging` with a test-mode key.
 
 The API creates the version's Pro price when it opens the first Pro checkout
 session for that version, so open one (it need not be paid) before running

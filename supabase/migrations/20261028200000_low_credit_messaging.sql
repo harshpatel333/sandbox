@@ -16,7 +16,7 @@ RETURNS text LANGUAGE sql STABLE AS $$
  FROM (SELECT md5(COALESCE(string_agg(id::text,',' ORDER BY id),'')) AS key
    FROM team_credit_grant WHERE team_id=p_team_id AND reason='signup trial credit') grants
  LEFT JOIN team_plan_assignment a ON a.team_id=p_team_id AND a.effective_to IS NULL
-  AND a.kind='subscription' AND a.terms->>'funding_policy'='prepaid';
+  AND a.kind='subscription' AND billing_assignment_prepaid_funded(a);
 $$;
 
 -- A prepaid-funded subscription's balance below low_credit_warning_cents is
@@ -40,7 +40,7 @@ LANGUAGE sql STABLE SECURITY INVOKER SET search_path=pg_catalog,public,pg_temp A
  WITH current AS (
   SELECT a.contract_id, a.effective_from, f.credit_checked_at AS checked
   FROM team_plan_assignment a JOIN billing_funding_account f ON f.team_id=a.team_id
-  WHERE a.team_id=p_team AND a.effective_to IS NULL AND a.kind='subscription' AND a.terms->>'funding_policy'='prepaid'
+  WHERE a.team_id=p_team AND a.effective_to IS NULL AND a.kind='subscription' AND billing_assignment_prepaid_funded(a)
    AND f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>now()
  ), grants AS (
   SELECT e.period_start, e.period_end, e.issued_at AS landed FROM billing_usage_entitlement e, current
