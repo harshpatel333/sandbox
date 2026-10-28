@@ -438,3 +438,32 @@ func TestIntegration_NewTeamCohortOpenCheckoutDoesNotExtendTrial(t *testing.T) {
 		t.Fatalf("an unpaid checkout subscription kept an expired trial eligible: state=%s eligible=%v", state, refreshed)
 	}
 }
+
+func TestIntegration_NewTeamCohortFallbackChecksSerialize(t *testing.T) {
+	pool, system, _ := cohortFixture(t)
+	cohortRelease(t, pool, system)
+	retireFree, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retireFree.Rollback(context.Background())
+	rolloutExec(t, retireFree, `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'),NULL)`)
+	rolloutExec(t, retireFree, `SET CONSTRAINTS ALL IMMEDIATE`)
+	clearTrial, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearTrial.Rollback(context.Background())
+	rolloutExec(t, clearTrial, `SET LOCAL lock_timeout='200ms'`)
+	rolloutExec(t, clearTrial, `UPDATE billing_trial_policy SET credit_usd=NULL WHERE singleton`)
+	if _, err = clearTrial.Exec(t.Context(), `SET CONSTRAINTS ALL IMMEDIATE`); pgCode(err) != "55P03" {
+		t.Fatalf("clearing the trial checked the fallback while Free was being retired: %v", err)
+	}
+	_ = clearTrial.Rollback(t.Context())
+	if err = retireFree.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(t.Context(), `UPDATE billing_trial_policy SET credit_usd=NULL WHERE singleton`); pgCode(err) != "55000" {
+		t.Fatalf("trial cleared after Free was retired: %v", err)
+	}
+}

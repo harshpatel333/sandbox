@@ -479,9 +479,12 @@ END $$;
 
 -- Signups fall back to Free while either subscription is unsellable, so Free
 -- stays required only until both are.
+-- Retiring Free and clearing either paid-first condition are checked against
+-- each other's committed state, so the checks take one shared lock in turn.
 CREATE OR REPLACE FUNCTION billing_keep_cohort_free_catalog() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 BEGIN
+ PERFORM pg_advisory_xact_lock(hashtext('billing-cohort-signup-fallback')::bigint);
  IF (billing_new_team_ready() OR EXISTS(SELECT 1 FROM billing_new_team_enrollment)) AND NOT (billing_paid_first_sellable() AND billing_trial_configured())
   AND NOT EXISTS(SELECT 1 FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published'
    AND v.kind='free' AND v.max_templates=0 AND v.allowance_period='day_window' AND v.allowance_on_exhausted='pause'
