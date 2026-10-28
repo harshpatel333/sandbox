@@ -48,8 +48,15 @@ A draft body carries the whole version (placeholders in angle brackets):
 
 `funding_policy` is `postpaid` unless set; only v2 subscriptions can be
 `prepaid`. `topoff` needs `prepaid`, and its amount and threshold are multiples
-of 500 cents up to 1,000,000. Publishing passes the version as `expected` (or
-omits it) so a concurrent edit is rejected rather than published.
+of 500 cents up to 1,000,000. The publish body may carry `expected`: the
+version's terms as last read (a full version object, or the same fields as a
+draft body, including `funding_policy` and `topoff`). A version whose terms
+differ is rejected rather than published.
+
+Production has two regions with separate databases. Make every write in both,
+with the same version `id` and `version` (the admin plan page does this), and
+check the published ids match before anything keyed by version, such as the
+YC coupon.
 
 ## What a publish changes
 
@@ -69,6 +76,7 @@ omits it) so a concurrent edit is rejected rather than published.
 
 Every version gets its own Stripe product, so a coupon restricted with
 `applies_to` covers only the version that existed when it was created. After
-publishing any new Pro version, including a limit-only edit, create the YC
-coupon and promotion code again for the new version (see
-`developer-pro-launch.md`).
+publishing any new Pro version, including a limit-only edit, deactivate the
+old YC promotion code and create a new one for the new version (see
+`developer-pro-launch.md`). A configured Pro price shared across versions is
+the exception: it keeps one product, so only the promotion code changes.

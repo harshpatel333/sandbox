@@ -66,18 +66,28 @@ def plan_price(stripe, version_id, price_id):
     if price_id:
         price = stripe.request("GET", "/v1/prices/" + urllib.parse.quote(price_id))
         if not price:
-            raise SetupError("Price not found")
-        return price
-    lookup = f"superserve_plan_{version_id}_monthly"
-    found = stripe.request("GET", "/v1/prices", {"lookup_keys[]": lookup, "limit": 2})["data"]
-    if len(found) != 1:
-        raise SetupError(f"Expected one price with lookup key {lookup}; start one Pro checkout so the API creates it, or pass --price")
-    return found[0]
+            raise SetupError(f"Price {price_id} does not exist in this Stripe account")
+    else:
+        lookup = f"superserve_plan_{version_id}_monthly"
+        found = stripe.request("GET", "/v1/prices", {"lookup_keys[]": lookup, "limit": 2})["data"]
+        if len(found) != 1:
+            raise SetupError(f"Expected one price with lookup key {lookup}; open one Pro checkout so the API creates it, or pass --price")
+        price = found[0]
+    metadata = price.get("metadata") or {}
+    recurring = price.get("recurring") or {}
+    if (metadata.get("commercial_offer") != "pro_monthly" or (version_id and metadata.get("plan_version_id") != version_id)
+            or recurring.get("interval") != "month" or recurring.get("usage_type") != "licensed"
+            or not isinstance(price.get("unit_amount"), int) or price["unit_amount"] <= 0):
+        raise SetupError(f"Price {price['id']} is not the Pro monthly fee (commercial_offer pro_monthly, licensed, monthly, positive amount)")
+    if price.get("livemode") is not stripe.live or not price.get("active"):
+        raise SetupError(f"Price {price['id']} is not active in this environment")
+    return price
 
 
 def check_coupon(coupon, product):
     applies = ((coupon.get("applies_to") or {}).get("products")) or []
-    if coupon.get("percent_off") != 100 or coupon.get("duration") != "once" or applies != [product] or not coupon.get("valid"):
+    if (coupon.get("percent_off") != 100 or coupon.get("duration") != "once" or applies != [product] or not coupon.get("valid")
+            or coupon.get("redeem_by") or coupon.get("max_redemptions")):
         raise SetupError(f"Coupon {coupon['id']} exists with different terms; choose another --coupon-id")
 
 
@@ -86,16 +96,14 @@ def check_promotion(promotion, coupon_id, max_redemptions):
     linked = source.get("coupon") if "promotion" in promotion else promotion.get("coupon")
     linked = linked.get("id") if isinstance(linked, dict) else linked
     restrictions = promotion.get("restrictions") or {}
-    if (linked != coupon_id or not restrictions.get("first_time_transaction")
-            or promotion.get("max_redemptions") != max_redemptions or not promotion.get("active")):
+    if (linked != coupon_id or not restrictions.get("first_time_transaction") or restrictions.get("minimum_amount")
+            or promotion.get("expires_at") or promotion.get("max_redemptions") != max_redemptions or not promotion.get("active")):
         raise SetupError(f"Promotion code {promotion['code']} exists with different terms; choose another --code")
 
 
 def run(stripe, args):
     stripe.verify_account()
     price = plan_price(stripe, args.plan_version_id, args.price)
-    if price.get("livemode") is not stripe.live or not price.get("active") or (price.get("recurring") or {}).get("interval") != "month":
-        raise SetupError("The Pro price must be an active monthly price in this environment")
     product = price["product"] if isinstance(price["product"], str) else price["product"]["id"]
     coupon_id = args.coupon_id or "yc-pro-" + product
     plan = {"account": stripe.account, "livemode": stripe.live, "price": price["id"], "product": product,
@@ -104,9 +112,9 @@ def run(stripe, args):
     coupon = stripe.request("GET", "/v1/coupons/" + urllib.parse.quote(coupon_id), {"expand[]": "applies_to"})
     if coupon:
         check_coupon(coupon, product)
-    found = stripe.request("GET", "/v1/promotion_codes", {"code": args.code, "limit": 2})["data"]
+    found = stripe.request("GET", "/v1/promotion_codes", {"code": args.code, "active": "true", "limit": 2})["data"]
     if len(found) > 1:
-        raise SetupError("Several promotion codes share this code; reconcile them in Stripe")
+        raise SetupError("Several active promotion codes share this code; reconcile them in Stripe")
     if found:
         check_promotion(found[0], coupon_id, args.max_redemptions)
     plan["actions"] = {"coupon": "reuse" if coupon else "create", "promotion_code": "reuse" if found else "create"}
