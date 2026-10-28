@@ -382,3 +382,24 @@ func TestProFirstCycleExpiryReleasesUnpaidSubscription(t *testing.T) {
 		})
 	}
 }
+
+func TestProExpiredUpgradeLeavesLiveSubscriptionEventsToAccount(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	h, team, _, params := newProFirstCycleQuoteFixture(t, now)
+	live := "sub_" + uuid.NewString()
+	if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status='active' WHERE team_id=$1`, team, live); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,subscription_id) VALUES(gen_random_uuid(),$1,gen_random_uuid(),$2,'pro_monthly','{}',$3,$3,$4,$3,25000,'expired',$5)`, team, params.CustomerID, now, now.AddDate(0, 1, 0), live); err != nil {
+		t.Fatal(err)
+	}
+	object, _ := json.Marshal(map[string]any{"id": live, "customer": params.CustomerID, "status": "past_due"})
+	envelope := stripeEventEnvelope{ID: "evt_" + uuid.NewString(), Type: "customer.subscription.updated", Data: stripeEventEnvelopeData{Object: object}}
+	payload, _ := json.Marshal(envelope)
+	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO stripe_webhook_event(event_id,event_type,payload) VALUES($1,$2,$3)`, envelope.ID, envelope.Type, payload); err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := h.processProWebhook(t.Context(), envelope); handled || err != nil {
+		t.Fatalf("an abandoned ordinary upgrade swallowed its live subscription's event: %v %v", handled, err)
+	}
+}

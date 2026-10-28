@@ -629,7 +629,9 @@ func (h *Handlers) expireProUpgrade(ctx context.Context, conn *pgxpool.Conn, u p
 		}
 		if _, err = tx.Exec(ctx, `UPDATE team_billing_period SET status='finalized',blocked_reason='reporting_only_calendar_period',gross_charges_usd=0,credits_applied_usd=0,net_invoice_amount_usd=0,finalized_at=clock_timestamp(),updated_at=clock_timestamp()
  WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='open' AND exported_at IS NULL AND approved_at IS NULL AND finalized_at IS NULL
-  AND NOT EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$1 AND commercial_billing_anchor IS NOT NULL)`, u.Team, u.Start, u.End); err != nil {
+  AND NOT EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$1 AND commercial_billing_anchor IS NOT NULL)
+  AND NOT EXISTS(SELECT 1 FROM billing_invoice_account WHERE team_id=$1)
+  AND NOT EXISTS(SELECT 1 FROM billing_incremental_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3)`, u.Team, u.Start, u.End); err != nil {
 			return err
 		}
 	}
