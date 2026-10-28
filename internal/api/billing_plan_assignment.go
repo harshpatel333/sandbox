@@ -469,6 +469,7 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 	}
 	kind := terms.Kind
 	preview := customerPlanChangePreview{TargetPlanKey: target, TargetDisplayName: terms.DisplayName, TargetKind: kind, Limits: terms.Limits}
+	preview.Limits.MaxSnapshots = nil
 	switch {
 	case pricing.EnrollmentEpoch != nil && !pricing.EntryOpen:
 		preview.Blocked = "new plan selection is temporarily closed"

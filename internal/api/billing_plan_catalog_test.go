@@ -100,6 +100,7 @@ func TestPlanVersionValidate(t *testing.T) {
 		"zero fee":             func(v *planVersion) { v.MonthlyFeeCents = int64p(0) },
 		"limits":               func(v *planVersion) { v.Limits.MaxConcurrent = nil },
 		"zero templates":       func(v *planVersion) { v.Limits.MaxTemplates = int32p(0) },
+		"zero snapshots":       func(v *planVersion) { v.Limits.MaxSnapshots = int32p(0) },
 		"memory below minimum": func(v *planVersion) { v.Limits.MaxMemoryMiB = int32p(255) },
 		"disk below minimum":   func(v *planVersion) { v.Limits.MaxDiskMiB = int32p(1023) },
 		"payg without caps": func(v *planVersion) {
@@ -156,6 +157,9 @@ func TestPlanVersionValidate(t *testing.T) {
 	}
 	if card := (&Handlers{}).planCard(planVersion{Kind: planKindPrepaid}, nil); card.FundingPolicy != fundingPolicyPrepaid {
 		t.Fatal("prepaid plan card reported", card.FundingPolicy)
+	}
+	if card := (&Handlers{}).planCard(planVersion{Kind: planKindSubscription, Limits: planLimits{MaxSnapshots: int32p(3)}}, nil); card.Limits.MaxSnapshots != nil {
+		t.Fatal("plan card published the internal snapshot cap")
 	}
 	starter := planVersion{PricingVersion: "v2", Family: "starter", Kind: "prepaid", DisplayName: "Starter", Limits: planLimits{MaxConcurrent: int32p(1)}, FundingPolicy: fundingPolicyPrepaid}
 	if starter.validate() == nil {
