@@ -178,15 +178,18 @@ func (s *SQLFlowSink) run() {
 // during shutdown, after vmd stops accepting requests, so it must not cost a
 // database round trip per event.
 func (s *SQLFlowSink) writeBatch(batch []FlowEvent) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	lookupCtx, cancelLookups := context.WithTimeout(context.Background(), 5*time.Second)
 	var rows db.InsertNetFlowsParams
 	for _, ev := range batch {
-		s.appendEvent(ctx, &rows, ev)
+		s.appendEvent(lookupCtx, &rows, ev)
 	}
+	cancelLookups()
 	if len(rows.SandboxIds) == 0 {
 		return
 	}
+	// A slow team lookup must not spend the deadline of rows already resolved.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if err := s.queries.InsertNetFlows(ctx, rows); err != nil {
 		log.Warn().Err(err).Int("rows", len(rows.SandboxIds)).Msg("network: InsertNetFlows failed")
 	}
