@@ -474,15 +474,14 @@ func TestCreditWarningOpenByKind(t *testing.T) {
 		{"legacy active trial", db.GetTeamTrialBalanceRow{Kind: "legacy_trial", State: "active", Eligible: true, RemainingUsd: usd(100)}, true},
 		{"legacy exhausted trial", db.GetTeamTrialBalanceRow{Kind: "legacy_trial", State: "exhausted", RemainingUsd: usd(0)}, false},
 		{"legacy trial ended by billing", db.GetTeamTrialBalanceRow{Kind: "legacy_trial", State: "ended_by_billing_activation", RemainingUsd: usd(0)}, false},
-		{"trial still running", db.GetTeamTrialBalanceRow{Kind: creditWarningTrial, State: "active", Eligible: true, RemainingUsd: usd(1), LowCreditThresholdUsd: usd(3)}, false},
+		{"trial still running", db.GetTeamTrialBalanceRow{Kind: creditWarningTrial, State: "active", Eligible: true, RemainingUsd: usd(1)}, false},
 		{"trial ended", db.GetTeamTrialBalanceRow{Kind: creditWarningTrial, State: "exhausted", RemainingUsd: usd(0)}, true},
 		{"trial never granted", db.GetTeamTrialBalanceRow{Kind: creditWarningTrial, State: "no_grant", RemainingUsd: usd(0)}, false},
-		{"prepaid above threshold", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "active", Eligible: true, RemainingUsd: usd(700), LowCreditThresholdUsd: usd(700)}, false},
-		{"prepaid below threshold", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "active", Eligible: true, RemainingUsd: usd(699), LowCreditThresholdUsd: usd(700)}, true},
-		{"prepaid used up", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "exhausted", RemainingUsd: usd(0), LowCreditThresholdUsd: usd(700)}, true},
-		{"prepaid with auto top-off", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "auto_topoff", RemainingUsd: usd(100), LowCreditThresholdUsd: usd(700)}, false},
-		{"prepaid unobserved", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "unknown", RemainingUsd: usd(0), LowCreditThresholdUsd: usd(700)}, false},
-		{"prepaid without a threshold", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "active", Eligible: true, RemainingUsd: usd(1)}, false},
+		{"prepaid at the low-credit level", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "active", Eligible: true, RemainingUsd: usd(100), LowCreditUsd: usd(100)}, false},
+		{"prepaid below the low-credit level", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "active", Eligible: true, RemainingUsd: usd(99), LowCreditUsd: usd(100)}, true},
+		{"prepaid used up", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "exhausted", RemainingUsd: usd(0), LowCreditUsd: usd(100)}, true},
+		{"prepaid with auto top-off", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "auto_topoff", RemainingUsd: usd(100), LowCreditUsd: usd(100)}, false},
+		{"prepaid unobserved", db.GetTeamTrialBalanceRow{Kind: creditWarningPrepaid, State: "unknown", RemainingUsd: usd(0), LowCreditUsd: usd(100)}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, got := creditWarningOpen(tc.row); got != tc.want {
@@ -502,31 +501,32 @@ func TestCreditWarningEmailCopyIsPlanNeutral(t *testing.T) {
 		if strings.Contains(body, "$95") || strings.Contains(body, "Nothing is deleted") {
 			t.Fatalf("%s email names a plan-specific offer or promises the future: %s", kind, body)
 		}
-		if kind != creditWarningTrial && (strings.Contains(strings.ToLower(subject+body), "trial") || !strings.Contains(body, "$1.23")) {
-			t.Fatalf("%s low-credit email must be plan-neutral and quote the balance: %q %s", kind, subject, body)
+		if kind != creditWarningTrial && strings.Contains(strings.ToLower(subject+body), "trial") {
+			t.Fatalf("%s low-credit email names the trial: %q %s", kind, subject, body)
 		}
 	}
-	if _, legacy := creditWarningEmail("legacy_trial", "example-team", 1, origin); strings.Contains(legacy, "Add credit") {
-		t.Fatalf("legacy trial email offers credit it cannot buy: %s", legacy)
+	if _, legacy := creditWarningEmail("legacy_trial", "example-team", 1.234, origin); strings.Contains(legacy, "Buy usage") || !strings.Contains(legacy, "$1.23") {
+		t.Fatalf("legacy trial email must quote the balance and offer nothing to buy: %s", legacy)
 	}
 	for _, tc := range []struct {
-		kind      string
-		remaining float64
-		want      []string
+		kind string
+		want []string
 	}{
-		{creditWarningTrial, 0, []string{"paused", "Nothing has been deleted", "Choose a plan", origin + "/\""}},
-		{creditWarningPrepaid, 1, []string{"running low", "Add credit", origin + "/plan-usage/\""}},
-		{creditWarningPrepaid, 0, []string{"has run out", "Add credit"}},
+		{creditWarningTrial, []string{"paused", "Nothing has been deleted", "Choose a plan", origin + "/\""}},
+		{creditWarningPrepaid, []string{"Your credit balance is too low. Buy usage to continue running sandboxes.", "Buy usage", origin + "/plan-usage/\""}},
 	} {
-		subject, body := creditWarningEmail(tc.kind, "example-team", tc.remaining, origin)
+		subject, body := creditWarningEmail(tc.kind, "example-team", 0.5, origin)
 		for _, want := range tc.want {
 			if !strings.Contains(subject+body, want) {
-				t.Fatalf("%s email at $%.2f missing %q: %q %s", tc.kind, tc.remaining, want, subject, body)
+				t.Fatalf("%s email missing %q: %q %s", tc.kind, want, subject, body)
 			}
 		}
-		if _, unlinked := creditWarningEmail(tc.kind, "example-team", tc.remaining, ""); strings.Contains(unlinked, "text-transform:uppercase") {
+		if _, unlinked := creditWarningEmail(tc.kind, "example-team", 0.5, ""); strings.Contains(unlinked, "text-transform:uppercase") {
 			t.Fatalf("%s email links somewhere without a configured console: %s", tc.kind, unlinked)
 		}
+	}
+	if _, prepaid := creditWarningEmail(creditWarningPrepaid, "example-team", 0.5, origin); strings.Contains(prepaid, "$") {
+		t.Fatalf("low-credit email quotes an amount: %s", prepaid)
 	}
 }
 

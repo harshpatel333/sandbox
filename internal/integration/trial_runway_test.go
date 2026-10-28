@@ -115,10 +115,6 @@ func TestTrialRunwayBillingAPI(t *testing.T) {
 		for field := range trial {
 			switch field {
 			case "grant_usd", "consumed_usd", "remaining_usd", "state", "eligible", "runway_state", "runway_observed_at":
-			case "low_credit_threshold_usd":
-				if trial[field] != nil {
-					t.Fatalf("legacy trial has a low-credit threshold: %v", trial[field])
-				}
 			default:
 				t.Fatalf("unexpected public trial field %s", field)
 			}

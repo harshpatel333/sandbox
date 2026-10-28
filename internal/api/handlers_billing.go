@@ -174,9 +174,6 @@ type billingTrialBalance struct {
 	Eligible         bool       `json:"eligible"`
 	RunwayState      string     `json:"runway_state"`
 	RunwayObservedAt *time.Time `json:"runway_observed_at"`
-	// Remaining credit below which the console calls it low; null where no
-	// setting applies.
-	LowCreditThresholdUSD *float64 `json:"low_credit_threshold_usd"`
 }
 
 type billingSummaryCostBreakdown struct {
@@ -415,12 +412,6 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	lowCreditThresholdUSD, err := nullableNumericFloat64(trialBalance.LowCreditThresholdUsd)
-	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert low credit threshold failed")
-		respondError(c, ErrInternal)
-		return
-	}
 	if (trialBalance.State == "active" && remainingUSD <= 0) ||
 		(trialBalance.State == "exhausted" && remainingUSD > 0) {
 		log.Error().Str("team_id", teamID.String()).Str("state", trialBalance.State).
@@ -635,14 +626,13 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		// an account with no applicable signup grant from an omitted/unknown
 		// billing field. The no_grant state carries zero monetary values.
 		Trial: &billingTrialBalance{
-			GrantUSD:              grantUSD,
-			ConsumedUSD:           consumedUSD,
-			RemainingUSD:          remainingUSD,
-			State:                 trialBalance.State,
-			Eligible:              trialBalance.Eligible,
-			RunwayState:           runwayState,
-			RunwayObservedAt:      runwayObservedAt,
-			LowCreditThresholdUSD: lowCreditThresholdUSD,
+			GrantUSD:         grantUSD,
+			ConsumedUSD:      consumedUSD,
+			RemainingUSD:     remainingUSD,
+			State:            trialBalance.State,
+			Eligible:         trialBalance.Eligible,
+			RunwayState:      runwayState,
+			RunwayObservedAt: runwayObservedAt,
 		},
 		Plan:         plan,
 		CalculatedAt: now,

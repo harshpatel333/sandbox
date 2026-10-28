@@ -39,8 +39,8 @@ func dedupeWarningRecipients(addresses []string) []string {
 
 // Warning kinds other than the legacy signup trial, as reported by
 // GetTeamTrialBalance. A trial awaiting its first plan is warned once when it
-// ends; a prepaid-funded subscription when its credit falls below its plan's
-// top-off threshold.
+// ends; a prepaid-funded subscription when its credit falls below the
+// configured low-credit level.
 const (
 	creditWarningTrial   = "trial"
 	creditWarningPrepaid = "prepaid"
@@ -52,13 +52,10 @@ func trialCreditWarningHTML(teamName string, remaining float64) string {
 		title, html.EscapeString(teamName), remaining))
 }
 
-func prepaidLowCreditHTML(teamName string, remaining float64, link string) string {
-	title, reason := "Your credit is running low", "Your remaining credit is low and Auto Topoff is off. When it runs out, running sandboxes will be paused. Paused sandboxes keep their data."
-	if remaining <= 0 {
-		title, reason = "Your credit has run out", "Your credit has run out and Auto Topoff is off, so running sandboxes will be paused. Paused sandboxes keep their data."
-	}
-	return emailShell(title, fmt.Sprintf("<h1>%s</h1><p>%s</p><p>Team: %s</p><p>Remaining credit: $%.2f</p>%s",
-		title, reason, html.EscapeString(teamName), remaining, optionalEmailButton("Add credit", link)))
+func prepaidLowCreditHTML(teamName, link string) string {
+	const title = "Your credit balance is too low"
+	return emailShell(title, fmt.Sprintf("<h1>%s</h1><p>Your credit balance is too low. Buy usage to continue running sandboxes.</p><p>Team: %s</p>%s",
+		title, html.EscapeString(teamName), optionalEmailButton("Buy usage", link)))
 }
 
 func trialEndedHTML(teamName, link string) string {
@@ -89,11 +86,7 @@ func creditWarningEmail(kind, teamName string, remaining float64, consoleOrigin 
 	case creditWarningTrial:
 		return "Your Superserve free trial has ended", trialEndedHTML(teamName, consoleLink(consoleOrigin, "/"))
 	case creditWarningPrepaid:
-		link := consoleLink(consoleOrigin, "/plan-usage/")
-		if remaining <= 0 {
-			return "Your Superserve credit has run out", prepaidLowCreditHTML(teamName, remaining, link)
-		}
-		return "Your Superserve credit is running low", prepaidLowCreditHTML(teamName, remaining, link)
+		return "Your Superserve credit balance is too low", prepaidLowCreditHTML(teamName, consoleLink(consoleOrigin, "/plan-usage/"))
 	default:
 		return "Your Superserve credit may run out soon", trialCreditWarningHTML(teamName, remaining)
 	}
@@ -111,7 +104,7 @@ func creditWarningOpen(b db.GetTeamTrialBalanceRow) (float64, bool) {
 	case creditWarningTrial:
 		return remaining, b.State == "exhausted"
 	case creditWarningPrepaid:
-		threshold, err := numericFloat(b.LowCreditThresholdUsd)
+		threshold, err := numericFloat(b.LowCreditUsd)
 		return remaining, err == nil && (b.State == "active" || b.State == "exhausted") && remaining < threshold
 	default:
 		return remaining, trialCreditWarningLifecycleEligible(b.Eligible, b.State) && remaining > 0

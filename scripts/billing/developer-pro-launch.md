@@ -15,18 +15,22 @@ Take the values from the approved launch record. Public values:
 | `monthly_fee_cents` | 2000 | 25000 |
 | Included credit (`credit_schedule` amount, expires after 1 month) | 2000 | 25000 |
 | `funding_policy` | `prepaid` | `postpaid` |
-| `topoff` | amount 500, `default_enabled` true, threshold `<topoff_threshold_cents>` | none |
+| `topoff` | `amount_cents` 500, `threshold_cents` 200, `default_enabled` true | none |
 | `max_concurrent` | 100 | 2000 |
 | `max_vcpu` / `max_memory_mib` | 4 / 16384 | 16 / 65536 |
 
+The Developer top-off threshold of 200 cents only validates once the catalog
+accepts whole-dollar thresholds from $1 (amounts keep $5 steps). Publish
+Developer only after that change has merged and deployed.
+
 Internal caps are never published, so they are not written here. Pass them
 from the launch record: `<disk_mib>` (`max_disk_mib`), `<developer_templates>`
-and `<pro_templates>` (`max_templates`), and the snapshot caps once the catalog
-carries them.
+and `<pro_templates>` (`max_templates`), and `<developer_snapshots>` and
+`<pro_snapshots>` (`max_snapshots`, once the catalog carries snapshot caps).
+The internal limits checklist below confirms they are set.
 
 Trial settings: `credit_usd` 0.05, `max_sandboxes` 1, and from the launch
-record `<trial_vcpu>`, `<trial_memory_mib>`, `<trial_disk_mib>` and
-`<trial_low_credit_usd>` (the banner's "almost used up" level).
+record `<trial_vcpu>`, `<trial_memory_mib>` and `<trial_disk_mib>`.
 
 ## Regions
 
@@ -69,10 +73,11 @@ messaging changes are deployed:
 3. Publish Developer the same way. Check the published row has
    `funding_policy = 'prepaid'` and its top-off columns set; an editor that
    does not send them publishes a postpaid plan.
-4. Check `SELECT billing_paid_first_sellable(), billing_trial_configured();`
+4. Run the internal limits checklist (below).
+5. Check `SELECT billing_paid_first_sellable(), billing_trial_configured();`
    returns `t, t`, then release the staging new-team gate with the usual
    release procedure.
-5. Create the staging YC promotion code (below) for the Pro version from step 2.
+6. Create the staging YC promotion code (below) for the Pro version from step 2.
 
 **S4. End-to-end test.**
 
@@ -84,11 +89,20 @@ messaging changes are deployed:
   during the trial, and none after a paid checkout.
 - Developer checkout with Auto Topoff on and with it off both activate. No
   low-credit email arrives before the included grant is issued. With Auto
-  Topoff off, the email arrives once when credit falls below the plan's top-off
-  threshold; with it on, none arrives.
+  Topoff off, the banner shows and the email ("Your credit balance is too low.
+  Buy usage to continue running sandboxes.") arrives once when credit falls
+  below the low-credit level; with it on, neither appears.
 - Pro checkout with the YC code activates with a $0 first invoice.
 - A team that signed up on Free before the test keeps its assignment, limits
   and `entry_state: active`. Enterprise still books a call.
+- Existing legacy pay-as-you-go, Starter and Free teams: the console shows each
+  its current plan correctly, each can upgrade to Developer and to Pro, and
+  nothing else about their billing or sandboxes changes.
+- Free teams see the upgrade banner and both plans.
+- Canceling Pro stops the team's sandboxes and the console lands on plan
+  selection.
+- Downgrading from Pro to Developer works and the team ends up on Developer's
+  terms.
 - Try the YC code from a Free team that already paid a $0 invoice: Stripe may
   treat it as a returning customer and reject `first_time_transaction`. Record
   the result; such teams need a separate path.
@@ -99,6 +113,7 @@ Preconditions:
 
 - S4 passed and the publish is authorized.
 - The catalog carries snapshot caps, and the Developer and Pro drafts set them.
+- The catalog accepts the Developer top-off threshold (whole dollars from $1).
 - Each region has a usable published v2 Free with `max_templates = 0`, so a
   rollback has somewhere to send new signups.
 
@@ -109,7 +124,8 @@ Then, in both regions:
    Free.
 3. Publish the Pro launch version, then Developer. Publishing Developer is the
    go-live: from then on every new signup gets the trial.
-4. Check the published version ids match across regions, then create the
+4. Run the internal limits checklist (below).
+5. Check the published version ids match across regions, then create the
    production YC coupon and promotion code for the final Pro version.
 
 Rollback is retiring Developer in both regions
@@ -128,8 +144,7 @@ privileged database connection:
 BEGIN;
 UPDATE billing_trial_policy
 SET credit_usd = :'credit_usd', max_sandboxes = :'max_sandboxes', max_vcpu = :'max_vcpu',
-    max_memory_mib = :'max_memory_mib', max_disk_mib = :'max_disk_mib',
-    low_credit_threshold_usd = :'low_credit_usd', updated_at = clock_timestamp()
+    max_memory_mib = :'max_memory_mib', max_disk_mib = :'max_disk_mib', updated_at = clock_timestamp()
 WHERE singleton RETURNING *;
 SELECT billing_trial_configured();
 COMMIT;
@@ -137,9 +152,30 @@ COMMIT;
 
 Pass the values with `psql -v credit_usd=... -v max_sandboxes=... ...`. A team's
 credit and limits are frozen when its trial starts; later edits apply to new
-signups. `low_credit_threshold_usd` is read live and only changes messaging.
+signups.
+
+## Internal limits checklist
+
+Run in staging and in each production region after publishing. Every column
+must be non-null; fix any null with a new catalog version or trial settings
+edit before going live.
+
+```sql
+SELECT family, version, max_disk_mib, max_templates, max_snapshots
+FROM billing_plan_version
+WHERE pricing_version = 'v2' AND state = 'published' AND family IN ('developer', 'pro')
+ORDER BY family;
+SELECT max_sandboxes, max_vcpu, max_memory_mib, max_disk_mib
+FROM billing_trial_policy WHERE singleton;
+```
 
 ## Low-credit messaging
+
+A Developer-style plan's banner and email fire when the balance is below
+`billing_funding_policy.low_credit_warning_cents` (100 unless changed) and Auto
+Topoff is off. The email names no amount. The trial has no running-low
+message: its banner shows for the whole trial and one email goes out when it
+ends.
 
 The low-credit email waits for each period's included grant. It stops
 waiting when the renewal invoice's collection fails, or

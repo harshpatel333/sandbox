@@ -31,10 +31,21 @@ func (s *countingCreditWarningSender) sent() []float64 {
 	return slices.Clone(s.remaining)
 }
 
-// Fixture values are arbitrary; the threshold comes from the plan's frozen
-// top-off terms.
+// lowCreditFixture is a prepaid-funded subscription with a configured
+// low-credit level above its top-off threshold, so tests see which one
+// messaging uses. Fixture values are arbitrary.
+func lowCreditFixture(t *testing.T) (*prepaidFixture, uuid.UUID) {
+	t.Helper()
+	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 500, DefaultEnabled: true})
+	f.exec(`UPDATE billing_funding_policy SET low_credit_warning_cents=1000 WHERE singleton`)
+	t.Cleanup(func() {
+		_, _ = f.h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET low_credit_warning_cents=DEFAULT WHERE singleton`)
+	})
+	return f, contract
+}
+
 func TestPrepaidLowCreditWarningOnlyWithAutoTopoffOff(t *testing.T) {
-	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true})
+	f, contract := lowCreditFixture(t)
 	sender := &countingCreditWarningSender{}
 	f.h.TrialWarningSender = sender
 	discovered := func() bool {
@@ -80,7 +91,7 @@ func TestPrepaidLowCreditWarningOnlyWithAutoTopoffOff(t *testing.T) {
 	f.observe(1000, true)
 	process()
 	if discovered() || len(sender.sent()) != 0 {
-		t.Fatal("warned at the top-off threshold")
+		t.Fatal("warned at the low-credit level")
 	}
 	f.observe(999, true)
 	if !discovered() {
@@ -132,7 +143,7 @@ func (f *prepaidFixture) lowCreditWarnings(sender *countingCreditWarningSender) 
 }
 
 func TestPrepaidLowCreditWarningUsesFirstCycleUpgradeGrant(t *testing.T) {
-	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true})
+	f, contract := lowCreditFixture(t)
 	sender := &countingCreditWarningSender{}
 	f.h.TrialWarningSender = sender
 	grant := "cg_" + uuid.NewString()
@@ -142,12 +153,12 @@ func TestPrepaidLowCreditWarningUsesFirstCycleUpgradeGrant(t *testing.T) {
  VALUES($1,$2,'{}',extract(epoch FROM now())::bigint,extract(epoch FROM now()+interval '29 days')::bigint,clock_timestamp())`, f.customer, grant)
 	f.observe(500, true)
 	if discovered, sent := f.lowCreditWarnings(sender); !discovered || sent != 1 {
-		t.Fatalf("month-one balance below the threshold: discovered=%v warnings=%d", discovered, sent)
+		t.Fatalf("month-one balance below the low-credit level: discovered=%v warnings=%d", discovered, sent)
 	}
 }
 
 func TestPrepaidLowCreditWarningStopsWaitingForAMissingGrant(t *testing.T) {
-	f, _ := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true})
+	f, _ := lowCreditFixture(t)
 	sender := &countingCreditWarningSender{}
 	f.h.TrialWarningSender = sender
 	f.observe(500, true)
@@ -173,7 +184,7 @@ func TestPrepaidLowCreditWarningStopsWaitingForAMissingGrant(t *testing.T) {
 }
 
 func TestPrepaidLowCreditWarningWaitsForRenewalCollection(t *testing.T) {
-	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true})
+	f, contract := lowCreditFixture(t)
 	sender := &countingCreditWarningSender{}
 	f.h.TrialWarningSender = sender
 	invoice := "in_" + uuid.NewString()
@@ -198,7 +209,7 @@ func TestPrepaidLowCreditWarningWaitsForRenewalCollection(t *testing.T) {
 }
 
 func TestPrepaidLowCreditWarningRearmsWhenAnOlderTopoffSettlesLater(t *testing.T) {
-	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true})
+	f, contract := lowCreditFixture(t)
 	f.issueIncludedGrant(contract)
 	sender := &countingCreditWarningSender{}
 	f.h.TrialWarningSender = sender
@@ -266,8 +277,8 @@ func TestPrepaidSummaryUnobservedBalanceIsNotLow(t *testing.T) {
 	}
 }
 
-func TestPrepaidSummaryLowBalanceUsesFrozenTopoffThreshold(t *testing.T) {
-	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: false})
+func TestPrepaidSummaryLowBalanceUsesConfiguredLevel(t *testing.T) {
+	f, contract := lowCreditFixture(t)
 	f.issueIncludedGrant(contract)
 	low := func() bool {
 		t.Helper()
@@ -285,10 +296,10 @@ func TestPrepaidSummaryLowBalanceUsesFrozenTopoffThreshold(t *testing.T) {
 	}
 	f.observe(999, true)
 	if !low() {
-		t.Fatal("a balance below the plan's top-off threshold is not low")
+		t.Fatal("a balance below the configured level is not low")
 	}
 	f.observe(1000, true)
 	if low() {
-		t.Fatal("a balance at the plan's top-off threshold is low")
+		t.Fatal("a balance at the configured level is low")
 	}
 }

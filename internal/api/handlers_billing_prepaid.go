@@ -44,11 +44,10 @@ const prepaidPurchaseJSON = `jsonb_build_object('id',p.id,'team_id',p.team_id,'s
 const prepaidBalanceObservedSQL = `COALESCE(f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp(),false)`
 
 // prepaidLowBalanceSQL compares a prepaid-funded subscription's balance, once
-// low-credit messaging may read it, with its frozen top-off threshold (never
-// low without one), and the legacy prepaid kind's observed balance with its
-// fixed level.
+// low-credit messaging may read it, with the configured low-credit level, and
+// the legacy prepaid kind's observed balance with its fixed level.
 const prepaidLowBalanceSQL = `(SELECT CASE WHEN bool_or(p.kind='subscription' AND p.terms->>'funding_policy'='prepaid')
-  THEN billing_prepaid_warning_balance_ready(t.team_id) AND f.credit_usd*100<max((p.terms->'topoff'->>'threshold_cents')::bigint)
+  THEN billing_prepaid_warning_balance_ready(t.team_id) AND f.credit_usd*100<(SELECT low_credit_warning_cents FROM billing_funding_policy WHERE singleton)
   ELSE ` + prepaidBalanceObservedSQL + ` AND floor(f.credit_usd*100)<500 END
  FROM team_plan_assignment p WHERE p.team_id=t.team_id AND p.effective_to IS NULL)`
 
