@@ -22,16 +22,17 @@ import (
 // the invoice credit ledger. Only Stripe transport and elapsed time are fake.
 func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 	for _, tc := range []struct {
+		offer   string
 		paid    int64
 		delayed bool
-	}{{25000, false}, {12500, false}, {0, false}, {25000, true}} {
+	}{{"pro_monthly", 25000, false}, {"pro_monthly", 12500, false}, {"pro_monthly", 0, false}, {"pro_monthly", 25000, true}, {"developer_monthly", 25000, false}, {"developer_monthly", 0, false}} {
 		paid := tc.paid
-		t.Run(fmt.Sprintf("paid-%d-delayed-%v", paid, tc.delayed), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s-paid-%d-delayed-%v", tc.offer, paid, tc.delayed), func(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Second)
 			if tc.delayed {
 				now = time.Date(2026, 10, 31, 23, 50, 0, 0, time.UTC)
 			}
-			h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
+			h, team, offer, params := newFirstCycleQuoteFixture(t, now, tc.offer)
 			poolConfig := h.Pool.Config()
 			poolConfig.MaxConns = 1
 			pool, err := pgxpool.NewWithConfig(t.Context(), poolConfig)
@@ -83,6 +84,9 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 			u.Subscription = &subID
 			session := StripeRetrievedCheckoutSession{ID: "cs_" + uuid.NewString(), Mode: "payment", CustomerID: u.Customer, ClientReferenceID: team.String(), Status: "complete", PaymentStatus: "paid", Currency: "usd", AmountSubtotal: u.Amount, AmountTotal: paid, InvoiceID: "in_fee_" + uuid.NewString(), PaymentIntentID: "pi_" + uuid.NewString(), Metadata: map[string]string{"pro_upgrade_id": u.ID.String()}}
 			session.TotalDetails.Discount = u.Amount - paid
+			if params.Topoff != nil {
+				_ = json.Unmarshal([]byte(`{"custom_fields":[{"key":"autotopoff","dropdown":{"value":"autotopoff"}}]}`), &session)
+			}
 			if paid == 0 {
 				session.PaymentStatus = "no_payment_required"
 			}
@@ -248,6 +252,17 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 			exec(`INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason) VALUES($1,0.07,0.07,'signup trial credit')`, team)
 			if outcome, e := h.activateProUpgrade(t.Context(), u, params, session); e != nil || outcome != "active" {
 				t.Fatalf("activation: %s %v", outcome, e)
+			}
+			var settled, recharge string
+			if e := h.Pool.QueryRow(t.Context(), `SELECT p.plan_key||'/'||COALESCE(p.terms->>'funding_policy','postpaid'),COALESCE((SELECT enabled::text||'/'||amount_cents||'/'||threshold_cents FROM billing_prepaid_auto_recharge WHERE team_id=$1),'none')
+ FROM team_plan_assignment p WHERE p.team_id=$1 AND p.effective_to IS NULL`, team).Scan(&settled, &recharge); e != nil {
+				t.Fatal(e)
+			}
+			if tc.offer == "developer_monthly" && (settled != "developer_monthly/prepaid" || recharge != "true/1500/1000") {
+				t.Fatalf("Developer did not settle with its funding and Auto Topoff: plan=%s recharge=%s", settled, recharge)
+			}
+			if tc.offer == "pro_monthly" && (settled != "pro_monthly/postpaid" || recharge != "none") {
+				t.Fatalf("Pro settled with prepaid funding: plan=%s recharge=%s", settled, recharge)
 			}
 			var leftover float64
 			var ended bool

@@ -48,8 +48,9 @@ var legacyProOffers = map[string]proOffer{
 	"pro_annual":  {Key: "pro_annual", Amount: 1200000, Months: 12, Credit: 100000},
 }
 
-// paidPlanOffers matches every offer_key in the self-serve plan catalog.
-const paidPlanOffers = "(SELECT offer_key FROM billing_plan)"
+// paidPlanOffers matches every paid offer_key: the legacy offer rows and every
+// offer a v2 subscription version has sold.
+const paidPlanOffers = "(SELECT billing_paid_offer_keys())"
 
 var errOfferUnavailable = errors.New("plan is not available")
 

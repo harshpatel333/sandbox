@@ -102,6 +102,14 @@ func TestProCheckoutResponsePreservesProratedCoverageQuote(t *testing.T) {
 
 func newProFirstCycleQuoteFixture(t *testing.T, now time.Time) (*Handlers, uuid.UUID, proOffer, StripeCreateCheckoutSessionParams) {
 	t.Helper()
+	return newFirstCycleQuoteFixture(t, now, "pro_monthly")
+}
+
+// newFirstCycleQuoteFixture quotes a first paid month of offerKey. A
+// developer_monthly quote publishes a prepaid-funded Developer version with an
+// Auto Topoff, at the same fixture fee and credit as the seeded Pro.
+func newFirstCycleQuoteFixture(t *testing.T, now time.Time, offerKey string) (*Handlers, uuid.UUID, proOffer, StripeCreateCheckoutSessionParams) {
+	t.Helper()
 	h, team := newPlanAssignmentFixture(t)
 	h.Now = func() time.Time { return now }
 	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("free", "free", 2, nil), Source: "signup", Reason: "new Free account"}); err != nil {
@@ -116,12 +124,27 @@ func newProFirstCycleQuoteFixture(t *testing.T, now time.Time) (*Handlers, uuid.
 	if _, err := h.Pool.Exec(t.Context(), `INSERT INTO team_billing_period(team_id,period_start,period_end) VALUES($1,$2,$3)`, team, start, end); err != nil {
 		t.Fatal(err)
 	}
-	terms, err := h.planTermsForPricingVersion(t.Context(), "pro_monthly", "v2")
+	if offerKey == "developer_monthly" {
+		var id uuid.UUID
+		if err := h.Pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version(family,version,pricing_version,kind,public,self_serve,display_name,monthly_fee_cents,credit_schedule,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates,funding_policy,topoff_amount_cents,topoff_threshold_cents,topoff_default_enabled)
+ VALUES('developer',(SELECT COALESCE(max(version),0)+1 FROM billing_plan_version WHERE family='developer'),'v2','subscription',true,true,'Developer',25000,
+  jsonb_build_array(jsonb_build_object('start_months',0,'repeat',NULL,'every_months',1,'amount_cents',25000,'expires_after_months',1)),7,3,3072,9216,4,'prepaid',1500,1000,true) RETURNING id`).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.Pool.Exec(t.Context(), `SELECT publish_billing_plan_version($1,NULL)`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	terms, err := h.planTermsForPricingVersion(t.Context(), offerKey, "v2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	offer := proOffer{Key: terms.OfferKey, Name: terms.DisplayName, Price: "price_pro", Amount: terms.FeeCents, Months: 1, Credit: terms.MonthlyCreditCents, VersionID: terms.VersionID, Version: terms.Version, Family: terms.Family, Pricing: "v2", PricingV2: true, Limits: &terms.Limits, Grants: terms.Grants, Allowance: terms.Allowance}
+	offer := proOffer{Key: terms.OfferKey, Name: terms.DisplayName, Price: "price_pro", Amount: terms.FeeCents, Months: 1, Credit: terms.MonthlyCreditCents, VersionID: terms.VersionID, Version: terms.Version, Family: terms.Family, Pricing: "v2", PricingV2: true, Limits: &terms.Limits, Grants: terms.Grants, Allowance: terms.Allowance, PrepaidFunded: terms.PrepaidFunded, Topoff: terms.Topoff}
 	params := StripeCreateCheckoutSessionParams{CustomerID: customer, OperationID: uuid.New(), ClientReferenceID: team.String(), BasePriceID: offer.Price, OneOffProduct: "prod_pro", AllowPromotionCodes: true, PlanTerms: &StripeCheckoutPlanTerms{Amount: offer.Amount, Months: 1, Credit: offer.Credit, VersionID: offer.VersionID, Version: offer.Version, Family: offer.Family, PricingV2: true, Limits: offer.Limits, Grants: offer.Grants}}
+	if offer.PrepaidFunded {
+		params.PlanTerms = checkoutPlanTerms(offer, true)
+		params.Topoff = &StripeCheckoutTopoff{AmountCents: offer.Topoff.AmountCents, DefaultEnabled: offer.Topoff.DefaultEnabled}
+	}
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "unavailable", 503) }))
 	t.Cleanup(provider.Close)
 	h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-05-27.dahlia"}

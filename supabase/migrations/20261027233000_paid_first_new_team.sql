@@ -39,6 +39,24 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp A
   AND v.matching_bps IS NULL AND billing_plan_version_monthly_credit(v) IS NOT NULL;
 $$;
 
+-- Paid offers are the legacy offer rows plus every offer a v2 subscription
+-- version has sold, retired ones included so accepted purchases still settle
+-- and renew. Only the active pricing model's offers get billing_plan rows.
+CREATE FUNCTION billing_paid_offer_keys() RETURNS SETOF text
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+ SELECT offer_key FROM billing_plan
+ UNION
+ SELECT v.family||'_monthly' FROM billing_plan_version v
+  WHERE v.pricing_version='v2' AND v.kind='subscription' AND v.state<>'draft' AND v.monthly_fee_cents IS NOT NULL
+ UNION
+ SELECT v.family||'_annual' FROM billing_plan_version v
+  WHERE v.pricing_version='v2' AND v.kind='subscription' AND v.state<>'draft' AND v.annual_fee_cents IS NOT NULL;
+$$;
+
+CREATE OR REPLACE FUNCTION billing_plan_offer(p_offer text) RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (SELECT 1 FROM billing_paid_offer_keys() k WHERE k = p_offer);
+$$;
+
 CREATE FUNCTION billing_team_awaiting_plan(p_team uuid) RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
  SELECT EXISTS(SELECT 1 FROM billing_new_team_enrollment e WHERE e.team_id=p_team AND e.initial_assignment_id IS NULL)
@@ -409,7 +427,7 @@ CREATE CONSTRAINT TRIGGER cohort_trial_policy_retained AFTER UPDATE ON billing_t
  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION billing_keep_cohort_free_catalog();
 
 DO $$ DECLARE r text; f text; BEGIN
- FOREACH f IN ARRAY ARRAY['billing_paid_first_sellable()','billing_trial_configured()','billing_team_awaiting_plan(uuid)','billing_team_trial_active(uuid)','billing_team_entry_state(uuid)'] LOOP
+ FOREACH f IN ARRAY ARRAY['billing_paid_offer_keys()','billing_paid_first_sellable()','billing_trial_configured()','billing_team_awaiting_plan(uuid)','billing_team_trial_active(uuid)','billing_team_entry_state(uuid)'] LOOP
   EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC',f);
   FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
    IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I',f,r); END IF;
