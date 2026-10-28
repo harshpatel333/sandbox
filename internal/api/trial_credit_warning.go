@@ -47,31 +47,36 @@ const (
 )
 
 func trialCreditWarningHTML(teamName string, remaining float64) string {
-	return lowCreditHTML("Less than 24 hours of credit remaining", "Based on your recent usage, your credit may run out within the next 24 hours.", teamName, remaining)
+	const title = "Less than 24 hours of credit remaining"
+	return emailShell(title, fmt.Sprintf("<h1>%s</h1><p>Based on your recent usage, your credit may run out within the next 24 hours.</p><p>When credit runs out, running sandboxes are paused. Paused sandboxes keep their data.</p><p>Team: %s</p><p>Remaining credit: $%.2f</p>",
+		title, html.EscapeString(teamName), remaining))
 }
 
-func prepaidLowCreditHTML(teamName string, remaining float64) string {
-	return lowCreditHTML("Your credit is running low", "Your remaining credit is low and Auto Topoff is off.", teamName, remaining)
+func prepaidLowCreditHTML(teamName string, remaining float64, consoleOrigin string) string {
+	title, reason := "Your credit is running low", "Your remaining credit is low and Auto Topoff is off. When it runs out, running sandboxes are paused. Paused sandboxes keep their data."
+	if remaining <= 0 {
+		title, reason = "Your credit has run out", "Your credit has run out and Auto Topoff is off, so running sandboxes are paused. Nothing has been deleted."
+	}
+	return emailShell(title, fmt.Sprintf("<h1>%s</h1><p>%s</p><p>Team: %s</p><p>Remaining credit: $%.2f</p>%s",
+		title, reason, html.EscapeString(teamName), remaining, emailButton("Add credit", consoleOrigin+"/plan-usage/")))
 }
 
-func lowCreditHTML(title, reason, teamName string, remaining float64) string {
-	return emailShell(title, fmt.Sprintf("<h1>%s</h1><p>%s</p><p>When credit runs out, running sandboxes are paused. Nothing is deleted.</p><p>Team: %s</p><p>Remaining credit: $%.2f</p>%s",
-		title, reason, html.EscapeString(teamName), remaining, emailButton("Add credit", emailConsoleURL+"/plan-usage/")))
-}
-
-func trialEndedHTML(teamName string) string {
+func trialEndedHTML(teamName, consoleOrigin string) string {
 	const title = "Your free trial has ended"
 	return emailShell(title, fmt.Sprintf("<h1>%s</h1><p>Your trial credit is used up, so your sandboxes are paused. Nothing has been deleted.</p><p>Choose a plan to resume where you left off.</p><p>Team: %s</p>%s",
-		title, html.EscapeString(teamName), emailButton("Choose a plan", emailConsoleURL+"/")))
+		title, html.EscapeString(teamName), emailButton("Choose a plan", consoleOrigin+"/")))
 }
 
 // creditWarningEmail renders the message for the warning kind GetTeamTrialBalance reported.
-func creditWarningEmail(kind, teamName string, remaining float64) (subject, body string) {
+func creditWarningEmail(kind, teamName string, remaining float64, consoleOrigin string) (subject, body string) {
 	switch kind {
 	case creditWarningTrial:
-		return "Your Superserve free trial has ended", trialEndedHTML(teamName)
+		return "Your Superserve free trial has ended", trialEndedHTML(teamName, consoleOrigin)
 	case creditWarningPrepaid:
-		return "Your Superserve credit is running low", prepaidLowCreditHTML(teamName, remaining)
+		if remaining <= 0 {
+			return "Your Superserve credit has run out", prepaidLowCreditHTML(teamName, remaining, consoleOrigin)
+		}
+		return "Your Superserve credit is running low", prepaidLowCreditHTML(teamName, remaining, consoleOrigin)
 	default:
 		return "Your Superserve credit may run out soon", trialCreditWarningHTML(teamName, remaining)
 	}
@@ -185,13 +190,19 @@ type trialCreditWarningIdempotentSender interface {
 // EmailTrialCreditWarningSender delivers the warning to all current billing
 // recipients without exposing addresses to one another.
 type EmailTrialCreditWarningSender struct {
-	sender  EmailSender
-	from    string
-	queries *db.Queries
+	sender        EmailSender
+	from          string
+	consoleOrigin string
+	queries       *db.Queries
 }
 
-func NewEmailTrialCreditWarningSender(sender EmailSender, from string, queries *db.Queries) *EmailTrialCreditWarningSender {
-	return &EmailTrialCreditWarningSender{sender: sender, from: from, queries: queries}
+// NewEmailTrialCreditWarningSender links messages to consoleOrigin, or to the
+// production console when it is empty.
+func NewEmailTrialCreditWarningSender(sender EmailSender, from, consoleOrigin string, queries *db.Queries) *EmailTrialCreditWarningSender {
+	if consoleOrigin == "" {
+		consoleOrigin = emailConsoleURL
+	}
+	return &EmailTrialCreditWarningSender{sender: sender, from: from, consoleOrigin: consoleOrigin, queries: queries}
 }
 func (s *EmailTrialCreditWarningSender) SendTrialCreditWarning(ctx context.Context, teamID uuid.UUID, remaining float64) error {
 	return s.sendTrialCreditWarning(ctx, teamID, remaining, uuid.Nil)
@@ -275,7 +286,7 @@ func (s *EmailTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Conte
 			return errors.New("trial credit warning lifecycle changed after claim")
 		}
 		// Persisted recipient outcomes suppress repeats across new claims.
-		subject, body := creditWarningEmail(balance.Kind, team.Name, remaining)
+		subject, body := creditWarningEmail(balance.Kind, team.Name, remaining, s.consoleOrigin)
 		if err := s.sender.SendEmail(ctx, EmailMessage{
 			From:           s.from,
 			To:             recipient,

@@ -43,6 +43,12 @@ const prepaidPurchaseJSON = `jsonb_build_object('id',p.id,'team_id',p.team_id,'s
 // zero balance then means unknown rather than used up.
 const prepaidBalanceObservedSQL = `COALESCE(f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp(),false)`
 
+// prepaidLowBalanceCentsSQL is the frozen top-off threshold of a prepaid-funded
+// subscription, null (never low) when it offers none, and the legacy prepaid
+// kind's fixed level otherwise.
+const prepaidLowBalanceCentsSQL = `(SELECT CASE WHEN bool_or(p.terms->>'funding_policy'='prepaid') THEN max((p.terms->'topoff'->>'threshold_cents')::bigint) ELSE 500 END
+ FROM team_plan_assignment p WHERE p.team_id=t.team_id AND p.effective_to IS NULL)`
+
 const prepaidAutoRechargeCapExceededSQL = `(a.amount_cents>1000000 OR a.threshold_cents>1000000)`
 const prepaidAutoRechargeEnabledSQL = `(COALESCE(a.enabled,false) AND NOT ` + prepaidAutoRechargeCapExceededSQL + `)`
 
@@ -56,7 +62,7 @@ func (h *Handlers) prepaidSummary(ctx context.Context, team uuid.UUID, purchases
  'checkout_idempotency_supported',true,
  'balance_cents',CASE WHEN `+prepaidBalanceObservedSQL+` THEN floor(f.credit_usd*100)::bigint ELSE 0 END,
  'balance_observed',`+prepaidBalanceObservedSQL+`,
- 'low_balance',`+prepaidBalanceObservedSQL+` AND floor(f.credit_usd*100)<500 AND NOT `+prepaidAutoRechargeEnabledSQL+`,
+ 'low_balance',`+prepaidBalanceObservedSQL+` AND floor(f.credit_usd*100)<`+prepaidLowBalanceCentsSQL+` AND NOT `+prepaidAutoRechargeEnabledSQL+`,
  'auto_recharge',`+prepaidAutoRechargeJSON+`,
  'has_saved_card',COALESCE(f.payment_method_ready,false),
  'purchases',(SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.created_at DESC),'[]') FROM

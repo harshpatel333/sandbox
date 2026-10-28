@@ -32,6 +32,16 @@ func (h *Handlers) ycConsoleOrigin() (string, error) {
 	return u.Scheme + "://" + u.Host, nil
 }
 
+// ConsoleOrigin is the configured console origin for links in mail, or empty
+// when none is configured.
+func (h *Handlers) ConsoleOrigin() string {
+	origin, err := h.ycConsoleOrigin()
+	if err != nil {
+		return ""
+	}
+	return origin
+}
+
 // Local HTTP links require both a loopback API bind and the selected local SMTP
 // transport. These are configuration prerequisites, not a devbox identity check.
 func (h *Handlers) ycLocalMailConfigured() bool {
