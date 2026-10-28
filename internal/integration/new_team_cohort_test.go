@@ -342,3 +342,57 @@ func cohortRequireCatalogFree(t *testing.T, pool *pgxpool.Pool, team uuid.UUID) 
 		t.Fatalf("signup did not get the catalog's published Free: %v %v", same, err)
 	}
 }
+
+func TestIntegration_NewTeamCohortFreeSignupsKeepFrozenFreeThroughGoLiveAndRollback(t *testing.T) {
+	pool, system, actor := cohortFixture(t)
+	retire := `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family=$1 AND pricing_version='v2' AND state='published'),NULL)`
+	rolloutExec(t, pool, retire, "developer")
+	cohortRelease(t, pool, system)
+	early := cohortCreate(t, pool, actor)
+	cohortRequireCatalogFree(t, pool, early)
+	snapshot := func() string {
+		t.Helper()
+		var s string
+		if err := pool.QueryRow(t.Context(), `SELECT jsonb_agg(to_jsonb(a) ORDER BY a.effective_from)::text||'|'||(SELECT to_jsonb(e)::text FROM billing_new_team_enrollment e WHERE e.team_id=$1)||'|'||
+  (SELECT jsonb_build_array(max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates)::text FROM team WHERE id=$1)
+ FROM team_plan_assignment a WHERE a.team_id=$1`, early).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	eligible := func() bool {
+		t.Helper()
+		var ok bool
+		if err := pool.QueryRow(t.Context(), `SELECT team_sandbox_billing_eligible($1) AND billing_team_entry_state($1)='active'`, early).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	before := snapshot()
+	if !eligible() {
+		t.Fatal("early Free team has no compute")
+	}
+	check := func(step string) {
+		t.Helper()
+		if after := snapshot(); after != before || !eligible() {
+			t.Fatalf("%s changed an early Free team:\nbefore %s\nafter  %s", step, before, after)
+		}
+	}
+	newSignup := func() uuid.UUID {
+		t.Helper()
+		other := uuid.New()
+		rolloutExec(t, pool, `INSERT INTO profile(id,email) VALUES($1,$2)`, other, other.String()+"@example.invalid")
+		return cohortCreate(t, pool, other)
+	}
+	cohortPublishSubscription(t, pool, "developer")
+	if !cohortAwaitingPlan(t, pool, newSignup()) {
+		t.Fatal("go-live did not start new signups on the trial")
+	}
+	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=0.09,max_sandboxes=3 WHERE singleton`)
+	check("go-live")
+	rolloutExec(t, pool, retire, "developer")
+	check("rollback")
+	cohortPublishSubscription(t, pool, "developer")
+	rolloutExec(t, pool, retire, "free")
+	check("retiring Free after go-live")
+}
