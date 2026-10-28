@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -246,13 +247,19 @@ func appendFlowRow(rows *db.InsertNetFlowsParams, ev FlowEvent, sandboxID, teamI
 	rows.TeamIds = append(rows.TeamIds, teamID)
 	rows.SandboxIds = append(rows.SandboxIds, sandboxID)
 	rows.Protocols = append(rows.Protocols, ev.Protocol)
-	rows.Hosts = append(rows.Hosts, ev.Host)
+	rows.Hosts = append(rows.Hosts, postgresText(ev.Host))
 	rows.DstIps = append(rows.DstIps, dstIP)
 	rows.DstPorts = append(rows.DstPorts, ev.DstPort)
 	rows.Verdicts = append(rows.Verdicts, ev.Verdict)
-	rows.MatchRules = append(rows.MatchRules, ev.MatchRule)
+	rows.MatchRules = append(rows.MatchRules, postgresText(ev.MatchRule))
 	rows.BytesSent = append(rows.BytesSent, max(ev.BytesSent, 0))
 	rows.BytesRecv = append(rows.BytesRecv, max(ev.BytesRecv, 0))
 	rows.DurationMs = append(rows.DurationMs, max(ev.DurationMs, 0))
 	return true
+}
+
+// postgresText makes sandbox-supplied text storable: one value Postgres
+// rejects (NUL, invalid UTF-8) would otherwise fail the whole batch.
+func postgresText(v string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(v, "\uFFFD"), "\x00", "")
 }

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -108,6 +109,14 @@ func TestAppendFlowRow(t *testing.T) {
 	}
 	if !reflect.DeepEqual(rows, want) {
 		t.Fatalf("rows = %+v, want %+v", rows, want)
+	}
+}
+
+func TestAppendFlowRowStoresSandboxTextPostgresAccepts(t *testing.T) {
+	var rows db.InsertNetFlowsParams
+	appendFlowRow(&rows, FlowEvent{Protocol: "http", Host: "bad\x00host\xff.example", DstIP: "192.0.2.6", DstPort: 80, Verdict: "blocked"}, uuid.New(), uuid.New())
+	if got := rows.Hosts[0]; got != "badhost\uFFFD.example" || !utf8.ValidString(got) {
+		t.Fatalf("host = %q", got)
 	}
 }
 
