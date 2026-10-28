@@ -88,7 +88,7 @@ BEGIN
 END $$;
 -- The allowance sweep retries the raise for teams skipped mid-purchase; this
 -- keeps each retry to the rows still below the shape.
-CREATE INDEX team_plan_assignment_below_shape ON team_plan_assignment(team_id)
+CREATE INDEX IF NOT EXISTS team_plan_assignment_below_shape ON team_plan_assignment(team_id)
  WHERE effective_to IS NULL AND contract_id IS NULL AND kind IN ('free','legacy_payg')
   AND (billing_json_cap(limits->'max_vcpu')<2 OR billing_json_cap(limits->'max_memory_mib')<4096
    OR billing_json_cap(limits->'max_disk_mib')<8192);
