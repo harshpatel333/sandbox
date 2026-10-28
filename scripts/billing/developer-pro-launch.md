@@ -139,6 +139,13 @@ Pass the values with `psql -v credit_usd=... -v max_sandboxes=... ...`. A team's
 credit and limits are frozen when its trial starts; later edits apply to new
 signups. `low_credit_threshold_usd` is read live and only changes messaging.
 
+## Low-credit messaging
+
+The low-credit email waits for each period's included grant, at most
+`billing_funding_policy.low_credit_grant_grace` after the period starts (per
+region, editable like the trial row). Email links use the API's `CONSOLE_URL`;
+without it the emails carry no link.
+
 ## YC promotion code
 
 `yc_promotion_code.py` creates a coupon (100% off, `duration=once`,

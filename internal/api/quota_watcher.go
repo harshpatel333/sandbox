@@ -33,7 +33,6 @@ const (
 	emailLogoURL     = "https://superserve.ai/assets/logo-light.png"
 	emailMeetingURL  = "https://www.superserve.ai/meet/?utm_source=email&utm_medium=quota"
 	emailSupportAddr = "support@superserve.ai"
-	emailConsoleURL  = "https://console.superserve.ai"
 )
 
 // QuotaAlert is a team crossing the usage threshold for one resource.
