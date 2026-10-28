@@ -119,6 +119,7 @@ func main() {
 	if err := ensureStandardStreamLinks("/dev"); err != nil {
 		log.Printf("init: standard stream links: %v", err)
 	}
+	prepareGuestFiles()
 
 	mux := http.NewServeMux()
 
@@ -273,6 +274,11 @@ func handleInit(ctx *sandboxContext) http.HandlerFunc {
 				log.Printf("init: set hostname %q failed: %v", body.Hostname, err)
 			} else {
 				log.Printf("init: hostname set to %q", body.Hostname)
+				// Before the response, so the name resolves by the time user
+				// code runs; /etc/hosts is in memory (prepareGuestFiles).
+				if err := mapHostname(etcHostsPath, body.Hostname); err != nil {
+					log.Printf("init: map hostname %q in /etc/hosts failed: %v", body.Hostname, err)
+				}
 			}
 		}
 
