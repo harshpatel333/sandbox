@@ -4,6 +4,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -187,6 +188,11 @@ func TestProFirstCyclePreservesCommercialAnchorsAndRejectsUnpaidLeftovers(t *tes
 				if _, err := h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,subscription_id) VALUES($1,$2,$3,$4,'pro_monthly','{"FirstPaidProCycle":true}',$5,$5,$6,$5,25000,'expired',$7)`, uuid.New(), team, uuid.New(), params.CustomerID, now, now.AddDate(0, 1, 0), subscription); err != nil {
 					t.Fatal(err)
 				}
+				if subscription != nil {
+					if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET stripe_subscription_id=$2,commercial_billing_anchor=$3 WHERE team_id=$1`, team, *subscription, now); err != nil {
+						t.Fatal(err)
+					}
+				}
 			case "prepaid_history":
 				if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("starter", "prepaid", 2, nil), Source: "staff", Reason: "prior paid terms"}); err != nil {
 					t.Fatal(err)
@@ -223,6 +229,101 @@ func TestProFirstCyclePreservesCommercialAnchorsAndRejectsUnpaidLeftovers(t *tes
 			}
 			if p.FirstPaidProCycle || u.Anchor.Equal(now) || u.Amount >= offer.Amount {
 				t.Fatalf("reset existing customer calendar: %+v", u)
+			}
+		})
+	}
+}
+
+func TestProFirstCycleExpiryReleasesUnpaidSubscription(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, kind := range []string{"unpaid", "already_canceled", "issued_invoice", "payment_evidence"} {
+		t.Run(kind, func(t *testing.T) {
+			h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
+			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
+			u, err := h.proUpgrade(t.Context(), team)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var accepted StripeCreateCheckoutSessionParams
+			if err = json.Unmarshal(u.Payload, &accepted); err != nil || !accepted.FirstPaidProCycle {
+				t.Fatalf("first-cycle quote: %+v %v", accepted, err)
+			}
+			subID := "sub_" + uuid.NewString()
+			u.Subscription = &subID
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, e := h.Pool.Exec(t.Context(), sql, args...); e != nil {
+					t.Fatal(e)
+				}
+			}
+			exec(`UPDATE billing_pro_upgrade SET subscription_id=$2,state='checkout',session_id=$3 WHERE id=$1`, u.ID, subID, "cs_"+uuid.NewString())
+			exec(`UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status='active',commercial_billing_anchor=$3,current_period_start=$3,current_period_end=$4 WHERE team_id=$1`, team, subID, u.Anchor, u.End)
+			if kind == "payment_evidence" {
+				exec(`UPDATE billing_pro_upgrade SET payment_evidence='{"invoice":"in_paid"}' WHERE id=$1`, u.ID)
+				u.Evidence = []byte(`{"invoice":"in_paid"}`)
+			}
+			status, invoices, cancels := "active", []any{map[string]any{"id": "in_opening", "status": "paid", "amount_paid": 0, "total": 0}}, 0
+			if kind == "already_canceled" {
+				status = "canceled"
+			}
+			if kind == "issued_invoice" {
+				invoices = append(invoices, map[string]any{"id": "in_open", "status": "open", "amount_paid": 0, "total": 2500})
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.URL.Path == "/v1/subscriptions/"+subID && r.Method == http.MethodGet:
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": subID, "customer": u.Customer, "status": status, "metadata": map[string]string{"pro_upgrade_id": u.ID.String(), "first_paid_pro_cycle": "true"}, "pause_collection": map[string]any{"behavior": "keep_as_draft"}})
+				case r.URL.Path == "/v1/subscriptions/"+subID && r.Method == http.MethodDelete:
+					if q := r.URL.Query(); q.Get("invoice_now") != "false" || q.Get("prorate") != "false" {
+						t.Errorf("cancel would invoice or prorate: %s", r.URL.RawQuery)
+					}
+					cancels++
+					status = "canceled"
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": subID, "status": status})
+				case r.URL.Path == "/v1/invoices" && r.URL.Query().Get("subscription") == subID:
+					_ = json.NewEncoder(w).Encode(map[string]any{"data": invoices})
+				default:
+					t.Errorf("unexpected provider route %s %s", r.Method, r.URL)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			client := &stripeHTTPClient{baseURL: srv.URL, httpClient: srv.Client(), apiVersion: "2026-07-29.dahlia"}
+			conn, err := h.Pool.Acquire(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			expiryErr := h.expireProUpgrade(t.Context(), conn, u, accepted, client)
+			conn.Release()
+			var state, account string
+			if err = h.Pool.QueryRow(t.Context(), `SELECT u.state,concat_ws('/',a.stripe_subscription_id,a.stripe_subscription_status,a.commercial_billing_anchor,a.current_period_start,a.current_period_end)
+ FROM billing_pro_upgrade u JOIN team_billing_account a ON a.team_id=u.team_id WHERE u.id=$1`, u.ID).Scan(&state, &account); err != nil {
+				t.Fatal(err)
+			}
+			if kind == "issued_invoice" || kind == "payment_evidence" {
+				if expiryErr == nil || cancels != 0 || state != "checkout" || !strings.HasPrefix(account, subID+"/active/") {
+					t.Fatalf("expiry released a subscription that may have been paid: err=%v cancels=%d state=%s account=%s", expiryErr, cancels, state, account)
+				}
+				return
+			}
+			wantCancels := 1
+			if kind == "already_canceled" {
+				wantCancels = 0
+			}
+			if expiryErr != nil || cancels != wantCancels || state != "expired" || account != "" {
+				t.Fatalf("expiry kept the unpaid subscription: err=%v cancels=%d state=%s account=%q", expiryErr, cancels, state, account)
+			}
+			h.Now = func() time.Time { return now.Add(time.Minute) }
+			params.OperationID = uuid.New()
+			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
+			next, err := h.proUpgrade(t.Context(), team)
+			if err != nil || next.ID == u.ID {
+				t.Fatalf("team could not quote again after expiry: %+v %v", next, err)
+			}
+			var p StripeCreateCheckoutSessionParams
+			if err = json.Unmarshal(next.Payload, &p); err != nil || !p.FirstPaidProCycle {
+				t.Fatal(fmt.Sprint("retry lost the first paid month: ", p.FirstPaidProCycle, err))
 			}
 		})
 	}

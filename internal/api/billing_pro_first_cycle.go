@@ -43,7 +43,8 @@ func firstProCycleEligible(ctx context.Context, q db.DBTX, team uuid.UUID, free,
  EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1)
  OR EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND kind<>'free')
  OR EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE team_id=$1 AND payment_state='succeeded'),
- EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state='expired' AND subscription_id IS NOT NULL AND request_payload->>'FirstPaidProCycle'='true')`, team).Scan(&previousPaidTerms, &abandonedFirstCycle)
+ EXISTS(SELECT 1 FROM billing_pro_upgrade u JOIN team_billing_account a ON a.team_id=u.team_id AND a.stripe_subscription_id=u.subscription_id
+  WHERE u.team_id=$1 AND u.state='expired' AND u.request_payload->>'FirstPaidProCycle'='true')`, team).Scan(&previousPaidTerms, &abandonedFirstCycle)
 	if err != nil {
 		return false, err
 	}
