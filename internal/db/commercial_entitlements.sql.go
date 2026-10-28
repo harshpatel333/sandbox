@@ -738,12 +738,15 @@ WITH contract AS MATERIALIZED (
         p.period_end::timestamptz AS period_end, p.amount_cents::bigint AS amount_cents, NULL::text AS upgrade_state
     FROM contract c CROSS JOIN LATERAL billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()) AS p(period_start, period_end, amount_cents)
     UNION ALL
-    -- The month an upgrade paid for runs before its recurring contract starts;
-    -- its own credit is what that month includes.
+    -- The first month an upgrade paid for runs before its recurring contract
+    -- starts; its own credit is what that month includes. A prorated upgrade's
+    -- credit starts partway through a period already in progress, so the
+    -- period's usage cannot be measured against it.
     SELECT u.contract_id, u.period_start, u.period_end, COALESCE(u.bridge_credit_cents, u.amount_cents),
         CASE WHEN u.grant_id IS NOT NULL OR COALESCE(u.bridge_credit_cents, u.amount_cents) = 0 THEN 'issued' ELSE 'pending' END
     FROM billing_pro_upgrade u JOIN contract c ON c.id = u.contract_id
-    WHERE u.state IN ('credited', 'active') AND u.period_start <= clock_timestamp() AND u.period_end > clock_timestamp()
+    WHERE u.state IN ('credited', 'active') AND u.request_payload->>'FirstPaidProCycle' = 'true'
+        AND u.period_start <= clock_timestamp() AND u.period_end > clock_timestamp()
         AND NOT EXISTS (SELECT 1 FROM billing_contract_entitlement(c::billing_commercial_contract, clock_timestamp()))
 )
 SELECT c.offer_key,
