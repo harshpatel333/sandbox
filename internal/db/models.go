@@ -970,6 +970,11 @@ type BillingPlanRelease struct {
 	PlanChangeID     pgtype.UUID `json:"plan_change_id"`
 }
 
+type BillingPlanShapeDeferred struct {
+	TeamID  uuid.UUID `json:"team_id"`
+	TriedAt time.Time `json:"tried_at"`
+}
+
 type BillingPlanVersion struct {
 	ID                        uuid.UUID          `json:"id"`
 	PricingVersion            string             `json:"pricing_version"`
