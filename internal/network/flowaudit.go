@@ -173,17 +173,21 @@ func (s *SQLFlowSink) run() {
 	}
 }
 
+// writeBatch inserts the whole batch in one statement: the final flush runs
+// during shutdown, after vmd stops accepting requests, so it must not cost a
+// database round trip per event.
 func (s *SQLFlowSink) writeBatch(batch []FlowEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	var rows db.InsertNetFlowsParams
 	for _, ev := range batch {
-		params, ok := s.eventToParams(ctx, ev)
-		if !ok {
-			continue
-		}
-		if err := s.queries.InsertNetFlow(ctx, params); err != nil {
-			log.Warn().Err(err).Msg("network: InsertNetFlow failed")
-		}
+		s.appendEvent(ctx, &rows, ev)
+	}
+	if len(rows.SandboxIds) == 0 {
+		return
+	}
+	if err := s.queries.InsertNetFlows(ctx, rows); err != nil {
+		log.Warn().Err(err).Int("rows", len(rows.SandboxIds)).Msg("network: InsertNetFlows failed")
 	}
 }
 
@@ -222,56 +226,33 @@ func (s *SQLFlowSink) teamFor(ctx context.Context, sandboxID uuid.UUID) (uuid.UU
 	return team, true
 }
 
-func (s *SQLFlowSink) eventToParams(ctx context.Context, ev FlowEvent) (db.InsertNetFlowParams, bool) {
+func (s *SQLFlowSink) appendEvent(ctx context.Context, rows *db.InsertNetFlowsParams, ev FlowEvent) {
 	sandboxID, err := uuid.Parse(ev.SandboxID)
 	if err != nil {
-		return db.InsertNetFlowParams{}, false
+		return
 	}
-	teamID, ok := s.teamFor(ctx, sandboxID)
-	if !ok {
-		return db.InsertNetFlowParams{}, false
+	if teamID, ok := s.teamFor(ctx, sandboxID); ok {
+		appendFlowRow(rows, ev, sandboxID, teamID)
 	}
-	return flowParams(ev, sandboxID, teamID)
 }
 
-// flowParams builds insert params from an event and its resolved ids.
-func flowParams(ev FlowEvent, sandboxID, teamID uuid.UUID) (db.InsertNetFlowParams, bool) {
+// appendFlowRow adds one event as a row; empty text and non-positive counters
+// are stored as NULL by the query.
+func appendFlowRow(rows *db.InsertNetFlowsParams, ev FlowEvent, sandboxID, teamID uuid.UUID) bool {
 	dstIP, err := netip.ParseAddr(ev.DstIP)
 	if err != nil {
-		return db.InsertNetFlowParams{}, false
+		return false
 	}
-	var host *string
-	if ev.Host != "" {
-		h := ev.Host
-		host = &h
-	}
-	var matchRule *string
-	if ev.MatchRule != "" {
-		m := ev.MatchRule
-		matchRule = &m
-	}
-	var bytesSent, bytesRecv *int64
-	if ev.BytesSent > 0 {
-		bytesSent = &ev.BytesSent
-	}
-	if ev.BytesRecv > 0 {
-		bytesRecv = &ev.BytesRecv
-	}
-	var durationMs *int32
-	if ev.DurationMs > 0 {
-		durationMs = &ev.DurationMs
-	}
-	return db.InsertNetFlowParams{
-		TeamID:     teamID,
-		SandboxID:  sandboxID,
-		Protocol:   ev.Protocol,
-		Host:       host,
-		DstIp:      dstIP,
-		DstPort:    ev.DstPort,
-		Verdict:    ev.Verdict,
-		MatchRule:  matchRule,
-		BytesSent:  bytesSent,
-		BytesRecv:  bytesRecv,
-		DurationMs: durationMs,
-	}, true
+	rows.TeamIds = append(rows.TeamIds, teamID)
+	rows.SandboxIds = append(rows.SandboxIds, sandboxID)
+	rows.Protocols = append(rows.Protocols, ev.Protocol)
+	rows.Hosts = append(rows.Hosts, ev.Host)
+	rows.DstIps = append(rows.DstIps, dstIP)
+	rows.DstPorts = append(rows.DstPorts, ev.DstPort)
+	rows.Verdicts = append(rows.Verdicts, ev.Verdict)
+	rows.MatchRules = append(rows.MatchRules, ev.MatchRule)
+	rows.BytesSent = append(rows.BytesSent, max(ev.BytesSent, 0))
+	rows.BytesRecv = append(rows.BytesRecv, max(ev.BytesRecv, 0))
+	rows.DurationMs = append(rows.DurationMs, max(ev.DurationMs, 0))
+	return true
 }
