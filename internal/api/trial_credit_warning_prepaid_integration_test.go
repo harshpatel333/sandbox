@@ -121,6 +121,57 @@ func TestPrepaidLowCreditWarningOnlyWithAutoTopoffOff(t *testing.T) {
 	}
 }
 
+func (f *prepaidFixture) lowCreditWarnings(sender *countingCreditWarningSender) (discovered bool, sent int) {
+	f.t.Helper()
+	teams, err := f.h.DB.ListTrialCreditWarningTeams(f.t.Context(), db.ListTrialCreditWarningTeamsParams{BatchLimit: 100000})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.h.processTrialCreditWarning(f.t.Context(), f.team)
+	return slices.Contains(teams, f.team), len(sender.sent())
+}
+
+func TestPrepaidLowCreditWarningUsesFirstCycleUpgradeGrant(t *testing.T) {
+	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true})
+	sender := &countingCreditWarningSender{}
+	f.h.TrialWarningSender = sender
+	grant := "cg_" + uuid.NewString()
+	f.rawExec(`INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence,grant_id,contract_id)
+ VALUES(gen_random_uuid(),$1,gen_random_uuid(),$2,'funded_monthly','{}',now(),now()-interval '1 hour',now()+interval '29 days',now(),700,'credited','{}',$3,$4)`, f.team, f.customer, grant, contract)
+	f.rawExec(`INSERT INTO billing_provider_credit(customer_id,grant_id,evidence,effective_at,expires_at,observed_at)
+ VALUES($1,$2,'{}',extract(epoch FROM now())::bigint,extract(epoch FROM now()+interval '29 days')::bigint,clock_timestamp())`, f.customer, grant)
+	f.observe(500, true)
+	if discovered, sent := f.lowCreditWarnings(sender); !discovered || sent != 1 {
+		t.Fatalf("month-one balance below the threshold: discovered=%v warnings=%d", discovered, sent)
+	}
+}
+
+func TestPrepaidLowCreditWarningStopsWaitingForAMissingGrant(t *testing.T) {
+	f, _ := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true})
+	sender := &countingCreditWarningSender{}
+	f.h.TrialWarningSender = sender
+	f.observe(500, true)
+	if discovered, sent := f.lowCreditWarnings(sender); discovered || sent != 0 {
+		t.Fatal("warned within the grace for the period's grant")
+	}
+	f.exec(`UPDATE billing_funding_policy SET low_credit_grant_grace=interval '1 millisecond' WHERE singleton`)
+	t.Cleanup(func() {
+		_, _ = f.h.Pool.Exec(context.Background(), `UPDATE billing_funding_policy SET low_credit_grant_grace=DEFAULT WHERE singleton`)
+	})
+	f.rawExec(`INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,payment_state,payment_idempotency_key,payment_first_attempt_at,
+  paid_at,payment_evidence,credit_state,credit_idempotency_key,credit_request)
+ VALUES($1,$2,'auto_recharge',1500,'succeeded',gen_random_uuid()::text,clock_timestamp(),clock_timestamp(),'{}','pending',gen_random_uuid()::text,'{}')`, f.team, f.customer)
+	f.observe(500, true)
+	if discovered, sent := f.lowCreditWarnings(sender); discovered || sent != 0 {
+		t.Fatal("warned while a paid top-off was still being credited")
+	}
+	f.rawExec(`UPDATE billing_prepaid_purchase SET payment_state='failed',paid_at=NULL,payment_evidence=NULL,failure_reason='fixture',credit_state='none',credit_request=NULL WHERE team_id=$1`, f.team)
+	f.observe(500, true)
+	if discovered, sent := f.lowCreditWarnings(sender); !discovered || sent != 1 {
+		t.Fatalf("a period whose grant never landed stayed silent: discovered=%v warnings=%d", discovered, sent)
+	}
+}
+
 // rawExec writes payment, credit and grant history directly; how they are
 // settled is outside what these tests exercise.
 func (f *prepaidFixture) rawExec(sql string, args ...any) {
@@ -167,7 +218,8 @@ func TestPrepaidSummaryUnobservedBalanceIsNotLow(t *testing.T) {
 }
 
 func TestPrepaidSummaryLowBalanceUsesFrozenTopoffThreshold(t *testing.T) {
-	f, _ := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: false})
+	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: false})
+	f.issueIncludedGrant(contract)
 	low := func() bool {
 		t.Helper()
 		raw, err := f.h.prepaidSummary(t.Context(), f.team, 0)
