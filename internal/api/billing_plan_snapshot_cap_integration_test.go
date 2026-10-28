@@ -44,7 +44,25 @@ func TestPlanAssignmentAppliesCatalogSnapshotCap(t *testing.T) {
 	if got := snapshots(); got != 7 {
 		t.Fatal("catalog snapshot cap not applied to the team", got)
 	}
-	if _, err = h.Pool.Exec(t.Context(), `UPDATE team SET limits_customized=true,max_snapshots=11 WHERE id=$1`, team); err != nil {
+	// A plan assigned in SQL without listing the cap still freezes and applies it.
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE team_id=$1 AND effective_to IS NULL`, team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE team SET max_snapshots=100 WHERE id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE team SET limits_customized=false WHERE id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	var frozen *int32
+	if err = h.Pool.QueryRow(t.Context(), `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
+ VALUES($1,'snapshot_fixture','custom',$2,'{}','{"max_concurrent":2}',clock_timestamp(),'staff','SQL-written assignment') RETURNING (limits->>'max_snapshots')::integer`, team, version).Scan(&frozen); err != nil {
+		t.Fatal(err)
+	}
+	if frozen == nil || *frozen != 7 || snapshots() != 7 {
+		t.Fatal("an SQL-written assignment did not freeze and apply the catalog cap", frozen, snapshots())
+	}
+	if _, err = h.Pool.Exec(t.Context(), `UPDATE team SET max_snapshots=11 WHERE id=$1`, team); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = assignInTx(t, h, planAssignment{Team: team, Terms: terms, Source: planSourceStaff, Reason: "customized limits stay"}); err != nil {

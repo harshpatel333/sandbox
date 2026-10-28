@@ -4,6 +4,7 @@ import (
 	"math/big"
 	"strings"
 	"testing"
+	"time"
 )
 
 func int32p(v int32) *int32 { return &v }
@@ -160,6 +161,9 @@ func TestPlanVersionValidate(t *testing.T) {
 	}
 	if card := (&Handlers{}).planCard(planVersion{Kind: planKindSubscription, Limits: planLimits{MaxSnapshots: int32p(3)}}, nil); card.Limits.MaxSnapshots != nil {
 		t.Fatal("plan card published the internal snapshot cap")
+	}
+	if change := teamPlanChangeJSON(teamPlanChange{TargetLimits: planLimits{MaxSnapshots: int32p(3)}}, time.Now()); change["limits"].(planLimits).MaxSnapshots != nil {
+		t.Fatal("plan change response published the internal snapshot cap")
 	}
 	starter := planVersion{PricingVersion: "v2", Family: "starter", Kind: "prepaid", DisplayName: "Starter", Limits: planLimits{MaxConcurrent: int32p(1)}, FundingPolicy: fundingPolicyPrepaid}
 	if starter.validate() == nil {

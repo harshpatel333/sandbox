@@ -935,6 +935,7 @@ func (h *Handlers) respondTeamPlanChange(c *gin.Context, team uuid.UUID, change 
 }
 
 func teamPlanChangeJSON(c teamPlanChange, now time.Time) gin.H {
+	c.TargetLimits.MaxSnapshots = nil
 	return gin.H{"id": c.ID, "target_plan_key": c.TargetPlanKey, "target_display_name": c.TargetTerms.DisplayName, "target_kind": c.TargetKind,
 		"effective_at": c.EffectiveAt, "pauses_running": c.PausesRunning, "state": c.State, "undoable": c.Undoable(now), "limits": c.TargetLimits}
 }
