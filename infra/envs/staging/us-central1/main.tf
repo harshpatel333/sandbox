@@ -242,7 +242,7 @@ module "api" {
     STRIPE_CHECKOUT_PRICE_IDS             = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
     STRIPE_PRO_MONTHLY_PRICE_ID           = "price_1UQiJZQ9Sm5V6nX8dRNQ5ob5"
     STRIPE_PRO_ANNUAL_PRICE_ID            = "price_1UQiJjQ9Sm5V6nX8toQIgOzz"
-    STRIPE_PORTAL_NO_CANCEL_CONFIGURATION = "bpc_TEST_PENDING"
+    STRIPE_PORTAL_NO_CANCEL_CONFIGURATION = "bpc_1UVRFrQ9Sm5V6nX8Zky67dnJ"
     BILLING_RESOURCE_CONFIG = jsonencode([
       {
         resource_key         = "vcpu"
