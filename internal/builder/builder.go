@@ -79,7 +79,7 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 	defer umaskZero()()
 
 	logger.Info().Str("scratch", scratch).Msg("pulling + flattening OCI image")
-	digest, err := b.pullAndFlatten(ctx, spec.From, scratch)
+	digest, image, err := b.pullAndFlatten(ctx, spec.From, scratch)
 	if err != nil {
 		return BuildRootfsResult{}, fmt.Errorf("pull %s: %w", spec.From, err)
 	}
@@ -113,6 +113,7 @@ func (b *inProcessBuilder) BuildRootfs(ctx context.Context, spec BuildSpec, dest
 		RootfsPath:     destPath,
 		ResolvedDigest: digest,
 		SizeBytes:      info.Size(),
+		Image:          image,
 	}, nil
 }
 

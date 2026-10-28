@@ -123,6 +123,11 @@ func TestClassifyBuildError(t *testing.T) {
 			wantCode: "unsupported_base",
 		},
 		{
+			name:     "image USER that cannot run commands",
+			err:      `image user "app": exec: user "app" not found`,
+			wantCode: "unsupported_base",
+		},
+		{
 			name:     "base image without the commands every build runs",
 			err:      "build rootfs: image is missing required commands: mount, sync",
 			wantCode: "unsupported_base",
@@ -163,5 +168,54 @@ func TestHomeFromPasswd(t *testing.T) {
 		if got := homeFromPasswd(in, "desktop"); got != want {
 			t.Errorf("homeFromPasswd(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestRuntimeDefaultsFollowTheImage(t *testing.T) {
+	bc := buildCtx{
+		env: map[string]string{
+			"PATH":  "/opt/venv/bin:/usr/bin",
+			"HOME":  "/root",
+			"LANG":  "C.UTF-8",
+			"DEBUG": "1",
+		},
+		setEnv:    map[string]struct{}{"PATH": {}},
+		imageUser: "1000:1000",
+	}
+	env := bc.runtimeEnv()
+	if env["PATH"] != "/opt/venv/bin:/usr/bin" || env["DEBUG"] != "1" {
+		t.Errorf("runtime env %v lost the image's PATH or a step's env", env)
+	}
+	if _, ok := env["HOME"]; ok {
+		t.Errorf("runtime env %v kept the build baseline's HOME", env)
+	}
+	w := bc.workload()
+	if w.user != "1000:1000" {
+		t.Errorf("runtime user = %q, want the image's", w.user)
+	}
+	if _, ok := w.env["HOME"]; ok {
+		t.Errorf("workload env %v kept root's HOME for the image user", w.env)
+	}
+	if w.workdir != "/" {
+		t.Errorf("image user workdir = %q, want / when nothing sets one", w.workdir)
+	}
+	bc.workdir = "/srv/app"
+	if got := bc.workload().workdir; got != "/srv/app" {
+		t.Errorf("image user workdir = %q, want the configured one", got)
+	}
+	bc.workdir = ""
+	bc.user = "app"
+	if got := bc.workload().workdir; got != "" {
+		t.Errorf("user step workdir = %q, want boxd's home fallback kept", got)
+	}
+	if got := bc.workload().user; got != "app" {
+		t.Errorf("runtime user = %q, want the user step's", got)
+	}
+	root := buildCtx{env: map[string]string{"HOME": "/root"}, imageUser: "0:0"}
+	if w := root.workload(); w.env["HOME"] != "/root" {
+		t.Errorf("workload env %v dropped HOME for a root image user", w.env)
+	}
+	if got := bc.asRoot().env["PATH"]; got != platformPath {
+		t.Errorf("setup PATH = %q, want the platform's", got)
 	}
 }

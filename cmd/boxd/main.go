@@ -400,13 +400,14 @@ func pathFromEnv(env []string) string {
 // os/exec.LookPath but uses a passed-in PATH instead of boxd's own.
 // Used so bare command names (e.g. "python") resolve against the child
 // process's effective PATH, which may include per-request overrides.
-func lookPathIn(file, pathEnv string) (string, error) {
+// Relative entries resolve against cwd, the child's working directory.
+func lookPathIn(file, pathEnv, cwd string) (string, error) {
 	if pathEnv == "" {
 		return "", fmt.Errorf("PATH is empty")
 	}
 	for _, dir := range filepath.SplitList(pathEnv) {
-		if dir == "" {
-			dir = "."
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(cwd, dir)
 		}
 		p := filepath.Join(dir, file)
 		fi, err := os.Stat(p)
@@ -421,27 +422,58 @@ func lookPathIn(file, pathEnv string) (string, error) {
 	return "", fmt.Errorf("executable file not found in PATH")
 }
 
-// resolveUser looks up a user by name and returns its uid/gid for use with
-// SysProcAttr.Credential. Returns (nil, nil) when the user is empty or is
-// "root" — the caller should run without a Credential in that case so the
-// child inherits boxd's uid (root).
-func resolveUser(name string) (*user.User, *syscall.Credential, error) {
-	if name == "" || name == "root" {
+// resolveUser turns a user spec into the passwd entry (for HOME and USER)
+// and the credential to run under. The spec takes the forms an image's USER
+// does: a name or uid, optionally with ":group" (a name or gid). A uid with
+// no passwd entry still runs, with HOME at "/", as it would under Docker.
+// Returns (nil, nil) for "" and "root", so the child inherits boxd's uid.
+func resolveUser(spec string) (*user.User, *syscall.Credential, error) {
+	if spec == "" || spec == "root" {
 		return nil, nil, nil
 	}
-	u, err := user.Lookup(name)
-	if err != nil {
+	name, group, hasGroup := strings.Cut(spec, ":")
+	synthetic := false
+	var u *user.User
+	var err error
+	if _, numErr := strconv.ParseUint(name, 10, 32); numErr == nil {
+		if u, err = user.LookupId(name); err != nil {
+			u = &user.User{Uid: name, Gid: "0", Username: name, HomeDir: "/"}
+			synthetic = true
+		}
+	} else if u, err = user.Lookup(name); err != nil {
 		return nil, nil, fmt.Errorf("user %q not found: %w", name, err)
+	}
+	gidStr := u.Gid
+	if hasGroup {
+		if _, numErr := strconv.ParseUint(group, 10, 32); numErr == nil {
+			gidStr = group
+		} else if g, err := user.LookupGroup(group); err == nil {
+			gidStr = g.Gid
+		} else {
+			return nil, nil, fmt.Errorf("group %q not found: %w", group, err)
+		}
 	}
 	uid, err := strconv.ParseUint(u.Uid, 10, 32)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse uid for %q: %w", name, err)
 	}
-	gid, err := strconv.ParseUint(u.Gid, 10, 32)
+	gid, err := strconv.ParseUint(gidStr, 10, 32)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parse gid for %q: %w", name, err)
+		return nil, nil, fmt.Errorf("parse gid for %q: %w", spec, err)
 	}
-	return u, &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, nil
+	cred := &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
+	// Without them the child would drop the account's supplementary groups.
+	// An explicit group restricts it to that one; an image without /etc/group
+	// just has none.
+	if !synthetic && !hasGroup {
+		ids, _ := u.GroupIds()
+		for _, id := range ids {
+			if g, err := strconv.ParseUint(id, 10, 32); err == nil {
+				cred.Groups = append(cred.Groups, uint32(g))
+			}
+		}
+	}
+	return u, cred, nil
 }
 
 // eventEmitter is runProcess's sink — shared by gRPC Start, /exec, and
@@ -510,7 +542,12 @@ func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, e
 	childEnv := s.buildEnv(msg.GetEnvs(), usr)
 	resolvedCmd := cmdName
 	if filepath.Base(cmdName) == cmdName {
-		p, err := lookPathIn(cmdName, pathFromEnv(childEnv))
+		// Absolute, so a relative cwd cannot apply twice once cmd.Dir is set.
+		absCwd, err := filepath.Abs(cwd)
+		if err != nil {
+			return connect.NewError(connect.CodeInvalidArgument, err)
+		}
+		p, err := lookPathIn(cmdName, pathFromEnv(childEnv), absCwd)
 		if err != nil {
 			return connect.NewError(connect.CodeInvalidArgument,
 				fmt.Errorf("resolve %q: %w", cmdName, err))
