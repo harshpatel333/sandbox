@@ -174,7 +174,7 @@ func TestRuntimeDefaultsFollowTheImage(t *testing.T) {
 			"LANG":  "C.UTF-8",
 			"DEBUG": "1",
 		},
-		imageEnv:  map[string]struct{}{"PATH": {}},
+		setEnv:    map[string]struct{}{"PATH": {}},
 		imageUser: "1000:1000",
 	}
 	env := bc.runtimeEnv()

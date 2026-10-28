@@ -813,7 +813,7 @@ func boxdWorkloadRunning(ctx context.Context, vmIP string) error {
 // runtimeEnv is the env baked in as the template's runtime default: what the
 // image and env steps set. The baseline that drives build-time exec
 // (PATH/HOME/USER/TERM/LANG/SHELL) comes from boxd's own env at runtime
-// instead, unless the image sets it.
+// instead, unless the image or an env step sets it.
 func (bc buildCtx) runtimeEnv() map[string]string {
 	baseline := map[string]struct{}{
 		"PATH": {}, "HOME": {}, "USER": {}, "TERM": {}, "LANG": {}, "SHELL": {},
@@ -821,7 +821,7 @@ func (bc buildCtx) runtimeEnv() map[string]string {
 	out := make(map[string]string, len(bc.env))
 	for k, v := range bc.env {
 		if _, skip := baseline[k]; skip {
-			if _, fromImage := bc.imageEnv[k]; !fromImage {
+			if _, set := bc.setEnv[k]; !set {
 				continue
 			}
 		}
@@ -847,7 +847,7 @@ func (bc buildCtx) asRoot() buildCtx {
 // who sandbox commands run as: the user step's, else the image's own USER, as
 // `docker run` would. Build steps stay root either way, so specs written for
 // root keep working on images that set a user. HOME and USER then come from
-// boxd for that user, unless the image sets them.
+// boxd for that user, unless the image or an env step sets them.
 func (bc buildCtx) workload() buildCtx {
 	if bc.user != "" || bc.imageUser == "" {
 		return bc
@@ -859,7 +859,7 @@ func (bc buildCtx) workload() buildCtx {
 	}
 	w.env = maps.Clone(bc.env)
 	for _, k := range []string{"HOME", "USER"} {
-		if _, fromImage := bc.imageEnv[k]; !fromImage {
+		if _, set := bc.setEnv[k]; !set {
 			delete(w.env, k)
 		}
 	}
@@ -882,8 +882,9 @@ type buildCtx struct {
 	user    string
 	workdir string
 
-	// What the base image sets: its env keys and its USER.
-	imageEnv  map[string]struct{}
+	// Env keys the image or an env step set, as opposed to the builder's
+	// baseline, and the image's USER.
+	setEnv    map[string]struct{}
 	imageUser string
 }
 
@@ -899,7 +900,7 @@ func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec,
 			// Builds are non-interactive; keep apt/debconf from prompting.
 			"DEBIAN_FRONTEND": "noninteractive",
 		},
-		imageEnv:  map[string]struct{}{},
+		setEnv:    map[string]struct{}{},
 		imageUser: image.User,
 	}
 	// Root is already who commands run as by default.
@@ -909,7 +910,7 @@ func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec,
 	for _, kv := range image.Env {
 		if k, v, ok := strings.Cut(kv, "="); ok && k != "" {
 			bc.env[k] = v
-			bc.imageEnv[k] = struct{}{}
+			bc.setEnv[k] = struct{}{}
 		}
 	}
 	if image.WorkingDir != "" {
@@ -953,6 +954,7 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 		return bc, nil
 	case step.Env != nil:
 		bc.env[step.Env.Key] = step.Env.Value
+		bc.setEnv[step.Env.Key] = struct{}{}
 		emitUser("system", "Set %s", step.Env.Key)
 		return bc, nil
 	case step.Workdir != nil:
