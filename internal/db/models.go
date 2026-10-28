@@ -2547,6 +2547,7 @@ type TeamPlanChange struct {
 	LastError                 *string            `json:"last_error"`
 	AdmissionSource           *string            `json:"admission_source"`
 	AdmissionEpoch            pgtype.UUID        `json:"admission_epoch"`
+	ProviderEnded             bool               `json:"provider_ended"`
 }
 
 type TeamPricingPlan struct {
