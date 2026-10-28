@@ -159,15 +159,15 @@ BEGIN
  -- 1. v2 Free catalog.
  SELECT * INTO old FROM billing_plan_version
   WHERE family='free' AND pricing_version='v2' AND state='published' FOR UPDATE;
- IF FOUND AND (COALESCE(old.max_template_vcpu,0)<2 OR COALESCE(old.max_template_memory_mib,0)<4096
-   OR COALESCE(old.max_template_disk_mib,0)<8192) THEN
+ IF FOUND AND (old.max_template_vcpu<2 OR old.max_template_memory_mib<4096
+   OR old.max_template_disk_mib<8192) THEN
   SELECT max(version)+1 INTO free_version FROM billing_plan_version WHERE family='free';
   free_id:=md5('billing-plan-version:v2:free:'||free_version)::uuid;
   INSERT INTO billing_plan_version SELECT (jsonb_populate_record(NULL::billing_plan_version,to_jsonb(old)||jsonb_build_object(
    'id',free_id,'version',free_version,'state','draft',
-   'max_template_vcpu',GREATEST(old.max_template_vcpu,2),
-   'max_template_memory_mib',GREATEST(old.max_template_memory_mib,4096),
-   'max_template_disk_mib',GREATEST(old.max_template_disk_mib,8192),
+   'max_template_vcpu',CASE WHEN old.max_template_vcpu<2 THEN 2 ELSE old.max_template_vcpu END,
+   'max_template_memory_mib',CASE WHEN old.max_template_memory_mib<4096 THEN 4096 ELSE old.max_template_memory_mib END,
+   'max_template_disk_mib',CASE WHEN old.max_template_disk_mib<8192 THEN 8192 ELSE old.max_template_disk_mib END,
    -- The allowance keeps its compute basis, so at the new shape it no
    -- longer lasts two hours; stop promising that on the plan card.
    'features',to_jsonb(COALESCE((SELECT array_agg(CASE WHEN f='2 hours of compute every day' THEN 'Daily compute allowance' ELSE f END ORDER BY o)
@@ -182,15 +182,15 @@ BEGIN
  -- 2. Legacy pay-as-you-go fallback.
  SELECT * INTO old FROM billing_plan_version
   WHERE family='payg' AND pricing_version='legacy' AND kind='legacy_payg' AND state='published' FOR UPDATE;
- IF FOUND AND (COALESCE(old.max_template_vcpu,0)<2 OR COALESCE(old.max_template_memory_mib,0)<4096
-   OR COALESCE(old.max_template_disk_mib,0)<8192) THEN
+ IF FOUND AND (old.max_template_vcpu<2 OR old.max_template_memory_mib<4096
+   OR old.max_template_disk_mib<8192) THEN
   SELECT max(version)+1 INTO payg_version FROM billing_plan_version WHERE family='payg';
   payg_id:=md5('billing-plan-version:legacy:payg:'||payg_version)::uuid;
   INSERT INTO billing_plan_version SELECT (jsonb_populate_record(NULL::billing_plan_version,to_jsonb(old)||jsonb_build_object(
    'id',payg_id,'version',payg_version,'state','draft',
-   'max_template_vcpu',GREATEST(old.max_template_vcpu,2),
-   'max_template_memory_mib',GREATEST(old.max_template_memory_mib,4096),
-   'max_template_disk_mib',GREATEST(old.max_template_disk_mib,8192),
+   'max_template_vcpu',CASE WHEN old.max_template_vcpu<2 THEN 2 ELSE old.max_template_vcpu END,
+   'max_template_memory_mib',CASE WHEN old.max_template_memory_mib<4096 THEN 4096 ELSE old.max_template_memory_mib END,
+   'max_template_disk_mib',CASE WHEN old.max_template_disk_mib<8192 THEN 8192 ELSE old.max_template_disk_mib END,
    'created_by',NULL,'created_at',clock_timestamp(),'updated_at',clock_timestamp(),
    'published_by',NULL,'published_at',NULL,'retired_by',NULL,'retired_at',NULL))).*;
   PERFORM publish_billing_plan_version(payg_id,NULL);
@@ -227,7 +227,8 @@ BEGIN
    WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published' AND v.kind='free' AND v.max_templates=0
     AND v.allowance_period='day_window' AND v.allowance_on_exhausted='pause' AND v.allowance_compute_seconds>0
     AND v.allowance_compute_vcpu>0 AND v.allowance_compute_memory_gib>0 AND NOT v.display_only AND NOT v.self_serve
-    AND v.max_template_vcpu>=2 AND v.max_template_memory_mib>=4096 AND v.max_template_disk_mib>=8192) THEN
+    AND COALESCE(v.max_template_vcpu>=2,true) AND COALESCE(v.max_template_memory_mib>=4096,true)
+    AND COALESCE(v.max_template_disk_mib>=8192,true)) THEN
   RAISE EXCEPTION 'a usable Free catalog, or sellable Developer and Pro with a configured trial, required' USING ERRCODE='55000';
  END IF;
  IF to_regprocedure('billing_lock_team_pricing_state(uuid)') IS NULL OR to_regprocedure('billing_team_awaiting_plan(uuid)') IS NULL
