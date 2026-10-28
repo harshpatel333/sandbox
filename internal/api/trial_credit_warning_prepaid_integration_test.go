@@ -197,6 +197,30 @@ func TestPrepaidLowCreditWarningWaitsForRenewalCollection(t *testing.T) {
 	}
 }
 
+func TestPrepaidLowCreditWarningRearmsWhenAnOlderTopoffSettlesLater(t *testing.T) {
+	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true})
+	f.issueIncludedGrant(contract)
+	sender := &countingCreditWarningSender{}
+	f.h.TrialWarningSender = sender
+	issued := func(createdAgo string) {
+		t.Helper()
+		f.rawExec(`INSERT INTO billing_prepaid_purchase(team_id,customer_id,source,amount_cents,payment_state,payment_idempotency_key,payment_first_attempt_at,
+  paid_at,payment_evidence,credit_state,credit_idempotency_key,credit_request,credit_first_attempt_at,stripe_credit_grant_id,credit_evidence,credited_at,created_at)
+ VALUES($1,$2,'auto_recharge',1500,'succeeded',gen_random_uuid()::text,clock_timestamp(),clock_timestamp(),'{}','issued',gen_random_uuid()::text,'{}',clock_timestamp(),
+  'cg_'||gen_random_uuid(),'{}',clock_timestamp(),clock_timestamp()-$3::interval)`, f.team, f.customer, createdAgo)
+	}
+	issued("0 seconds")
+	f.observe(500, true)
+	if discovered, sent := f.lowCreditWarnings(sender); !discovered || sent != 1 {
+		t.Fatalf("low balance after the first top-off: discovered=%v warnings=%d", discovered, sent)
+	}
+	issued("1 hour")
+	f.observe(500, true)
+	if discovered, sent := f.lowCreditWarnings(sender); !discovered || sent != 2 {
+		t.Fatalf("an older top-off that settled later did not re-arm the warning: discovered=%v warnings=%d", discovered, sent)
+	}
+}
+
 // rawExec writes payment, credit and grant history directly; how they are
 // settled is outside what these tests exercise.
 func (f *prepaidFixture) rawExec(sql string, args ...any) {
