@@ -853,7 +853,7 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 	terms := planTerms{OfferKey: c.TargetPlanKey, DisplayName: c.TargetTerms.DisplayName, FeeCents: c.TargetTerms.FeeCents, IntervalMonths: c.TargetTerms.IntervalMonths,
 		MonthlyCreditCents: c.TargetTerms.MonthlyCreditCents, VersionID: c.TargetTerms.VersionID, Version: c.TargetTerms.Version, Family: c.TargetTerms.Family,
 		PricingVersion: c.TargetTerms.PricingVersion, Kind: c.TargetKind, Grants: c.TargetTerms.Grants, Matching: c.TargetTerms.Matching,
-		Allowance: c.TargetTerms.Allowance, Limits: c.TargetLimits}
+		Allowance: c.TargetTerms.Allowance, Limits: c.TargetLimits, PrepaidFunded: c.TargetTerms.FundingPolicy == fundingPolicyPrepaid, Topoff: c.TargetTerms.Topoff}
 	actor := c.RequestedBy
 	plan, err := assignTeamPlan(ctx, tx, planAssignment{Team: c.Team, Terms: terms, Source: planSourcePlanChange, Actor: &actor,
 		Reason: c.Reason, Key: "plan-change:" + c.ID.String()})

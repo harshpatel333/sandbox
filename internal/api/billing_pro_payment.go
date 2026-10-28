@@ -625,7 +625,8 @@ func assignCheckoutPlan(ctx context.Context, tx pgx.Tx, choice proChoice, offer 
 		return errors.New("accepted purchase limits are missing")
 	}
 	terms := planTerms{OfferKey: choice.Offer, DisplayName: offer.Name, FeeCents: offer.Amount, IntervalMonths: offer.Months, MonthlyCreditCents: offer.Credit,
-		VersionID: offer.VersionID, Version: offer.Version, PricingVersion: "v2", Family: offer.Family, Kind: "subscription", Grants: offer.Grants, Allowance: offer.Allowance, Matching: offer.Matching, Limits: *offer.Limits}
+		VersionID: offer.VersionID, Version: offer.Version, PricingVersion: "v2", Family: offer.Family, Kind: "subscription", Grants: offer.Grants, Allowance: offer.Allowance, Matching: offer.Matching, Limits: *offer.Limits,
+		PrepaidFunded: offer.PrepaidFunded, Topoff: offer.Topoff}
 	_, err = assignTeamPlan(ctx, tx, planAssignment{Team: choice.Team, Terms: terms, Source: planSourceCheckout, Actor: &choice.Actor, Reason: "paid checkout", ContractID: &contract, Key: "checkout:" + contract.String()})
 	return err
 }

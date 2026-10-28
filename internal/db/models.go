@@ -354,6 +354,13 @@ type BillingCatalogAudit struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type BillingCheckoutTopoff struct {
+	SessionID string    `json:"session_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	Enabled   bool      `json:"enabled"`
+	AppliedAt time.Time `json:"applied_at"`
+}
+
 type BillingCommercialContract struct {
 	ID                     uuid.UUID          `json:"id"`
 	TeamID                 uuid.UUID          `json:"team_id"`
@@ -1001,6 +1008,10 @@ type BillingPlanVersion struct {
 	PublishedAt               pgtype.Timestamptz `json:"published_at"`
 	RetiredBy                 pgtype.UUID        `json:"retired_by"`
 	RetiredAt                 pgtype.Timestamptz `json:"retired_at"`
+	FundingPolicy             string             `json:"funding_policy"`
+	TopoffAmountCents         *int64             `json:"topoff_amount_cents"`
+	TopoffThresholdCents      *int64             `json:"topoff_threshold_cents"`
+	TopoffDefaultEnabled      *bool              `json:"topoff_default_enabled"`
 }
 
 type BillingPrepaidAutoRecharge struct {

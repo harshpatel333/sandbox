@@ -198,6 +198,9 @@ type StripeCheckoutPlanTerms struct {
 	DisplayName string         `json:",omitempty"`
 	Grants      []planGrant    `json:",omitempty"`
 	Allowance   *planAllowance `json:",omitempty"`
+	// Absent for postpaid, so earlier frozen checkouts keep their shape.
+	FundingPolicy string      `json:",omitempty"`
+	Topoff        *planTopoff `json:",omitempty"`
 }
 
 type StripeCheckoutSession struct {
