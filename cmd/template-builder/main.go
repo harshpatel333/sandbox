@@ -141,6 +141,9 @@ func classifyBuildError(err error) (code, userMsg string) {
 	case strings.Contains(raw, "image has no /bin/sh"):
 		return "unsupported_base", "base image has no shell at /bin/sh; use an image that ships one"
 
+	case strings.Contains(raw, "image user "):
+		return "unsupported_base", "the image's USER cannot run commands in the image; check that the user and its group exist"
+
 	case strings.Contains(raw, "image is missing required commands"):
 		msg := raw
 		if idx := strings.Index(msg, "image is missing"); idx >= 0 {
@@ -320,6 +323,14 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	bc, err := executeBuildSteps(ctx, netInfo.HostIP, cfg.spec, br.Image)
 	if err != nil {
 		return fmt.Errorf("build steps: %w", err)
+	}
+
+	// Every sandbox command runs as this user, so one that cannot run fails
+	// the build rather than each command after it.
+	if w := bc.workload(); w.user != bc.user {
+		if err := runShellCmdQuiet(ctx, netInfo.HostIP, "true", w); err != nil {
+			return fmt.Errorf("image user %q: %w", w.user, err)
+		}
 	}
 
 	if err := runStartCmd(ctx, netInfo.HostIP, cfg.spec, bc.workload()); err != nil {

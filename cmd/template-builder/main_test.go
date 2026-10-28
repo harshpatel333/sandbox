@@ -123,6 +123,11 @@ func TestClassifyBuildError(t *testing.T) {
 			wantCode: "unsupported_base",
 		},
 		{
+			name:     "image USER that cannot run commands",
+			err:      `image user "app": exec: user "app" not found`,
+			wantCode: "unsupported_base",
+		},
+		{
 			name:     "base image without the commands every build runs",
 			err:      "build rootfs: image is missing required commands: mount, sync",
 			wantCode: "unsupported_base",
