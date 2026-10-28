@@ -123,6 +123,9 @@ func TestPlanVersionValidate(t *testing.T) {
 		"unknown funding policy": func(v *planVersion) { v.FundingPolicy = "credit" },
 		"legacy prepaid funding": func(v *planVersion) { v.PricingVersion, v.FundingPolicy = "legacy", fundingPolicyPrepaid },
 		"top-off while postpaid": func(v *planVersion) { v.Topoff = &planTopoff{AmountCents: 500, ThresholdCents: 500} },
+		"top-off threshold in cents": func(v *planVersion) {
+			v.FundingPolicy, v.Topoff = fundingPolicyPrepaid, &planTopoff{AmountCents: 500, ThresholdCents: 150}
+		},
 		"top-off checkout refuses": func(v *planVersion) {
 			v.FundingPolicy, v.Topoff = fundingPolicyPrepaid, &planTopoff{AmountCents: 750, ThresholdCents: 500}
 		},
@@ -146,7 +149,7 @@ func TestPlanVersionValidate(t *testing.T) {
 		"starter":       {PricingVersion: "v2", Family: "starter", Kind: "prepaid", Public: true, DisplayName: "Starter", Limits: planLimits{MaxConcurrent: int32p(100)}},
 		"matching deal": {PricingVersion: "v2", Family: "custom_example", Kind: "custom", DisplayName: "Example", Matching: &planMatching{MatchingBps: 10000, CapCents: 8000000}},
 		"prepaid-funded subscription": {PricingVersion: "v2", Family: "funded", Kind: "subscription", DisplayName: "Funded", MonthlyFeeCents: int64p(700),
-			Limits: planLimits{MaxConcurrent: int32p(3)}, FundingPolicy: fundingPolicyPrepaid, Topoff: &planTopoff{AmountCents: 1500, ThresholdCents: 1000}},
+			Limits: planLimits{MaxConcurrent: int32p(3)}, FundingPolicy: fundingPolicyPrepaid, Topoff: &planTopoff{AmountCents: 1500, ThresholdCents: 100}},
 	} {
 		if err := v.validate(); err != nil {
 			t.Errorf("%s: %v", name, err)

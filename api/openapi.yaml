@@ -1159,8 +1159,8 @@ paths:
                   type: integer
                   format: int64
                   maximum: 1000000
-                  minimum: 500
-                  multipleOf: 500
+                  minimum: 100
+                  multipleOf: 100
                 amount_cents:
                   type: integer
                   format: int64
@@ -5693,7 +5693,7 @@ components:
         threshold_cents:
           type: integer
           format: int64
-          description: A top-up is bought when the balance falls below this, in USD cents.
+          description: A top-up is bought when the balance falls below this, in USD cents; whole dollars from $1.
         default_enabled:
           type: boolean
           description: Whether checkout preselects automatic top-up.
