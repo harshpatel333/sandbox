@@ -1,9 +1,3 @@
--- name: InsertNetFlow :exec
-INSERT INTO net_flow (
-    team_id, sandbox_id, protocol, host, dst_ip, dst_port,
-    verdict, match_rule, bytes_sent, bytes_recv, duration_ms
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11);
-
 -- name: GetSandboxTeamID :one
 -- Resolves team_id from sandbox_id for the flow writer (the egress proxy has
 -- no team context). Cached per sandbox by the caller.
@@ -27,3 +21,26 @@ LIMIT sqlc.arg('row_limit');
 -- ahead of it, and drops the days past it. Idempotent; the control plane
 -- runs it hourly, one table per call so no table waits on another's locks.
 SELECT log_partitions_maintain(sqlc.arg(parent)::text, sqlc.arg(keep_days)::int);
+
+-- name: InsertNetFlows :exec
+-- One round trip per batch. Empty strings and zero counters stand for NULL,
+-- since array elements cannot carry sqlc's nullable types.
+INSERT INTO net_flow (
+    team_id, sandbox_id, protocol, host, dst_ip, dst_port,
+    verdict, match_rule, bytes_sent, bytes_recv, duration_ms
+)
+SELECT f.team_id, f.sandbox_id, f.protocol, NULLIF(f.host, ''), f.dst_ip, f.dst_port,
+       f.verdict, NULLIF(f.match_rule, ''), NULLIF(f.bytes_sent, 0), NULLIF(f.bytes_recv, 0), NULLIF(f.duration_ms, 0)
+FROM (
+    SELECT unnest(@team_ids::uuid[]) AS team_id,
+           unnest(@sandbox_ids::uuid[]) AS sandbox_id,
+           unnest(@protocols::text[]) AS protocol,
+           unnest(@hosts::text[]) AS host,
+           unnest(@dst_ips::inet[]) AS dst_ip,
+           unnest(@dst_ports::int[]) AS dst_port,
+           unnest(@verdicts::text[]) AS verdict,
+           unnest(@match_rules::text[]) AS match_rule,
+           unnest(@bytes_sent::bigint[]) AS bytes_sent,
+           unnest(@bytes_recv::bigint[]) AS bytes_recv,
+           unnest(@duration_ms::int[]) AS duration_ms
+) AS f;

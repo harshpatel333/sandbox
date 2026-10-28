@@ -26,37 +26,54 @@ func (q *Queries) GetSandboxTeamID(ctx context.Context, id uuid.UUID) (uuid.UUID
 	return team_id, err
 }
 
-const insertNetFlow = `-- name: InsertNetFlow :exec
+const insertNetFlows = `-- name: InsertNetFlows :exec
 INSERT INTO net_flow (
     team_id, sandbox_id, protocol, host, dst_ip, dst_port,
     verdict, match_rule, bytes_sent, bytes_recv, duration_ms
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+)
+SELECT f.team_id, f.sandbox_id, f.protocol, NULLIF(f.host, ''), f.dst_ip, f.dst_port,
+       f.verdict, NULLIF(f.match_rule, ''), NULLIF(f.bytes_sent, 0), NULLIF(f.bytes_recv, 0), NULLIF(f.duration_ms, 0)
+FROM (
+    SELECT unnest($1::uuid[]) AS team_id,
+           unnest($2::uuid[]) AS sandbox_id,
+           unnest($3::text[]) AS protocol,
+           unnest($4::text[]) AS host,
+           unnest($5::inet[]) AS dst_ip,
+           unnest($6::int[]) AS dst_port,
+           unnest($7::text[]) AS verdict,
+           unnest($8::text[]) AS match_rule,
+           unnest($9::bigint[]) AS bytes_sent,
+           unnest($10::bigint[]) AS bytes_recv,
+           unnest($11::int[]) AS duration_ms
+) AS f
 `
 
-type InsertNetFlowParams struct {
-	TeamID     uuid.UUID  `json:"team_id"`
-	SandboxID  uuid.UUID  `json:"sandbox_id"`
-	Protocol   string     `json:"protocol"`
-	Host       *string    `json:"host"`
-	DstIp      netip.Addr `json:"dst_ip"`
-	DstPort    int32      `json:"dst_port"`
-	Verdict    string     `json:"verdict"`
-	MatchRule  *string    `json:"match_rule"`
-	BytesSent  *int64     `json:"bytes_sent"`
-	BytesRecv  *int64     `json:"bytes_recv"`
-	DurationMs *int32     `json:"duration_ms"`
+type InsertNetFlowsParams struct {
+	TeamIds    []uuid.UUID  `json:"team_ids"`
+	SandboxIds []uuid.UUID  `json:"sandbox_ids"`
+	Protocols  []string     `json:"protocols"`
+	Hosts      []string     `json:"hosts"`
+	DstIps     []netip.Addr `json:"dst_ips"`
+	DstPorts   []int32      `json:"dst_ports"`
+	Verdicts   []string     `json:"verdicts"`
+	MatchRules []string     `json:"match_rules"`
+	BytesSent  []int64      `json:"bytes_sent"`
+	BytesRecv  []int64      `json:"bytes_recv"`
+	DurationMs []int32      `json:"duration_ms"`
 }
 
-func (q *Queries) InsertNetFlow(ctx context.Context, arg InsertNetFlowParams) error {
-	_, err := q.db.Exec(ctx, insertNetFlow,
-		arg.TeamID,
-		arg.SandboxID,
-		arg.Protocol,
-		arg.Host,
-		arg.DstIp,
-		arg.DstPort,
-		arg.Verdict,
-		arg.MatchRule,
+// One round trip per batch. Empty strings and zero counters stand for NULL,
+// since array elements cannot carry sqlc's nullable types.
+func (q *Queries) InsertNetFlows(ctx context.Context, arg InsertNetFlowsParams) error {
+	_, err := q.db.Exec(ctx, insertNetFlows,
+		arg.TeamIds,
+		arg.SandboxIds,
+		arg.Protocols,
+		arg.Hosts,
+		arg.DstIps,
+		arg.DstPorts,
+		arg.Verdicts,
+		arg.MatchRules,
 		arg.BytesSent,
 		arg.BytesRecv,
 		arg.DurationMs,
