@@ -33,3 +33,14 @@ func TestResolveUserTakesImageUserForms(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveUserKeepsSupplementaryGroups(t *testing.T) {
+	t.Parallel()
+	_, cred, err := resolveUser("0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cred.Groups) == 0 {
+		t.Error("root's supplementary groups were dropped")
+	}
+}

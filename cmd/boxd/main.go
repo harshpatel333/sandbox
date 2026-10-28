@@ -432,6 +432,7 @@ func resolveUser(spec string) (*user.User, *syscall.Credential, error) {
 		return nil, nil, nil
 	}
 	name, group, hasGroup := strings.Cut(spec, ":")
+	synthetic := false
 	u, err := user.Lookup(name)
 	if err != nil {
 		if _, numErr := strconv.ParseUint(name, 10, 32); numErr != nil {
@@ -439,6 +440,7 @@ func resolveUser(spec string) (*user.User, *syscall.Credential, error) {
 		}
 		if u, err = user.LookupId(name); err != nil {
 			u = &user.User{Uid: name, Gid: "0", Username: name, HomeDir: "/"}
+			synthetic = true
 		}
 	}
 	gidStr := u.Gid
@@ -459,7 +461,18 @@ func resolveUser(spec string) (*user.User, *syscall.Credential, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse gid for %q: %w", spec, err)
 	}
-	return u, &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, nil
+	cred := &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
+	// Without them the child would drop the account's supplementary groups.
+	// An image without /etc/group just has none.
+	if !synthetic {
+		ids, _ := u.GroupIds()
+		for _, id := range ids {
+			if g, err := strconv.ParseUint(id, 10, 32); err == nil {
+				cred.Groups = append(cred.Groups, uint32(g))
+			}
+		}
+	}
+	return u, cred, nil
 }
 
 // eventEmitter is runProcess's sink — shared by gRPC Start, /exec, and
@@ -528,7 +541,12 @@ func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, e
 	childEnv := s.buildEnv(msg.GetEnvs(), usr)
 	resolvedCmd := cmdName
 	if filepath.Base(cmdName) == cmdName {
-		p, err := lookPathIn(cmdName, pathFromEnv(childEnv), cwd)
+		// Absolute, so a relative cwd cannot apply twice once cmd.Dir is set.
+		absCwd, err := filepath.Abs(cwd)
+		if err != nil {
+			return connect.NewError(connect.CodeInvalidArgument, err)
+		}
+		p, err := lookPathIn(cmdName, pathFromEnv(childEnv), absCwd)
 		if err != nil {
 			return connect.NewError(connect.CodeInvalidArgument,
 				fmt.Errorf("resolve %q: %w", cmdName, err))
