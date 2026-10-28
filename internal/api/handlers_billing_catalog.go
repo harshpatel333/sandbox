@@ -240,7 +240,7 @@ func bindCatalogReason(c *gin.Context) (string, bool) {
 // planWriteColumns are the columns a draft sets, in planVersionArgs order.
 const planWriteColumns = `public,display_name,price_label,tagline,features,sort_order,display_only,self_serve,monthly_fee_cents,annual_fee_cents,
 credit_schedule,matching_bps,cap_cents,allowance_period,allowance_on_exhausted,allowance_cents,allowance_compute_seconds,allowance_compute_vcpu,
-allowance_compute_memory_gib,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates,
+allowance_compute_memory_gib,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates,max_snapshots,
 funding_policy,topoff_amount_cents,topoff_threshold_cents,topoff_default_enabled`
 
 func planVersionArgs(v planVersion) []any {
@@ -271,7 +271,7 @@ func planVersionArgs(v planVersion) []any {
 	}
 	return []any{v.Public, v.DisplayName, v.PriceLabel, v.Tagline, v.Features, v.SortOrder, v.DisplayOnly, v.SelfServe, v.MonthlyFeeCents, v.AnnualFeeCents,
 		schedule, bps, capCents, period, onExhausted, allowanceCents, seconds, vcpu, memory,
-		v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB, v.Limits.MaxTemplates,
+		v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB, v.Limits.MaxTemplates, v.Limits.MaxSnapshots,
 		policy, topoffAmount, topoffThreshold, topoffDefault}
 }
 

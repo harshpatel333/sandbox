@@ -435,3 +435,73 @@ func TestRewriteAptSources_KeepsCachedListsUsable(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsureLocalhost(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		before *string
+		want   string
+	}{
+		"missing file":       {nil, localhostEntries},
+		"empty file":         {ptr(""), localhostEntries},
+		"other entries only": {ptr("10.0.0.5\tdb\n"), localhostEntries + "10.0.0.5\tdb\n"},
+		"image maps it":      {ptr("127.0.0.1 localhost\n"), "127.0.0.1 localhost\n"},
+		"only in a comment":  {ptr("# 127.0.0.1 localhost\n"), localhostEntries + "# 127.0.0.1 localhost\n"},
+		"not an address":     {ptr("not-an-ip localhost\n"), localhostEntries + "not-an-ip localhost\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "hosts")
+			if tc.before != nil {
+				writeTestFile(t, path, *tc.before)
+			}
+			if err := ensureLocalhost(path); err != nil {
+				t.Fatal(err)
+			}
+			if got := readTestFile(t, path); got != tc.want {
+				t.Fatalf("hosts = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnsureLocalhostReplacesASymlink(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hosts")
+	if err := os.Symlink("/run/hosts", path); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureLocalhost(path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || readTestFile(t, path) != localhostEntries {
+		t.Fatalf("hosts not replaced by a regular file with localhost entries")
+	}
+}
+
+func ptr(s string) *string { return &s }
+
+func TestEnsureLocalhostBreaksAHardlink(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	other, path := filepath.Join(dir, "passwd"), filepath.Join(dir, "hosts")
+	writeTestFile(t, other, "root:x:0:0::/root:/bin/sh\n")
+	if err := os.Link(other, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureLocalhost(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := readTestFile(t, other); got != "root:x:0:0::/root:/bin/sh\n" {
+		t.Fatalf("the hardlinked file was rewritten: %q", got)
+	}
+	if !strings.HasPrefix(readTestFile(t, path), localhostEntries) {
+		t.Fatal("hosts lacks the localhost entries")
+	}
+}

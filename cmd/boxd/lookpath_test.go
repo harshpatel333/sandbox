@@ -34,7 +34,7 @@ func TestLookPathIn_Finds(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	got, err := lookPathIn("mytool", "/nonexistent:"+dir)
+	got, err := lookPathIn("mytool", "/nonexistent:"+dir, "/")
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
@@ -49,20 +49,34 @@ func TestLookPathIn_SkipsNonExecutable(t *testing.T) {
 	if err := os.WriteFile(path, []byte("not a binary"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, err := lookPathIn("readme", dir); err == nil {
+	if _, err := lookPathIn("readme", dir, "/"); err == nil {
 		t.Error("expected error for non-executable file")
 	}
 }
 
 func TestLookPathIn_EmptyPath(t *testing.T) {
-	if _, err := lookPathIn("sh", ""); err == nil {
+	if _, err := lookPathIn("sh", "", "/"); err == nil {
 		t.Error("expected error for empty PATH")
 	}
 }
 
 func TestLookPathIn_NotFound(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := lookPathIn("does-not-exist", dir); err == nil {
+	if _, err := lookPathIn("does-not-exist", dir, "/"); err == nil {
 		t.Error("expected error for missing command")
+	}
+}
+
+func TestLookPathIn_RelativeEntryUsesCwd(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.Mkdir(filepath.Join(cwd, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "bin", "mytool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := lookPathIn("mytool", "bin", cwd)
+	if err != nil || got != filepath.Join(cwd, "bin", "mytool") {
+		t.Fatalf("lookPathIn = %q, %v", got, err)
 	}
 }

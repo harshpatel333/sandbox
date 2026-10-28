@@ -83,7 +83,7 @@ func newTeamCohortTestFixture(t *testing.T) newTeamCohortFixture {
 		t.Fatal(err)
 	}
 	exec(`SELECT publish_billing_plan_version($1,NULL)`, developer)
-	exec(`UPDATE billing_trial_policy SET credit_usd=0.07,max_sandboxes=2,max_vcpu=3,max_memory_mib=3072,max_disk_mib=9216 WHERE singleton`)
+	exec(`UPDATE billing_trial_policy SET credit_usd=0.07,max_sandboxes=2,max_vcpu=3,max_memory_mib=5120,max_disk_mib=9216 WHERE singleton`)
 	if err = pool.QueryRow(ctx, `SELECT billing_prepare_new_team_gate('use',$1,'test','new-team API test')`, system).Scan(&f.epoch); err != nil {
 		t.Fatal(err)
 	}

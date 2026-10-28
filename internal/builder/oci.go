@@ -20,7 +20,8 @@ import (
 
 // pullAndFlatten resolves imageRef (e.g. "python:3.11") to a digest, pulls
 // the linux/amd64 layers, and extracts the flattened filesystem into destDir.
-// Returns the resolved "sha256:..." digest for persistence on template_build.
+// Returns the resolved "sha256:..." digest for persistence on template_build,
+// and the image's runtime config.
 //
 // destDir must exist and be writable. Existing contents are NOT cleared;
 // callers should pass a fresh empty directory.
@@ -29,10 +30,10 @@ import (
 // We honor them during layer-by-layer extraction — a `.wh.foo` file in a
 // later layer removes `foo` from the accumulated tree. This matches what a
 // runtime like Docker/containerd does when materializing an image.
-func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir string) (string, error) {
+func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir string) (string, ImageConfig, error) {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
-		return "", fmt.Errorf("parse image reference %q: %w", imageRef, err)
+		return "", ImageConfig{}, fmt.Errorf("parse image reference %q: %w", imageRef, err)
 	}
 
 	// remote.WithContext lets context cancellation propagate into the HTTP
@@ -43,16 +44,20 @@ func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir
 		remote.WithAuthFromKeychain(keychain),
 	)
 	if err != nil {
-		return "", fmt.Errorf("fetch image %q: %w", imageRef, err)
+		return "", ImageConfig{}, fmt.Errorf("fetch image %q: %w", imageRef, err)
 	}
 
-	if err := validatePlatform(img, b.cfg.PlatformOS, b.cfg.PlatformArch); err != nil {
-		return "", err
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return "", ImageConfig{}, fmt.Errorf("read image config: %w", err)
+	}
+	if err := validatePlatform(cfg, b.cfg.PlatformOS, b.cfg.PlatformArch); err != nil {
+		return "", ImageConfig{}, err
 	}
 
 	digest, err := img.Digest()
 	if err != nil {
-		return "", fmt.Errorf("read digest: %w", err)
+		return "", ImageConfig{}, fmt.Errorf("read digest: %w", err)
 	}
 
 	// Flatten: export the squashed image as a single tar stream (crane does
@@ -70,23 +75,23 @@ func (b *inProcessBuilder) pullAndFlatten(ctx context.Context, imageRef, destDir
 		// Drain the export goroutine so it doesn't deadlock on pipe write.
 		_ = pr.CloseWithError(err)
 		<-exportErr
-		return "", fmt.Errorf("extract image: %w", err)
+		return "", ImageConfig{}, fmt.Errorf("extract image: %w", err)
 	}
 	if err := <-exportErr; err != nil {
-		return "", fmt.Errorf("export image: %w", err)
+		return "", ImageConfig{}, fmt.Errorf("export image: %w", err)
 	}
 
-	return digest.String(), nil
+	return digest.String(), ImageConfig{
+		Env:        cfg.Config.Env,
+		User:       cfg.Config.User,
+		WorkingDir: cfg.Config.WorkingDir,
+	}, nil
 }
 
 // validatePlatform rejects images that don't match the required OS/arch,
 // before the slow mkfs.ext4 step. Whether the image can boot is decided from
 // its contents once extracted (requireShell).
-func validatePlatform(img v1.Image, wantOS, wantArch string) error {
-	cfg, err := img.ConfigFile()
-	if err != nil {
-		return fmt.Errorf("read image config: %w", err)
-	}
+func validatePlatform(cfg *v1.ConfigFile, wantOS, wantArch string) error {
 	if cfg.OS != wantOS {
 		return fmt.Errorf("image os is %q, want %q", cfg.OS, wantOS)
 	}
