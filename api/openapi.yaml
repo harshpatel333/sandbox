@@ -5981,9 +5981,13 @@ components:
               type: string
               format: date-time
             funding_policy:
-              $ref: "#/components/schemas/BillingFundingPolicy"
+              description: From the assignment's frozen terms. `prepaid` only for a subscription frozen as prepaid-funded; every other plan, including the legacy prepaid kind, reports `postpaid`.
+              allOf:
+                - $ref: "#/components/schemas/BillingFundingPolicy"
             topoff:
-              $ref: "#/components/schemas/BillingPlanTopoff"
+              description: The top-off frozen into the assignment's terms; null for postpaid plans.
+              allOf:
+                - $ref: "#/components/schemas/BillingPlanTopoff"
         period:
           type: object
           required: [start, end]
