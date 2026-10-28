@@ -89,10 +89,9 @@ signups again in both production regions after go-live:
 - Pro checkout with the YC code activates with a $0 first invoice.
 - A team that signed up on Free before the test keeps its assignment, limits
   and `entry_state: active`. Enterprise still books a call.
-- Existing legacy pay-as-you-go, Starter and Free teams: the console shows each
-  its current plan correctly, each can upgrade to Developer and to Pro, and
-  nothing else about their billing or sandboxes changes.
-- Free teams see the upgrade banner and both plans.
+- Existing Free teams see the upgrade banner and can buy Developer and Pro.
+- Legacy-pricing pay-as-you-go and Starter teams: everything they see and use
+  is unchanged, and they are not offered Developer.
 - Cancellation (support-only at launch): staff switch a Developer or Pro team to Free
   with `POST /internal/teams/{team_id}/billing/plan-changes`
   (`target_plan` `free`, `idempotency_key`, `reason`). Check the request is
