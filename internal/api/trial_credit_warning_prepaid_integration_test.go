@@ -172,6 +172,31 @@ func TestPrepaidLowCreditWarningStopsWaitingForAMissingGrant(t *testing.T) {
 	}
 }
 
+func TestPrepaidLowCreditWarningWaitsForRenewalCollection(t *testing.T) {
+	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true})
+	sender := &countingCreditWarningSender{}
+	f.h.TrialWarningSender = sender
+	invoice := "in_" + uuid.NewString()
+	f.rawExec(`UPDATE team_plan_assignment SET effective_from=now()-interval '31 days' WHERE team_id=$1 AND effective_to IS NULL`, f.team)
+	f.rawExec(`INSERT INTO billing_usage_entitlement(team_id,contract_id,payment_id,kind,period_start,period_end,amount_cents,currency,state,
+  first_attempt_at,request_payload,provider_invoice_start,provider_invoice_end,stripe_credit_grant_id,issuance_evidence,issued_at)
+ VALUES($1,$2,gen_random_uuid(),'metered_usage',date_trunc('second',now())-interval '31 days',date_trunc('second',now())-interval '2 hours',700,'usd','issued',
+  now()-interval '31 days','{}',now()-interval '31 days',now()-interval '30 days','cg_'||gen_random_uuid(),'{"fixture":true}',now()-interval '31 days')`, f.team, contract)
+	f.rawExec(`INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan,state)
+ SELECT team_id,period_start,period_end,$2,'{}','released' FROM billing_usage_entitlement WHERE team_id=$1`, f.team, invoice)
+	f.rawExec(`INSERT INTO billing_invoice_collection(invoice_id,customer_id,subscription_id,livemode,settlement_hash,idempotency_key,payment_authorized,state)
+ VALUES($1,$2,$3,false,'fixture',$1,true,'processing')`, invoice, f.customer, f.sub)
+	f.observe(500, true)
+	if discovered, sent := f.lowCreditWarnings(sender); discovered || sent != 0 {
+		t.Fatal("warned while the renewal invoice was still being collected")
+	}
+	f.rawExec(`UPDATE billing_invoice_collection SET state='requires_payment_method' WHERE invoice_id=$1`, invoice)
+	f.observe(500, true)
+	if discovered, sent := f.lowCreditWarnings(sender); !discovered || sent != 1 {
+		t.Fatalf("a failed renewal stayed silent: discovered=%v warnings=%d", discovered, sent)
+	}
+}
+
 // rawExec writes payment, credit and grant history directly; how they are
 // settled is outside what these tests exercise.
 func (f *prepaidFixture) rawExec(sql string, args ...any) {

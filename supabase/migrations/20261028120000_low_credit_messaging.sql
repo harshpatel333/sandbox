@@ -25,18 +25,20 @@ RETURNS text LANGUAGE sql STABLE AS $$
 $$;
 
 -- How long a prepaid-funded period may run without its included grant before
--- low-credit messaging stops waiting for it, as when a renewal is unpaid or its
--- grant is withheld. It is configuration.
+-- low-credit messaging stops waiting for it. A renewal grant lands only after
+-- the closing invoice is finalized, paid and its webhook processed, so this is
+-- a backstop for renewals that stall without failing. It is configuration.
 ALTER TABLE billing_funding_policy
- ADD COLUMN low_credit_grant_grace interval NOT NULL DEFAULT interval '1 hour' CHECK(low_credit_grant_grace>interval '0');
+ ADD COLUMN low_credit_grant_grace interval NOT NULL DEFAULT interval '24 hours' CHECK(low_credit_grant_grace>interval '0');
 
 -- A prepaid-funded balance is worth warning about once it was read after the
 -- period's included grant and after every top-off paid since: the grant lands
--- after checkout and after each renewal invoice, so a reading in that gap shows
--- only leftover credit. A period whose grant has not landed within the grace
--- is warned on its current balance.
+-- after checkout and after each renewal invoice is paid, so a reading in that
+-- gap shows only leftover credit. A period whose grant has not landed is
+-- warned on its current balance once the renewal invoice's collection has
+-- failed, or after the grace.
 CREATE FUNCTION billing_prepaid_warning_balance_ready(p_team uuid) RETURNS boolean
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+LANGUAGE sql STABLE SECURITY INVOKER SET search_path=pg_catalog,public,pg_temp AS $$
  WITH current AS (
   SELECT a.contract_id, a.effective_from, f.credit_checked_at AS checked
   FROM team_plan_assignment a JOIN billing_funding_account f ON f.team_id=a.team_id
@@ -49,16 +51,22 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp A
   SELECT u.period_start, u.period_end, c.observed_at FROM billing_pro_upgrade u
   JOIN billing_provider_credit c ON c.customer_id=u.customer_id AND c.grant_id=u.grant_id, current
   WHERE u.team_id=p_team AND u.contract_id=current.contract_id AND u.state IN ('credited','active')
+ ), period AS (
+  SELECT current.checked,
+   EXISTS(SELECT 1 FROM grants g WHERE g.period_start<=now() AND g.period_end>now()) AS granted,
+   GREATEST(current.effective_from,(SELECT max(g.period_end) FROM grants g WHERE g.period_end<=now())) AS started
+  FROM current
  )
  SELECT COALESCE(bool_or(
-   NOT EXISTS(SELECT 1 FROM grants g WHERE g.landed>=current.checked)
-   AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.team_id=p_team AND e.state='issued' AND e.issued_at>=current.checked)
+   NOT EXISTS(SELECT 1 FROM grants g WHERE g.landed>=period.checked)
+   AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.team_id=p_team AND e.state='issued' AND e.issued_at>=period.checked)
    AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=p_team AND p.payment_state='succeeded'
-    AND (p.credit_state<>'issued' OR p.credited_at>=current.checked) AND NOT billing_prepaid_credit_withheld(p))
-   AND (EXISTS(SELECT 1 FROM grants g WHERE g.period_start<=now() AND g.period_end>now())
-    OR GREATEST(current.effective_from,(SELECT max(g.period_end) FROM grants g WHERE g.period_end<=now()))
-       +(SELECT low_credit_grant_grace FROM billing_funding_policy WHERE singleton)<current.checked)),false)
- FROM current;
+    AND (p.credit_state<>'issued' OR p.credited_at>=period.checked) AND NOT billing_prepaid_credit_withheld(p))
+   AND (period.granted
+    OR EXISTS(SELECT 1 FROM billing_invoice_close c JOIN billing_invoice_collection j ON j.invoice_id=c.invoice_id
+     WHERE c.team_id=p_team AND c.period_end=period.started AND j.state IN ('requires_payment_method','review_required','uncollectible','void'))
+    OR period.started+(SELECT low_credit_grant_grace FROM billing_funding_policy WHERE singleton)<period.checked)),false)
+ FROM period;
 $$;
 
 DO $$ DECLARE r text; BEGIN

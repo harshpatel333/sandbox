@@ -494,10 +494,8 @@ func TestCreditWarningOpenByKind(t *testing.T) {
 
 func TestCreditWarningEmailCopyIsPlanNeutral(t *testing.T) {
 	const origin = "https://console.example.com"
-	team := db.Team{ID: uuid.MustParse("11111111-1111-4111-8111-111111111111"), Name: "example-team", HomeRegion: "use"}
-	teamQuery := "?team=use%3A11111111-1111-4111-8111-111111111111"
 	for _, kind := range []string{"legacy_trial", creditWarningTrial, creditWarningPrepaid} {
-		subject, body := creditWarningEmail(kind, team, 1.234, origin)
+		subject, body := creditWarningEmail(kind, "example-team", 1.234, origin)
 		if subject == "" || !strings.Contains(body, "example-team") {
 			t.Fatalf("%s email missing subject or team: %q %s", kind, subject, body)
 		}
@@ -508,7 +506,7 @@ func TestCreditWarningEmailCopyIsPlanNeutral(t *testing.T) {
 			t.Fatalf("%s low-credit email must be plan-neutral and quote the balance: %q %s", kind, subject, body)
 		}
 	}
-	if _, legacy := creditWarningEmail("legacy_trial", team, 1, origin); strings.Contains(legacy, "Add credit") {
+	if _, legacy := creditWarningEmail("legacy_trial", "example-team", 1, origin); strings.Contains(legacy, "Add credit") {
 		t.Fatalf("legacy trial email offers credit it cannot buy: %s", legacy)
 	}
 	for _, tc := range []struct {
@@ -516,17 +514,17 @@ func TestCreditWarningEmailCopyIsPlanNeutral(t *testing.T) {
 		remaining float64
 		want      []string
 	}{
-		{creditWarningTrial, 0, []string{"paused", "Nothing has been deleted", "Choose a plan", origin + "/" + teamQuery}},
-		{creditWarningPrepaid, 1, []string{"running low", "Add credit", origin + "/plan-usage/" + teamQuery}},
+		{creditWarningTrial, 0, []string{"paused", "Nothing has been deleted", "Choose a plan", origin + "/\""}},
+		{creditWarningPrepaid, 1, []string{"running low", "Add credit", origin + "/plan-usage/\""}},
 		{creditWarningPrepaid, 0, []string{"has run out", "Add credit"}},
 	} {
-		subject, body := creditWarningEmail(tc.kind, team, tc.remaining, origin)
+		subject, body := creditWarningEmail(tc.kind, "example-team", tc.remaining, origin)
 		for _, want := range tc.want {
 			if !strings.Contains(subject+body, want) {
 				t.Fatalf("%s email at $%.2f missing %q: %q %s", tc.kind, tc.remaining, want, subject, body)
 			}
 		}
-		if _, unlinked := creditWarningEmail(tc.kind, team, tc.remaining, ""); strings.Contains(unlinked, "text-transform:uppercase") {
+		if _, unlinked := creditWarningEmail(tc.kind, "example-team", tc.remaining, ""); strings.Contains(unlinked, "text-transform:uppercase") {
 			t.Fatalf("%s email links somewhere without a configured console: %s", tc.kind, unlinked)
 		}
 	}

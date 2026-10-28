@@ -141,9 +141,10 @@ signups. `low_credit_threshold_usd` is read live and only changes messaging.
 
 ## Low-credit messaging
 
-The low-credit email waits for each period's included grant, at most
-`billing_funding_policy.low_credit_grant_grace` after the period starts (per
-region, editable like the trial row). Email links use the API's `CONSOLE_URL`;
+The low-credit email waits for each period's included grant. It stops
+waiting when the renewal invoice's collection fails, or
+`billing_funding_policy.low_credit_grant_grace` (24 hours unless changed; per
+region, editable like the trial row) after the period starts. Email links use the API's `CONSOLE_URL`;
 without it the emails carry no link.
 
 ## YC promotion code
