@@ -1,8 +1,8 @@
 {
   "name": "superserve/python-3.11",
-  "vcpu": 1,
-  "memory_mib": 1024,
-  "disk_mib": 4096,
+  "vcpu": 2,
+  "memory_mib": 4096,
+  "disk_mib": 8192,
   "build_spec": {
     "from": "python:3.11-slim",
     "steps": [

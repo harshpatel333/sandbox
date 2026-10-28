@@ -14,7 +14,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -178,8 +180,13 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 		proConflict(c)
 		return
 	}
+	awaiting, err := teamAwaitingPlan(ctx, tx, team)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
 	now := h.nowUTC().Truncate(time.Second)
-	firstPaidCycle, err := firstProCycleEligible(ctx, tx, team, assigned && plan.Kind == planKindFree, a.CommercialBillingAnchor.Valid, a.StripeSubscriptionID != nil)
+	firstPaidCycle, err := firstProCycleEligible(ctx, tx, team, awaiting || (assigned && plan.Kind == planKindFree), a.CommercialBillingAnchor.Valid, a.StripeSubscriptionID != nil)
 	if errors.Is(err, errProFirstCycleReconciliation) {
 		respondErrorMsg(c, "billing_reconciliation_required", err.Error(), http.StatusConflict)
 		return
@@ -283,10 +290,36 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 	h.resumeProUpgradeCheckout(c, u)
 }
 
+const providerBackdateMargin = 1500 * time.Millisecond
+
+// A session missing from the provider's listing is treated as expired only
+// once the provider's clock has certainly passed the quote deadline too.
+const upgradeExpiryClockMargin = 5 * time.Minute
+
+// respondUpgradeUnsettled reports a payment still settling only when the
+// customer has paid; an upgrade whose checkout could not be opened is an
+// error the customer can retry, never a pending payment without a session.
+func (h *Handlers) respondUpgradeUnsettled(c *gin.Context, team uuid.UUID, cause error) {
+	ctx := c.Request.Context()
+	latest, err := h.proUpgrade(ctx, team)
+	paid := err == nil && (latest.State == "paid" || latest.State == "credited" || latest.State == "active")
+	if !paid && err == nil && latest.Session != nil {
+		if s, e := h.Stripe.(*stripeHTTPClient).RetrieveCheckoutSession(ctx, *latest.Session); e == nil && s.Status == "complete" {
+			paid = true
+		}
+	}
+	if paid {
+		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
+		return
+	}
+	log.Warn().Err(cause).Str("team_id", team.String()).Msg("upgrade checkout unavailable")
+	respondErrorMsg(c, "checkout_unavailable", "Checkout could not be opened. Please try again.", http.StatusServiceUnavailable)
+}
+
 func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 	outcome, err := h.reconcileProUpgrade(c.Request.Context(), u, false)
 	if err != nil {
-		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
+		h.respondUpgradeUnsettled(c, u.Team, err)
 		return
 	}
 	if outcome == "active" {
@@ -301,12 +334,12 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 	}
 	latest, err := h.proUpgrade(c.Request.Context(), u.Team)
 	if err != nil || latest.Session == nil {
-		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
+		h.respondUpgradeUnsettled(c, u.Team, fmt.Errorf("upgrade %s has no checkout session: %w", outcome, err))
 		return
 	}
 	s, err := h.Stripe.(*stripeHTTPClient).RetrieveCheckoutSession(c.Request.Context(), *latest.Session)
 	if err != nil || s.Status != "open" {
-		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
+		h.respondUpgradeUnsettled(c, u.Team, fmt.Errorf("upgrade checkout session is %q: %w", s.Status, err))
 		return
 	}
 	c.JSON(http.StatusOK, billingSessionResponse{URL: s.URL})
@@ -413,9 +446,20 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 				u.Session = stringPtr(found.ID)
 			}
 		}
-		if u.Session == nil && !h.nowUTC().Before(*params.ExpiresAt) {
-			_, err = conn.Exec(ctx, `UPDATE billing_pro_upgrade SET state='expired' WHERE id=$1 AND payment_evidence IS NULL`, u.ID)
-			return "retryable", err
+		if u.Session == nil && !h.nowUTC().Before(params.ExpiresAt.Add(upgradeExpiryClockMargin)) {
+			return "retryable", h.expireProUpgrade(ctx, conn, u, params, client)
+		}
+	}
+	if u.Session != nil {
+		session, e := client.RetrieveCheckoutSession(ctx, *u.Session)
+		if e != nil {
+			return "", e
+		}
+		if e = checkUpgradeSession(u, session); e != nil {
+			return "", e
+		}
+		if session.Status == "expired" {
+			return "retryable", h.expireProUpgrade(ctx, conn, u, params, client)
 		}
 	}
 	sub, err := h.prepareProUpgradeSubscription(ctx, conn, &u, params, client)
@@ -443,8 +487,8 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 	if err != nil {
 		return "", err
 	}
-	if session.ID != *u.Session || session.Mode != "payment" || session.CustomerID != u.Customer || session.ClientReferenceID != u.Team.String() || session.Metadata["pro_upgrade_id"] != u.ID.String() {
-		return "", errors.New("upgrade checkout association differs")
+	if err = checkUpgradeSession(u, session); err != nil {
+		return "", err
 	}
 	if restart && session.Status == "open" {
 		if err = client.doForm(ctx, http.MethodPost, "/v1/checkout/sessions/"+url.PathEscape(session.ID)+"/expire", nil, nil, "pro-upgrade-expire:"+u.ID.String()); err != nil {
@@ -456,8 +500,7 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 		}
 	}
 	if session.Status == "expired" {
-		_, err = conn.Exec(ctx, `UPDATE billing_pro_upgrade SET state='expired' WHERE id=$1 AND payment_evidence IS NULL`, u.ID)
-		return "retryable", err
+		return "retryable", h.expireProUpgrade(ctx, conn, u, params, client)
 	}
 	if session.Status != "complete" {
 		return "payment_confirmation_pending", nil
@@ -497,10 +540,10 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 	if err = h.enrollInvoiceAccount(ctx, u.Team, nil); err != nil {
 		return "", err
 	}
-	return h.activateProUpgrade(ctx, u, params)
+	return h.activateProUpgrade(ctx, u, params, session)
 }
 
-func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params StripeCreateCheckoutSessionParams) (string, error) {
+func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params StripeCreateCheckoutSessionParams, session StripeRetrievedCheckoutSession) (string, error) {
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
 		return "", err
@@ -521,6 +564,20 @@ func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params 
 	if err = h.DB.WithTx(tx).ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: u.Team, StripeGrantID: ""}); err != nil {
 		return "", err
 	}
+	var newTeamTrial bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_new_team_enrollment WHERE team_id=$1 AND initial_assignment_id IS NULL)`, u.Team).Scan(&newTeamTrial); err != nil {
+		return "", err
+	}
+	if err = applyUpgradeTopoff(ctx, tx, u, params, session); err != nil {
+		return "", err
+	}
+	// A new team's first paid plan ends its trial, dropping any credit left.
+	if _, err = tx.Exec(ctx, `UPDATE team_credit_grant SET remaining_usd=0,updated_at=clock_timestamp() WHERE team_id=$1 AND reason='signup trial credit' AND remaining_usd<>0 AND $2`, u.Team, u.InitialAssignment == nil && newTeamTrial); err != nil {
+		return "", err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET trial_ended_at=COALESCE(trial_ended_at,clock_timestamp()),updated_at=clock_timestamp() WHERE team_id=$1 AND trial_ended_at IS NULL AND $2`, u.Team, u.InitialAssignment == nil && newTeamTrial); err != nil {
+		return "", err
+	}
 	if _, err = tx.Exec(ctx, `UPDATE billing_signup_choice SET state='committed',offer_key=$2,generation=$3,actor_id=$4,base_price_id=$5,request_payload=$6,session_id=$7,subscription_id=$8,revision=revision+1,admission_source=(SELECT admission_source FROM billing_pro_upgrade WHERE id=$9),admission_epoch=(SELECT admission_epoch FROM billing_pro_upgrade WHERE id=$9) WHERE team_id=$1 AND state='selecting'`, u.Team, u.Offer, u.Quoted, u.Actor, params.BasePriceID, u.Payload, u.Session, u.Subscription, u.ID); err != nil {
 		return "", err
 	}
@@ -528,6 +585,147 @@ func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params 
 		return "", err
 	}
 	return "active", nil
+}
+
+func checkUpgradeSession(u proUpgrade, session StripeRetrievedCheckoutSession) error {
+	if session.ID != *u.Session || session.Mode != "payment" || session.CustomerID != u.Customer || session.ClientReferenceID != u.Team.String() || session.Metadata["pro_upgrade_id"] != u.ID.String() {
+		return errors.New("upgrade checkout association differs")
+	}
+	return nil
+}
+
+// An expired upgrade can no longer be paid, so a first paid month also hands
+// back the collection-paused subscription, the billing calendar it claimed and
+// the untouched reporting period of that calendar, leaving the team free to
+// quote again.
+func (h *Handlers) expireProUpgrade(ctx context.Context, conn *pgxpool.Conn, u proUpgrade, p StripeCreateCheckoutSessionParams, c *stripeHTTPClient) error {
+	if u.Evidence != nil {
+		return errors.New("paid upgrade cannot expire")
+	}
+	subscription := ""
+	if p.FirstPaidProCycle {
+		var err error
+		if subscription, err = cancelUnpaidUpgradeSubscription(ctx, c, u); err != nil {
+			return err
+		}
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	tag, err := tx.Exec(ctx, `UPDATE billing_pro_upgrade SET state='expired',subscription_id=COALESCE(subscription_id,NULLIF($2,'')) WHERE id=$1 AND payment_evidence IS NULL AND state NOT IN ('expired','ended')`, u.ID, subscription)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("upgrade payment state changed during expiry")
+	}
+	if subscription != "" {
+		if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL,current_period_start=NULL,current_period_end=NULL,
+ commercial_billing_anchor=CASE WHEN commercial_billing_anchor=$4 THEN NULL ELSE commercial_billing_anchor END
+ WHERE team_id=$1 AND stripe_customer_id=$2 AND stripe_subscription_id=$3`, u.Team, u.Customer, subscription, u.Anchor); err != nil {
+			return err
+		}
+		h.retireAbandonedFirstCyclePeriod(ctx, tx, u)
+	}
+	return tx.Commit(ctx)
+}
+
+// The abandoned month's reporting period is retired only while nothing has
+// touched it, and in a savepoint: the provider cancellation has already
+// happened, so a refusal here leaves the period open rather than undoing expiry.
+func (h *Handlers) retireAbandonedFirstCyclePeriod(ctx context.Context, tx pgx.Tx, u proUpgrade) {
+	sp, err := tx.Begin(ctx)
+	if err == nil {
+		_, err = sp.Exec(ctx, `UPDATE team_billing_period SET status='finalized',blocked_reason='reporting_only_calendar_period',gross_charges_usd=0,credits_applied_usd=0,net_invoice_amount_usd=0,finalized_at=clock_timestamp(),updated_at=clock_timestamp()
+ WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='open' AND exported_at IS NULL AND approved_at IS NULL AND finalized_at IS NULL AND blocked_at IS NULL
+  AND COALESCE(gross_charges_usd,0)=0 AND COALESCE(credits_applied_usd,0)=0 AND COALESCE(net_invoice_amount_usd,0)=0
+  AND NOT EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$1 AND commercial_billing_anchor IS NOT NULL)
+  AND NOT EXISTS(SELECT 1 FROM billing_invoice_account WHERE team_id=$1)
+  AND NOT EXISTS(SELECT 1 FROM billing_incremental_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3)
+  AND NOT EXISTS(SELECT 1 FROM billing_period_close_work WHERE team_id=$1 AND period_start=$2 AND period_end=$3)
+  AND NOT EXISTS(SELECT 1 FROM billing_usage_export WHERE team_id=$1 AND period_start=$2 AND period_end=$3)
+  AND NOT EXISTS(SELECT 1 FROM billing_export_allocation WHERE team_id=$1 AND period_start=$2 AND period_end=$3)`, u.Team, u.Start, u.End)
+		if err == nil {
+			err = sp.Commit(ctx)
+		}
+	}
+	if err != nil {
+		if sp != nil {
+			_ = sp.Rollback(ctx)
+		}
+		log.Warn().Err(err).Str("team_id", u.Team.String()).Str("pro_upgrade_id", u.ID.String()).Msg("abandoned first paid month reporting period left open")
+	}
+}
+
+// cancelUnpaidUpgradeSubscription cancels the subscription created for the
+// upgrade, found by its metadata even when its identity was never saved, and
+// returns its identity, or "" when none was created.
+func cancelUnpaidUpgradeSubscription(ctx context.Context, c *stripeHTTPClient, u proUpgrade) (string, error) {
+	type subscription struct {
+		ID       string            `json:"id"`
+		Customer string            `json:"customer"`
+		Status   string            `json:"status"`
+		Metadata map[string]string `json:"metadata"`
+	}
+	var sub subscription
+	if u.Subscription != nil {
+		if err := c.doForm(ctx, http.MethodGet, "/v1/subscriptions/"+url.PathEscape(*u.Subscription), nil, &sub, ""); err != nil {
+			return "", err
+		}
+		if sub.ID != *u.Subscription {
+			return "", errors.New("upgrade subscription association differs")
+		}
+	} else {
+		var all struct {
+			Data    []subscription `json:"data"`
+			HasMore bool           `json:"has_more"`
+		}
+		if err := c.doForm(ctx, http.MethodGet, "/v1/subscriptions?"+url.Values{"customer": {u.Customer}, "status": {"all"}, "limit": {"100"}}.Encode(), nil, &all, ""); err != nil {
+			return "", err
+		}
+		if all.HasMore {
+			return "", errors.New("upgrade subscription inventory exceeds supported bound")
+		}
+		for _, s := range all.Data {
+			if s.Metadata["pro_upgrade_id"] == u.ID.String() {
+				if sub.ID != "" {
+					return "", errors.New("ambiguous upgrade subscriptions")
+				}
+				sub = s
+			}
+		}
+		if sub.ID == "" {
+			return "", nil
+		}
+	}
+	if sub.Customer != u.Customer || sub.Metadata["pro_upgrade_id"] != u.ID.String() {
+		return "", errors.New("upgrade subscription association differs")
+	}
+	var invoices struct {
+		Data []struct {
+			Status     string `json:"status"`
+			AmountPaid int64  `json:"amount_paid"`
+			Total      int64  `json:"total"`
+		} `json:"data"`
+		HasMore bool `json:"has_more"`
+	}
+	if err := c.doForm(ctx, http.MethodGet, "/v1/invoices?"+url.Values{"subscription": {sub.ID}, "limit": {"100"}}.Encode(), nil, &invoices, ""); err != nil {
+		return "", err
+	}
+	if invoices.HasMore {
+		return "", errors.New("upgrade subscription invoice inventory exceeds supported bound")
+	}
+	for _, inv := range invoices.Data {
+		if inv.AmountPaid != 0 || (inv.Status != "draft" && inv.Status != "void" && (inv.Status != "paid" || inv.Total != 0)) {
+			return "", errors.New("unpaid upgrade subscription has issued invoices and requires reconciliation")
+		}
+	}
+	if sub.Status == "canceled" || sub.Status == "incomplete_expired" {
+		return sub.ID, nil
+	}
+	return sub.ID, c.doForm(ctx, http.MethodDelete, "/v1/subscriptions/"+url.PathEscape(sub.ID)+"?"+url.Values{"invoice_now": {"false"}, "prorate": {"false"}}.Encode(), nil, nil, "")
 }
 
 func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxpool.Conn, u *proUpgrade, p StripeCreateCheckoutSessionParams, c *stripeHTTPClient) (invoiceSubscription, error) {
@@ -570,6 +768,15 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 			}
 			for i, t := range p.ResourceTerms {
 				form.Set(fmt.Sprintf("items[%d][price]", i), t.PriceID)
+			}
+			// The provider accepts a backdated start only once it is in the
+			// past, and a first paid month starts at the quote itself.
+			if wait := u.Anchor.Add(providerBackdateMargin).Sub(h.nowUTC()); wait > 0 {
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					return invoiceSubscription{}, ctx.Err()
+				}
 			}
 			var created invoiceSubscription
 			if err := c.doForm(ctx, http.MethodPost, "/v1/subscriptions", form, &created, "pro-upgrade-subscription:"+u.ID.String()); err != nil {
@@ -662,4 +869,50 @@ func validateProUpgradeSubscription(u proUpgrade, p StripeCreateCheckoutSessionP
 		return time.Time{}, time.Time{}, err
 	}
 	return expectedStart, expectedEnd, nil
+}
+
+// applyUpgradeTopoff settles the funding of a prepaid-funded plan with the
+// top-off answer the customer gave at checkout, under the admission the
+// checkout accepted.
+func applyUpgradeTopoff(ctx context.Context, tx pgx.Tx, u proUpgrade, params StripeCreateCheckoutSessionParams, session StripeRetrievedCheckoutSession) error {
+	if params.PlanTerms == nil || params.PlanTerms.FundingPolicy != fundingPolicyPrepaid {
+		return nil
+	}
+	enabled := false
+	if params.Topoff != nil {
+		var err error
+		if enabled, err = session.topoffChosen(); err != nil {
+			return err
+		}
+	}
+	var admission pricingPublicState
+	var epoch *uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(admission_source,''),admission_epoch FROM billing_pro_upgrade WHERE id=$1`, u.ID).Scan(&admission.Source, &epoch); err != nil {
+		return err
+	}
+	if epoch != nil {
+		admission.Epoch = *epoch
+	}
+	if !enabled {
+		return applyCheckoutTopoff(ctx, tx, u.Team, session.ID, false, admission)
+	}
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	err = applyCheckoutTopoff(ctx, sp, u.Team, session.ID, true, admission)
+	if err == nil {
+		return sp.Commit(ctx)
+	}
+	if rollbackErr := sp.Rollback(ctx); rollbackErr != nil {
+		return rollbackErr
+	}
+	// A plan already paid for must still activate when entry closed after
+	// checkout; the top-off stays off, which the low-credit warnings cover.
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
+		return err
+	}
+	log.Warn().Err(err).Str("team_id", u.Team.String()).Msg("checkout top-off admission closed; activating with top-off off")
+	return applyCheckoutTopoff(ctx, tx, u.Team, session.ID, false, admission)
 }

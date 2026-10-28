@@ -67,6 +67,17 @@ type BuildRootfsResult struct {
 
 	// SizeBytes is the on-disk size of the produced ext4 file.
 	SizeBytes int64
+
+	// Image is the base image's runtime config.
+	Image ImageConfig
+}
+
+// ImageConfig is what a base image sets for the processes it runs, as
+// `docker run` applies it.
+type ImageConfig struct {
+	Env        []string
+	User       string
+	WorkingDir string
 }
 
 // Config is the injectable dependency bundle used by Builder. Callers

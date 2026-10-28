@@ -93,6 +93,16 @@ func (h *Handlers) CreatePrepaidCheckout(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	// A team still on its trial has no plan to add credit to; it buys a plan.
+	awaiting, err := teamAwaitingPlan(ctx, h.Pool, team)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	if awaiting {
+		respondErrorMsg(c, "plan_required", "Choose a plan before buying credit.", http.StatusConflict)
+		return
+	}
 	client, _ := h.Stripe.(*stripeHTTPClient)
 	recoverOperation := func() bool {
 		handled, resumeErr := h.resumePrepaidCheckoutOperation(c, client, team, actor, req)

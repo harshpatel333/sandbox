@@ -366,9 +366,13 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	if err == nil {
 		pending, err = pendingCustomerPlanChange(ctx, tx, team, "customer")
 	}
+	entry := entryActive
+	if err == nil {
+		entry, err = teamEntryState(ctx, tx, team)
+	}
 	var proCheckout customerProCheckout
 	if err == nil {
-		proCheckout, err = customerProCheckoutTerms(ctx, tx, team, assigned && current.Kind == planKindFree, anchor.Valid)
+		proCheckout, err = customerProCheckoutTerms(ctx, tx, team, entry != entryActive || (assigned && current.Kind == planKindFree), anchor.Valid)
 	}
 	if err == nil {
 		err = tx.Commit(ctx)
@@ -385,6 +389,7 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"plan":           plan,
+		"entry_state":    entry,
 		"period":         customerBillingPeriod{Start: start, End: end},
 		"pending_change": pending,
 		"pro_checkout":   proCheckout,
@@ -469,6 +474,7 @@ func (h *Handlers) GetBillingPlanChangePreview(c *gin.Context) {
 	}
 	kind := terms.Kind
 	preview := customerPlanChangePreview{TargetPlanKey: target, TargetDisplayName: terms.DisplayName, TargetKind: kind, Limits: terms.Limits}
+	preview.Limits.MaxSnapshots = nil
 	switch {
 	case pricing.EnrollmentEpoch != nil && !pricing.EntryOpen:
 		preview.Blocked = "new plan selection is temporarily closed"

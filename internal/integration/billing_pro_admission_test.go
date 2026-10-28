@@ -61,7 +61,7 @@ func TestIntegration_ProReleasedAcceptanceAndOperationReplay(t *testing.T) {
 	op := uuid.New()
 	body["operation_id"] = op.String()
 	request, _ := json.Marshal(body)
-	assertProResponse(t, r, key, "/stripe/checkout-session", string(request), http.StatusAccepted, "payment_confirmation_pending")
+	assertProResponse(t, r, key, "/stripe/checkout-session", string(request), http.StatusServiceUnavailable, "checkout_unavailable")
 	var frozen bool
 	if err := testPool.QueryRow(t.Context(), `SELECT id=$2 AND request_payload->'PlanTerms'->>'PricingV2'='true' AND initial_assignment_id=(SELECT id FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL) FROM billing_pro_upgrade WHERE team_id=$1`, f.team, op).Scan(&frozen); err != nil || !frozen {
 		t.Fatalf("released intent/predecessor not frozen: %v %v", frozen, err)
@@ -72,7 +72,7 @@ func TestIntegration_ProReleasedAcceptanceAndOperationReplay(t *testing.T) {
 	if _, err := testPool.Exec(t.Context(), `UPDATE billing_pricing_switch SET pricing_version='legacy' WHERE singleton`); err != nil {
 		t.Fatal(err)
 	}
-	assertProResponse(t, r, key, "/stripe/checkout-session", string(request), http.StatusAccepted, "payment_confirmation_pending")
+	assertProResponse(t, r, key, "/stripe/checkout-session", string(request), http.StatusServiceUnavailable, "checkout_unavailable")
 	body["operation_id"] = uuid.NewString()
 	changed, _ := json.Marshal(body)
 	assertProResponse(t, r, key, "/stripe/checkout-session", string(changed), http.StatusConflict, "plan_conflict")

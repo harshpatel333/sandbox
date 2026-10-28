@@ -19,7 +19,7 @@ func TestProFirstCycleDelayedProviderCreationKeepsMonthEndCalendar(t *testing.T)
 		t.Run(fmt.Sprint(year), func(t *testing.T) {
 			anchor := time.Date(year, 1, 31, 12, 0, 0, 0, time.UTC)
 			h, team, offer, params := newProFirstCycleQuoteFixture(t, anchor)
-			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 			u, err := h.proUpgrade(t.Context(), team)
 			if err != nil {
 				t.Fatal(err)
@@ -103,7 +103,7 @@ func TestProFirstCycleDelayedProviderCreationKeepsMonthEndCalendar(t *testing.T)
 func TestProFirstCycleStoredAuthorityRejectsProviderMarkerRemoval(t *testing.T) {
 	anchor := time.Date(2027, 1, 31, 12, 0, 0, 0, time.UTC)
 	h, team, offer, params := newProFirstCycleQuoteFixture(t, anchor)
-	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 	u, err := h.proUpgrade(t.Context(), team)
 	if err != nil {
 		t.Fatal(err)
