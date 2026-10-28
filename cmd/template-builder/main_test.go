@@ -184,11 +184,18 @@ func TestRuntimeDefaultsFollowTheImage(t *testing.T) {
 	if _, ok := env["HOME"]; ok {
 		t.Errorf("runtime env %v kept the build baseline's HOME", env)
 	}
-	if got := bc.runtimeUser(); got != "1000:1000" {
-		t.Errorf("runtime user = %q, want the image's", got)
+	w := bc.workload()
+	if w.user != "1000:1000" {
+		t.Errorf("runtime user = %q, want the image's", w.user)
+	}
+	if _, ok := w.env["HOME"]; ok {
+		t.Errorf("workload env %v kept root's HOME for the image user", w.env)
 	}
 	bc.user = "app"
-	if got := bc.runtimeUser(); got != "app" {
+	if got := bc.workload().user; got != "app" {
 		t.Errorf("runtime user = %q, want the user step's", got)
+	}
+	if got := bc.asRoot().env["PATH"]; got != platformPath {
+		t.Errorf("setup PATH = %q, want the platform's", got)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -321,16 +322,16 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 		return fmt.Errorf("build steps: %w", err)
 	}
 
-	if err := runStartCmd(ctx, netInfo.HostIP, cfg.spec, bc); err != nil {
+	if err := runStartCmd(ctx, netInfo.HostIP, cfg.spec, bc.workload()); err != nil {
 		return fmt.Errorf("start_cmd: %w", err)
 	}
-	if err := pollReadyCmd(ctx, netInfo.HostIP, cfg.spec, bc); err != nil {
+	if err := pollReadyCmd(ctx, netInfo.HostIP, cfg.spec, bc.workload()); err != nil {
 		return fmt.Errorf("ready_cmd: %w", err)
 	}
 
 	// Bake env / user / workdir into boxd so they travel in the snapshot
 	// as the template's runtime defaults for every future sandbox.
-	runtimeUser := bc.runtimeUser()
+	runtimeUser := bc.workload().user
 	if err := postBoxdInit(ctx, netInfo.HostIP, bc.runtimeEnv(), runtimeUser, bc.workdir); err != nil {
 		return fmt.Errorf("bake context into boxd: %w", err)
 	}
@@ -339,7 +340,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 
 	// Enable guest swap after build steps, before the snapshot (see
 	// GuestSwapSetupScript). Best-effort — the script swallows failures.
-	rootCtx := buildCtx{env: bc.env, user: "root", workdir: "/"}
+	rootCtx := bc.asRoot()
 	if err := runShellCmdQuiet(ctx, netInfo.HostIP, builder.GuestSwapSetupScript, rootCtx); err != nil {
 		emitInternal("system", "guest swap setup skipped: %v", err)
 	}
@@ -829,14 +830,35 @@ func (bc buildCtx) runtimeEnv() map[string]string {
 	return out
 }
 
-// runtimeUser is who sandbox commands run as: the user step's, else the
-// image's own USER, as `docker run` would. Build steps stay root either way,
-// so specs written for root keep working on images that set a user.
-func (bc buildCtx) runtimeUser() string {
-	if bc.user != "" {
-		return bc.user
+// platformPath finds the system tools the builder's own commands use, which
+// an image's PATH need not include.
+const platformPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// asRoot is the context for the builder's own setup commands.
+func (bc buildCtx) asRoot() buildCtx {
+	env := maps.Clone(bc.env)
+	env["PATH"] = platformPath
+	return buildCtx{env: env, user: "root", workdir: "/"}
+}
+
+// workload is the context start_cmd and ready_cmd run in, and its user is
+// who sandbox commands run as: the user step's, else the image's own USER, as
+// `docker run` would. Build steps stay root either way, so specs written for
+// root keep working on images that set a user. HOME and USER then come from
+// boxd for that user, unless the image sets them.
+func (bc buildCtx) workload() buildCtx {
+	if bc.user != "" || bc.imageUser == "" {
+		return bc
 	}
-	return bc.imageUser
+	w := bc
+	w.user = bc.imageUser
+	w.env = maps.Clone(bc.env)
+	for _, k := range []string{"HOME", "USER"} {
+		if _, fromImage := bc.imageEnv[k]; !fromImage {
+			delete(w.env, k)
+		}
+	}
+	return w
 }
 
 // ---------------------------------------------------------------------------
@@ -863,7 +885,7 @@ type buildCtx struct {
 func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec, image builder.ImageConfig) (buildCtx, error) {
 	bc := buildCtx{
 		env: map[string]string{
-			"PATH":  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"PATH":  platformPath,
 			"HOME":  "/root",
 			"USER":  "root",
 			"TERM":  "xterm",
@@ -885,8 +907,7 @@ func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec,
 		// Docker creates the WORKDIR when a container starts, so an image need
 		// not ship it.
 		dir := filepath.Join("/", image.WorkingDir)
-		root := buildCtx{env: bc.env, user: "root", workdir: "/"}
-		if err := runShellCmd(ctx, vmIP, "mkdir -p "+shellquote.Single(dir), root); err != nil {
+		if err := runShellCmd(ctx, vmIP, "mkdir -p "+shellquote.Single(dir), bc.asRoot()); err != nil {
 			return bc, fmt.Errorf("create image workdir %s: %w", dir, err)
 		}
 		bc.workdir = dir
@@ -945,8 +966,7 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 		}
 		mkdir := fmt.Sprintf("mkdir -p %s && chown -R %s:%s %s",
 			shellquote.Single(target), shellquote.Single(ownUser), shellquote.Single(ownUser), shellquote.Single(target))
-		root := bc
-		root.user = "root" // ensure mkdir + chown run as root
+		root := bc.asRoot()
 		if err := runShellCmd(ctx, vmIP, mkdir, root); err != nil {
 			return bc, fmt.Errorf("create workdir %s: %w", target, err)
 		}
@@ -957,8 +977,7 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 		name := step.User.Name
 		// Check if user exists; create if missing. Running as root so the
 		// adduser call can actually create the account.
-		root := bc
-		root.user = "root"
+		root := bc.asRoot()
 		if err := runShellCmd(ctx, vmIP, ensureUserCommand(name), root); err != nil {
 			return bc, fmt.Errorf("ensure user %s: %w", name, err)
 		}
