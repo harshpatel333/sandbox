@@ -127,6 +127,10 @@ func testProUpgradeFutureCredit(t *testing.T, monthlyCredit int64) {
 			_ = json.NewEncoder(w).Encode(sub)
 			return
 		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/billing/credit_grants/"+grant.ID+"/void" && monthlyCredit == 50000 {
+			http.Error(w, `{"error":{"message":"temporarily unavailable"}}`, 503)
+			return
+		}
 		if r.Method != http.MethodGet {
 			t.Errorf("replay mutated provider: %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected", 500)
@@ -570,7 +574,11 @@ func testProUpgradeReleaseReentry(t *testing.T, h *Handlers, team uuid.UUID, u p
 	}
 	sub.Items.Data[1].End = actualEnd
 	f := planChangeV2Fixture{h: h, team: team, actor: u.Actor}
-	change, err := f.request(t, "starter", "zero-bridge-release")
+	target := "starter"
+	if monthlyCredit == 50000 {
+		target = "free"
+	}
+	change, err := f.request(t, target, "zero-bridge-release")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,6 +592,15 @@ func testProUpgradeReleaseReentry(t *testing.T, h *Handlers, team uuid.UUID, u p
 	sub.EndedAt = u.End.Unix()
 	f.tick(t)
 	change = f.reload(t, change.ID)
+	if target == "free" {
+		f.tick(t)
+		change = f.reload(t, change.ID)
+		released, err := proReleaseForReentry(t.Context(), h.Pool, team, u.Customer)
+		if change.State != "applied" || err != nil || released != nil {
+			t.Fatalf("paid reentry admitted before the released bridge credit was voided: %+v %v %v", change, released, err)
+		}
+		return
+	}
 	if change.State != "completed" {
 		t.Fatalf("zero bridge release: %+v", change)
 	}
