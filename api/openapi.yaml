@@ -6010,6 +6010,10 @@ components:
         accepted:
           type: boolean
           description: Whether these terms belong to an existing accepted checkout. This does not indicate that payment has completed.
+        offer_key:
+          type: string
+          description: Catalog offer of the accepted checkout, such as pro_monthly or developer_monthly; omitted when no checkout has been accepted.
+          example: developer_monthly
         period_start:
           type: string
           format: date-time

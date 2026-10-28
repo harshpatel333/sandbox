@@ -26,7 +26,7 @@ func TestProFirstCycleQuoteIgnoresFreeUsageCalendar(t *testing.T) {
 		t.Run(now.Format(time.RFC3339), func(t *testing.T) {
 			h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
 			preview, err := customerProCheckoutTerms(t.Context(), h.Pool, team, true, false)
-			if err != nil || !preview.FirstPaidProCycle || preview.Accepted || preview.PeriodEnd != nil || preview.FirstPaymentCents != nil {
+			if err != nil || !preview.FirstPaidProCycle || preview.Accepted || preview.OfferKey != "" || preview.PeriodEnd != nil || preview.FirstPaymentCents != nil {
 				t.Fatalf("unaccepted first cycle preview: %+v %v", preview, err)
 			}
 			quote := func() { requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable) }
@@ -45,7 +45,7 @@ func TestProFirstCycleQuoteIgnoresFreeUsageCalendar(t *testing.T) {
 			}
 			status, err := customerProCheckoutTerms(t.Context(), h.Pool, team, true, false)
 			wire, _ := json.Marshal(status)
-			if err != nil || !status.Accepted || !status.FirstPaidProCycle || status.PeriodStart == nil || !status.PeriodStart.Equal(now) || status.PeriodEnd == nil || !status.PeriodEnd.Equal(wantEnd) || status.CreditExpiresAt == nil || !status.CreditExpiresAt.Equal(wantEnd) || status.FirstCreditCents == nil || *status.FirstCreditCents != offer.Credit || status.FirstPaymentCents == nil || *status.FirstPaymentCents != offer.Amount || !strings.Contains(string(wire), `"first_paid_pro_cycle":true`) {
+			if err != nil || !status.Accepted || !status.FirstPaidProCycle || status.PeriodStart == nil || !status.PeriodStart.Equal(now) || status.PeriodEnd == nil || !status.PeriodEnd.Equal(wantEnd) || status.CreditExpiresAt == nil || !status.CreditExpiresAt.Equal(wantEnd) || status.FirstCreditCents == nil || *status.FirstCreditCents != offer.Credit || status.FirstPaymentCents == nil || *status.FirstPaymentCents != offer.Amount || !strings.Contains(string(wire), `"first_paid_pro_cycle":true`) || !strings.Contains(string(wire), `"offer_key":"`+offer.Key+`"`) {
 				t.Fatalf("accepted quote contract: %s %v", wire, err)
 			}
 			// Even across a calendar boundary, an accepted checkout keeps its exact quote.

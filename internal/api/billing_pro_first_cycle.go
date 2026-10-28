@@ -57,6 +57,7 @@ func firstProCycleEligible(ctx context.Context, q db.DBTX, team uuid.UUID, free,
 type customerProCheckout struct {
 	FirstPaidProCycle bool       `json:"first_paid_pro_cycle"`
 	Accepted          bool       `json:"accepted"`
+	OfferKey          string     `json:"offer_key,omitempty"`
 	PeriodStart       *time.Time `json:"period_start,omitempty"`
 	PeriodEnd         *time.Time `json:"period_end,omitempty"`
 	CreditExpiresAt   *time.Time `json:"credit_expires_at,omitempty"`
@@ -77,7 +78,7 @@ func customerProCheckoutTerms(ctx context.Context, q db.DBTX, team uuid.UUID, fr
 			return out, err
 		}
 		credit := u.bridgeCreditAmount()
-		out = customerProCheckout{FirstPaidProCycle: p.FirstPaidProCycle, Accepted: true, PeriodStart: &u.Quoted, PeriodEnd: &u.End, FirstPaymentCents: &u.Amount, FirstCreditCents: &credit}
+		out = customerProCheckout{FirstPaidProCycle: p.FirstPaidProCycle, Accepted: true, OfferKey: u.Offer, PeriodStart: &u.Quoted, PeriodEnd: &u.End, FirstPaymentCents: &u.Amount, FirstCreditCents: &credit}
 		if expires != 0 {
 			out.CreditExpiresAt = &u.End
 		}
