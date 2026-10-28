@@ -32,7 +32,7 @@ func cohortFixture(t *testing.T) (*pgxpool.Pool, uuid.UUID, uuid.UUID) {
 	for _, family := range []string{"developer", "pro"} {
 		cohortPublishSubscription(t, pool, family)
 	}
-	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=0.07,max_sandboxes=2,max_vcpu=3,max_memory_mib=3072,max_disk_mib=9216 WHERE singleton`)
+	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=0.07,max_sandboxes=2,max_vcpu=3,max_memory_mib=5120,max_disk_mib=9216 WHERE singleton`)
 	return pool, system, actor
 }
 
@@ -287,7 +287,7 @@ func cohortAwaitingPlan(t *testing.T, pool *pgxpool.Pool, team uuid.UUID) bool {
 
 func TestIntegration_NewTeamCohortTrialUsesConfiguredCreditLimitsAndFences(t *testing.T) {
 	pool, system, actor := cohortFixture(t)
-	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=0.07,max_sandboxes=2,max_vcpu=3,max_memory_mib=3072,max_disk_mib=9216 WHERE singleton`)
+	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=0.07,max_sandboxes=2,max_vcpu=3,max_memory_mib=5120,max_disk_mib=9216 WHERE singleton`)
 	cohortRelease(t, pool, system)
 	team := cohortCreate(t, pool, actor)
 	var credit float64
@@ -298,7 +298,7 @@ func TestIntegration_NewTeamCohortTrialUsesConfiguredCreditLimitsAndFences(t *te
  FROM team_credit_grant g CROSS JOIN team_effective_limits($1) l WHERE g.team_id=$1 AND g.reason='signup trial credit'`, team).Scan(&credit, &concurrent, &vcpu, &memory, &disk, &templates, &state, &eligible); err != nil {
 		t.Fatal(err)
 	}
-	if credit != 0.07 || concurrent != 2 || vcpu != 3 || memory != 3072 || disk != 9216 || templates != 0 || state != "trial" || !eligible {
+	if credit != 0.07 || concurrent != 2 || vcpu != 3 || memory != 5120 || disk != 9216 || templates != 0 || state != "trial" || !eligible {
 		t.Fatalf("trial did not freeze configured terms: credit=%v limits=%d/%d/%d/%d templates=%d state=%s eligible=%v", credit, concurrent, vcpu, memory, disk, templates, state, eligible)
 	}
 	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=1 WHERE singleton`)
@@ -341,6 +341,10 @@ func TestIntegration_NewTeamCohortReleaseNeedsFreeOrSellableTrial(t *testing.T) 
 		{"usable Free only", func(t *testing.T, p *pgxpool.Pool) { rolloutExec(t, p, retire, "developer") }, true},
 		{"sellable trial only", func(t *testing.T, p *pgxpool.Pool) { rolloutExec(t, p, retire, "free") }, true},
 		{"Free below the template shape", func(t *testing.T, p *pgxpool.Pool) { rolloutExec(t, p, retire, "developer"); smallFree(t, p) }, false},
+		{"trial below the template shape", func(t *testing.T, p *pgxpool.Pool) {
+			rolloutExec(t, p, retire, "free")
+			rolloutExec(t, p, `UPDATE billing_trial_policy SET max_memory_mib=3072 WHERE singleton`)
+		}, false},
 		// Sellable plans without a configured trial do not open it, and an
 		// undersized Free is no fallback either.
 		{"trial unconfigured and Free below the shape", func(t *testing.T, p *pgxpool.Pool) {

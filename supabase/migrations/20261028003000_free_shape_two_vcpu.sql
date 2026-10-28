@@ -86,6 +86,12 @@ BEGIN
   END;
  END LOOP;
 END $$;
+-- The allowance sweep retries the raise for teams skipped mid-purchase; this
+-- keeps each retry to the rows still below the shape.
+CREATE INDEX team_plan_assignment_below_shape ON team_plan_assignment(team_id)
+ WHERE effective_to IS NULL AND contract_id IS NULL AND kind IN ('free','legacy_payg')
+  AND (billing_json_cap(limits->'max_vcpu')<2 OR billing_json_cap(limits->'max_memory_mib')<4096
+   OR billing_json_cap(limits->'max_disk_mib')<8192);
 REVOKE ALL ON FUNCTION billing_raise_plan_shape() FROM PUBLIC;
 DO $$ DECLARE r text; BEGIN
  FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
@@ -178,7 +184,10 @@ BEGIN
  END IF;
  g.evidence:=p_evidence;
  IF NOT billing_new_team_evidence_valid(g) THEN RAISE EXCEPTION 'verified cohort-contract writer and schema evidence required' USING ERRCODE='55000'; END IF;
- IF NOT (billing_paid_first_sellable() AND billing_trial_configured()) AND NOT EXISTS(SELECT 1 FROM billing_plan_version v
+ -- A trial must admit the curated template shape, like Free, or a trial
+ -- team's first sandbox is refused.
+ IF NOT (billing_paid_first_sellable() AND billing_trial_configured() AND EXISTS(SELECT 1 FROM billing_trial_policy
+   WHERE singleton AND max_vcpu>=2 AND max_memory_mib>=4096 AND max_disk_mib>=8192)) AND NOT EXISTS(SELECT 1 FROM billing_plan_version v
    WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published' AND v.kind='free' AND v.max_templates=0
     AND v.allowance_period='day_window' AND v.allowance_on_exhausted='pause' AND v.allowance_compute_seconds>0
     AND v.allowance_compute_vcpu>0 AND v.allowance_compute_memory_gib>0 AND NOT v.display_only AND NOT v.self_serve
