@@ -5,11 +5,14 @@
 -- published version that copies every other term from its predecessor.
 --
 --  1. v2 Free: new teams freeze its caps at signup.
---  2. Open v2 Free assignments: existing teams carry frozen caps, so each one
---     still below the shape closes and reopens on the new version. Teams whose
---     limits staff customized keep their team row untouched (apply_assignment_limits).
---  3. Legacy pay-as-you-go: legacy teams without caps of their own fall back
+--  2. Legacy pay-as-you-go: legacy teams without caps of their own fall back
 --     to its latest published version (team_effective_limits).
+--  3. Open Free and legacy pay-as-you-go assignments: existing teams carry
+--     frozen caps, so each one still below the shape closes and reopens on the
+--     new version of its plan. Teams whose limits staff customized keep their
+--     team row untouched (apply_assignment_limits).
+--  4. The new-team gate release pins the Free shape it expects; it now expects
+--     this one.
 DO $$
 DECLARE
  old billing_plan_version;
@@ -19,6 +22,15 @@ DECLARE
  at_time timestamptz;
  moved integer := 0;
 BEGIN
+ -- Once the new-team cohort is live, every catalog write must leave a
+ -- zero-template Free published (cohort_free_catalog_retained). Say so up
+ -- front instead of failing at commit.
+ IF (billing_new_team_ready() OR EXISTS(SELECT 1 FROM billing_new_team_enrollment))
+  AND NOT EXISTS(SELECT 1 FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2'
+   AND v.state='published' AND v.kind='free' AND v.max_templates=0) THEN
+  RAISE EXCEPTION 'publish the zero-template Free catalog before raising the Free shape' USING ERRCODE='55000';
+ END IF;
+
  -- 1. v2 Free catalog.
  SELECT * INTO old FROM billing_plan_version
   WHERE family='free' AND pricing_version='v2' AND state='published' FOR UPDATE;
@@ -38,39 +50,7 @@ BEGIN
  SELECT id,version INTO free_id,free_version FROM billing_plan_version
   WHERE family='free' AND pricing_version='v2' AND state='published';
 
- -- 2. Open v2 Free assignments still below the shape.
- IF free_id IS NOT NULL THEN
-  FOR a IN SELECT p.* FROM team_plan_assignment p
-   WHERE p.kind='free' AND p.plan_key='free' AND p.effective_to IS NULL AND p.contract_id IS NULL
-    AND p.terms->>'pricing_version'='v2'
-    AND (COALESCE(billing_json_cap(p.limits->'max_vcpu'),0)<2
-     OR COALESCE(billing_json_cap(p.limits->'max_memory_mib'),0)<4096
-     OR COALESCE(billing_json_cap(p.limits->'max_disk_mib'),0)<8192)
-   ORDER BY p.team_id
-  LOOP
-   -- One team's frozen invoice history must not hold back every other team;
-   -- such a team keeps its old caps and is reported for a manual follow-up.
-   BEGIN
-    PERFORM 1 FROM team WHERE id=a.team_id FOR UPDATE;
-    at_time:=clock_timestamp();
-    UPDATE team_plan_assignment SET effective_to=at_time WHERE id=a.id;
-    INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason,idempotency_key)
-    VALUES(a.team_id,a.plan_key,a.kind,free_id,
-     a.terms||jsonb_build_object('version_id',free_id,'version',free_version),
-     a.limits||jsonb_build_object(
-      'max_vcpu',GREATEST(COALESCE(billing_json_cap(a.limits->'max_vcpu'),0),2),
-      'max_memory_mib',GREATEST(COALESCE(billing_json_cap(a.limits->'max_memory_mib'),0),4096),
-      'max_disk_mib',GREATEST(COALESCE(billing_json_cap(a.limits->'max_disk_mib'),0),8192)),
-     at_time,'migration','Free shape raised to 2 vCPU / 4096 MiB / 8192 MiB','free-shape-2-4-8:'||a.id);
-    moved:=moved+1;
-   EXCEPTION WHEN OTHERS THEN
-    RAISE WARNING 'free shape: team % kept its Free caps: %',a.team_id,SQLERRM;
-   END;
-  END LOOP;
- END IF;
- RAISE NOTICE 'free shape: % open Free assignments moved to version %',moved,free_version;
-
- -- 3. Legacy pay-as-you-go fallback.
+ -- 2. Legacy pay-as-you-go fallback.
  SELECT * INTO old FROM billing_plan_version
   WHERE family='payg' AND pricing_version='legacy' AND kind='legacy_payg' AND state='published' FOR UPDATE;
  IF FOUND AND (COALESCE(old.max_template_vcpu,0)<2 OR COALESCE(old.max_template_memory_mib,0)<4096
@@ -86,4 +66,74 @@ BEGIN
    'published_by',NULL,'published_at',NULL,'retired_by',NULL,'retired_at',NULL))).*;
   PERFORM publish_billing_plan_version(payg_id,NULL);
  END IF;
+ SELECT id,version INTO payg_id,payg_version FROM billing_plan_version
+  WHERE family='payg' AND pricing_version='legacy' AND kind='legacy_payg' AND state='published';
+
+ -- 3. Open Free and legacy pay-as-you-go assignments still below the shape.
+ FOR a IN SELECT p.* FROM team_plan_assignment p
+  WHERE p.kind IN ('free','legacy_payg') AND p.effective_to IS NULL AND p.contract_id IS NULL
+   AND (COALESCE(billing_json_cap(p.limits->'max_vcpu'),0)<2
+    OR COALESCE(billing_json_cap(p.limits->'max_memory_mib'),0)<4096
+    OR COALESCE(billing_json_cap(p.limits->'max_disk_mib'),0)<8192)
+  ORDER BY p.team_id
+ LOOP
+  -- One team's frozen invoice history must not hold back every other team;
+  -- such a team keeps its old caps and is reported for a manual follow-up.
+  BEGIN
+   PERFORM 1 FROM team WHERE id=a.team_id FOR UPDATE;
+   at_time:=clock_timestamp();
+   UPDATE team_plan_assignment SET effective_to=at_time WHERE id=a.id;
+   INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason,idempotency_key)
+   VALUES(a.team_id,a.plan_key,a.kind,
+    CASE a.kind WHEN 'free' THEN COALESCE(free_id,a.plan_version_id) ELSE COALESCE(payg_id,a.plan_version_id) END,
+    a.terms||CASE a.kind
+     WHEN 'free' THEN COALESCE(jsonb_build_object('version_id',free_id,'version',free_version),'{}'::jsonb)
+     ELSE COALESCE(jsonb_build_object('version_id',payg_id,'version',payg_version),'{}'::jsonb) END,
+    a.limits||jsonb_build_object(
+     'max_vcpu',GREATEST(COALESCE(billing_json_cap(a.limits->'max_vcpu'),0),2),
+     'max_memory_mib',GREATEST(COALESCE(billing_json_cap(a.limits->'max_memory_mib'),0),4096),
+     'max_disk_mib',GREATEST(COALESCE(billing_json_cap(a.limits->'max_disk_mib'),0),8192)),
+    at_time,'migration','Plan shape raised to 2 vCPU / 4096 MiB / 8192 MiB','free-shape-2-4-8:'||a.id);
+   moved:=moved+1;
+  EXCEPTION WHEN OTHERS THEN
+   RAISE WARNING 'free shape: team % kept its plan caps: %',a.team_id,SQLERRM;
+  END;
+ END LOOP;
+ RAISE NOTICE 'free shape: % open assignments moved to the new shape',moved;
+END $$;
+
+-- 4. The new-team gate release validates the published Free shape; it now
+-- expects the curated template shape. Body otherwise unchanged from
+-- 20261027140152_new_team_billing_cohort.sql.
+CREATE OR REPLACE FUNCTION billing_release_new_team_gate(p_region text,p_system uuid,p_epoch uuid,p_actor text,p_reason text,p_evidence jsonb)
+RETURNS uuid LANGUAGE plpgsql SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE g billing_new_team_gate; f billing_plan_version; raw text;
+BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN RAISE EXCEPTION 'release requires READ COMMITTED isolation'; END IF;
+ SELECT pricing_version INTO STRICT raw FROM billing_pricing_switch WHERE singleton FOR SHARE;
+ SELECT * INTO STRICT g FROM billing_new_team_gate WHERE singleton FOR UPDATE;
+ IF raw<>'legacy' OR g.state<>'closed' OR p_epoch IS DISTINCT FROM g.epoch OR p_region IS DISTINCT FROM g.region OR p_system IS DISTINCT FROM g.system_team_id
+  OR COALESCE(btrim(p_actor),'')='' OR COALESCE(btrim(p_reason),'')='' THEN
+  RAISE EXCEPTION 'matching closed new-team cell and epoch required' USING ERRCODE='55000';
+ END IF;
+ g.evidence:=p_evidence;
+ IF NOT billing_new_team_evidence_valid(g) THEN RAISE EXCEPTION 'verified cohort-contract writer and schema evidence required' USING ERRCODE='55000'; END IF;
+ SELECT * INTO f FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published' FOR SHARE;
+ IF NOT FOUND OR f.kind<>'free' OR f.max_templates IS DISTINCT FROM 0 OR f.allowance_period IS DISTINCT FROM 'day_window'
+  OR f.allowance_on_exhausted IS DISTINCT FROM 'pause' OR f.allowance_compute_seconds IS DISTINCT FROM 7200
+  OR f.allowance_compute_vcpu IS DISTINCT FROM 1 OR f.allowance_compute_memory_gib IS DISTINCT FROM 1
+  OR f.max_sandboxes IS DISTINCT FROM 1 OR f.max_template_vcpu IS DISTINCT FROM 2 OR f.max_template_memory_mib IS DISTINCT FROM 4096
+  OR f.max_template_disk_mib IS NULL OR f.display_only OR f.self_serve THEN
+  RAISE EXCEPTION 'usable zero-template two-hour Free catalog required' USING ERRCODE='55000';
+ END IF;
+ IF to_regprocedure('billing_free_allowance_refresh(uuid)') IS NULL OR to_regprocedure('billing_free_plan(uuid)') IS NULL
+  OR to_regprocedure('request_team_pause_all(uuid,text)') IS NULL OR to_regprocedure('billing_lock_team_pricing_state(uuid)') IS NULL
+  OR NOT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='team_plan_assignment'::regclass AND attname='free_allowance_since' AND NOT attisdropped)
+  OR NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='team'::regclass AND tgname='team_new_free_plan' AND tgenabled IN ('O','A') AND tgfoid='assign_new_team_free_plan()'::regprocedure)
+  OR NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='sandbox'::regclass AND tgname='sandbox_free_shape' AND tgenabled IN ('O','A')) THEN
+  RAISE EXCEPTION 'cohort, Free enforcement and allowance worker schema required' USING ERRCODE='55000';
+ END IF;
+ UPDATE billing_new_team_gate SET state='released',evidence=p_evidence,released_at=clock_timestamp() WHERE singleton;
+ INSERT INTO billing_new_team_gate_event(epoch,region,action,actor,reason,details) VALUES(g.epoch,g.region,'release',p_actor,p_reason,p_evidence);
+ RETURN g.epoch;
 END $$;

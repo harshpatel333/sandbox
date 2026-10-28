@@ -69,7 +69,7 @@ func newTeamCohortTestFixture(t *testing.T) newTeamCohortFixture {
 	exec(`INSERT INTO profile(id,email) VALUES($1,'cohort-api@example.invalid')`, f.actor)
 	var free uuid.UUID
 	err = pool.QueryRow(ctx, `INSERT INTO billing_plan_version(family,version,pricing_version,kind,display_name,public,allowance_period,allowance_on_exhausted,allowance_compute_seconds,allowance_compute_vcpu,allowance_compute_memory_gib,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates)
- VALUES('free',(SELECT max(version)+1 FROM billing_plan_version WHERE family='free'),'v2','free','Free',true,'day_window','pause',7200,1,1,1,1,1024,4096,0) RETURNING id`).Scan(&free)
+ VALUES('free',(SELECT max(version)+1 FROM billing_plan_version WHERE family='free'),'v2','free','Free',true,'day_window','pause',7200, 1, 1, 1, 2, 4096, 8192,0) RETURNING id`).Scan(&free)
 	if err != nil {
 		t.Fatal(err)
 	}
