@@ -2111,6 +2111,54 @@ func TestIntegration_CustomerPortalSessionValidatesRedirectURL(t *testing.T) {
 	if got := stripe.portalCalls[0].ReturnURL; got != "https://app.superserve.test/billing" {
 		t.Fatalf("portal return url = %q, want validated url", got)
 	}
+	if got := stripe.portalCalls[0].Configuration; got != "" {
+		t.Fatalf("team without a plan contract got portal configuration %q, want the default", got)
+	}
+}
+
+func TestIntegration_CustomerPortalSessionWithoutCancellationForCatalogPlans(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	customer, subscription, anchor := "cus_"+teamID.String(), "sub_"+teamID.String(), time.Now().UTC().Truncate(time.Second)
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'billing_export_enabled', true) ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled`, teamID); err != nil {
+		t.Fatalf("enable billing export: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, commercial_billing_anchor) VALUES ($1, $2, $3, 'active', $4)`, teamID, customer, subscription, anchor); err != nil {
+		t.Fatalf("seed billing account: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO billing_commercial_contract (team_id, offer_key, starts_at, customer_id, subscription_id, base_price_id, charge_amount_cents, charge_interval_months, entitlement_amount_cents, entitlement_anchor)
+		VALUES ($1, 'pro_monthly', $4, $2, $3, 'price_pro', 120000, 1, 100000, $4)`, teamID, customer, subscription, anchor); err != nil {
+		t.Fatalf("seed plan contract: %v", err)
+	}
+	for _, configuration := range []string{"", "bpc_no_cancel"} {
+		t.Setenv("INTERNAL_API_TOKEN", internalRBACToken)
+		cfg := &config.Config{
+			Port:                              "0",
+			VMDAddress:                        "localhost:0",
+			SystemTeamID:                      testSystemTeamID.String(),
+			StripeWebhookSecret:               testStripeWebhookSecret,
+			StripeMeterErrorWebhookSecret:     testStripeMeterErrorWebhookSecret,
+			StripeAPIVersion:                  "2025-06-30",
+			StripeCheckoutPriceIDs:            []string{"price_cpu", "price_memory", "price_storage"},
+			AppAllowedOrigins:                 []string{"https://app.superserve.test"},
+			StripePortalNoCancelConfiguration: configuration,
+		}
+		stripe := &fakeStripeClient{nextPortalURL: "https://billing.stripe.test/portal"}
+		h := api.NewHandlers(&stubVMD{}, db.New(testPool), cfg)
+		h.Pool = testPool
+		h.Stripe = stripe
+		r := api.SetupRouter(t.Context(), h, testPool)
+		w := do(r, "POST", "/stripe/customer-portal-session", apiKey, `{"return_url":"https://app.superserve.test/billing"}`)
+		if configuration == "" {
+			if w.Code != http.StatusServiceUnavailable || len(stripe.portalCalls) != 0 {
+				t.Fatalf("unconfigured plan portal opened the default portal: %d %s calls=%d", w.Code, w.Body.String(), len(stripe.portalCalls))
+			}
+			continue
+		}
+		if w.Code != http.StatusOK || len(stripe.portalCalls) != 1 || stripe.portalCalls[0].Configuration != configuration {
+			t.Fatalf("plan portal did not use the configuration without cancellation: %d %s %+v", w.Code, w.Body.String(), stripe.portalCalls)
+		}
+	}
 }
 
 func TestIntegration_ApproveExportRequiresPlatformAdminSession(t *testing.T) {
