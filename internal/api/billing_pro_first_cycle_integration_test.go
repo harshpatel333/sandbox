@@ -236,7 +236,7 @@ func TestProFirstCyclePreservesCommercialAnchorsAndRejectsUnpaidLeftovers(t *tes
 
 func TestProFirstCycleExpiryReleasesUnpaidSubscription(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	for _, kind := range []string{"unpaid", "cancelled_before_commit", "unrecorded_subscription", "issued_invoice", "payment_evidence"} {
+	for _, kind := range []string{"unpaid", "cancelled_before_commit", "unrecorded_subscription", "issued_invoice", "cancelled_with_paid_invoice", "payment_evidence"} {
 		t.Run(kind, func(t *testing.T) {
 			h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
 			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
@@ -276,6 +276,10 @@ func TestProFirstCycleExpiryReleasesUnpaidSubscription(t *testing.T) {
 			if kind == "issued_invoice" {
 				invoices = append(invoices, map[string]any{"id": "in_open", "status": "open", "amount_paid": 0, "total": 2500})
 			}
+			if kind == "cancelled_with_paid_invoice" {
+				status = "canceled"
+				invoices = append(invoices, map[string]any{"id": "in_paid", "status": "paid", "amount_paid": 2500, "total": 2500})
+			}
 			session := StripeRetrievedCheckoutSession{ID: sessionID, Mode: "payment", CustomerID: u.Customer, ClientReferenceID: team.String(), Status: "expired", Metadata: map[string]string{"pro_upgrade_id": u.ID.String()}}
 			subscription := func() map[string]any {
 				return map[string]any{"id": subID, "customer": u.Customer, "status": status, "metadata": map[string]string{"pro_upgrade_id": u.ID.String(), "first_paid_pro_cycle": "true"}}
@@ -311,7 +315,7 @@ func TestProFirstCycleExpiryReleasesUnpaidSubscription(t *testing.T) {
 			unavailable := h.Stripe
 			h.Stripe = client
 			var expiryErr error
-			if kind == "issued_invoice" || kind == "payment_evidence" {
+			if kind == "issued_invoice" || kind == "cancelled_with_paid_invoice" || kind == "payment_evidence" {
 				u.Session, u.Subscription = &sessionID, recorded
 				if kind == "payment_evidence" {
 					u.Evidence = []byte(`{"invoice":"in_paid"}`)
@@ -334,7 +338,7 @@ func TestProFirstCycleExpiryReleasesUnpaidSubscription(t *testing.T) {
  FROM billing_pro_upgrade u JOIN team_billing_account a ON a.team_id=u.team_id WHERE u.id=$1`, u.ID).Scan(&state, &account); err != nil {
 				t.Fatal(err)
 			}
-			if kind == "issued_invoice" || kind == "payment_evidence" {
+			if kind == "issued_invoice" || kind == "cancelled_with_paid_invoice" || kind == "payment_evidence" {
 				if expiryErr == nil || cancels != 0 || !strings.HasPrefix(state, "checkout/") || !strings.HasPrefix(account, subID+"/active/") {
 					t.Fatalf("expiry released a subscription that may have been paid: err=%v cancels=%d state=%s account=%s", expiryErr, cancels, state, account)
 				}

@@ -703,9 +703,6 @@ func cancelUnpaidUpgradeSubscription(ctx context.Context, c *stripeHTTPClient, u
 	if sub.Customer != u.Customer || sub.Metadata["pro_upgrade_id"] != u.ID.String() {
 		return "", errors.New("upgrade subscription association differs")
 	}
-	if sub.Status == "canceled" || sub.Status == "incomplete_expired" {
-		return sub.ID, nil
-	}
 	var invoices struct {
 		Data []struct {
 			Status     string `json:"status"`
@@ -724,6 +721,9 @@ func cancelUnpaidUpgradeSubscription(ctx context.Context, c *stripeHTTPClient, u
 		if inv.AmountPaid != 0 || (inv.Status != "draft" && inv.Status != "void" && (inv.Status != "paid" || inv.Total != 0)) {
 			return "", errors.New("unpaid upgrade subscription has issued invoices and requires reconciliation")
 		}
+	}
+	if sub.Status == "canceled" || sub.Status == "incomplete_expired" {
+		return sub.ID, nil
 	}
 	return sub.ID, c.doForm(ctx, http.MethodDelete, "/v1/subscriptions/"+url.PathEscape(sub.ID)+"?"+url.Values{"invoice_now": {"false"}, "prorate": {"false"}}.Encode(), nil, nil, "")
 }
