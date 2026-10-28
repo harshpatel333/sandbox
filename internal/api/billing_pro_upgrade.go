@@ -292,6 +292,10 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 
 const providerBackdateMargin = 1500 * time.Millisecond
 
+// A session missing from the provider's listing is treated as expired only
+// once the provider's clock has certainly passed the quote deadline too.
+const upgradeExpiryClockMargin = 5 * time.Minute
+
 // respondUpgradeUnsettled reports a payment still settling only when the
 // customer has paid; an upgrade whose checkout could not be opened is an
 // error the customer can retry, never a pending payment without a session.
@@ -442,7 +446,19 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 				u.Session = stringPtr(found.ID)
 			}
 		}
-		if u.Session == nil && !h.nowUTC().Before(*params.ExpiresAt) {
+		if u.Session == nil && !h.nowUTC().Before(params.ExpiresAt.Add(upgradeExpiryClockMargin)) {
+			return "retryable", h.expireProUpgrade(ctx, conn, u, params, client)
+		}
+	}
+	if u.Session != nil {
+		session, e := client.RetrieveCheckoutSession(ctx, *u.Session)
+		if e != nil {
+			return "", e
+		}
+		if e = checkUpgradeSession(u, session); e != nil {
+			return "", e
+		}
+		if session.Status == "expired" {
 			return "retryable", h.expireProUpgrade(ctx, conn, u, params, client)
 		}
 	}
@@ -471,8 +487,8 @@ func (h *Handlers) reconcileProUpgrade(ctx context.Context, u proUpgrade, restar
 	if err != nil {
 		return "", err
 	}
-	if session.ID != *u.Session || session.Mode != "payment" || session.CustomerID != u.Customer || session.ClientReferenceID != u.Team.String() || session.Metadata["pro_upgrade_id"] != u.ID.String() {
-		return "", errors.New("upgrade checkout association differs")
+	if err = checkUpgradeSession(u, session); err != nil {
+		return "", err
 	}
 	if restart && session.Status == "open" {
 		if err = client.doForm(ctx, http.MethodPost, "/v1/checkout/sessions/"+url.PathEscape(session.ID)+"/expire", nil, nil, "pro-upgrade-expire:"+u.ID.String()); err != nil {
@@ -571,16 +587,25 @@ func (h *Handlers) activateProUpgrade(ctx context.Context, u proUpgrade, params 
 	return "active", nil
 }
 
+func checkUpgradeSession(u proUpgrade, session StripeRetrievedCheckoutSession) error {
+	if session.ID != *u.Session || session.Mode != "payment" || session.CustomerID != u.Customer || session.ClientReferenceID != u.Team.String() || session.Metadata["pro_upgrade_id"] != u.ID.String() {
+		return errors.New("upgrade checkout association differs")
+	}
+	return nil
+}
+
 // An expired upgrade can no longer be paid, so a first paid month also hands
-// back the collection-paused subscription and the billing calendar it claimed,
-// leaving the team free to quote again.
+// back the collection-paused subscription, the billing calendar it claimed and
+// the untouched reporting period of that calendar, leaving the team free to
+// quote again.
 func (h *Handlers) expireProUpgrade(ctx context.Context, conn *pgxpool.Conn, u proUpgrade, p StripeCreateCheckoutSessionParams, c *stripeHTTPClient) error {
 	if u.Evidence != nil {
 		return errors.New("paid upgrade cannot expire")
 	}
-	release := p.FirstPaidProCycle && u.Subscription != nil
-	if release {
-		if err := cancelUnpaidUpgradeSubscription(ctx, c, u); err != nil {
+	subscription := ""
+	if p.FirstPaidProCycle {
+		var err error
+		if subscription, err = cancelUnpaidUpgradeSubscription(ctx, c, u); err != nil {
 			return err
 		}
 	}
@@ -589,37 +614,74 @@ func (h *Handlers) expireProUpgrade(ctx context.Context, conn *pgxpool.Conn, u p
 		return err
 	}
 	defer tx.Rollback(context.WithoutCancel(ctx))
-	tag, err := tx.Exec(ctx, `UPDATE billing_pro_upgrade SET state='expired' WHERE id=$1 AND payment_evidence IS NULL AND state NOT IN ('expired','ended')`, u.ID)
+	tag, err := tx.Exec(ctx, `UPDATE billing_pro_upgrade SET state='expired',subscription_id=COALESCE(subscription_id,NULLIF($2,'')) WHERE id=$1 AND payment_evidence IS NULL AND state NOT IN ('expired','ended')`, u.ID, subscription)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() != 1 {
 		return errors.New("upgrade payment state changed during expiry")
 	}
-	if release {
-		if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL,commercial_billing_anchor=NULL,current_period_start=NULL,current_period_end=NULL WHERE team_id=$1 AND stripe_customer_id=$2 AND stripe_subscription_id=$3 AND commercial_billing_anchor=$4`, u.Team, u.Customer, *u.Subscription, u.Anchor); err != nil {
+	if subscription != "" {
+		if _, err = tx.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=NULL,stripe_subscription_status=NULL,current_period_start=NULL,current_period_end=NULL,
+ commercial_billing_anchor=CASE WHEN commercial_billing_anchor=$4 THEN NULL ELSE commercial_billing_anchor END
+ WHERE team_id=$1 AND stripe_customer_id=$2 AND stripe_subscription_id=$3`, u.Team, u.Customer, subscription, u.Anchor); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `UPDATE team_billing_period SET status='finalized',blocked_reason='reporting_only_calendar_period',gross_charges_usd=0,credits_applied_usd=0,net_invoice_amount_usd=0,finalized_at=clock_timestamp(),updated_at=clock_timestamp()
+ WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='open' AND exported_at IS NULL AND approved_at IS NULL AND finalized_at IS NULL
+  AND NOT EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$1 AND commercial_billing_anchor IS NOT NULL)`, u.Team, u.Start, u.End); err != nil {
 			return err
 		}
 	}
 	return tx.Commit(ctx)
 }
 
-func cancelUnpaidUpgradeSubscription(ctx context.Context, c *stripeHTTPClient, u proUpgrade) error {
-	id := *u.Subscription
-	var sub struct {
+// cancelUnpaidUpgradeSubscription cancels the subscription created for the
+// upgrade, found by its metadata even when its identity was never saved, and
+// returns its identity, or "" when none was created.
+func cancelUnpaidUpgradeSubscription(ctx context.Context, c *stripeHTTPClient, u proUpgrade) (string, error) {
+	type subscription struct {
 		ID       string            `json:"id"`
 		Customer string            `json:"customer"`
 		Status   string            `json:"status"`
 		Metadata map[string]string `json:"metadata"`
 	}
-	if err := c.doForm(ctx, http.MethodGet, "/v1/subscriptions/"+url.PathEscape(id), nil, &sub, ""); err != nil {
-		return err
+	var sub subscription
+	if u.Subscription != nil {
+		if err := c.doForm(ctx, http.MethodGet, "/v1/subscriptions/"+url.PathEscape(*u.Subscription), nil, &sub, ""); err != nil {
+			return "", err
+		}
+		if sub.ID != *u.Subscription {
+			return "", errors.New("upgrade subscription association differs")
+		}
+	} else {
+		var all struct {
+			Data    []subscription `json:"data"`
+			HasMore bool           `json:"has_more"`
+		}
+		if err := c.doForm(ctx, http.MethodGet, "/v1/subscriptions?"+url.Values{"customer": {u.Customer}, "status": {"all"}, "limit": {"100"}}.Encode(), nil, &all, ""); err != nil {
+			return "", err
+		}
+		if all.HasMore {
+			return "", errors.New("upgrade subscription inventory exceeds supported bound")
+		}
+		for _, s := range all.Data {
+			if s.Metadata["pro_upgrade_id"] == u.ID.String() {
+				if sub.ID != "" {
+					return "", errors.New("ambiguous upgrade subscriptions")
+				}
+				sub = s
+			}
+		}
+		if sub.ID == "" {
+			return "", nil
+		}
 	}
-	if sub.ID != id || sub.Customer != u.Customer || sub.Metadata["pro_upgrade_id"] != u.ID.String() {
-		return errors.New("upgrade subscription association differs")
+	if sub.Customer != u.Customer || sub.Metadata["pro_upgrade_id"] != u.ID.String() {
+		return "", errors.New("upgrade subscription association differs")
 	}
 	if sub.Status == "canceled" || sub.Status == "incomplete_expired" {
-		return nil
+		return sub.ID, nil
 	}
 	var invoices struct {
 		Data []struct {
@@ -629,18 +691,18 @@ func cancelUnpaidUpgradeSubscription(ctx context.Context, c *stripeHTTPClient, u
 		} `json:"data"`
 		HasMore bool `json:"has_more"`
 	}
-	if err := c.doForm(ctx, http.MethodGet, "/v1/invoices?"+url.Values{"subscription": {id}, "limit": {"100"}}.Encode(), nil, &invoices, ""); err != nil {
-		return err
+	if err := c.doForm(ctx, http.MethodGet, "/v1/invoices?"+url.Values{"subscription": {sub.ID}, "limit": {"100"}}.Encode(), nil, &invoices, ""); err != nil {
+		return "", err
 	}
 	if invoices.HasMore {
-		return errors.New("upgrade subscription invoice inventory exceeds supported bound")
+		return "", errors.New("upgrade subscription invoice inventory exceeds supported bound")
 	}
 	for _, inv := range invoices.Data {
 		if inv.AmountPaid != 0 || (inv.Status != "draft" && inv.Status != "void" && (inv.Status != "paid" || inv.Total != 0)) {
-			return errors.New("unpaid upgrade subscription has issued invoices and requires reconciliation")
+			return "", errors.New("unpaid upgrade subscription has issued invoices and requires reconciliation")
 		}
 	}
-	return c.doForm(ctx, http.MethodDelete, "/v1/subscriptions/"+url.PathEscape(id)+"?"+url.Values{"invoice_now": {"false"}, "prorate": {"false"}}.Encode(), nil, nil, "")
+	return sub.ID, c.doForm(ctx, http.MethodDelete, "/v1/subscriptions/"+url.PathEscape(sub.ID)+"?"+url.Values{"invoice_now": {"false"}, "prorate": {"false"}}.Encode(), nil, nil, "")
 }
 
 func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxpool.Conn, u *proUpgrade, p StripeCreateCheckoutSessionParams, c *stripeHTTPClient) (invoiceSubscription, error) {

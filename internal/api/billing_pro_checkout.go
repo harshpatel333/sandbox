@@ -614,7 +614,8 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 		return false, upgradeErr
 	}
 	var released bool
-	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE customer_id=$1 AND (subscription_id=$2 OR previous_choice->>'session_id'=$3))`, obj.Customer, subscription, obj.ID).Scan(&released); err != nil {
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE customer_id=$1 AND (subscription_id=$2 OR previous_choice->>'session_id'=$3))
+ OR EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE customer_id=$1 AND state='expired' AND payment_evidence IS NULL AND (subscription_id=$2 OR session_id=$3))`, obj.Customer, subscription, obj.ID).Scan(&released); err != nil {
 		return false, err
 	}
 	if released {

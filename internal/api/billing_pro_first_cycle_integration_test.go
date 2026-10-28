@@ -236,7 +236,7 @@ func TestProFirstCyclePreservesCommercialAnchorsAndRejectsUnpaidLeftovers(t *tes
 
 func TestProFirstCycleExpiryReleasesUnpaidSubscription(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	for _, kind := range []string{"unpaid", "already_canceled", "issued_invoice", "payment_evidence"} {
+	for _, kind := range []string{"unpaid", "cancelled_before_commit", "unrecorded_subscription", "issued_invoice", "payment_evidence"} {
 		t.Run(kind, func(t *testing.T) {
 			h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
 			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
@@ -248,73 +248,127 @@ func TestProFirstCycleExpiryReleasesUnpaidSubscription(t *testing.T) {
 			if err = json.Unmarshal(u.Payload, &accepted); err != nil || !accepted.FirstPaidProCycle {
 				t.Fatalf("first-cycle quote: %+v %v", accepted, err)
 			}
-			subID := "sub_" + uuid.NewString()
-			u.Subscription = &subID
 			exec := func(sql string, args ...any) {
 				t.Helper()
 				if _, e := h.Pool.Exec(t.Context(), sql, args...); e != nil {
 					t.Fatal(e)
 				}
 			}
-			exec(`UPDATE billing_pro_upgrade SET subscription_id=$2,state='checkout',session_id=$3 WHERE id=$1`, u.ID, subID, "cs_"+uuid.NewString())
+			subID, sessionID := "sub_"+uuid.NewString(), "cs_test_"+strings.ReplaceAll(uuid.NewString(), "-", "")
+			var recorded *string
+			if kind != "unrecorded_subscription" {
+				recorded = &subID
+			}
+			exec(`UPDATE billing_pro_upgrade SET subscription_id=$2,state='checkout',session_id=$3 WHERE id=$1`, u.ID, recorded, sessionID)
 			exec(`UPDATE team_billing_account SET stripe_subscription_id=$2,stripe_subscription_status='active',commercial_billing_anchor=$3,current_period_start=$3,current_period_end=$4 WHERE team_id=$1`, team, subID, u.Anchor, u.End)
 			if kind == "payment_evidence" {
 				exec(`UPDATE billing_pro_upgrade SET payment_evidence='{"invoice":"in_paid"}' WHERE id=$1`, u.ID)
-				u.Evidence = []byte(`{"invoice":"in_paid"}`)
 			}
-			status, invoices, cancels := "active", []any{map[string]any{"id": "in_opening", "status": "paid", "amount_paid": 0, "total": 0}}, 0
-			if kind == "already_canceled" {
+			if kind == "unpaid" {
+				exec(`DELETE FROM team_billing_period WHERE team_id=$1`, team)
+				exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, team, u.Start, u.End)
+			}
+			status, cancels := "active", 0
+			if kind == "cancelled_before_commit" {
 				status = "canceled"
 			}
+			invoices := []any{map[string]any{"id": "in_opening", "status": "paid", "amount_paid": 0, "total": 0}}
 			if kind == "issued_invoice" {
 				invoices = append(invoices, map[string]any{"id": "in_open", "status": "open", "amount_paid": 0, "total": 2500})
 			}
+			session := StripeRetrievedCheckoutSession{ID: sessionID, Mode: "payment", CustomerID: u.Customer, ClientReferenceID: team.String(), Status: "expired", Metadata: map[string]string{"pro_upgrade_id": u.ID.String()}}
+			subscription := func() map[string]any {
+				return map[string]any{"id": subID, "customer": u.Customer, "status": status, "metadata": map[string]string{"pro_upgrade_id": u.ID.String(), "first_paid_pro_cycle": "true"}}
+			}
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
+				var out any
 				switch {
+				case r.URL.Path == "/v1/checkout/sessions/"+sessionID:
+					out = session
+				case r.URL.Path == "/v1/subscriptions" && r.URL.Query().Get("customer") == u.Customer:
+					out = map[string]any{"data": []any{subscription()}}
 				case r.URL.Path == "/v1/subscriptions/"+subID && r.Method == http.MethodGet:
-					_ = json.NewEncoder(w).Encode(map[string]any{"id": subID, "customer": u.Customer, "status": status, "metadata": map[string]string{"pro_upgrade_id": u.ID.String(), "first_paid_pro_cycle": "true"}, "pause_collection": map[string]any{"behavior": "keep_as_draft"}})
+					out = subscription()
 				case r.URL.Path == "/v1/subscriptions/"+subID && r.Method == http.MethodDelete:
 					if q := r.URL.Query(); q.Get("invoice_now") != "false" || q.Get("prorate") != "false" {
 						t.Errorf("cancel would invoice or prorate: %s", r.URL.RawQuery)
 					}
 					cancels++
 					status = "canceled"
-					_ = json.NewEncoder(w).Encode(map[string]any{"id": subID, "status": status})
+					out = subscription()
 				case r.URL.Path == "/v1/invoices" && r.URL.Query().Get("subscription") == subID:
-					_ = json.NewEncoder(w).Encode(map[string]any{"data": invoices})
+					out = map[string]any{"data": invoices}
 				default:
 					t.Errorf("unexpected provider route %s %s", r.Method, r.URL)
 					http.NotFound(w, r)
+					return
 				}
+				_ = json.NewEncoder(w).Encode(out)
 			}))
 			defer srv.Close()
 			client := &stripeHTTPClient{baseURL: srv.URL, httpClient: srv.Client(), apiVersion: "2026-07-29.dahlia"}
-			conn, err := h.Pool.Acquire(t.Context())
-			if err != nil {
-				t.Fatal(err)
+			unavailable := h.Stripe
+			h.Stripe = client
+			var expiryErr error
+			if kind == "issued_invoice" || kind == "payment_evidence" {
+				u.Session, u.Subscription = &sessionID, recorded
+				if kind == "payment_evidence" {
+					u.Evidence = []byte(`{"invoice":"in_paid"}`)
+				}
+				conn, e := h.Pool.Acquire(t.Context())
+				if e != nil {
+					t.Fatal(e)
+				}
+				expiryErr = h.expireProUpgrade(t.Context(), conn, u, accepted, client)
+				conn.Release()
+			} else {
+				var outcome string
+				outcome, expiryErr = h.reconcileProUpgrade(t.Context(), u, false)
+				if expiryErr == nil && outcome != "retryable" {
+					t.Fatalf("expired checkout outcome %q", outcome)
+				}
 			}
-			expiryErr := h.expireProUpgrade(t.Context(), conn, u, accepted, client)
-			conn.Release()
 			var state, account string
-			if err = h.Pool.QueryRow(t.Context(), `SELECT u.state,concat_ws('/',a.stripe_subscription_id,a.stripe_subscription_status,a.commercial_billing_anchor,a.current_period_start,a.current_period_end)
+			if err = h.Pool.QueryRow(t.Context(), `SELECT u.state||'/'||COALESCE(u.subscription_id,''),concat_ws('/',a.stripe_subscription_id,a.stripe_subscription_status,a.commercial_billing_anchor,a.current_period_start,a.current_period_end)
  FROM billing_pro_upgrade u JOIN team_billing_account a ON a.team_id=u.team_id WHERE u.id=$1`, u.ID).Scan(&state, &account); err != nil {
 				t.Fatal(err)
 			}
 			if kind == "issued_invoice" || kind == "payment_evidence" {
-				if expiryErr == nil || cancels != 0 || state != "checkout" || !strings.HasPrefix(account, subID+"/active/") {
+				if expiryErr == nil || cancels != 0 || !strings.HasPrefix(state, "checkout/") || !strings.HasPrefix(account, subID+"/active/") {
 					t.Fatalf("expiry released a subscription that may have been paid: err=%v cancels=%d state=%s account=%s", expiryErr, cancels, state, account)
 				}
 				return
 			}
 			wantCancels := 1
-			if kind == "already_canceled" {
+			if kind == "cancelled_before_commit" {
 				wantCancels = 0
 			}
-			if expiryErr != nil || cancels != wantCancels || state != "expired" || account != "" {
+			if expiryErr != nil || cancels != wantCancels || state != "expired/"+subID || account != "" {
 				t.Fatalf("expiry kept the unpaid subscription: err=%v cancels=%d state=%s account=%q", expiryErr, cancels, state, account)
 			}
+			if kind == "unpaid" {
+				var open bool
+				if err = h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM team_billing_period WHERE team_id=$1 AND status='open')`, team).Scan(&open); err != nil || open {
+					t.Fatalf("abandoned month stayed an open reporting period: %v %v", open, err)
+				}
+			}
+			object, _ := json.Marshal(subscription())
+			for _, event := range []string{"customer.subscription.deleted", "invoice.finalized"} {
+				obj := object
+				if event == "invoice.finalized" {
+					obj, _ = json.Marshal(map[string]any{"id": "in_late", "customer": u.Customer, "subscription": subID})
+				}
+				envelope := stripeEventEnvelope{ID: "evt_" + uuid.NewString(), Type: event, Data: stripeEventEnvelopeData{Object: obj}}
+				payload, _ := json.Marshal(envelope)
+				exec(`INSERT INTO stripe_webhook_event(event_id,event_type,payload) VALUES($1,$2,$3)`, envelope.ID, envelope.Type, payload)
+				handled, e := h.processProWebhook(t.Context(), envelope)
+				if !handled || e != nil {
+					t.Fatalf("%s for the released subscription was left to the account handler: %v %v", event, handled, e)
+				}
+			}
 			h.Now = func() time.Time { return now.Add(time.Minute) }
+			h.Stripe = unavailable
 			params.OperationID = uuid.New()
 			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 			next, err := h.proUpgrade(t.Context(), team)
