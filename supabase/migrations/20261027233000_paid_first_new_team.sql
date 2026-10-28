@@ -30,11 +30,13 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp A
 $$;
 
 -- Paid-first signup sends every new team to a self-serve subscription, so it
--- applies only while both are sellable. Until then signups keep Free.
+-- applies only while checkout can sell both, by the same rule checkout uses.
+-- Until then signups keep Free.
 CREATE FUNCTION billing_paid_first_sellable() RETURNS boolean
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
- SELECT count(DISTINCT family)=2 FROM billing_plan_version WHERE family IN ('developer','pro') AND pricing_version='v2' AND state='published'
-  AND kind='subscription' AND public AND self_serve AND NOT display_only AND monthly_fee_cents>0;
+ SELECT count(DISTINCT v.family)=2 FROM billing_plan_version v WHERE v.family IN ('developer','pro') AND v.pricing_version='v2' AND v.state='published'
+  AND v.kind='subscription' AND v.public AND v.self_serve AND NOT v.display_only AND v.monthly_fee_cents>0
+  AND v.matching_bps IS NULL AND billing_plan_version_monthly_credit(v) IS NOT NULL;
 $$;
 
 CREATE FUNCTION billing_team_awaiting_plan(p_team uuid) RETURNS boolean

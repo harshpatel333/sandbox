@@ -396,3 +396,21 @@ func TestIntegration_NewTeamCohortFreeSignupsKeepFrozenFreeThroughGoLiveAndRollb
 	rolloutExec(t, pool, retire, "free")
 	check("retiring Free after go-live")
 }
+
+func TestIntegration_NewTeamCohortPaidFirstUsesCheckoutSellability(t *testing.T) {
+	pool, system, actor := cohortFixture(t)
+	rolloutExec(t, pool, `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family='developer' AND pricing_version='v2' AND state='published'),NULL)`)
+	var id uuid.UUID
+	if err := pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version(family,version,pricing_version,kind,public,self_serve,display_name,monthly_fee_cents,credit_schedule,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates)
+ VALUES('developer',(SELECT max(version)+1 FROM billing_plan_version WHERE family='developer'),'v2','subscription',true,true,'developer',3100,
+  jsonb_build_array(jsonb_build_object('start_months',0,'repeat',NULL,'every_months',1,'amount_cents',3100,'expires_after_months',2)),7,3,3072,9216,4) RETURNING id`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	rolloutExec(t, pool, `SELECT publish_billing_plan_version($1,NULL)`, id)
+	cohortRelease(t, pool, system)
+	team := cohortCreate(t, pool, actor)
+	if cohortAwaitingPlan(t, pool, team) {
+		t.Fatal("signup started a trial although checkout cannot sell Developer")
+	}
+	cohortRequireCatalogFree(t, pool, team)
+}
