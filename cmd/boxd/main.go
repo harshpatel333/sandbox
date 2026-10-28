@@ -433,15 +433,15 @@ func resolveUser(spec string) (*user.User, *syscall.Credential, error) {
 	}
 	name, group, hasGroup := strings.Cut(spec, ":")
 	synthetic := false
-	u, err := user.Lookup(name)
-	if err != nil {
-		if _, numErr := strconv.ParseUint(name, 10, 32); numErr != nil {
-			return nil, nil, fmt.Errorf("user %q not found: %w", name, err)
-		}
+	var u *user.User
+	var err error
+	if _, numErr := strconv.ParseUint(name, 10, 32); numErr == nil {
 		if u, err = user.LookupId(name); err != nil {
 			u = &user.User{Uid: name, Gid: "0", Username: name, HomeDir: "/"}
 			synthetic = true
 		}
+	} else if u, err = user.Lookup(name); err != nil {
+		return nil, nil, fmt.Errorf("user %q not found: %w", name, err)
 	}
 	gidStr := u.Gid
 	if hasGroup {
