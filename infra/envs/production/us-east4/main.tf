@@ -242,7 +242,7 @@ module "api" {
     STRIPE_CHECKOUT_PRICE_IDS             = "price_1U60fMPyzR3Q9AgflfcjIHsp,price_1U60hxPyzR3Q9AgfOsciXQ43"
     STRIPE_PRO_MONTHLY_PRICE_ID           = "price_1UQiPfPyzR3Q9AgfIb5nwoXS"
     STRIPE_PRO_ANNUAL_PRICE_ID            = "price_1UQiPzPyzR3Q9AgfHvQaYI5q"
-    STRIPE_PORTAL_NO_CANCEL_CONFIGURATION = "bpc_LIVE_PENDING"
+    STRIPE_PORTAL_NO_CANCEL_CONFIGURATION = "bpc_1UVRHpPyzR3Q9Agfhk2O0aDP"
     APP_ALLOWED_ORIGINS                   = "https://console.superserve.ai"
 
     # The purge of deleted sandboxes' backups from BACKUP_BUCKET: the GC
