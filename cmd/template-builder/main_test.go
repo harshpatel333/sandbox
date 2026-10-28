@@ -165,3 +165,30 @@ func TestHomeFromPasswd(t *testing.T) {
 		}
 	}
 }
+
+func TestRuntimeDefaultsFollowTheImage(t *testing.T) {
+	bc := buildCtx{
+		env: map[string]string{
+			"PATH":  "/opt/venv/bin:/usr/bin",
+			"HOME":  "/root",
+			"LANG":  "C.UTF-8",
+			"DEBUG": "1",
+		},
+		imageEnv:  map[string]struct{}{"PATH": {}},
+		imageUser: "1000:1000",
+	}
+	env := bc.runtimeEnv()
+	if env["PATH"] != "/opt/venv/bin:/usr/bin" || env["DEBUG"] != "1" {
+		t.Errorf("runtime env %v lost the image's PATH or a step's env", env)
+	}
+	if _, ok := env["HOME"]; ok {
+		t.Errorf("runtime env %v kept the build baseline's HOME", env)
+	}
+	if got := bc.runtimeUser(); got != "1000:1000" {
+		t.Errorf("runtime user = %q, want the image's", got)
+	}
+	bc.user = "app"
+	if got := bc.runtimeUser(); got != "app" {
+		t.Errorf("runtime user = %q, want the user step's", got)
+	}
+}

@@ -316,7 +316,7 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	emitInternal("system", "boxd ready")
 	emitUser("system", "Starting build environment")
 
-	bc, err := executeBuildSteps(ctx, netInfo.HostIP, cfg.spec)
+	bc, err := executeBuildSteps(ctx, netInfo.HostIP, cfg.spec, br.Image)
 	if err != nil {
 		return fmt.Errorf("build steps: %w", err)
 	}
@@ -330,11 +330,12 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 
 	// Bake env / user / workdir into boxd so they travel in the snapshot
 	// as the template's runtime defaults for every future sandbox.
-	if err := postBoxdInit(ctx, netInfo.HostIP, userEnv(bc.env), bc.user, bc.workdir); err != nil {
+	runtimeUser := bc.runtimeUser()
+	if err := postBoxdInit(ctx, netInfo.HostIP, bc.runtimeEnv(), runtimeUser, bc.workdir); err != nil {
 		return fmt.Errorf("bake context into boxd: %w", err)
 	}
 	emitInternal("system", "baked context into boxd (user=%q workdir=%q env=%d)",
-		bc.user, bc.workdir, len(bc.env))
+		runtimeUser, bc.workdir, len(bc.env))
 
 	// Enable guest swap after build steps, before the snapshot (see
 	// GuestSwapSetupScript). Best-effort — the script swallows failures.
@@ -808,22 +809,34 @@ func boxdWorkloadRunning(ctx context.Context, vmIP string) error {
 	return nil
 }
 
-// userEnv filters the build-time env map down to the keys set via `env`
-// steps, stripping the platform baseline (PATH/HOME/USER/TERM/LANG/SHELL)
-// that template-builder uses to drive build-time exec. Those come from
-// boxd's own env at runtime and shouldn't be baked into the template.
-func userEnv(buildEnv map[string]string) map[string]string {
+// runtimeEnv is the env baked in as the template's runtime default: what the
+// image and env steps set. The baseline that drives build-time exec
+// (PATH/HOME/USER/TERM/LANG/SHELL) comes from boxd's own env at runtime
+// instead, unless the image sets it.
+func (bc buildCtx) runtimeEnv() map[string]string {
 	baseline := map[string]struct{}{
 		"PATH": {}, "HOME": {}, "USER": {}, "TERM": {}, "LANG": {}, "SHELL": {},
 	}
-	out := make(map[string]string, len(buildEnv))
-	for k, v := range buildEnv {
+	out := make(map[string]string, len(bc.env))
+	for k, v := range bc.env {
 		if _, skip := baseline[k]; skip {
-			continue
+			if _, fromImage := bc.imageEnv[k]; !fromImage {
+				continue
+			}
 		}
 		out[k] = v
 	}
 	return out
+}
+
+// runtimeUser is who sandbox commands run as: the user step's, else the
+// image's own USER, as `docker run` would. Build steps stay root either way,
+// so specs written for root keep working on images that set a user.
+func (bc buildCtx) runtimeUser() string {
+	if bc.user != "" {
+		return bc.user
+	}
+	return bc.imageUser
 }
 
 // ---------------------------------------------------------------------------
@@ -834,16 +847,20 @@ const stepTimeout = 10 * time.Minute
 
 // buildCtx carries the state that threads through template build steps:
 // env vars the next run step sees, the user it runs as, and the cwd. env
-// is the initial baseline plus accumulated env steps; user defaults to
-// root until a user step switches it; workdir defaults empty (boxd's
-// fallback) until a workdir step sets it.
+// is the initial baseline, then the image's ENV, then accumulated env steps;
+// user defaults to root until a user step switches it; workdir starts at the
+// image's WORKDIR, or empty (boxd's fallback), until a workdir step sets it.
 type buildCtx struct {
 	env     map[string]string
 	user    string
 	workdir string
+
+	// What the base image sets: its env keys and its USER.
+	imageEnv  map[string]struct{}
+	imageUser string
 }
 
-func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec) (buildCtx, error) {
+func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec, image builder.ImageConfig) (buildCtx, error) {
 	bc := buildCtx{
 		env: map[string]string{
 			"PATH":  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -855,6 +872,24 @@ func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec)
 			// Builds are non-interactive; keep apt/debconf from prompting.
 			"DEBIAN_FRONTEND": "noninteractive",
 		},
+		imageEnv:  map[string]struct{}{},
+		imageUser: image.User,
+	}
+	for _, kv := range image.Env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k != "" {
+			bc.env[k] = v
+			bc.imageEnv[k] = struct{}{}
+		}
+	}
+	if image.WorkingDir != "" {
+		// Docker creates the WORKDIR when a container starts, so an image need
+		// not ship it.
+		dir := filepath.Join("/", image.WorkingDir)
+		root := buildCtx{env: bc.env, user: "root", workdir: "/"}
+		if err := runShellCmd(ctx, vmIP, "mkdir -p "+shellquote.Single(dir), root); err != nil {
+			return bc, fmt.Errorf("create image workdir %s: %w", dir, err)
+		}
+		bc.workdir = dir
 	}
 
 	for i, step := range spec.Steps {
