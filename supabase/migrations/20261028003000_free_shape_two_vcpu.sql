@@ -43,6 +43,10 @@ BEGIN
    'max_template_vcpu',GREATEST(old.max_template_vcpu,2),
    'max_template_memory_mib',GREATEST(old.max_template_memory_mib,4096),
    'max_template_disk_mib',GREATEST(old.max_template_disk_mib,8192),
+   -- The allowance keeps its compute basis, so at the new shape it no
+   -- longer lasts two hours; stop promising that on the plan card.
+   'features',to_jsonb((SELECT array_agg(CASE WHEN f='2 hours of compute every day' THEN 'Daily compute allowance' ELSE f END ORDER BY o)
+    FROM unnest(old.features) WITH ORDINALITY AS u(f,o))),
    'created_by',NULL,'created_at',clock_timestamp(),'updated_at',clock_timestamp(),
    'published_by',NULL,'published_at',NULL,'retired_by',NULL,'retired_at',NULL))).*;
   PERFORM publish_billing_plan_version(free_id,NULL);

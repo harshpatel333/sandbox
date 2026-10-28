@@ -31,6 +31,10 @@ func TestFreeShapeTwoVCPUCatalog(t *testing.T) {
 	if templates != 10 || allowance != 7200 || previous != "retired" {
 		t.Fatalf("v2 Free version 2 must copy its predecessor's terms and retire it: templates=%d allowance=%ds previous=%s", templates, allowance, previous)
 	}
+	var promisesHours bool
+	if err := testPool.QueryRow(ctx, `SELECT '2 hours of compute every day'=ANY(features) FROM billing_plan_version WHERE id=md5('billing-plan-version:v2:free:2')::uuid`).Scan(&promisesHours); err != nil || promisesHours {
+		t.Fatalf("the allowance no longer lasts two hours at the new shape; the card must not promise it (err=%v)", err)
+	}
 	if err := testPool.QueryRow(ctx, `SELECT v.max_template_vcpu,v.max_template_memory_mib,v.max_template_disk_mib,p.state
 	 FROM billing_plan_version v JOIN billing_plan_version p ON p.id=md5('billing-plan-version:legacy:payg:1')::uuid
 	 WHERE v.id=md5('billing-plan-version:legacy:payg:2')::uuid`).Scan(&vcpu, &mem, &disk, &previous); err != nil {
