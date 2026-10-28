@@ -263,6 +263,13 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 	}
 	client := h.Stripe.(*stripeHTTPClient)
 	var product string
+	var terms []StripeCheckoutResourceTerms
+	var termsErr error
+	termsDone := make(chan struct{})
+	go func() {
+		defer close(termsDone)
+		terms, termsErr = h.freezeProResourceTerms(c.Request.Context(), team, prices, client)
+	}()
 	// A resumed purchase keeps the price it was started with.
 	if resuming {
 		err = client.validateProPrice(c.Request.Context(), offer)
@@ -272,12 +279,12 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		offer.Price = price.ID
 		product = price.Product
 	}
+	<-termsDone
 	if err != nil {
 		respondErrorMsg(c, "service_unavailable", "Pro price configuration requires verification", 503)
 		return
 	}
-	terms, err := h.freezeProResourceTerms(c.Request.Context(), team, prices, client)
-	if err != nil {
+	if termsErr != nil {
 		respondErrorMsg(c, "service_unavailable", "Pro resource configuration requires verification", 503)
 		return
 	}
