@@ -300,3 +300,37 @@ func TestFreeShapeTwoVCPUAfterFreeRetired(t *testing.T) {
 		t.Fatal("a running trial kept limits below the shape", teamMemory, err)
 	}
 }
+
+// A raise that fails for one team is deferred, so the sweep retries it rather
+// than leaving the team below the shape for good.
+func TestFreeShapeTwoVCPUDefersFailedRaise(t *testing.T) {
+	ctx := t.Context()
+	team, old := uuid.New(), uuid.New()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`INSERT INTO team(id,name) VALUES($1,$2)`, team, "free-shape-"+team.String())
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM team WHERE id=$1`, team) })
+	exec(`UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE team_id=$1 AND effective_to IS NULL`, team)
+	// An earlier assignment already holds the key the replacement will use, so
+	// the raise's insert fails for this team.
+	exec(`INSERT INTO team_plan_assignment(team_id,plan_key,kind,terms,limits,effective_from,source,reason,idempotency_key)
+	 VALUES($1,'free','free','{}','{"max_concurrent":1}',clock_timestamp()-interval '2 hours','staff','holds the key','free-shape-2-4-8:'||$2::text)`, team, old)
+	exec(`UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE team_id=$1 AND effective_to IS NULL`, team)
+	exec(`INSERT INTO team_plan_assignment(id,team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
+	 VALUES($2,$1,'free','free',md5('billing-plan-version:v2:free:1')::uuid,'{"pricing_version":"v2","version":1}','{"max_concurrent":1,"max_vcpu":1,"max_templates":0}',
+	  clock_timestamp(),'signup','new team')`, team, old)
+	exec(`SELECT billing_raise_plan_shape()`)
+	var deferred, kept bool
+	if err := testPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_shape_deferred WHERE team_id=$1),
+	 EXISTS(SELECT 1 FROM team_plan_assignment WHERE id=$2 AND effective_to IS NULL)`, team, old).Scan(&deferred, &kept); err != nil {
+		t.Fatal(err)
+	}
+	if !kept || !deferred {
+		t.Fatalf("a failed raise must keep the assignment and defer the team: kept=%v deferred=%v", kept, deferred)
+	}
+	exec(`DELETE FROM billing_plan_shape_deferred WHERE team_id=$1`, team)
+}

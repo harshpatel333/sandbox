@@ -63,8 +63,8 @@ BEGIN
     OR billing_json_cap(p.limits->'max_disk_mib')<8192)
   ORDER BY p.team_id
  LOOP
-  -- One team's frozen invoice history must not hold back every other team;
-  -- such a team keeps its old caps and is reported for a manual follow-up.
+  -- One team's failure must not hold back every other team; it keeps its old
+  -- caps for now and the sweep retries it.
   BEGIN
    -- Same order as financial operations: invoice serialization, then team.
    PERFORM pg_advisory_xact_lock(hashtextextended('invoice:'||a.team_id::text,0));
@@ -105,6 +105,8 @@ BEGIN
    DELETE FROM billing_plan_shape_deferred WHERE team_id=a.team_id;
    moved:=moved+1;
   EXCEPTION WHEN OTHERS THEN
+   -- The sweep retries only deferred teams, so a failed raise is deferred too.
+   INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT DO NOTHING;
    RAISE WARNING 'free shape: team % kept its plan caps: %',a.team_id,SQLERRM;
   END;
  END LOOP;
