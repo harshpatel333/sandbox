@@ -342,12 +342,13 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 
 	// Bake env / user / workdir into boxd so they travel in the snapshot
 	// as the template's runtime defaults for every future sandbox.
-	runtimeUser := bc.workload().user
-	if err := postBoxdInit(ctx, netInfo.HostIP, bc.runtimeEnv(), runtimeUser, bc.workdir); err != nil {
+	runtime := bc.workload()
+	runtimeUser := runtime.user
+	if err := postBoxdInit(ctx, netInfo.HostIP, bc.runtimeEnv(), runtimeUser, runtime.workdir); err != nil {
 		return fmt.Errorf("bake context into boxd: %w", err)
 	}
 	emitInternal("system", "baked context into boxd (user=%q workdir=%q env=%d)",
-		runtimeUser, bc.workdir, len(bc.env))
+		runtimeUser, runtime.workdir, len(bc.env))
 
 	// Enable guest swap after build steps, before the snapshot (see
 	// GuestSwapSetupScript). Best-effort — the script swallows failures.
@@ -873,6 +874,11 @@ func (bc buildCtx) workload() buildCtx {
 		if _, set := bc.setEnv[k]; !set {
 			delete(w.env, k)
 		}
+	}
+	// Docker starts in / when nothing sets a WORKDIR; the user's passwd home
+	// need not exist (nobody's is /nonexistent).
+	if w.workdir == "" {
+		w.workdir = "/"
 	}
 	return w
 }

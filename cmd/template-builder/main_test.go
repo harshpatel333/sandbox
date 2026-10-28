@@ -196,7 +196,18 @@ func TestRuntimeDefaultsFollowTheImage(t *testing.T) {
 	if _, ok := w.env["HOME"]; ok {
 		t.Errorf("workload env %v kept root's HOME for the image user", w.env)
 	}
+	if w.workdir != "/" {
+		t.Errorf("image user workdir = %q, want / when nothing sets one", w.workdir)
+	}
+	bc.workdir = "/srv/app"
+	if got := bc.workload().workdir; got != "/srv/app" {
+		t.Errorf("image user workdir = %q, want the configured one", got)
+	}
+	bc.workdir = ""
 	bc.user = "app"
+	if got := bc.workload().workdir; got != "" {
+		t.Errorf("user step workdir = %q, want boxd's home fallback kept", got)
+	}
 	if got := bc.workload().user; got != "app" {
 		t.Errorf("runtime user = %q, want the user step's", got)
 	}
