@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"html"
 	"math"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -75,28 +74,28 @@ func optionalEmailButton(label, link string) string {
 	return emailButton(label, link)
 }
 
-// consoleLink addresses a console page for one team, in the form checkout
-// returns use; it is empty when no console origin is configured.
-func consoleLink(origin, path string, team db.Team) string {
+// consoleLink addresses a console page; it is empty when no console origin
+// is configured.
+func consoleLink(origin, path string) string {
 	if origin == "" {
 		return ""
 	}
-	return origin + path + "?" + url.Values{"team": {team.HomeRegion + ":" + team.ID.String()}}.Encode()
+	return origin + path
 }
 
 // creditWarningEmail renders the message for the warning kind GetTeamTrialBalance reported.
-func creditWarningEmail(kind string, team db.Team, remaining float64, consoleOrigin string) (subject, body string) {
+func creditWarningEmail(kind, teamName string, remaining float64, consoleOrigin string) (subject, body string) {
 	switch kind {
 	case creditWarningTrial:
-		return "Your Superserve free trial has ended", trialEndedHTML(team.Name, consoleLink(consoleOrigin, "/", team))
+		return "Your Superserve free trial has ended", trialEndedHTML(teamName, consoleLink(consoleOrigin, "/"))
 	case creditWarningPrepaid:
-		link := consoleLink(consoleOrigin, "/plan-usage/", team)
+		link := consoleLink(consoleOrigin, "/plan-usage/")
 		if remaining <= 0 {
-			return "Your Superserve credit has run out", prepaidLowCreditHTML(team.Name, remaining, link)
+			return "Your Superserve credit has run out", prepaidLowCreditHTML(teamName, remaining, link)
 		}
-		return "Your Superserve credit is running low", prepaidLowCreditHTML(team.Name, remaining, link)
+		return "Your Superserve credit is running low", prepaidLowCreditHTML(teamName, remaining, link)
 	default:
-		return "Your Superserve credit may run out soon", trialCreditWarningHTML(team.Name, remaining)
+		return "Your Superserve credit may run out soon", trialCreditWarningHTML(teamName, remaining)
 	}
 }
 
@@ -301,7 +300,7 @@ func (s *EmailTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Conte
 			return errors.New("trial credit warning lifecycle changed after claim")
 		}
 		// Persisted recipient outcomes suppress repeats across new claims.
-		subject, body := creditWarningEmail(balance.Kind, team, remaining, s.consoleOrigin)
+		subject, body := creditWarningEmail(balance.Kind, team.Name, remaining, s.consoleOrigin)
 		if err := s.sender.SendEmail(ctx, EmailMessage{
 			From:           s.from,
 			To:             recipient,
