@@ -127,6 +127,11 @@ func testProUpgradeFutureCredit(t *testing.T, monthlyCredit int64) {
 			_ = json.NewEncoder(w).Encode(sub)
 			return
 		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/billing/credit_grants/"+grant.ID+"/void" && (monthlyCredit == 1 || monthlyCredit == 50000) {
+			grant.VoidedAt = time.Now().Unix()
+			_ = json.NewEncoder(w).Encode(grant)
+			return
+		}
 		if r.Method != http.MethodGet {
 			t.Errorf("replay mutated provider: %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected", 500)
@@ -290,6 +295,9 @@ func testProUpgradeFutureCredit(t *testing.T, monthlyCredit int64) {
 			t.Fatal(err)
 		}
 		testProUpgradeReleaseReentry(t, h, team, u, &sub, monthlyCredit)
+		if (grant.VoidedAt != 0) != (u.bridgeCreditAmount() > 0) {
+			t.Fatalf("bridge credit %d voided=%v at release", u.bridgeCreditAmount(), grant.VoidedAt != 0)
+		}
 		return
 	}
 	tx, e := conn.Begin(t.Context())

@@ -43,6 +43,8 @@ type renewalStripe struct {
 	cancelOnRead   int
 	renewOnRead    int
 	failAfterWrite bool
+	grants         map[string]int64
+	voids          []string
 }
 
 func (s *renewalStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -55,6 +57,17 @@ func (s *renewalStripe) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.checkout != nil && r.Method == http.MethodGet && r.URL.Path == "/v1/checkout/sessions/"+s.checkout.ID {
 		_ = json.NewEncoder(w).Encode(s.checkout)
 		return
+	}
+	if grant, ok := strings.CutPrefix(r.URL.Path, "/v1/billing/credit_grants/"); ok && s.grants != nil {
+		grant, void := strings.CutSuffix(grant, "/void")
+		if _, known := s.grants[grant]; known {
+			if void && r.Method == http.MethodPost {
+				s.grants[grant] = time.Now().Unix()
+				s.voids = append(s.voids, grant)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": grant, "customer": s.customer, "voided_at": s.grants[grant]})
+			return
+		}
 	}
 	if r.URL.Path != "/v1/subscriptions/"+s.sub {
 		s.t.Errorf("unexpected provider request %s %s", r.Method, r.URL)
