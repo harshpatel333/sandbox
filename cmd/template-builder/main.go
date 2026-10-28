@@ -834,6 +834,8 @@ func (bc buildCtx) runtimeEnv() map[string]string {
 // an image's PATH need not include.
 const platformPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+func isRootUser(name string) bool { return name == "root" || name == "0" }
+
 // asRoot is the context for the builder's own setup commands.
 func (bc buildCtx) asRoot() buildCtx {
 	env := maps.Clone(bc.env)
@@ -852,6 +854,9 @@ func (bc buildCtx) workload() buildCtx {
 	}
 	w := bc
 	w.user = bc.imageUser
+	if name, _, _ := strings.Cut(w.user, ":"); isRootUser(name) {
+		return w
+	}
 	w.env = maps.Clone(bc.env)
 	for _, k := range []string{"HOME", "USER"} {
 		if _, fromImage := bc.imageEnv[k]; !fromImage {
@@ -896,6 +901,10 @@ func executeBuildSteps(ctx context.Context, vmIP string, spec builder.BuildSpec,
 		},
 		imageEnv:  map[string]struct{}{},
 		imageUser: image.User,
+	}
+	// Root is already who commands run as by default.
+	if name, _, hasGroup := strings.Cut(bc.imageUser, ":"); !hasGroup && isRootUser(name) {
+		bc.imageUser = ""
 	}
 	for _, kv := range image.Env {
 		if k, v, ok := strings.Cut(kv, "="); ok && k != "" {

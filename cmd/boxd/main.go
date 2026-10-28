@@ -400,13 +400,14 @@ func pathFromEnv(env []string) string {
 // os/exec.LookPath but uses a passed-in PATH instead of boxd's own.
 // Used so bare command names (e.g. "python") resolve against the child
 // process's effective PATH, which may include per-request overrides.
-func lookPathIn(file, pathEnv string) (string, error) {
+// Relative entries resolve against cwd, the child's working directory.
+func lookPathIn(file, pathEnv, cwd string) (string, error) {
 	if pathEnv == "" {
 		return "", fmt.Errorf("PATH is empty")
 	}
 	for _, dir := range filepath.SplitList(pathEnv) {
-		if dir == "" {
-			dir = "."
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(cwd, dir)
 		}
 		p := filepath.Join(dir, file)
 		fi, err := os.Stat(p)
@@ -527,7 +528,7 @@ func (s *processService) runProcess(ctx context.Context, msg *pb.StartRequest, e
 	childEnv := s.buildEnv(msg.GetEnvs(), usr)
 	resolvedCmd := cmdName
 	if filepath.Base(cmdName) == cmdName {
-		p, err := lookPathIn(cmdName, pathFromEnv(childEnv))
+		p, err := lookPathIn(cmdName, pathFromEnv(childEnv), cwd)
 		if err != nil {
 			return connect.NewError(connect.CodeInvalidArgument,
 				fmt.Errorf("resolve %q: %w", cmdName, err))

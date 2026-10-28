@@ -195,6 +195,10 @@ func TestRuntimeDefaultsFollowTheImage(t *testing.T) {
 	if got := bc.workload().user; got != "app" {
 		t.Errorf("runtime user = %q, want the user step's", got)
 	}
+	root := buildCtx{env: map[string]string{"HOME": "/root"}, imageUser: "0:0"}
+	if w := root.workload(); w.env["HOME"] != "/root" {
+		t.Errorf("workload env %v dropped HOME for a root image user", w.env)
+	}
 	if got := bc.asRoot().env["PATH"]; got != platformPath {
 		t.Errorf("setup PATH = %q, want the platform's", got)
 	}
