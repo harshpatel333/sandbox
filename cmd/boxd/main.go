@@ -463,8 +463,9 @@ func resolveUser(spec string) (*user.User, *syscall.Credential, error) {
 	}
 	cred := &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
 	// Without them the child would drop the account's supplementary groups.
-	// An image without /etc/group just has none.
-	if !synthetic {
+	// An explicit group restricts it to that one; an image without /etc/group
+	// just has none.
+	if !synthetic && !hasGroup {
 		ids, _ := u.GroupIds()
 		for _, id := range ids {
 			if g, err := strconv.ParseUint(id, 10, 32); err == nil {
