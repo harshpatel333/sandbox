@@ -34,6 +34,28 @@ type StripeRetrievedCheckoutSession struct {
 	Mode              string            `json:"mode"`
 	ExpiresAt         int64             `json:"expires_at"`
 	Metadata          map[string]string `json:"metadata"`
+	CustomFields      []struct {
+		Key      string `json:"key"`
+		Dropdown *struct {
+			Value *string `json:"value"`
+		} `json:"dropdown"`
+	} `json:"custom_fields"`
+}
+
+// topoffChosen reports the customer's checkout top-off answer. A completed
+// session always carries one because the field is required.
+func (s StripeRetrievedCheckoutSession) topoffChosen() (bool, error) {
+	for _, f := range s.CustomFields {
+		if f.Key == checkoutTopoffField && f.Dropdown != nil && f.Dropdown.Value != nil {
+			switch *f.Dropdown.Value {
+			case checkoutTopoffOn:
+				return true, nil
+			case checkoutTopoffOff:
+				return false, nil
+			}
+		}
+	}
+	return false, errors.New("checkout top-off choice is missing")
 }
 
 type stripeCheckoutSessionRetriever interface {

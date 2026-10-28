@@ -171,6 +171,29 @@ type StripeCreateCheckoutSessionParams struct {
 	IdempotencyKey           string
 	ExpiresAt                *time.Time
 	OneTimeLines             []StripeCheckoutOneTimeLine `json:",omitempty"`
+	// Topoff asks the customer at checkout whether to turn on automatic
+	// top-off; settlement reads the answer back from the session.
+	Topoff *StripeCheckoutTopoff `json:",omitempty"`
+}
+
+// StripeCheckoutTopoff is the frozen top-off offer shown at checkout.
+type StripeCheckoutTopoff struct {
+	AmountCents    int64
+	DefaultEnabled bool
+}
+
+const (
+	checkoutTopoffField = "autotopoff"
+	checkoutTopoffOn    = "autotopoff"
+	checkoutTopoffOff   = "off"
+)
+
+func checkoutTopoffMessage(amount int64) string {
+	dollars := fmt.Sprintf("$%d", amount/100)
+	if amount%100 != 0 {
+		dollars = fmt.Sprintf("$%.2f", float64(amount)/100)
+	}
+	return "Automatically add " + dollars + " when your credits run low to help keep your sandboxes running. Added credits never expire."
 }
 
 // StripeCheckoutOneTimeLine is charged once on the subscription's first invoice.
@@ -560,6 +583,22 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 	}
 	if params.AllowPromotionCodes {
 		form.Set("allow_promotion_codes", "true")
+	}
+	if t := params.Topoff; t != nil {
+		def := checkoutTopoffOff
+		if t.DefaultEnabled {
+			def = checkoutTopoffOn
+		}
+		form.Set("custom_fields[0][key]", checkoutTopoffField)
+		form.Set("custom_fields[0][type]", "dropdown")
+		form.Set("custom_fields[0][label][type]", "custom")
+		form.Set("custom_fields[0][label][custom]", "Auto Topoff")
+		form.Set("custom_fields[0][dropdown][options][0][label]", "Auto Topoff")
+		form.Set("custom_fields[0][dropdown][options][0][value]", checkoutTopoffOn)
+		form.Set("custom_fields[0][dropdown][options][1][label]", "Off")
+		form.Set("custom_fields[0][dropdown][options][1][value]", checkoutTopoffOff)
+		form.Set("custom_fields[0][dropdown][default_value]", def)
+		form.Set("custom_text[after_submit][message]", checkoutTopoffMessage(t.AmountCents))
 	}
 	if params.BasePriceID != "" && params.OneOffAmount == 0 {
 		i := len(params.PriceIDs)
@@ -1745,6 +1784,15 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		return
 	}
 	if h.Pool != nil {
+		awaiting, err := teamAwaitingPlan(c.Request.Context(), h.Pool, teamID)
+		if err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if awaiting {
+			respondErrorMsg(c, "plan_required", "Choose a plan before checkout.", http.StatusConflict)
+			return
+		}
 		var proPending bool
 		if err := h.Pool.QueryRow(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers+`)`, teamID).Scan(&proPending); err != nil {
 			respondError(c, ErrInternal)
