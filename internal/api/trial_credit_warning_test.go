@@ -305,7 +305,7 @@ func TestTrialCreditWarningSenderReturnsRecoverableFailure(t *testing.T) {
 }
 
 func TestResendTrialCreditWarningRequiresProviderConfiguration(t *testing.T) {
-	sender := NewEmailTrialCreditWarningSender(nil, "", nil)
+	sender := NewEmailTrialCreditWarningSender(nil, "", "", nil)
 	if err := sender.SendTrialCreditWarning(context.Background(), uuid.New(), 1); err == nil {
 		t.Fatal("missing provider configuration must not be treated as a successful send")
 	}
@@ -493,22 +493,36 @@ func TestCreditWarningOpenByKind(t *testing.T) {
 }
 
 func TestCreditWarningEmailCopyIsPlanNeutral(t *testing.T) {
+	const origin = "https://console.example.com"
 	for _, kind := range []string{"legacy_trial", creditWarningTrial, creditWarningPrepaid} {
-		subject, body := creditWarningEmail(kind, "example-team", 1.234)
-		if subject == "" || !strings.Contains(body, "example-team") || !strings.Contains(body, emailConsoleURL) {
-			t.Fatalf("%s email missing subject, team or console link: %q %s", kind, subject, body)
+		subject, body := creditWarningEmail(kind, "example-team", 1.234, origin)
+		if subject == "" || !strings.Contains(body, "example-team") {
+			t.Fatalf("%s email missing subject or team: %q %s", kind, subject, body)
 		}
-		if strings.Contains(body, "$95") || strings.Contains(body, "payment method") {
-			t.Fatalf("%s email names a plan-specific offer: %s", kind, body)
+		if strings.Contains(body, "$95") || strings.Contains(body, "Nothing is deleted") {
+			t.Fatalf("%s email names a plan-specific offer or promises the future: %s", kind, body)
 		}
 		if kind != creditWarningTrial && (strings.Contains(strings.ToLower(subject+body), "trial") || !strings.Contains(body, "$1.23")) {
 			t.Fatalf("%s low-credit email must be plan-neutral and quote the balance: %q %s", kind, subject, body)
 		}
 	}
-	_, ended := creditWarningEmail(creditWarningTrial, "example-team", 0)
-	for _, want := range []string{"paused", "Nothing has been deleted", "Choose a plan"} {
-		if !strings.Contains(ended, want) {
-			t.Fatalf("trial ended email missing %q: %s", want, ended)
+	if _, legacy := creditWarningEmail("legacy_trial", "example-team", 1, origin); strings.Contains(legacy, "Add credit") {
+		t.Fatalf("legacy trial email offers credit it cannot buy: %s", legacy)
+	}
+	for _, tc := range []struct {
+		kind      string
+		remaining float64
+		want      []string
+	}{
+		{creditWarningTrial, 0, []string{"paused", "Nothing has been deleted", "Choose a plan", origin + "/"}},
+		{creditWarningPrepaid, 1, []string{"running low", "Add credit", origin + "/plan-usage/"}},
+		{creditWarningPrepaid, 0, []string{"has run out", "Add credit"}},
+	} {
+		subject, body := creditWarningEmail(tc.kind, "example-team", tc.remaining, origin)
+		for _, want := range tc.want {
+			if !strings.Contains(subject+body, want) {
+				t.Fatalf("%s email at $%.2f missing %q: %q %s", tc.kind, tc.remaining, want, subject, body)
+			}
 		}
 	}
 }
@@ -583,7 +597,7 @@ func TestTrialCreditWarningSenderKeepsRecipientsPrivate(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
-	sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", queries)
+	sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", "", queries)
 	if err := sender.SendTrialCreditWarningWithKey(context.Background(), uuid.New(), 1.23, uuid.New()); err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +702,7 @@ func TestTrialCreditWarningPartialDeliverySurvivesNewClaim(t *testing.T) {
 				w.WriteHeader(http.StatusAccepted)
 			}))
 			defer server.Close()
-			sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", queries)
+			sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", "", queries)
 			err := sender.SendTrialCreditWarningWithKey(context.Background(), teamID, 1.23, claimToken)
 			var unknown *unknownEmailOutcomeError
 			var permanent *rejectedEmailError
@@ -951,7 +965,7 @@ func TestTrialCreditWarningAllRecipientsRevokedRemainsRetryable(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
-	sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", queries)
+	sender := NewEmailTrialCreditWarningSender(&ResendEmailSender{apiKey: "test-key", endpoint: server.URL, client: server.Client()}, "billing@example.com", "", queries)
 	err := sender.SendTrialCreditWarningWithKey(context.Background(), uuid.New(), 1, uuid.New())
 	var unknown *unknownEmailOutcomeError
 	var permanent *rejectedEmailError

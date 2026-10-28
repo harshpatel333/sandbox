@@ -391,7 +391,7 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 		plan = &customerPlan{PlanKey: current.PlanKey, Kind: current.Kind, DisplayName: current.Terms.DisplayName, EffectiveFrom: current.EffectiveFrom,
 			Limits:        planLimits{MaxConcurrent: &limits.MaxConcurrent, MaxVCPU: &limits.MaxVCPU, MaxMemoryMiB: &limits.MaxMemoryMiB, MaxDiskMiB: &limits.MaxDiskMiB, MaxTemplates: &limits.MaxTemplates},
 			FundingPolicy: fundingPolicyPostpaid}
-		if current.prepaidFunded() {
+		if current.Terms.FundingPolicy == fundingPolicyPrepaid {
 			plan.FundingPolicy, plan.Topoff = fundingPolicyPrepaid, current.Terms.Topoff
 		}
 	}
