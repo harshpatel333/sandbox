@@ -232,17 +232,18 @@ module "api" {
     # primary. The host-local superserve-otel-collector receives OTLP on :4318
     # and forwards to Google Managed Prometheus; the use4 network already admits
     # the Cloud Run sender range to the host on 4317/4318 (allow_otel_ingress).
-    OTEL_ENVIRONMENT            = local.environment
-    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${local.active_vmd_ip}:4318"
-    OTEL_EXPORT_INTERVAL        = "15s"
-    OTEL_METRICS_ENABLED        = "true"
-    OTEL_SERVICE_NAME           = "sandbox-controlplane"
-    STRIPE_API_BASE_URL         = "https://api.stripe.com"
-    STRIPE_API_VERSION          = "2026-05-27.dahlia"
-    STRIPE_CHECKOUT_PRICE_IDS   = "price_1U60fMPyzR3Q9AgflfcjIHsp,price_1U60hxPyzR3Q9AgfOsciXQ43"
-    STRIPE_PRO_MONTHLY_PRICE_ID = "price_1UQiPfPyzR3Q9AgfIb5nwoXS"
-    STRIPE_PRO_ANNUAL_PRICE_ID  = "price_1UQiPzPyzR3Q9AgfHvQaYI5q"
-    APP_ALLOWED_ORIGINS         = "https://console.superserve.ai"
+    OTEL_ENVIRONMENT                      = local.environment
+    OTEL_EXPORTER_OTLP_ENDPOINT           = "http://${local.active_vmd_ip}:4318"
+    OTEL_EXPORT_INTERVAL                  = "15s"
+    OTEL_METRICS_ENABLED                  = "true"
+    OTEL_SERVICE_NAME                     = "sandbox-controlplane"
+    STRIPE_API_BASE_URL                   = "https://api.stripe.com"
+    STRIPE_API_VERSION                    = "2026-05-27.dahlia"
+    STRIPE_CHECKOUT_PRICE_IDS             = "price_1U60fMPyzR3Q9AgflfcjIHsp,price_1U60hxPyzR3Q9AgfOsciXQ43"
+    STRIPE_PRO_MONTHLY_PRICE_ID           = "price_1UQiPfPyzR3Q9AgfIb5nwoXS"
+    STRIPE_PRO_ANNUAL_PRICE_ID            = "price_1UQiPzPyzR3Q9AgfHvQaYI5q"
+    STRIPE_PORTAL_NO_CANCEL_CONFIGURATION = "bpc_LIVE_PENDING"
+    APP_ALLOWED_ORIGINS                   = "https://console.superserve.ai"
 
     # The purge of deleted sandboxes' backups from BACKUP_BUCKET: the GC
 
