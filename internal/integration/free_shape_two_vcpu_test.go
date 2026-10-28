@@ -268,7 +268,7 @@ func TestFreeShapeTwoVCPUAfterFreeRetired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool, system, _ := cohortFixture(t)
+	pool, system, actor := cohortFixture(t)
 	team := uuid.New()
 	rolloutExec(t, pool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "free-shape-"+team.String())
 	rolloutExec(t, pool, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE team_id=$1 AND effective_to IS NULL`, team)
@@ -277,6 +277,10 @@ func TestFreeShapeTwoVCPUAfterFreeRetired(t *testing.T) {
 	 FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published'`, team)
 	cohortRelease(t, pool, system)
 	rolloutExec(t, pool, `UPDATE billing_trial_policy SET max_memory_mib=3072 WHERE singleton`)
+	trial := cohortCreate(t, pool, actor)
+	if !cohortAwaitingPlan(t, pool, trial) {
+		t.Fatal("fixture signup is not on the trial")
+	}
 	rolloutExec(t, pool, `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'),NULL)`)
 	if _, err := pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal("migration refused a valid paid-first catalog without Free:", err)
@@ -290,5 +294,9 @@ func TestFreeShapeTwoVCPUAfterFreeRetired(t *testing.T) {
 	var trialMemory int
 	if err := pool.QueryRow(ctx, `SELECT max_memory_mib FROM billing_trial_policy WHERE singleton`).Scan(&trialMemory); err != nil || trialMemory != 4096 {
 		t.Fatal("an undersized trial on a released cell was not raised to the shape", trialMemory, err)
+	}
+	var teamMemory int
+	if err := pool.QueryRow(ctx, `SELECT max_template_memory_mib FROM team WHERE id=$1`, trial).Scan(&teamMemory); err != nil || teamMemory != 4096 {
+		t.Fatal("a running trial kept limits below the shape", teamMemory, err)
 	}
 }

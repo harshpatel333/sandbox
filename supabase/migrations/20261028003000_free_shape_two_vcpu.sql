@@ -133,6 +133,17 @@ BEGIN
   max_memory_mib=CASE WHEN max_memory_mib<4096 THEN 4096 ELSE max_memory_mib END,
   max_disk_mib=CASE WHEN max_disk_mib<8192 THEN 8192 ELSE max_disk_mib END
  WHERE singleton AND (max_vcpu<2 OR max_memory_mib<4096 OR max_disk_mib<8192);
+ -- Trials already running froze the old trial caps onto their team row.
+ PERFORM set_config('superserve.applying_plan_limits','on',true);
+ UPDATE team t SET
+  max_template_vcpu=CASE WHEN t.max_template_vcpu<2 THEN 2 ELSE t.max_template_vcpu END,
+  max_template_memory_mib=CASE WHEN t.max_template_memory_mib<4096 THEN 4096 ELSE t.max_template_memory_mib END,
+  max_template_disk_mib=CASE WHEN t.max_template_disk_mib<8192 THEN 8192 ELSE t.max_template_disk_mib END
+ FROM billing_new_team_enrollment e
+ WHERE e.team_id=t.id AND e.initial_assignment_id IS NULL AND NOT t.limits_customized
+  AND NOT EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=t.id AND p.effective_to IS NULL)
+  AND (t.max_template_vcpu<2 OR t.max_template_memory_mib<4096 OR t.max_template_disk_mib<8192);
+ PERFORM set_config('superserve.applying_plan_limits','off',true);
 
  -- Once the new-team cohort is live, every catalog write must leave a
  -- zero-template Free published unless paid-first signup has replaced it
