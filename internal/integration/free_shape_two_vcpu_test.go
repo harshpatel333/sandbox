@@ -130,7 +130,8 @@ func TestFreeShapeTwoVCPUTransition(t *testing.T) {
 }
 
 // A cap the frozen limits leave out is no cap, so the raise neither selects
-// such an assignment nor writes a floor over the missing key.
+// such an assignment nor writes a floor over the missing key, and it never
+// lowers a cap already above the shape.
 func TestFreeShapeTwoVCPUKeepsMissingCaps(t *testing.T) {
 	ctx := t.Context()
 	migration, err := os.ReadFile("../../supabase/migrations/20261028003000_free_shape_two_vcpu.sql")
@@ -154,7 +155,7 @@ func TestFreeShapeTwoVCPUKeepsMissingCaps(t *testing.T) {
 		return team
 	}
 	uncapped := assign(`{"max_concurrent":1,"max_vcpu":null,"max_templates":0}`)
-	partial := assign(`{"max_concurrent":1,"max_vcpu":1,"max_templates":0}`)
+	partial := assign(`{"max_concurrent":1,"max_vcpu":1,"max_disk_mib":20000,"max_templates":0}`)
 	if _, err := testPool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
 	}
@@ -166,8 +167,9 @@ func TestFreeShapeTwoVCPUKeepsMissingCaps(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `SELECT limits::text FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, partial).Scan(&limits); err != nil {
 		t.Fatal(err)
 	}
-	if limits != `{"max_vcpu": 2, "max_templates": 0, "max_concurrent": 1}` {
-		t.Fatalf("raise wrote floors over missing caps: %s", limits)
+	// Raise-only: a cap below the shape is raised, one above it is kept.
+	if limits != `{"max_vcpu": 2, "max_disk_mib": 20000, "max_templates": 0, "max_concurrent": 1}` {
+		t.Fatalf("raise lowered a cap or wrote floors over missing caps: %s", limits)
 	}
 }
 

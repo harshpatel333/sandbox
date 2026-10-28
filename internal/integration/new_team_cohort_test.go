@@ -318,29 +318,39 @@ func TestIntegration_NewTeamCohortTrialUsesConfiguredCreditLimitsAndFences(t *te
 
 func TestIntegration_NewTeamCohortReleaseNeedsFreeOrSellableTrial(t *testing.T) {
 	retire := `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family=$1 AND pricing_version='v2' AND state='published'),NULL)`
-	for _, tc := range []struct {
-		name    string
-		prepare func(*pgxpool.Pool)
-		opens   bool
-	}{
-		{"neither", func(p *pgxpool.Pool) { rolloutExec(t, p, retire, "free"); rolloutExec(t, p, retire, "developer") }, false},
-		{"usable Free only", func(p *pgxpool.Pool) { rolloutExec(t, p, retire, "developer") }, true},
-		{"sellable trial only", func(p *pgxpool.Pool) { rolloutExec(t, p, retire, "free") }, true},
-		{"Free below the template shape", func(p *pgxpool.Pool) {
-			rolloutExec(t, p, retire, "developer")
-			var small uuid.UUID
-			if err := p.QueryRow(t.Context(), `INSERT INTO billing_plan_version SELECT (jsonb_populate_record(NULL::billing_plan_version,to_jsonb(v)||jsonb_build_object(
+	smallFree := func(t *testing.T, p *pgxpool.Pool) {
+		t.Helper()
+		var small uuid.UUID
+		if err := p.QueryRow(t.Context(), `INSERT INTO billing_plan_version SELECT (jsonb_populate_record(NULL::billing_plan_version,to_jsonb(v)||jsonb_build_object(
   'id',gen_random_uuid(),'version',(SELECT max(version)+1 FROM billing_plan_version WHERE family='free'),'state','draft','max_template_vcpu',1,'max_template_memory_mib',1024,
   'created_by',NULL,'published_by',NULL,'published_at',NULL,'retired_by',NULL,'retired_at',NULL))).*
  FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published' RETURNING id`).Scan(&small); err != nil {
-				t.Fatal(err)
-			}
-			rolloutExec(t, p, `SELECT publish_billing_plan_version($1,NULL)`, small)
+			t.Fatal(err)
+		}
+		rolloutExec(t, p, `SELECT publish_billing_plan_version($1,NULL)`, small)
+	}
+	for _, tc := range []struct {
+		name    string
+		prepare func(*testing.T, *pgxpool.Pool)
+		opens   bool
+	}{
+		{"neither", func(t *testing.T, p *pgxpool.Pool) {
+			rolloutExec(t, p, retire, "free")
+			rolloutExec(t, p, retire, "developer")
+		}, false},
+		{"usable Free only", func(t *testing.T, p *pgxpool.Pool) { rolloutExec(t, p, retire, "developer") }, true},
+		{"sellable trial only", func(t *testing.T, p *pgxpool.Pool) { rolloutExec(t, p, retire, "free") }, true},
+		{"Free below the template shape", func(t *testing.T, p *pgxpool.Pool) { rolloutExec(t, p, retire, "developer"); smallFree(t, p) }, false},
+		// Sellable plans without a configured trial do not open it, and an
+		// undersized Free is no fallback either.
+		{"trial unconfigured and Free below the shape", func(t *testing.T, p *pgxpool.Pool) {
+			rolloutExec(t, p, `UPDATE billing_trial_policy SET credit_usd=NULL WHERE singleton`)
+			smallFree(t, p)
 		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pool, system, _ := cohortFixture(t)
-			tc.prepare(pool)
+			tc.prepare(t, pool)
 			_, err := cohortTryRelease(t, pool, system)
 			if tc.opens && err != nil {
 				t.Fatalf("gate stayed closed: %v", err)
