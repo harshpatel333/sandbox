@@ -907,3 +907,28 @@ func TestNewTeamCohortRetiringDeveloperLeavesTrialTeamsAwaitingPro(t *testing.T)
 		}
 	}
 }
+
+func TestNewTeamCohortTrialTeamCannotBuyPrepaidCredit(t *testing.T) {
+	f := newTeamCohortTestFixture(t)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("trial team reached the provider: %s %s", r.Method, r.URL.Path)
+		http.Error(w, "unexpected", 500)
+	}))
+	t.Cleanup(provider.Close)
+	f.h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+	r := gin.New()
+	r.POST("/billing/prepaid/checkout", func(c *gin.Context) {
+		c.Set("team_id", f.team.String())
+		c.Set("actor_id", f.actor)
+		f.h.CreatePrepaidCheckout(c)
+	})
+	for _, req := range []prepaidCheckoutBody{
+		{AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"},
+		{AmountCents: 500, OperationID: uuid.New(), SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"},
+	} {
+		rec := prepaidOperationPost(r, req)
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "plan_required") {
+			t.Fatalf("trial team prepaid purchase: %d %s", rec.Code, rec.Body)
+		}
+	}
+}
