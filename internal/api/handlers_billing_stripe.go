@@ -1784,6 +1784,15 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		return
 	}
 	if h.Pool != nil {
+		awaiting, err := teamAwaitingPlan(c.Request.Context(), h.Pool, teamID)
+		if err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if awaiting {
+			respondErrorMsg(c, "plan_required", "Choose a plan before checkout.", http.StatusConflict)
+			return
+		}
 		var proPending bool
 		if err := h.Pool.QueryRow(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers+`)`, teamID).Scan(&proPending); err != nil {
 			respondError(c, ErrInternal)

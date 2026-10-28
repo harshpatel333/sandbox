@@ -931,6 +931,18 @@ func TestNewTeamCohortTrialTeamCannotBuyPrepaidCredit(t *testing.T) {
 			t.Fatalf("trial team prepaid purchase: %d %s", rec.Code, rec.Body)
 		}
 	}
+	r.POST("/stripe/checkout-session", func(c *gin.Context) {
+		c.Set("team_id", f.team.String())
+		c.Set("actor_id", f.actor)
+		f.h.CreateStripeCheckoutSession(c)
+	})
+	for _, body := range []string{`{"success_url":"https://console.example.com/ok","cancel_url":"https://console.example.com/cancel"}`, `{"offer":"free","success_url":"https://console.example.com/ok","cancel_url":"https://console.example.com/cancel"}`} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/stripe/checkout-session", strings.NewReader(body)))
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "plan_required") {
+			t.Fatalf("trial team pay-as-you-go checkout: %d %s", rec.Code, rec.Body)
+		}
+	}
 }
 
 func TestNewTeamCohortTrialTeamIsNotOfferedFree(t *testing.T) {
