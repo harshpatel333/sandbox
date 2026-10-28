@@ -18,8 +18,11 @@
 --     start the curated templates.
 --  5. The new-team gate release requires Free or the trial to admit the shape.
 -- Teams that kept a below-shape assignment because a purchase was in flight.
+-- Each retry moves a team to the back, so teams that stay busy cannot keep
+-- the others out of the sweep's batch.
 CREATE TABLE IF NOT EXISTS billing_plan_shape_deferred (
- team_id uuid PRIMARY KEY REFERENCES team(id) ON DELETE CASCADE
+ team_id uuid PRIMARY KEY REFERENCES team(id) ON DELETE CASCADE,
+ tried_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 ALTER TABLE billing_plan_shape_deferred ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON billing_plan_shape_deferred FROM PUBLIC;
@@ -57,7 +60,7 @@ BEGIN
   WHERE family='payg' AND pricing_version='legacy' AND kind='legacy_payg' AND state='published';
  FOR a IN SELECT p.* FROM team_plan_assignment p
   WHERE p.kind IN ('free','legacy_payg') AND p.effective_to IS NULL AND p.contract_id IS NULL
-   AND (NOT p_deferred_only OR p.team_id IN (SELECT team_id FROM billing_plan_shape_deferred ORDER BY team_id LIMIT 20))
+   AND (NOT p_deferred_only OR p.team_id IN (SELECT team_id FROM billing_plan_shape_deferred ORDER BY tried_at,team_id LIMIT 20))
    -- An absent or null cap is no cap: it already admits the shape.
    AND (billing_json_cap(p.limits->'max_vcpu')<2
     OR billing_json_cap(p.limits->'max_memory_mib')<4096
@@ -70,13 +73,13 @@ BEGIN
    -- Same order as financial operations: invoice serialization, then team.
    -- A team busy with either is deferred rather than waited on.
    IF NOT pg_try_advisory_xact_lock(hashtextextended('invoice:'||a.team_id::text,0)) THEN
-    INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT DO NOTHING;
+    INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT(team_id) DO UPDATE SET tried_at=clock_timestamp();
     skipped:=skipped+1;
     CONTINUE;
    END IF;
    PERFORM 1 FROM team WHERE id=a.team_id FOR UPDATE SKIP LOCKED;
    IF NOT FOUND THEN
-    INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT DO NOTHING;
+    INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT(team_id) DO UPDATE SET tried_at=clock_timestamp();
     skipped:=skipped+1;
     CONTINUE;
    END IF;
@@ -93,7 +96,7 @@ BEGIN
     OR EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=a.team_id AND state IN ('scheduled','applied'))
    INTO in_flight;
    IF in_flight THEN
-    INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT DO NOTHING;
+    INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT(team_id) DO UPDATE SET tried_at=clock_timestamp();
     skipped:=skipped+1;
     CONTINUE;
    END IF;
@@ -117,7 +120,7 @@ BEGIN
    moved:=moved+1;
   EXCEPTION WHEN OTHERS THEN
    -- The sweep retries only deferred teams, so a failed raise is deferred too.
-   INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT DO NOTHING;
+   INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT(team_id) DO UPDATE SET tried_at=clock_timestamp();
    RAISE WARNING 'free shape: team % kept its plan caps: %',a.team_id,SQLERRM;
   END;
  END LOOP;

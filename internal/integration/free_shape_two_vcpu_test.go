@@ -334,3 +334,53 @@ func TestFreeShapeTwoVCPUDefersFailedRaise(t *testing.T) {
 	}
 	exec(`DELETE FROM billing_plan_shape_deferred WHERE team_id=$1`, team)
 }
+
+// Teams that stay busy rotate to the back of the deferred batch, so a team
+// after them is still raised.
+func TestFreeShapeTwoVCPUDeferredBatchRotates(t *testing.T) {
+	ctx := t.Context()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	belowShape := func(id uuid.UUID) {
+		t.Helper()
+		exec(`INSERT INTO team(id,name) VALUES($1,$2)`, id, "free-shape-"+id.String())
+		t.Cleanup(func() {
+			_, _ = testPool.Exec(context.Background(), `DELETE FROM billing_plan_shape_deferred WHERE team_id=$1`, id)
+			_, _ = testPool.Exec(context.Background(), `DELETE FROM team WHERE id=$1`, id)
+		})
+		exec(`UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE team_id=$1 AND effective_to IS NULL`, id)
+		exec(`INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
+	 VALUES($1,'free','free',md5('billing-plan-version:v2:free:1')::uuid,'{"pricing_version":"v2","version":1}','{"max_concurrent":1,"max_vcpu":1,"max_templates":0}',clock_timestamp(),'signup','new team')`, id)
+		exec(`INSERT INTO billing_plan_shape_deferred(team_id) VALUES($1)`, id)
+	}
+	// Busy teams sort first by id and were deferred first.
+	var busy []uuid.UUID
+	for i := 0; i < 20; i++ {
+		id := uuid.MustParse("00000000-0000-4000-8000-" + uuid.NewString()[24:])
+		belowShape(id)
+		busy = append(busy, id)
+	}
+	settled := uuid.MustParse("ffffffff-ffff-4fff-8fff-" + uuid.NewString()[24:])
+	belowShape(settled)
+	holder, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(context.WithoutCancel(ctx))
+	for _, id := range busy {
+		if _, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('invoice:'||$1::text,0))`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		exec(`SELECT billing_raise_plan_shape(true)`)
+	}
+	var raised bool
+	if err = testPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL AND source='migration')`, settled).Scan(&raised); err != nil || !raised {
+		t.Fatal("busy teams kept a later deferred team out of the batch", raised, err)
+	}
+}

@@ -971,7 +971,8 @@ type BillingPlanRelease struct {
 }
 
 type BillingPlanShapeDeferred struct {
-	TeamID uuid.UUID `json:"team_id"`
+	TeamID  uuid.UUID `json:"team_id"`
+	TriedAt time.Time `json:"tried_at"`
 }
 
 type BillingPlanVersion struct {
