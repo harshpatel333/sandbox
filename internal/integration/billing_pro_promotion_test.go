@@ -258,7 +258,7 @@ func TestIntegration_ProUpgradeHoldPrecedesCheckoutAndRecoversLostResponse(t *te
 	f, r, key := newProFixture(t, "pro_monthly")
 	f.upgrade = &proUpgradeProviderFixture{t: t, loseHoldResponse: true}
 	withReleasedProPricing(t)
-	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 202, "payment_confirmation_pending")
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 503, "checkout_unavailable")
 	f.mu.Lock()
 	creates, held, writes := f.creates, f.held, f.upgrade.holdWrites
 	f.mu.Unlock()
@@ -287,7 +287,7 @@ func TestIntegration_ProRejectsIncompatibleExistingSubscriptionWithoutHoldingCol
 				t.Fatal(err)
 			}
 			withReleasedProPricing(t)
-			assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 202, "payment_confirmation_pending")
+			assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 503, "checkout_unavailable")
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			if f.held || f.creates != 0 || f.upgrade.holdWrites != 0 || f.upgrade.base {
@@ -302,7 +302,7 @@ func TestIntegration_ProUpgradeLostCheckoutResponseRecoversFrozenPurchaseOff(t *
 	f.upgrade = &proUpgradeProviderFixture{t: t}
 	f.failCreate = true
 	withReleasedProPricing(t)
-	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 202, "payment_confirmation_pending")
+	assertProResponse(t, r, key, "/stripe/checkout-session", proCheckoutBody("pro_monthly"), 503, "checkout_unavailable")
 	f.mu.Lock()
 	initialPrices, quote := len(f.priceCreates), f.upgrade.quoted
 	f.mu.Unlock()

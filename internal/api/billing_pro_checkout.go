@@ -32,6 +32,8 @@ type proOffer struct {
 	Grants            []planGrant
 	Allowance         *planAllowance
 	Limits            *planLimits
+	PrepaidFunded     bool
+	Topoff            *planTopoff
 	// PricingV2 purchases accept a promotion code at checkout and assign the
 	// team's plan when they activate.
 	PricingV2 bool
@@ -46,8 +48,9 @@ var legacyProOffers = map[string]proOffer{
 	"pro_annual":  {Key: "pro_annual", Amount: 1200000, Months: 12, Credit: 100000},
 }
 
-// paidPlanOffers matches every offer_key in the self-serve plan catalog.
-const paidPlanOffers = "(SELECT offer_key FROM billing_plan)"
+// paidPlanOffers matches every paid offer_key: the legacy offer rows and every
+// offer a v2 subscription version has sold.
+const paidPlanOffers = "(SELECT billing_paid_offer_keys())"
 
 var errOfferUnavailable = errors.New("plan is not available")
 
@@ -75,7 +78,7 @@ func (h *Handlers) proOfferForPricingVersion(ctx context.Context, key, model str
 	if err != nil {
 		return proOffer{Key: key}, err
 	}
-	return proOffer{Key: key, Name: t.DisplayName, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Pricing: t.PricingVersion, Matching: t.Matching, Limits: &t.Limits, Price: h.Config.PlanPriceID(key), Family: t.Family, Grants: t.Grants, Allowance: t.Allowance}, nil
+	return proOffer{Key: key, Name: t.DisplayName, Amount: t.FeeCents, Months: t.IntervalMonths, Credit: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Pricing: t.PricingVersion, Matching: t.Matching, Limits: &t.Limits, Price: h.Config.PlanPriceID(key), Family: t.Family, Grants: t.Grants, Allowance: t.Allowance, PrepaidFunded: t.PrepaidFunded, Topoff: t.Topoff}, nil
 }
 
 // checkoutOffer returns the frozen terms of the team's pending purchase of key,
@@ -94,6 +97,21 @@ func (h *Handlers) checkoutOffer(ctx context.Context, team uuid.UUID, key string
 	return o, false, err
 }
 
+// checkoutPlanTerms are the terms a checkout freezes; a v2 checkout also
+// freezes the plan identity and funding it assigns.
+func checkoutPlanTerms(offer proOffer, v2 bool) *StripeCheckoutPlanTerms {
+	t := &StripeCheckoutPlanTerms{Amount: offer.Amount, Months: offer.Months, Credit: offer.Credit, VersionID: offer.VersionID, Matching: offer.Matching, Limits: offer.Limits}
+	if !v2 {
+		return t
+	}
+	t.Grants, t.Allowance = offer.Grants, offer.Allowance
+	t.PricingV2, t.Family, t.Version, t.DisplayName = true, offer.Family, offer.Version, offer.Name
+	if offer.PrepaidFunded {
+		t.FundingPolicy, t.Topoff = fundingPolicyPrepaid, offer.Topoff
+	}
+	return t
+}
+
 // frozenProOffer returns the terms a purchase was started with.
 func frozenProOffer(key string, payload StripeCreateCheckoutSessionParams) (proOffer, error) {
 	t := payload.PlanTerms
@@ -109,7 +127,11 @@ func frozenProOffer(key string, payload StripeCreateCheckoutSessionParams) (proO
 	if payload.AllowPromotionCodes != t.PricingV2 || (t.PricingV2 && (t.Months != 1 || t.VersionID == uuid.Nil || t.Limits == nil || t.Limits.MaxConcurrent == nil || t.Family == "" || t.Version <= 0)) {
 		return proOffer{}, errors.New("invalid frozen pricing v2 terms")
 	}
-	o := proOffer{PredecessorKnown: t.PredecessorKnown, InitialAssignment: t.InitialAssignment, Key: key, Name: t.DisplayName, Amount: t.Amount, Months: t.Months, Credit: t.Credit, VersionID: t.VersionID, Matching: t.Matching, Limits: t.Limits, PricingV2: t.PricingV2, Family: t.Family, Version: t.Version, Grants: t.Grants, Allowance: t.Allowance}
+	prepaid := t.FundingPolicy == fundingPolicyPrepaid
+	if (t.FundingPolicy != "" && !prepaid) || (prepaid && !t.PricingV2) || (t.Topoff != nil && !prepaid) {
+		return proOffer{}, errors.New("invalid frozen funding terms")
+	}
+	o := proOffer{PredecessorKnown: t.PredecessorKnown, InitialAssignment: t.InitialAssignment, Key: key, Name: t.DisplayName, Amount: t.Amount, Months: t.Months, Credit: t.Credit, VersionID: t.VersionID, Matching: t.Matching, Limits: t.Limits, PricingV2: t.PricingV2, Family: t.Family, Version: t.Version, Grants: t.Grants, Allowance: t.Allowance, PrepaidFunded: prepaid, Topoff: t.Topoff}
 	if t.PricingV2 {
 		o.Pricing = "v2"
 	}
@@ -265,12 +287,13 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		return
 	}
 	params := StripeCreateCheckoutSessionParams{OperationID: req.OperationID, OneOffProduct: product, CustomerID: customer, SuccessURL: success, CancelURL: cancelURL, ClientReferenceID: team.String(), PriceIDs: prices, BasePriceID: offer.Price, Flexible: true, ResourceTerms: terms,
-		PlanTerms: &StripeCheckoutPlanTerms{Amount: offer.Amount, Months: offer.Months, Credit: offer.Credit, VersionID: offer.VersionID, Matching: offer.Matching, Limits: offer.Limits}}
+		PlanTerms: checkoutPlanTerms(offer, offer.Pricing == "v2" && !resuming)}
 	v2 := offer.Pricing == "v2"
 	if v2 && !resuming {
 		params.AllowPromotionCodes = true
-		params.PlanTerms.Grants, params.PlanTerms.Allowance = offer.Grants, offer.Allowance
-		params.PlanTerms.PricingV2, params.PlanTerms.Family, params.PlanTerms.Version, params.PlanTerms.DisplayName = true, offer.Family, offer.Version, offer.Name
+		if t := offer.Topoff; t != nil {
+			params.Topoff = &StripeCheckoutTopoff{AmountCents: t.AmountCents, DefaultEnabled: t.DefaultEnabled}
+		}
 		if _, err = frozenProOffer(offer.Key, params); err != nil {
 			respondErrorMsg(c, "service_unavailable", "Pro plan configuration requires verification", 503)
 			return
@@ -591,7 +614,9 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 		return false, upgradeErr
 	}
 	var released bool
-	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE customer_id=$1 AND (subscription_id=$2 OR previous_choice->>'session_id'=$3))`, obj.Customer, subscription, obj.ID).Scan(&released); err != nil {
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_release WHERE customer_id=$1 AND (subscription_id=$2 OR previous_choice->>'session_id'=$3))
+ OR EXISTS(SELECT 1 FROM billing_pro_upgrade u WHERE u.customer_id=$1 AND u.state='expired' AND u.payment_evidence IS NULL AND u.request_payload->>'FirstPaidProCycle'='true'
+  AND (u.subscription_id=$2 OR u.session_id=$3) AND NOT EXISTS(SELECT 1 FROM team_billing_account a WHERE a.stripe_customer_id=$1 AND a.stripe_subscription_id=u.subscription_id))`, obj.Customer, subscription, obj.ID).Scan(&released); err != nil {
 		return false, err
 	}
 	if released {

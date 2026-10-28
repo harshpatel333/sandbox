@@ -171,6 +171,29 @@ type StripeCreateCheckoutSessionParams struct {
 	IdempotencyKey           string
 	ExpiresAt                *time.Time
 	OneTimeLines             []StripeCheckoutOneTimeLine `json:",omitempty"`
+	// Topoff asks the customer at checkout whether to turn on automatic
+	// top-off; settlement reads the answer back from the session.
+	Topoff *StripeCheckoutTopoff `json:",omitempty"`
+}
+
+// StripeCheckoutTopoff is the frozen top-off offer shown at checkout.
+type StripeCheckoutTopoff struct {
+	AmountCents    int64
+	DefaultEnabled bool
+}
+
+const (
+	checkoutTopoffField = "autotopoff"
+	checkoutTopoffOn    = "autotopoff"
+	checkoutTopoffOff   = "off"
+)
+
+func checkoutTopoffMessage(amount int64) string {
+	dollars := fmt.Sprintf("$%d", amount/100)
+	if amount%100 != 0 {
+		dollars = fmt.Sprintf("$%.2f", float64(amount)/100)
+	}
+	return "Automatically add " + dollars + " when your credits run low to help keep your sandboxes running. Added credits never expire."
 }
 
 // StripeCheckoutOneTimeLine is charged once on the subscription's first invoice.
@@ -198,6 +221,9 @@ type StripeCheckoutPlanTerms struct {
 	DisplayName string         `json:",omitempty"`
 	Grants      []planGrant    `json:",omitempty"`
 	Allowance   *planAllowance `json:",omitempty"`
+	// Absent for postpaid, so earlier frozen checkouts keep their shape.
+	FundingPolicy string      `json:",omitempty"`
+	Topoff        *planTopoff `json:",omitempty"`
 }
 
 type StripeCheckoutSession struct {
@@ -206,8 +232,9 @@ type StripeCheckoutSession struct {
 }
 
 type StripeCreateCustomerPortalSessionParams struct {
-	CustomerID string
-	ReturnURL  string
+	CustomerID    string
+	ReturnURL     string
+	Configuration string
 }
 
 type StripePortalSession struct {
@@ -557,6 +584,22 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 	if params.AllowPromotionCodes {
 		form.Set("allow_promotion_codes", "true")
 	}
+	if t := params.Topoff; t != nil {
+		def := checkoutTopoffOff
+		if t.DefaultEnabled {
+			def = checkoutTopoffOn
+		}
+		form.Set("custom_fields[0][key]", checkoutTopoffField)
+		form.Set("custom_fields[0][type]", "dropdown")
+		form.Set("custom_fields[0][label][type]", "custom")
+		form.Set("custom_fields[0][label][custom]", "Auto Topoff")
+		form.Set("custom_fields[0][dropdown][options][0][label]", "Auto Topoff")
+		form.Set("custom_fields[0][dropdown][options][0][value]", checkoutTopoffOn)
+		form.Set("custom_fields[0][dropdown][options][1][label]", "Off")
+		form.Set("custom_fields[0][dropdown][options][1][value]", checkoutTopoffOff)
+		form.Set("custom_fields[0][dropdown][default_value]", def)
+		form.Set("custom_text[after_submit][message]", checkoutTopoffMessage(t.AmountCents))
+	}
 	if params.BasePriceID != "" && params.OneOffAmount == 0 {
 		i := len(params.PriceIDs)
 		form.Set(fmt.Sprintf("line_items[%d][price]", i), params.BasePriceID)
@@ -589,6 +632,9 @@ func (c *stripeHTTPClient) CreateCustomerPortalSession(ctx context.Context, para
 	form := url.Values{}
 	form.Set("customer", params.CustomerID)
 	form.Set("return_url", params.ReturnURL)
+	if params.Configuration != "" {
+		form.Set("configuration", params.Configuration)
+	}
 	var resp struct {
 		URL string `json:"url"`
 	}
@@ -1738,6 +1784,15 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		return
 	}
 	if h.Pool != nil {
+		awaiting, err := teamAwaitingPlan(c.Request.Context(), h.Pool, teamID)
+		if err != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if awaiting {
+			respondErrorMsg(c, "plan_required", "Choose a plan before checkout.", http.StatusConflict)
+			return
+		}
 		var proPending bool
 		if err := h.Pool.QueryRow(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=$1 AND offer_key IN `+paidPlanOffers+`)`, teamID).Scan(&proPending); err != nil {
 			respondError(c, ErrInternal)
@@ -2059,6 +2114,12 @@ func (h *Handlers) EstablishBillingCutover(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"cutover_at": cutover, "teams_updated": count})
 }
 
+// portalWithoutCancellation selects teams with a live contract for a catalog
+// plan, or a paid upgrade still committing one. Managed offers such as YC and
+// sponsored usage are not catalog plans.
+const portalWithoutCancellation = `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND status<>'ended' AND offer_key IN ` + paidPlanOffers + `)
+ OR EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state IN ('paid','credited','active'))`
+
 func (h *Handlers) CreateStripeCustomerPortalSession(c *gin.Context) {
 	teamID, err := customerContextTeamID(c)
 	if err != nil {
@@ -2122,9 +2183,29 @@ func (h *Handlers) CreateStripeCustomerPortalSession(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "team does not have an active Stripe subscription", http.StatusConflict)
 		return
 	}
+	// Cancelling a catalog plan in the portal would skip the plan change that
+	// ends its contract and returns the team to Free, so those teams get a
+	// portal without cancellation and never the default one.
+	var catalogPlan bool
+	if err = h.Pool.QueryRow(c.Request.Context(), portalWithoutCancellation, teamID).Scan(&catalogPlan); err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read portal plan contract failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	configuration := ""
+	if catalogPlan {
+		if h.Config != nil {
+			configuration = h.Config.StripePortalNoCancelConfiguration
+		}
+		if configuration == "" {
+			respondErrorMsg(c, "service_unavailable", "Stripe customer portal is not configured for plan subscriptions", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	session, err := h.Stripe.CreateCustomerPortalSession(c.Request.Context(), StripeCreateCustomerPortalSessionParams{
-		CustomerID: *account.StripeCustomerID,
-		ReturnURL:  returnURL,
+		CustomerID:    *account.StripeCustomerID,
+		ReturnURL:     returnURL,
+		Configuration: configuration,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("create Stripe portal session failed")

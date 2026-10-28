@@ -59,6 +59,9 @@ type frozenPlanTerms struct {
 	Grants             []planGrant    `json:"grants"`
 	Matching           *planMatching  `json:"matching"`
 	Allowance          *planAllowance `json:"allowance"`
+	// Absent for postpaid, so terms frozen before funding policies keep their shape.
+	FundingPolicy string      `json:"funding_policy,omitempty"`
+	Topoff        *planTopoff `json:"topoff,omitempty"`
 }
 
 // freezePlanTerms keeps a compute allowance as its compute basis, not as an
@@ -75,9 +78,13 @@ func freezePlanTerms(t planTerms) frozenPlanTerms {
 	if grants == nil {
 		grants = []planGrant{}
 	}
-	return frozenPlanTerms{OfferKey: t.OfferKey, DisplayName: t.DisplayName, FeeCents: t.FeeCents, IntervalMonths: t.IntervalMonths,
+	frozen := frozenPlanTerms{OfferKey: t.OfferKey, DisplayName: t.DisplayName, FeeCents: t.FeeCents, IntervalMonths: t.IntervalMonths,
 		MonthlyCreditCents: t.MonthlyCreditCents, VersionID: t.VersionID, Version: t.Version, Family: t.Family, PricingVersion: t.PricingVersion, Kind: t.Kind,
 		Grants: grants, Matching: t.Matching, Allowance: allowance}
+	if t.PrepaidFunded {
+		frozen.FundingPolicy, frozen.Topoff = fundingPolicyPrepaid, t.Topoff
+	}
+	return frozen
 }
 
 // planAssignment asks for a team to be on a plan from now on.
@@ -131,6 +138,13 @@ func currentTeamPlan(ctx context.Context, q db.DBTX, team uuid.UUID) (teamPlan, 
 		return p, false, nil
 	}
 	return p, err == nil, err
+}
+
+// prepaidFunded reports a plan whose sandboxes run on funded credit: the
+// prepaid kind, or a subscription frozen with the prepaid funding policy. It
+// mirrors billing_assignment_prepaid_funded.
+func (p teamPlan) prepaidFunded() bool {
+	return p.Kind == planKindPrepaid || (p.Kind == planKindSubscription && p.Terms.FundingPolicy == fundingPolicyPrepaid)
 }
 
 func teamPlanHistory(ctx context.Context, q db.DBTX, team uuid.UUID, limit int) ([]teamPlan, error) {
@@ -352,9 +366,13 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	if err == nil {
 		pending, err = pendingCustomerPlanChange(ctx, tx, team, "customer")
 	}
+	entry := entryActive
+	if err == nil {
+		entry, err = teamEntryState(ctx, tx, team)
+	}
 	var proCheckout customerProCheckout
 	if err == nil {
-		proCheckout, err = customerProCheckoutTerms(ctx, tx, team, assigned && current.Kind == planKindFree, anchor.Valid)
+		proCheckout, err = customerProCheckoutTerms(ctx, tx, team, entry != entryActive || (assigned && current.Kind == planKindFree), anchor.Valid)
 	}
 	if err == nil {
 		err = tx.Commit(ctx)
@@ -371,6 +389,7 @@ func (h *Handlers) GetBillingPlan(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"plan":           plan,
+		"entry_state":    entry,
 		"period":         customerBillingPeriod{Start: start, End: end},
 		"pending_change": pending,
 		"pro_checkout":   proCheckout,

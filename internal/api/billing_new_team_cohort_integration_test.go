@@ -67,13 +67,23 @@ func newTeamCohortTestFixture(t *testing.T) newTeamCohortFixture {
 	}
 	f.old = old.ID
 	exec(`INSERT INTO profile(id,email) VALUES($1,'cohort-api@example.invalid')`, f.actor)
+	// Production runs the zero-template Free step on the catalog's Free.
 	var free uuid.UUID
-	err = pool.QueryRow(ctx, `INSERT INTO billing_plan_version(family,version,pricing_version,kind,display_name,public,allowance_period,allowance_on_exhausted,allowance_compute_seconds,allowance_compute_vcpu,allowance_compute_memory_gib,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates)
- VALUES('free',(SELECT max(version)+1 FROM billing_plan_version WHERE family='free'),'v2','free','Free',true,'day_window','pause',7200, 1, 1, 1, 2, 4096, 8192,0) RETURNING id`).Scan(&free)
-	if err != nil {
+	if err = pool.QueryRow(ctx, `INSERT INTO billing_plan_version SELECT (jsonb_populate_record(NULL::billing_plan_version,to_jsonb(v)||jsonb_build_object(
+  'id',gen_random_uuid(),'version',(SELECT max(version)+1 FROM billing_plan_version WHERE family='free'),'state','draft','max_templates',0,
+  'created_by',NULL,'published_by',NULL,'published_at',NULL,'retired_by',NULL,'retired_at',NULL))).*
+ FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published' RETURNING id`).Scan(&free); err != nil {
 		t.Fatal(err)
 	}
 	exec(`SELECT publish_billing_plan_version($1,NULL)`, free)
+	var developer uuid.UUID
+	err = pool.QueryRow(ctx, `INSERT INTO billing_plan_version(family,version,pricing_version,kind,public,self_serve,display_name,monthly_fee_cents,credit_schedule,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates)
+ VALUES('developer',1,'v2','subscription',true,true,'Developer',3100,jsonb_build_array(jsonb_build_object('start_months',0,'repeat',NULL,'every_months',1,'amount_cents',3100,'expires_after_months',1)),7,3,3072,9216,4) RETURNING id`).Scan(&developer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`SELECT publish_billing_plan_version($1,NULL)`, developer)
+	exec(`UPDATE billing_trial_policy SET credit_usd=0.07,max_sandboxes=2,max_vcpu=3,max_memory_mib=3072,max_disk_mib=9216 WHERE singleton`)
 	if err = pool.QueryRow(ctx, `SELECT billing_prepare_new_team_gate('use',$1,'test','new-team API test')`, system).Scan(&f.epoch); err != nil {
 		t.Fatal(err)
 	}
@@ -94,6 +104,52 @@ func newTeamCohortTestFixture(t *testing.T) newTeamCohortFixture {
 	f.h.Stripe = &stripeHTTPClient{}
 	return f
 }
+
+// onFree puts the trial team on Free, as teams enrolled before paid-first
+// signup still are.
+func (f newTeamCohortFixture) onFree(t *testing.T) {
+	t.Helper()
+	terms, err := f.h.planTermsForPricingVersion(t.Context(), "free", "v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err = assignTeamPlan(t.Context(), tx, planAssignment{Team: f.team, Terms: terms, Source: planSourceStaff, Actor: &f.actor, Reason: "enrolled before paid-first signup"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f newTeamCohortFixture) entryState(t *testing.T, team uuid.UUID) (string, bool) {
+	t.Helper()
+	r := gin.New()
+	r.GET("/plan", func(c *gin.Context) {
+		c.Set("team_id", team.String())
+		c.Set("actor_id", f.actor)
+		f.h.GetBillingPlan(c)
+	})
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/plan", nil))
+	var v struct {
+		Plan       *customerPlan       `json:"plan"`
+		EntryState string              `json:"entry_state"`
+		Checkout   customerProCheckout `json:"pro_checkout"`
+	}
+	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &v) != nil {
+		t.Fatalf("billing plan response: %d %s", rec.Code, rec.Body.String())
+	}
+	if v.EntryState != entryActive && v.Plan != nil {
+		t.Fatalf("entry state %s disagrees with plan %+v", v.EntryState, v.Plan)
+	}
+	return v.EntryState, v.Checkout.FirstPaidProCycle
+}
+
 func (f newTeamCohortFixture) close(t *testing.T) {
 	t.Helper()
 	if _, err := f.h.Pool.Exec(t.Context(), `SELECT billing_close_new_team_gate($1,'test','close new acceptance only')`, f.epoch); err != nil {
@@ -151,6 +207,7 @@ func TestNewTeamCohortCapabilitiesAreTeamScopedAndKeepClosedDisplay(t *testing.T
 
 func TestNewTeamCohortStarterFreezesAndReplaysAcrossGateClosure(t *testing.T) {
 	f := newTeamCohortTestFixture(t)
+	f.onFree(t)
 	customer := "cus_local_cohort"
 	if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,$2)`, f.team, customer); err != nil {
 		t.Fatal(err)
@@ -222,13 +279,69 @@ func TestNewTeamCohortFirstProUsesFullMonthAndRetainsAcceptedQuote(t *testing.T)
 		c, _ := gin.CreateTestContext(rec)
 		c.Request = httptest.NewRequest(http.MethodPost, "/quote", nil)
 		f.h.createProUpgrade(c, f.team, f.actor, offer, params, admission)
-		if rec.Code != 202 {
+		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("cohort quote %d %s", rec.Code, rec.Body.String())
 		}
+	}
+	if state, first := f.entryState(t, f.team); state != entryTrial || !first {
+		t.Fatalf("new team before checkout: %s first=%v", state, first)
+	}
+	if state, _ := f.entryState(t, f.old); state != entryActive {
+		t.Fatalf("existing team entry state %s", state)
 	}
 	quote()
 	accepted, err := f.h.proUpgrade(t.Context(), f.team)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := f.entryState(t, f.team); state != entryTrial {
+		t.Fatalf("open checkout entry state %s", state)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `INSERT INTO billing_pro_upgrade_setup(id,upgrade_id,request_payload,created_at) VALUES(gen_random_uuid(),$1,'{}',now())`, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := f.entryState(t, f.team); state != entryTrial {
+		t.Fatalf("checkout needing a card ended a trial with credit left: %s", state)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE team_trial_eligibility_cache SET eligible=false WHERE team_id=$1`, f.team); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := f.entryState(t, f.team); state != entryPaymentFailed {
+		t.Fatalf("used-up trial with a checkout needing a card: %s", state)
+	}
+	if _, err = f.h.Pool.Exec(t.Context(), `UPDATE billing_pro_upgrade_setup SET state='expired' WHERE upgrade_id=$1`, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	settled := accepted
+	settled.Start, settled.End = accepted.Anchor, accepted.End
+	tx, err := f.h.Pool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err = tx.Exec(t.Context(), `UPDATE billing_pro_upgrade SET state='credited',payment_evidence='{}',grant_id='credgr_local' WHERE id=$1`, accepted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = retireFirstProCycleReportingPeriods(t.Context(), tx, settled); err != nil {
+		t.Fatalf("paid first month of a trial team cannot settle: %v", err)
+	}
+	contract := uuid.New()
+	if _, err = tx.Exec(t.Context(), `UPDATE team_billing_account SET stripe_subscription_id='sub_local',stripe_subscription_status='active',commercial_billing_anchor=$2 WHERE team_id=$1`, f.team, accepted.Anchor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(t.Context(), `INSERT INTO billing_commercial_contract(id,team_id,offer_key,starts_at,customer_id,subscription_id,base_price_id,charge_amount_cents,charge_interval_months,entitlement_amount_cents,entitlement_cadence,entitlement_anchor) VALUES($1,$2,'pro_monthly',$3,$4,'sub_local','price_local_pro',25000,1,25000,'monthly',$3)`, contract, f.team, accepted.Anchor, customer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(t.Context(), `UPDATE billing_pro_upgrade SET contract_id=$2 WHERE id=$1`, accepted.ID, contract); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = assignTeamPlan(t.Context(), tx, planAssignment{Team: f.team, Terms: terms, Source: planSourceCheckout, Actor: &f.actor, Reason: "paid checkout", ContractID: &contract, Key: "checkout:" + contract.String()}); err != nil {
+		t.Fatal(err)
+	}
+	if err = retireFirstProCycleReportingPeriods(t.Context(), tx, settled); err != nil {
+		t.Fatalf("settlement retry after the paid plan was assigned failed: %v", err)
+	}
+	if err = tx.Rollback(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	_, end, valid := billing.AnniversaryPeriod(now, now)
@@ -313,6 +426,7 @@ func TestNewTeamCohortRechargeSchedulerKeepsAcceptedConsentAfterClose(t *testing
 
 func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
 	f := newTeamCohortTestFixture(t)
+	f.onFree(t)
 	f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
 	f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
 	for _, sql := range []string{`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_implicit')`, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)`} {
@@ -478,6 +592,7 @@ func TestNewTeamCohortImplicitPrepaidHTTPReplayAfterClose(t *testing.T) {
 
 func TestNewTeamCohortImplicitRedirectDelimiterCannotBypassPolicy(t *testing.T) {
 	f := newTeamCohortTestFixture(t)
+	f.onFree(t)
 	f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
 	f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
 	original := prepaidCheckoutBody{AmountCents: 500, SuccessURL: "https://console.example.com/ok?x=a", CancelURL: "https://console.example.com/cancel?x=b|https://evil.example/out"}
@@ -520,6 +635,7 @@ func TestNewTeamCohortImplicitRecoverySurvivesFreshPolicyChanges(t *testing.T) {
 	for _, policy := range []string{"capacity", "pro_pending", "export", "managed"} {
 		t.Run(policy, func(t *testing.T) {
 			f := newTeamCohortTestFixture(t)
+			f.onFree(t)
 			f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
 			f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
 			exec := func(sql string, args ...any) {
@@ -628,6 +744,7 @@ func TestNewTeamCohortImplicitPriceDriftReturnsStatusWithoutReplay(t *testing.T)
 	for _, drift := range []string{"prices", "resources", "missing_prices"} {
 		t.Run(drift, func(t *testing.T) {
 			f := newTeamCohortTestFixture(t)
+			f.onFree(t)
 			f.h.Config.AppAllowedOrigins = []string{"https://console.example.com"}
 			f.h.Config.StripeCheckoutPriceIDs = []string{"price_cpu", "price_memory"}
 			for _, sql := range []string{`INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_drift')`, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)`} {
@@ -733,5 +850,131 @@ func TestNewTeamCohortFirstCheckoutClosureRaceIsConflict(t *testing.T) {
 	var clean bool
 	if err := f.h.Pool.QueryRow(t.Context(), `SELECT checkout_initializing_at IS NULL AND cardinality(checkout_pending_attempt_ids)=0 AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE team_id=$1) FROM team_billing_account WHERE team_id=$1`, f.team).Scan(&clean); err != nil || !clean || calls != 0 {
 		t.Fatalf("closed admission produced financial effects: %v/%v/%d", clean, err, calls)
+	}
+}
+
+func TestNewTeamCohortRetiringDeveloperLeavesTrialTeamsAwaitingPro(t *testing.T) {
+	for _, ended := range []bool{false, true} {
+		f := newTeamCohortTestFixture(t)
+		now := time.Now().UTC().Truncate(time.Second)
+		f.h.Now = func() time.Time { return now }
+		if _, err := f.h.Pool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_local_trial')`, f.team); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.h.Pool.Exec(t.Context(), `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family='developer' AND state='published'),NULL)`); err != nil {
+			t.Fatal(err)
+		}
+		want := entryTrial
+		if ended {
+			want = entryTrialEnded
+			if _, err := f.h.Pool.Exec(t.Context(), `UPDATE team_trial_eligibility_cache SET eligible=false WHERE team_id=$1`, f.team); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if state, _ := f.entryState(t, f.team); state != want {
+			t.Fatalf("retiring Developer moved a %s team to %s", want, state)
+		}
+		var plans int
+		if err := f.h.Pool.QueryRow(t.Context(), `SELECT count(*) FROM team_plan_assignment WHERE team_id=$1`, f.team).Scan(&plans); err != nil || plans != 0 {
+			t.Fatalf("retiring Developer assigned a plan: %d %v", plans, err)
+		}
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/checkout", nil)
+		f.h.createProCheckout(c, f.team, f.actor, billingCheckoutSessionRequest{Offer: "developer_monthly"})
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_offer") {
+			t.Fatalf("retired Developer checkout: %d %s", rec.Code, rec.Body.String())
+		}
+		terms, err := f.h.planTermsForPricingVersion(t.Context(), "pro_monthly", "v2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		offer := proOffer{Key: terms.OfferKey, Name: terms.DisplayName, Price: "price_local_pro", Amount: terms.FeeCents, Months: 1, Credit: terms.MonthlyCreditCents, VersionID: terms.VersionID, Version: terms.Version, Family: terms.Family, Pricing: "v2", PricingV2: true, Limits: &terms.Limits, Grants: terms.Grants}
+		params := StripeCreateCheckoutSessionParams{CustomerID: "cus_local_trial", OperationID: uuid.New(), ClientReferenceID: f.team.String(), BasePriceID: offer.Price, OneOffProduct: "prod_local_pro", AllowPromotionCodes: true, PlanTerms: &StripeCheckoutPlanTerms{Amount: offer.Amount, Months: 1, Credit: offer.Credit, VersionID: offer.VersionID, Version: offer.Version, Family: offer.Family, PricingV2: true, Limits: offer.Limits, Grants: offer.Grants}}
+		provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "test unavailable", 503) }))
+		f.h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+		admission, err := f.h.teamPricingState(t.Context(), f.team)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec = httptest.NewRecorder()
+		c, _ = gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/quote", nil)
+		f.h.createProUpgrade(c, f.team, f.actor, offer, params, admission)
+		provider.Close()
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s team could not buy Pro after Developer was retired: %d %s", want, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestNewTeamCohortTrialTeamCannotBuyPrepaidCredit(t *testing.T) {
+	f := newTeamCohortTestFixture(t)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("trial team reached the provider: %s %s", r.Method, r.URL.Path)
+		http.Error(w, "unexpected", 500)
+	}))
+	t.Cleanup(provider.Close)
+	f.h.Stripe = &stripeHTTPClient{baseURL: provider.URL, httpClient: provider.Client(), apiVersion: "2026-07-29.dahlia"}
+	r := gin.New()
+	r.POST("/billing/prepaid/checkout", func(c *gin.Context) {
+		c.Set("team_id", f.team.String())
+		c.Set("actor_id", f.actor)
+		f.h.CreatePrepaidCheckout(c)
+	})
+	for _, req := range []prepaidCheckoutBody{
+		{AmountCents: 500, SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"},
+		{AmountCents: 500, OperationID: uuid.New(), SuccessURL: "https://console.example.com/ok", CancelURL: "https://console.example.com/cancel"},
+	} {
+		rec := prepaidOperationPost(r, req)
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "plan_required") {
+			t.Fatalf("trial team prepaid purchase: %d %s", rec.Code, rec.Body)
+		}
+	}
+	r.POST("/stripe/checkout-session", func(c *gin.Context) {
+		c.Set("team_id", f.team.String())
+		c.Set("actor_id", f.actor)
+		f.h.CreateStripeCheckoutSession(c)
+	})
+	for _, body := range []string{`{"success_url":"https://console.example.com/ok","cancel_url":"https://console.example.com/cancel"}`, `{"offer":"free","success_url":"https://console.example.com/ok","cancel_url":"https://console.example.com/cancel"}`} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/stripe/checkout-session", strings.NewReader(body)))
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "plan_required") {
+			t.Fatalf("trial team pay-as-you-go checkout: %d %s", rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestNewTeamCohortTrialTeamIsNotOfferedFree(t *testing.T) {
+	f := newTeamCohortTestFixture(t)
+	get := func(path string, handle gin.HandlerFunc, team uuid.UUID) map[string]any {
+		t.Helper()
+		r := gin.New()
+		r.GET(path, func(c *gin.Context) {
+			c.Set("team_id", team.String())
+			c.Set("actor_id", f.actor)
+			handle(c)
+		})
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		var v map[string]any
+		if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &v) != nil {
+			t.Fatalf("%s: %d %s", path, rec.Code, rec.Body)
+		}
+		return v
+	}
+	fresh := get("/cap", f.h.GetBillingCapabilities, f.team)["fresh_entry"].(map[string]any)
+	if fresh["choose_free"] != false || fresh["starter"] != false || fresh["auto_recharge"] != false || fresh["pro"] != true {
+		t.Fatalf("trial team offers: %+v", fresh)
+	}
+	plan := get("/summary", f.h.GetBillingSummary, f.team)["plan"].(map[string]any)
+	if plan["key"] != "trial" || plan["name"] != "Free trial" || plan["status"] != entryTrial {
+		t.Fatalf("trial team summary plan: %+v", plan)
+	}
+	if _, err := f.h.Pool.Exec(t.Context(), `UPDATE team_trial_eligibility_cache SET eligible=false WHERE team_id=$1`, f.team); err != nil {
+		t.Fatal(err)
+	}
+	if plan = get("/summary", f.h.GetBillingSummary, f.team)["plan"].(map[string]any); plan["status"] != entryTrialEnded {
+		t.Fatalf("ended trial summary plan: %+v", plan)
 	}
 }

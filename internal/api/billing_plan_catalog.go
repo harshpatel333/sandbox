@@ -66,6 +66,23 @@ type planAllowance struct {
 	Compute     *planCompute `json:"compute,omitempty"`
 }
 
+// Funding policies: how a subscription's usage is funded. Prepaid spends the
+// included and topped-up credit and pauses sandboxes when it runs out; the
+// prepaid kind is always funded that way.
+const (
+	fundingPolicyPrepaid  = "prepaid"
+	fundingPolicyPostpaid = "postpaid"
+)
+
+// planTopoff is the automatic top-up a prepaid-funded plan offers: AmountCents
+// of non-expiring credit once the balance falls below ThresholdCents.
+// DefaultEnabled is what checkout preselects.
+type planTopoff struct {
+	AmountCents    int64 `json:"amount_cents"`
+	ThresholdCents int64 `json:"threshold_cents"`
+	DefaultEnabled bool  `json:"default_enabled"`
+}
+
 var planKinds = map[string]bool{"free": true, "prepaid": true, "subscription": true, "legacy_payg": true, "custom": true}
 
 type planVersion struct {
@@ -89,6 +106,8 @@ type planVersion struct {
 	Matching        *planMatching  `json:"matching"`
 	Allowance       *planAllowance `json:"allowance"`
 	Limits          planLimits     `json:"limits"`
+	FundingPolicy   string         `json:"funding_policy"`
+	Topoff          *planTopoff    `json:"topoff"`
 	CreatedBy       *uuid.UUID     `json:"created_by"`
 	CreatedAt       time.Time      `json:"created_at"`
 	UpdatedAt       time.Time      `json:"updated_at"`
@@ -102,6 +121,7 @@ const planVersionColumns = `id,pricing_version,family,version,state,kind,public,
 monthly_fee_cents,annual_fee_cents,credit_schedule,matching_bps,cap_cents,
 allowance_period,allowance_on_exhausted,allowance_cents,allowance_compute_seconds,allowance_compute_vcpu,allowance_compute_memory_gib,
 max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates,
+funding_policy,topoff_amount_cents,topoff_threshold_cents,topoff_default_enabled,
 created_by,created_at,updated_at,published_by,published_at,retired_by,retired_at`
 
 func scanPlanVersion(row pgx.Row) (planVersion, error) {
@@ -111,10 +131,13 @@ func scanPlanVersion(row pgx.Row) (planVersion, error) {
 	var capCents, allowanceCents *int64
 	var period, onExhausted *string
 	var seconds, vcpu, memory *int32
+	var topoffAmount, topoffThreshold *int64
+	var topoffDefault *bool
 	err := row.Scan(&v.ID, &v.PricingVersion, &v.Family, &v.Version, &v.State, &v.Kind, &v.Public, &v.DisplayName, &v.PriceLabel, &v.Tagline, &v.Features,
 		&v.SortOrder, &v.DisplayOnly, &v.SelfServe, &v.MonthlyFeeCents, &v.AnnualFeeCents, &schedule, &bps, &capCents,
 		&period, &onExhausted, &allowanceCents, &seconds, &vcpu, &memory,
 		&v.Limits.MaxConcurrent, &v.Limits.MaxVCPU, &v.Limits.MaxMemoryMiB, &v.Limits.MaxDiskMiB, &v.Limits.MaxTemplates,
+		&v.FundingPolicy, &topoffAmount, &topoffThreshold, &topoffDefault,
 		&v.CreatedBy, &v.CreatedAt, &v.UpdatedAt, &v.PublishedBy, &v.PublishedAt, &v.RetiredBy, &v.RetiredAt)
 	if err != nil {
 		return v, err
@@ -124,6 +147,9 @@ func scanPlanVersion(row pgx.Row) (planVersion, error) {
 	}
 	if bps != nil && capCents != nil {
 		v.Matching = &planMatching{MatchingBps: *bps, CapCents: *capCents}
+	}
+	if topoffAmount != nil && topoffThreshold != nil && topoffDefault != nil {
+		v.Topoff = &planTopoff{AmountCents: *topoffAmount, ThresholdCents: *topoffThreshold, DefaultEnabled: *topoffDefault}
 	}
 	if period != nil && onExhausted != nil {
 		v.Allowance = &planAllowance{Period: *period, OnExhausted: *onExhausted}
@@ -224,6 +250,15 @@ func (v planVersion) validate() error {
 			return errors.New("v2 Free requires a daily allowance that pauses on exhaustion and every sandbox shape limit")
 		}
 	}
+	if v.FundingPolicy != "" && v.FundingPolicy != fundingPolicyPrepaid && v.FundingPolicy != fundingPolicyPostpaid {
+		return errors.New("funding policy must be prepaid or postpaid")
+	}
+	if v.prepaidFunded() && (v.Kind != "subscription" || v.PricingVersion != "v2") {
+		return errors.New("only v2 subscription plans take a prepaid funding policy")
+	}
+	if t := v.Topoff; t != nil && (!v.prepaidFunded() || !validNewPrepaidAmount(t.AmountCents) || !validNewPrepaidAmount(t.ThresholdCents)) {
+		return errors.New("top-off needs a prepaid funding policy, and its amount and threshold must be multiples of $5 up to $10,000")
+	}
 	if v.DisplayOnly {
 		if v.hasFee() || v.SelfServe || len(v.CreditSchedule) != 0 || v.Matching != nil || v.Allowance != nil {
 			return errors.New("display-only plans carry no fees, credits, matching, allowance or self-serve checkout")
@@ -246,6 +281,12 @@ func (v planVersion) validate() error {
 		return errors.New("a custom plan needs a fee, credits, matching, an allowance or limits")
 	}
 	return nil
+}
+
+// prepaidFunded reports a subscription funded like prepaid credit. An unset
+// policy is postpaid.
+func (v planVersion) prepaidFunded() bool {
+	return v.FundingPolicy == fundingPolicyPrepaid
 }
 
 func (v planVersion) hasFee() bool {

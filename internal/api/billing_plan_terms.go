@@ -37,6 +37,8 @@ type planTerms struct {
 	Matching           *planMatching
 	Allowance          *planAllowance
 	Limits             planLimits
+	PrepaidFunded      bool
+	Topoff             *planTopoff
 	Available          bool
 	Retired            bool
 }
@@ -208,7 +210,7 @@ func (h *Handlers) termsOfVersion(ctx context.Context, v planVersion, months int
 	credit, _ := uniformMonthlyCredit(v.CreditSchedule)
 	return planTerms{OfferKey: offerKey, DisplayName: v.DisplayName, FeeCents: feeCents, IntervalMonths: months, MonthlyCreditCents: credit,
 		VersionID: v.ID, Version: v.Version, PricingVersion: v.PricingVersion, Family: v.Family, Kind: v.Kind, Grants: v.CreditSchedule,
-		Matching: v.Matching, Allowance: allowance, Limits: v.Limits, Available: v.sellable() && !retired, Retired: retired}, nil
+		Matching: v.Matching, Allowance: allowance, Limits: v.Limits, PrepaidFunded: v.prepaidFunded(), Topoff: v.Topoff, Available: v.sellable() && !retired, Retired: retired}, nil
 }
 
 // resolveAllowance prices a compute allowance at the public rate card, the

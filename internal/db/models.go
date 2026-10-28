@@ -354,6 +354,13 @@ type BillingCatalogAudit struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type BillingCheckoutTopoff struct {
+	SessionID string    `json:"session_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	Enabled   bool      `json:"enabled"`
+	AppliedAt time.Time `json:"applied_at"`
+}
+
 type BillingCommercialContract struct {
 	ID                     uuid.UUID          `json:"id"`
 	TeamID                 uuid.UUID          `json:"team_id"`
@@ -867,14 +874,14 @@ type BillingMeterReconciliation struct {
 }
 
 type BillingNewTeamEnrollment struct {
-	TeamID               uuid.UUID `json:"team_id"`
-	Region               string    `json:"region"`
-	EnrollmentEpoch      uuid.UUID `json:"enrollment_epoch"`
-	InitialAssignmentID  uuid.UUID `json:"initial_assignment_id"`
-	InitialFreeVersionID uuid.UUID `json:"initial_free_version_id"`
-	CreatorUserID        uuid.UUID `json:"creator_user_id"`
-	Source               string    `json:"source"`
-	EnrolledAt           time.Time `json:"enrolled_at"`
+	TeamID               uuid.UUID   `json:"team_id"`
+	Region               string      `json:"region"`
+	EnrollmentEpoch      uuid.UUID   `json:"enrollment_epoch"`
+	InitialAssignmentID  pgtype.UUID `json:"initial_assignment_id"`
+	InitialFreeVersionID pgtype.UUID `json:"initial_free_version_id"`
+	CreatorUserID        uuid.UUID   `json:"creator_user_id"`
+	Source               string      `json:"source"`
+	EnrolledAt           time.Time   `json:"enrolled_at"`
 }
 
 type BillingNewTeamGate struct {
@@ -1001,6 +1008,10 @@ type BillingPlanVersion struct {
 	PublishedAt               pgtype.Timestamptz `json:"published_at"`
 	RetiredBy                 pgtype.UUID        `json:"retired_by"`
 	RetiredAt                 pgtype.Timestamptz `json:"retired_at"`
+	FundingPolicy             string             `json:"funding_policy"`
+	TopoffAmountCents         *int64             `json:"topoff_amount_cents"`
+	TopoffThresholdCents      *int64             `json:"topoff_threshold_cents"`
+	TopoffDefaultEnabled      *bool              `json:"topoff_default_enabled"`
 }
 
 type BillingPrepaidAutoRecharge struct {
@@ -1425,6 +1436,16 @@ type BillingTeamPauseTarget struct {
 	Reason       string             `json:"reason"`
 	RequestedAt  time.Time          `json:"requested_at"`
 	DoneAt       pgtype.Timestamptz `json:"done_at"`
+}
+
+type BillingTrialPolicy struct {
+	Singleton    bool           `json:"singleton"`
+	CreditUsd    pgtype.Numeric `json:"credit_usd"`
+	MaxSandboxes *int32         `json:"max_sandboxes"`
+	MaxVcpu      *int32         `json:"max_vcpu"`
+	MaxMemoryMib *int32         `json:"max_memory_mib"`
+	MaxDiskMib   *int32         `json:"max_disk_mib"`
+	UpdatedAt    time.Time      `json:"updated_at"`
 }
 
 type BillingUsageEntitlement struct {

@@ -39,7 +39,7 @@ func (h *Handlers) startProBillingMonitoring(ctx context.Context) {
 	}()
 }
 func (h *Handlers) sampleProBillingBacklog(ctx context.Context, recorder telemetry.ProBillingRecorder) error {
-	rows, err := h.Pool.Query(ctx, `SELECT offer_key FROM billing_plan ORDER BY sort_order,offer_key`)
+	rows, err := h.Pool.Query(ctx, `SELECT k FROM billing_paid_offer_keys() k ORDER BY k`)
 	if err != nil {
 		return err
 	}

@@ -3938,8 +3938,8 @@ components:
       type: object
       description: >-
         The team's commercial plan. Separate from pricing_tier, which is the
-        usage rate card every plan shares. Teams without a paid plan are Free.
-        Remaining credit, including Pro's included usage, is reported by the
+        usage rate card every plan shares. Teams without a paid plan are Free,
+        except new teams on the free trial, which report key trial. Remaining credit, including Pro's included usage, is reported by the
         Stripe credit fields.
       required:
         - key
@@ -3953,15 +3953,18 @@ components:
       properties:
         key:
           type: string
-          description: free, a plan catalog offer key such as pro_annual, or a managed offer such as yc_2026.
+          description: free, trial, a plan catalog offer key such as pro_annual, or a managed offer such as yc_2026.
           example: pro_annual
         name:
           type: string
           example: Pro Annual
         status:
           type: string
-          enum: [active, pending]
-          description: pending until the plan's first payment is confirmed.
+          enum: [active, pending, trial, trial_ended, payment_failed]
+          description: >-
+            pending until the plan's first payment is confirmed. A new team
+            that has not bought a plan reports key trial with its entry state:
+            trial, trial_ended or payment_failed.
         price_usd:
           type: number
           format: double
@@ -5586,7 +5589,7 @@ components:
 
     BillingCapabilitiesResponse:
       type: object
-      required: [schema_version, team_id, pricing_version, admission_source, entry_open, epoch, enrollment_epoch, fresh_entry, actions, catalog]
+      required: [schema_version, team_id, pricing_version, admission_source, entry_open, epoch, enrollment_epoch, fresh_entry, actions, catalog, offers]
       properties:
         schema_version:
           type: integer
@@ -5634,6 +5637,63 @@ components:
               type: boolean
         catalog:
           $ref: "#/components/schemas/BillingPlansResponse"
+        offers:
+          type: array
+          description: Every priced interval of the catalog's plans, whether or not it can be checked out now.
+          items:
+            $ref: "#/components/schemas/BillingOffer"
+
+    BillingOffer:
+      type: object
+      required: [offer_key, family, display_name, price_cents, interval_months, included_credit_cents, funding_policy, topoff, sellable]
+      properties:
+        offer_key:
+          type: string
+        family:
+          type: string
+        display_name:
+          type: string
+        price_cents:
+          type: integer
+          format: int64
+          description: Fee in USD cents per billing interval.
+        interval_months:
+          type: integer
+          enum: [1, 12]
+        included_credit_cents:
+          type: integer
+          format: int64
+          description: Credit included every month; 0 when the plan has no uniform monthly credit.
+        funding_policy:
+          $ref: "#/components/schemas/BillingFundingPolicy"
+        topoff:
+          $ref: "#/components/schemas/BillingPlanTopoff"
+        sellable:
+          type: boolean
+          description: Whether this team can check out the offer now.
+
+    BillingFundingPolicy:
+      type: string
+      enum: [prepaid, postpaid]
+      description: "`prepaid` spends included and topped-up credit and pauses sandboxes when it runs out; `postpaid` bills usage at the end of the period."
+
+    BillingPlanTopoff:
+      type: object
+      nullable: true
+      required: [amount_cents, threshold_cents, default_enabled]
+      description: Automatic top-up offered with a prepaid plan.
+      properties:
+        amount_cents:
+          type: integer
+          format: int64
+          description: Non-expiring credit bought on each top-up, in USD cents.
+        threshold_cents:
+          type: integer
+          format: int64
+          description: A top-up is bought when the balance falls below this, in USD cents.
+        default_enabled:
+          type: boolean
+          description: Whether checkout preselects automatic top-up.
 
     BillingSignupAdmission:
       type: object
@@ -5676,7 +5736,7 @@ components:
             $ref: "#/components/schemas/BillingPlan"
     BillingPlanCard:
       type: object
-      required: [family, version, kind, name, price_label, tagline, features, display_only, monthly, annual, credit_summary, monthly_credit_cents, allowance, matching, limits]
+      required: [family, version, kind, name, price_label, tagline, features, display_only, monthly, annual, credit_summary, monthly_credit_cents, allowance, matching, limits, funding_policy, topoff]
       properties:
         family:
           type: string
@@ -5760,6 +5820,10 @@ components:
               format: int64
         limits:
           $ref: "#/components/schemas/BillingPlanLimits"
+        funding_policy:
+          $ref: "#/components/schemas/BillingFundingPolicy"
+        topoff:
+          $ref: "#/components/schemas/BillingPlanTopoff"
     BillingPlanLimits:
       type: object
       required: [max_concurrent, max_vcpu, max_memory_mib, max_disk_mib, max_templates]
@@ -5876,8 +5940,16 @@ components:
           nullable: true
     BillingPlanResponse:
       type: object
-      required: [plan, period, pending_change]
+      required: [plan, entry_state, period, pending_change]
       properties:
+        entry_state:
+          type: string
+          enum: [trial, trial_ended, payment_failed, active]
+          description: >-
+            Whether the team has paid for a plan. A new team is on its trial
+            with compute until the trial credit runs out (trial_ended), or a
+            checkout still needs a usable card (payment_failed); active covers
+            every team with a plan.
         plan:
           type: object
           nullable: true
@@ -5938,6 +6010,10 @@ components:
         accepted:
           type: boolean
           description: Whether these terms belong to an existing accepted checkout. This does not indicate that payment has completed.
+        offer_key:
+          type: string
+          description: Catalog offer of the accepted checkout, such as pro_monthly or developer_monthly; omitted when no checkout has been accepted.
+          example: developer_monthly
         period_start:
           type: string
           format: date-time

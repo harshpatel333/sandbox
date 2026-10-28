@@ -331,6 +331,15 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	g.Go(func() error {
 		row, err := h.DB.GetCurrentCommercialPlan(ctx, teamID)
 		if errors.Is(err, pgx.ErrNoRows) {
+			// A team still choosing its first plan is on its trial, not Free.
+			entry, e := teamEntryState(ctx, h.Pool, teamID)
+			if e != nil {
+				return fmt.Errorf("get team entry state: %w", e)
+			}
+			if entry != entryActive {
+				plan = billingSummaryPlan{Key: "trial", Name: "Free trial", Status: entry}
+				return nil
+			}
 			plan = billingSummaryPlan{Key: "free", Name: "Free", Status: "active"}
 			return nil
 		}

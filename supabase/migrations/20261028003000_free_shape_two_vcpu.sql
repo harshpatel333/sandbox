@@ -155,12 +155,13 @@ BEGIN
  RAISE NOTICE 'free shape: % open assignments moved to the new shape, % kept for a purchase in flight',moved,skipped;
 END $$;
 
--- 4. The new-team gate release validates the published Free shape; it now
--- expects the curated template shape. Body otherwise unchanged from
--- 20261027140152_new_team_billing_cohort.sql.
+-- 4. The new-team gate release keeps every launch condition: sellable
+-- Developer and Pro with a configured trial, or a usable Free whose caps fit
+-- the curated template shape, plus the cohort, pending-payment and Free
+-- enforcement schema.
 CREATE OR REPLACE FUNCTION billing_release_new_team_gate(p_region text,p_system uuid,p_epoch uuid,p_actor text,p_reason text,p_evidence jsonb)
 RETURNS uuid LANGUAGE plpgsql SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE g billing_new_team_gate; f billing_plan_version; raw text;
+DECLARE g billing_new_team_gate; raw text;
 BEGIN
  IF current_setting('transaction_isolation')<>'read committed' THEN RAISE EXCEPTION 'release requires READ COMMITTED isolation'; END IF;
  SELECT pricing_version INTO STRICT raw FROM billing_pricing_switch WHERE singleton FOR SHARE;
@@ -171,20 +172,20 @@ BEGIN
  END IF;
  g.evidence:=p_evidence;
  IF NOT billing_new_team_evidence_valid(g) THEN RAISE EXCEPTION 'verified cohort-contract writer and schema evidence required' USING ERRCODE='55000'; END IF;
- SELECT * INTO f FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published' FOR SHARE;
- IF NOT FOUND OR f.kind<>'free' OR f.max_templates IS DISTINCT FROM 0 OR f.allowance_period IS DISTINCT FROM 'day_window'
-  OR f.allowance_on_exhausted IS DISTINCT FROM 'pause' OR f.allowance_compute_seconds IS DISTINCT FROM 7200
-  OR f.allowance_compute_vcpu IS DISTINCT FROM 1 OR f.allowance_compute_memory_gib IS DISTINCT FROM 1
-  OR f.max_sandboxes IS DISTINCT FROM 1 OR f.max_template_vcpu IS DISTINCT FROM 2 OR f.max_template_memory_mib IS DISTINCT FROM 4096
-  OR f.max_template_disk_mib IS DISTINCT FROM 8192 OR f.display_only OR f.self_serve THEN
-  RAISE EXCEPTION 'usable zero-template two-hour Free catalog required' USING ERRCODE='55000';
+ IF NOT (billing_paid_first_sellable() AND billing_trial_configured()) AND NOT EXISTS(SELECT 1 FROM billing_plan_version v
+   WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published' AND v.kind='free' AND v.max_templates=0
+    AND v.allowance_period='day_window' AND v.allowance_on_exhausted='pause' AND v.allowance_compute_seconds>0
+    AND v.allowance_compute_vcpu>0 AND v.allowance_compute_memory_gib>0 AND NOT v.display_only AND NOT v.self_serve
+    AND v.max_template_vcpu>=2 AND v.max_template_memory_mib>=4096 AND v.max_template_disk_mib>=8192) THEN
+  RAISE EXCEPTION 'a usable Free catalog, or sellable Developer and Pro with a configured trial, required' USING ERRCODE='55000';
  END IF;
- IF to_regprocedure('billing_free_allowance_refresh(uuid)') IS NULL OR to_regprocedure('billing_free_plan(uuid)') IS NULL
-  OR to_regprocedure('request_team_pause_all(uuid,text)') IS NULL OR to_regprocedure('billing_lock_team_pricing_state(uuid)') IS NULL
+ IF to_regprocedure('billing_lock_team_pricing_state(uuid)') IS NULL OR to_regprocedure('billing_team_awaiting_plan(uuid)') IS NULL
+  OR to_regprocedure('billing_free_allowance_refresh(uuid)') IS NULL OR to_regprocedure('billing_free_plan(uuid)') IS NULL
+  OR to_regprocedure('request_team_pause_all(uuid,text)') IS NULL
   OR NOT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='team_plan_assignment'::regclass AND attname='free_allowance_since' AND NOT attisdropped)
   OR NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='team'::regclass AND tgname='team_new_free_plan' AND tgenabled IN ('O','A') AND tgfoid='assign_new_team_free_plan()'::regprocedure)
   OR NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='sandbox'::regclass AND tgname='sandbox_free_shape' AND tgenabled IN ('O','A')) THEN
-  RAISE EXCEPTION 'cohort, Free enforcement and allowance worker schema required' USING ERRCODE='55000';
+  RAISE EXCEPTION 'cohort, pending-payment and Free enforcement schema required' USING ERRCODE='55000';
  END IF;
  UPDATE billing_new_team_gate SET state='released',evidence=p_evidence,released_at=clock_timestamp() WHERE singleton;
  INSERT INTO billing_new_team_gate_event(epoch,region,action,actor,reason,details) VALUES(g.epoch,g.region,'release',p_actor,p_reason,p_evidence);
