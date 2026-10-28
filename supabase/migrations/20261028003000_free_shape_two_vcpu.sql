@@ -9,18 +9,95 @@
 --     to its latest published version (team_effective_limits).
 --  3. Open Free and legacy pay-as-you-go assignments: existing teams carry
 --     frozen caps, so each one still below the shape closes and reopens on the
---     new version of its plan. Teams whose limits staff customized keep their
---     team row untouched (apply_assignment_limits).
+--     new version of its plan (billing_raise_plan_shape). A team with a
+--     purchase in flight keeps its assignment, since the checkout names it;
+--     the Free allowance sweep calls the same function so such a team moves
+--     once the purchase settles. Teams whose limits staff customized keep
+--     their team row untouched (apply_assignment_limits).
 --  4. The new-team gate release pins the Free shape it expects; it now expects
 --     this one.
+-- Moves every open Free or legacy pay-as-you-go assignment still below the
+-- curated template shape onto the published version of its plan. Safe to
+-- call repeatedly; the Free allowance sweep does, so a team that kept its
+-- assignment while a purchase was in flight moves once that settles.
+CREATE OR REPLACE FUNCTION billing_raise_plan_shape(OUT moved integer, OUT skipped integer)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE
+ free_id uuid; free_version integer;
+ payg_id uuid; payg_version integer;
+ a team_plan_assignment;
+ at_time timestamptz;
+ in_flight boolean;
+BEGIN
+ moved:=0; skipped:=0;
+ SELECT id,version INTO free_id,free_version FROM billing_plan_version
+  WHERE family='free' AND pricing_version='v2' AND state='published';
+ SELECT id,version INTO payg_id,payg_version FROM billing_plan_version
+  WHERE family='payg' AND pricing_version='legacy' AND kind='legacy_payg' AND state='published';
+ FOR a IN SELECT p.* FROM team_plan_assignment p
+  WHERE p.kind IN ('free','legacy_payg') AND p.effective_to IS NULL AND p.contract_id IS NULL
+   AND (COALESCE(billing_json_cap(p.limits->'max_vcpu'),0)<2
+    OR COALESCE(billing_json_cap(p.limits->'max_memory_mib'),0)<4096
+    OR COALESCE(billing_json_cap(p.limits->'max_disk_mib'),0)<8192)
+  ORDER BY p.team_id
+ LOOP
+  -- One team's frozen invoice history must not hold back every other team;
+  -- such a team keeps its old caps and is reported for a manual follow-up.
+  BEGIN
+   -- Same order as financial operations: invoice serialization, then team.
+   PERFORM pg_advisory_xact_lock(hashtextextended('invoice:'||a.team_id::text,0));
+   PERFORM 1 FROM team WHERE id=a.team_id FOR UPDATE;
+   PERFORM 1 FROM team_plan_assignment WHERE id=a.id AND effective_to IS NULL;
+   IF NOT FOUND THEN CONTINUE; END IF;
+   -- A purchase in flight snapshots the current assignment id and refuses to
+   -- activate against a different one. Such a team keeps its caps until the
+   -- purchase settles; the paid plan it lands on carries larger ones.
+   SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=a.team_id AND status<>'ended')
+    OR EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=a.team_id AND state NOT IN ('expired','ended'))
+    OR EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=a.team_id AND state='pending' AND offer_key<>'free')
+    OR EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=a.team_id AND (checkout_initializing_at IS NOT NULL OR checkout_may_exist))
+    OR EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE team_id=a.team_id AND (payment_state IN ('pending','uncertain','processing') OR credit_state IN ('pending','uncertain')))
+    OR EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=a.team_id AND state IN ('scheduled','applied'))
+   INTO in_flight;
+   IF in_flight THEN
+    skipped:=skipped+1;
+    CONTINUE;
+   END IF;
+   at_time:=clock_timestamp();
+   UPDATE team_plan_assignment SET effective_to=at_time WHERE id=a.id;
+   INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason,idempotency_key)
+   VALUES(a.team_id,a.plan_key,a.kind,
+    CASE a.kind WHEN 'free' THEN COALESCE(free_id,a.plan_version_id) ELSE COALESCE(payg_id,a.plan_version_id) END,
+    a.terms||CASE a.kind
+     WHEN 'free' THEN COALESCE(jsonb_build_object('version_id',free_id,'version',free_version),'{}'::jsonb)
+     ELSE COALESCE(jsonb_build_object('version_id',payg_id,'version',payg_version),'{}'::jsonb) END,
+    a.limits||jsonb_build_object(
+     'max_vcpu',GREATEST(COALESCE(billing_json_cap(a.limits->'max_vcpu'),0),2),
+     'max_memory_mib',GREATEST(COALESCE(billing_json_cap(a.limits->'max_memory_mib'),0),4096),
+     'max_disk_mib',GREATEST(COALESCE(billing_json_cap(a.limits->'max_disk_mib'),0),8192)),
+    at_time,'migration','Plan shape raised to 2 vCPU / 4096 MiB / 8192 MiB','free-shape-2-4-8:'||a.id);
+   moved:=moved+1;
+  EXCEPTION WHEN OTHERS THEN
+   RAISE WARNING 'free shape: team % kept its plan caps: %',a.team_id,SQLERRM;
+  END;
+ END LOOP;
+END $$;
+REVOKE ALL ON FUNCTION billing_raise_plan_shape() FROM PUBLIC;
+DO $$ DECLARE r text; BEGIN
+ FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
+   EXECUTE format('REVOKE ALL ON FUNCTION billing_raise_plan_shape() FROM %I',r);
+   IF r='service_role' THEN EXECUTE format('GRANT EXECUTE ON FUNCTION billing_raise_plan_shape() TO %I',r); END IF;
+  END IF;
+ END LOOP;
+END $$;
+
 DO $$
 DECLARE
  old billing_plan_version;
  free_id uuid; free_version integer;
  payg_id uuid; payg_version integer;
- a team_plan_assignment;
- at_time timestamptz;
- moved integer := 0; skipped integer := 0; in_flight boolean;
+ moved integer; skipped integer;
 BEGIN
  -- Once the new-team cohort is live, every catalog write must leave a
  -- zero-template Free published (cohort_free_catalog_retained). Say so up
@@ -45,8 +122,8 @@ BEGIN
    'max_template_disk_mib',GREATEST(old.max_template_disk_mib,8192),
    -- The allowance keeps its compute basis, so at the new shape it no
    -- longer lasts two hours; stop promising that on the plan card.
-   'features',to_jsonb((SELECT array_agg(CASE WHEN f='2 hours of compute every day' THEN 'Daily compute allowance' ELSE f END ORDER BY o)
-    FROM unnest(old.features) WITH ORDINALITY AS u(f,o))),
+   'features',to_jsonb(COALESCE((SELECT array_agg(CASE WHEN f='2 hours of compute every day' THEN 'Daily compute allowance' ELSE f END ORDER BY o)
+    FROM unnest(old.features) WITH ORDINALITY AS u(f,o)),'{}'::text[])),
    'created_by',NULL,'created_at',clock_timestamp(),'updated_at',clock_timestamp(),
    'published_by',NULL,'published_at',NULL,'retired_by',NULL,'retired_at',NULL))).*;
   PERFORM publish_billing_plan_version(free_id,NULL);
@@ -73,52 +150,9 @@ BEGIN
  SELECT id,version INTO payg_id,payg_version FROM billing_plan_version
   WHERE family='payg' AND pricing_version='legacy' AND kind='legacy_payg' AND state='published';
 
- -- 3. Open Free and legacy pay-as-you-go assignments still below the shape.
- FOR a IN SELECT p.* FROM team_plan_assignment p
-  WHERE p.kind IN ('free','legacy_payg') AND p.effective_to IS NULL AND p.contract_id IS NULL
-   AND (COALESCE(billing_json_cap(p.limits->'max_vcpu'),0)<2
-    OR COALESCE(billing_json_cap(p.limits->'max_memory_mib'),0)<4096
-    OR COALESCE(billing_json_cap(p.limits->'max_disk_mib'),0)<8192)
-  ORDER BY p.team_id
- LOOP
-  -- One team's frozen invoice history must not hold back every other team;
-  -- such a team keeps its old caps and is reported for a manual follow-up.
-  BEGIN
-   PERFORM 1 FROM team WHERE id=a.team_id FOR UPDATE;
-   -- A purchase in flight snapshots the current assignment id and refuses to
-   -- activate against a different one. Such a team keeps its caps until the
-   -- purchase settles; the paid plan it lands on carries larger ones.
-   SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=a.team_id AND status<>'ended')
-    OR EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=a.team_id AND state NOT IN ('expired','ended'))
-    OR EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=a.team_id AND state='pending' AND offer_key<>'free')
-    OR EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=a.team_id AND (checkout_initializing_at IS NOT NULL OR checkout_may_exist))
-    OR EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE team_id=a.team_id AND (payment_state IN ('pending','uncertain','processing') OR credit_state IN ('pending','uncertain')))
-    OR EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=a.team_id AND state IN ('scheduled','applied'))
-   INTO in_flight;
-   IF in_flight THEN
-    skipped:=skipped+1;
-    RAISE WARNING 'free shape: team % has a purchase in flight; caps unchanged',a.team_id;
-    CONTINUE;
-   END IF;
-   at_time:=clock_timestamp();
-   UPDATE team_plan_assignment SET effective_to=at_time WHERE id=a.id;
-   INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason,idempotency_key)
-   VALUES(a.team_id,a.plan_key,a.kind,
-    CASE a.kind WHEN 'free' THEN COALESCE(free_id,a.plan_version_id) ELSE COALESCE(payg_id,a.plan_version_id) END,
-    a.terms||CASE a.kind
-     WHEN 'free' THEN COALESCE(jsonb_build_object('version_id',free_id,'version',free_version),'{}'::jsonb)
-     ELSE COALESCE(jsonb_build_object('version_id',payg_id,'version',payg_version),'{}'::jsonb) END,
-    a.limits||jsonb_build_object(
-     'max_vcpu',GREATEST(COALESCE(billing_json_cap(a.limits->'max_vcpu'),0),2),
-     'max_memory_mib',GREATEST(COALESCE(billing_json_cap(a.limits->'max_memory_mib'),0),4096),
-     'max_disk_mib',GREATEST(COALESCE(billing_json_cap(a.limits->'max_disk_mib'),0),8192)),
-    at_time,'migration','Plan shape raised to 2 vCPU / 4096 MiB / 8192 MiB','free-shape-2-4-8:'||a.id);
-   moved:=moved+1;
-  EXCEPTION WHEN OTHERS THEN
-   RAISE WARNING 'free shape: team % kept its plan caps: %',a.team_id,SQLERRM;
-  END;
- END LOOP;
- RAISE NOTICE 'free shape: % open assignments moved to the new shape, % skipped for a purchase in flight',moved,skipped;
+ -- 3. Open assignments still below the shape.
+ SELECT * INTO moved,skipped FROM billing_raise_plan_shape();
+ RAISE NOTICE 'free shape: % open assignments moved to the new shape, % kept for a purchase in flight',moved,skipped;
 END $$;
 
 -- 4. The new-team gate release validates the published Free shape; it now
@@ -142,7 +176,7 @@ BEGIN
   OR f.allowance_on_exhausted IS DISTINCT FROM 'pause' OR f.allowance_compute_seconds IS DISTINCT FROM 7200
   OR f.allowance_compute_vcpu IS DISTINCT FROM 1 OR f.allowance_compute_memory_gib IS DISTINCT FROM 1
   OR f.max_sandboxes IS DISTINCT FROM 1 OR f.max_template_vcpu IS DISTINCT FROM 2 OR f.max_template_memory_mib IS DISTINCT FROM 4096
-  OR f.max_template_disk_mib IS NULL OR f.display_only OR f.self_serve THEN
+  OR f.max_template_disk_mib IS DISTINCT FROM 8192 OR f.display_only OR f.self_serve THEN
   RAISE EXCEPTION 'usable zero-template two-hour Free catalog required' USING ERRCODE='55000';
  END IF;
  IF to_regprocedure('billing_free_allowance_refresh(uuid)') IS NULL OR to_regprocedure('billing_free_plan(uuid)') IS NULL

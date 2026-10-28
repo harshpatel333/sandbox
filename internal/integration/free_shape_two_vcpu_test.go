@@ -188,4 +188,19 @@ func TestFreeShapeTwoVCPUKeepsInFlightCheckout(t *testing.T) {
 	if assignments != 1 || !stillOpen {
 		t.Fatalf("in-flight checkout team must keep its assignment: assignments=%d open=%v", assignments, stillOpen)
 	}
+	// Once the purchase settles, the sweep's call moves the team.
+	if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET checkout_may_exist=false WHERE team_id=$1`, team); err != nil {
+		t.Fatal(err)
+	}
+	var moved int
+	if err := testPool.QueryRow(ctx, `SELECT moved FROM billing_raise_plan_shape()`).Scan(&moved); err != nil {
+		t.Fatal(err)
+	}
+	var mem int
+	if err := testPool.QueryRow(ctx, `SELECT (limits->>'max_memory_mib')::int FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&mem); err != nil {
+		t.Fatal(err)
+	}
+	if moved < 1 || mem < 4096 {
+		t.Fatalf("settled team must move on the next call: moved=%d memory=%d", moved, mem)
+	}
 }
