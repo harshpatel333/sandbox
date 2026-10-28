@@ -215,17 +215,18 @@ module "api" {
     # (which targets the active host's labels): a standby promotion must
     # re-run the otel deploy or metrics export silently drops until it does.
     # Export failure is non-fatal to the control plane.
-    OTEL_ENVIRONMENT            = local.environment
-    OTEL_EXPORTER_OTLP_ENDPOINT = "http://${local.active_vmd_ip}:4318"
-    OTEL_EXPORT_INTERVAL        = "15s"
-    OTEL_METRICS_ENABLED        = "true"
-    OTEL_SERVICE_NAME           = "sandbox-controlplane"
-    STRIPE_API_BASE_URL         = "https://api.stripe.com"
-    STRIPE_API_VERSION          = "2026-05-27.dahlia"
-    STRIPE_CHECKOUT_PRICE_IDS   = "price_1U60fMPyzR3Q9AgflfcjIHsp,price_1U60hxPyzR3Q9AgfOsciXQ43"
-    STRIPE_PRO_MONTHLY_PRICE_ID = "price_1UQiPfPyzR3Q9AgfIb5nwoXS"
-    STRIPE_PRO_ANNUAL_PRICE_ID  = "price_1UQiPzPyzR3Q9AgfHvQaYI5q"
-    APP_ALLOWED_ORIGINS         = "https://console.superserve.ai"
+    OTEL_ENVIRONMENT                      = local.environment
+    OTEL_EXPORTER_OTLP_ENDPOINT           = "http://${local.active_vmd_ip}:4318"
+    OTEL_EXPORT_INTERVAL                  = "15s"
+    OTEL_METRICS_ENABLED                  = "true"
+    OTEL_SERVICE_NAME                     = "sandbox-controlplane"
+    STRIPE_API_BASE_URL                   = "https://api.stripe.com"
+    STRIPE_API_VERSION                    = "2026-05-27.dahlia"
+    STRIPE_CHECKOUT_PRICE_IDS             = "price_1U60fMPyzR3Q9AgflfcjIHsp,price_1U60hxPyzR3Q9AgfOsciXQ43"
+    STRIPE_PRO_MONTHLY_PRICE_ID           = "price_1UQiPfPyzR3Q9AgfIb5nwoXS"
+    STRIPE_PRO_ANNUAL_PRICE_ID            = "price_1UQiPzPyzR3Q9AgfHvQaYI5q"
+    STRIPE_PORTAL_NO_CANCEL_CONFIGURATION = "bpc_1UVRHpPyzR3Q9Agfhk2O0aDP"
+    APP_ALLOWED_ORIGINS                   = "https://console.superserve.ai"
 
     # The serving host's identity for VMD-call metric labels. Without it the
     # wrapper falls back to labeling every series "default", which
