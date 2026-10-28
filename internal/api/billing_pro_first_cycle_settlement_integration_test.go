@@ -41,7 +41,7 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 			t.Cleanup(pool.Close)
 			h.Pool, h.DB = pool, db.New(pool)
 			params.ResourceTerms = []StripeCheckoutResourceTerms{{ResourceKey: "vcpu", PriceID: "price_cpu", UnitAmountDecimal: "1", MeterID: "mtr_cpu", EventName: "cpu"}}
-			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 			u, err := h.proUpgrade(t.Context(), team)
 			if err != nil {
 				t.Fatal(err)
@@ -66,7 +66,7 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 					t.Fatal(err)
 				}
 				h.Now = func() time.Time { return recoveredAt }
-				requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+				requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 				replay, e := h.proUpgrade(t.Context(), team)
 				if e != nil || replay.ID != u.ID || !replay.Anchor.Equal(u.Anchor) || string(replay.Payload) != string(u.Payload) {
 					t.Fatalf("cross-month recovery changed accepted quote: %+v %v", replay, e)

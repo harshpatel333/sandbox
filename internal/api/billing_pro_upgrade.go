@@ -290,10 +290,32 @@ func (h *Handlers) createProUpgrade(c *gin.Context, team, actor uuid.UUID, offer
 	h.resumeProUpgradeCheckout(c, u)
 }
 
+const providerBackdateMargin = 1500 * time.Millisecond
+
+// respondUpgradeUnsettled reports a payment still settling only when the
+// customer has paid; an upgrade whose checkout could not be opened is an
+// error the customer can retry, never a pending payment without a session.
+func (h *Handlers) respondUpgradeUnsettled(c *gin.Context, team uuid.UUID, cause error) {
+	ctx := c.Request.Context()
+	latest, err := h.proUpgrade(ctx, team)
+	paid := err == nil && (latest.State == "paid" || latest.State == "credited" || latest.State == "active")
+	if !paid && err == nil && latest.Session != nil {
+		if s, e := h.Stripe.(*stripeHTTPClient).RetrieveCheckoutSession(ctx, *latest.Session); e == nil && s.Status == "complete" {
+			paid = true
+		}
+	}
+	if paid {
+		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
+		return
+	}
+	log.Warn().Err(cause).Str("team_id", team.String()).Msg("upgrade checkout unavailable")
+	respondErrorMsg(c, "checkout_unavailable", "Checkout could not be opened. Please try again.", http.StatusServiceUnavailable)
+}
+
 func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 	outcome, err := h.reconcileProUpgrade(c.Request.Context(), u, false)
 	if err != nil {
-		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
+		h.respondUpgradeUnsettled(c, u.Team, err)
 		return
 	}
 	if outcome == "active" {
@@ -308,12 +330,12 @@ func (h *Handlers) resumeProUpgradeCheckout(c *gin.Context, u proUpgrade) {
 	}
 	latest, err := h.proUpgrade(c.Request.Context(), u.Team)
 	if err != nil || latest.Session == nil {
-		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
+		h.respondUpgradeUnsettled(c, u.Team, fmt.Errorf("upgrade %s has no checkout session: %w", outcome, err))
 		return
 	}
 	s, err := h.Stripe.(*stripeHTTPClient).RetrieveCheckoutSession(c.Request.Context(), *latest.Session)
 	if err != nil || s.Status != "open" {
-		c.JSON(http.StatusAccepted, gin.H{"outcome": "payment_confirmation_pending"})
+		h.respondUpgradeUnsettled(c, u.Team, fmt.Errorf("upgrade checkout session is %q: %w", s.Status, err))
 		return
 	}
 	c.JSON(http.StatusOK, billingSessionResponse{URL: s.URL})
@@ -591,6 +613,15 @@ func (h *Handlers) prepareProUpgradeSubscription(ctx context.Context, conn *pgxp
 			}
 			for i, t := range p.ResourceTerms {
 				form.Set(fmt.Sprintf("items[%d][price]", i), t.PriceID)
+			}
+			// The provider accepts a backdated start only once it is in the
+			// past, and a first paid month starts at the quote itself.
+			if wait := u.Anchor.Add(providerBackdateMargin).Sub(h.nowUTC()); wait > 0 {
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					return invoiceSubscription{}, ctx.Err()
+				}
 			}
 			var created invoiceSubscription
 			if err := c.doForm(ctx, http.MethodPost, "/v1/subscriptions", form, &created, "pro-upgrade-subscription:"+u.ID.String()); err != nil {

@@ -622,7 +622,7 @@ func testProUpgradeReleaseReentry(t *testing.T, h *Handlers, team uuid.UUID, u p
 	c, _ := gin.CreateTestContext(response)
 	c.Request = httptest.NewRequest(http.MethodPost, "/stripe/pro-checkout", nil)
 	h.createProUpgrade(c, team, u.Actor, offer, params, admission)
-	if response.Code != http.StatusAccepted {
+	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("released bridge cannot reenter: %d %s", response.Code, response.Body.String())
 	}
 	accepted, err := h.proUpgrade(t.Context(), team)

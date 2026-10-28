@@ -19,7 +19,7 @@ func TestProFirstCycleReportingTransitionPreservesFreeUsage(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Second)
 			h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
-			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+			requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 			u, err := h.proUpgrade(t.Context(), team)
 			if err != nil {
 				t.Fatal(err)
@@ -124,7 +124,7 @@ func TestProFirstCycleReportingTransitionPreservesFreeUsage(t *testing.T) {
 func TestProFirstCycleRetirementFencesStaleCloseDiscovery(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second).AddDate(0, -1, 0)
 	h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
-	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 	u, err := h.proUpgrade(t.Context(), team)
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +198,7 @@ func TestProFirstCycleRetirementFencesStaleCloseDiscovery(t *testing.T) {
 func TestProFirstCycleRetirementRollsBackNewlyClaimedCloseWork(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second).AddDate(0, -1, 0)
 	h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
-	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 	u, err := h.proUpgrade(t.Context(), team)
 	if err != nil {
 		t.Fatal(err)

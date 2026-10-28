@@ -279,7 +279,7 @@ func TestNewTeamCohortFirstProUsesFullMonthAndRetainsAcceptedQuote(t *testing.T)
 		c, _ := gin.CreateTestContext(rec)
 		c.Request = httptest.NewRequest(http.MethodPost, "/quote", nil)
 		f.h.createProUpgrade(c, f.team, f.actor, offer, params, admission)
-		if rec.Code != 202 {
+		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("cohort quote %d %s", rec.Code, rec.Body.String())
 		}
 	}
@@ -902,7 +902,7 @@ func TestNewTeamCohortRetiringDeveloperLeavesTrialTeamsAwaitingPro(t *testing.T)
 		c.Request = httptest.NewRequest(http.MethodPost, "/quote", nil)
 		f.h.createProUpgrade(c, f.team, f.actor, offer, params, admission)
 		provider.Close()
-		if rec.Code != http.StatusAccepted {
+		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("%s team could not buy Pro after Developer was retired: %d %s", want, rec.Code, rec.Body.String())
 		}
 	}

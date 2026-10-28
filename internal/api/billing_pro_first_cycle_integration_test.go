@@ -28,7 +28,7 @@ func TestProFirstCycleQuoteIgnoresFreeUsageCalendar(t *testing.T) {
 			if err != nil || !preview.FirstPaidProCycle || preview.Accepted || preview.PeriodEnd != nil || preview.FirstPaymentCents != nil {
 				t.Fatalf("unaccepted first cycle preview: %+v %v", preview, err)
 			}
-			quote := func() { requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted) }
+			quote := func() { requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable) }
 			quote()
 			accepted, err := h.proUpgrade(t.Context(), team)
 			if err != nil {
@@ -64,7 +64,7 @@ func TestProCheckoutResponsePreservesProratedCoverageQuote(t *testing.T) {
 	if _, err := assignInTx(t, h, planAssignment{Team: team, Terms: testPlanTerms("starter", planKindPrepaid, 2, nil), Source: "staff", Reason: "existing Starter checkout coverage regression"}); err != nil {
 		t.Fatal(err)
 	}
-	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusAccepted)
+	requestProFirstCycleQuote(t, h, team, offer, params, http.StatusServiceUnavailable)
 	u, err := h.proUpgrade(t.Context(), team)
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +144,7 @@ func TestProFirstCyclePreservesCommercialAnchorsAndRejectsUnpaidLeftovers(t *tes
 	for _, kind := range []string{"commercial_anchor", "provider_without_anchor", "expired_first_cycle", "expired_untouched_quote", "prepaid_history"} {
 		t.Run(kind, func(t *testing.T) {
 			h, team, offer, params := newProFirstCycleQuoteFixture(t, now)
-			want := http.StatusAccepted
+			want := http.StatusServiceUnavailable
 			switch kind {
 			case "commercial_anchor":
 				if _, err := h.Pool.Exec(t.Context(), `UPDATE team_billing_account SET commercial_billing_anchor=$2 WHERE team_id=$1`, team, now.AddDate(0, -1, 0).Add(-24*time.Hour)); err != nil {
