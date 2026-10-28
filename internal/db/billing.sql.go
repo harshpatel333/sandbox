@@ -1986,7 +1986,7 @@ SELECT 0::numeric AS grant_usd,
              WHEN funding.credit > 0 THEN 'active' ELSE 'exhausted' END)::text AS state,
        (NOT funding.topoff AND funding.ready AND funding.credit > 0)::boolean AS eligible,
        'prepaid'::text AS kind,
-       ((plan.terms->'topoff'->>'threshold_cents')::numeric / 100)::numeric AS low_credit_threshold_usd
+       ((SELECT p.low_credit_warning_cents FROM billing_funding_policy p WHERE p.singleton)::numeric / 100)::numeric AS low_credit_usd
 FROM plan, funding
 UNION ALL
 SELECT trial.grant_usd::numeric,
@@ -1996,19 +1996,19 @@ SELECT trial.grant_usd::numeric,
              WHEN cohort.settling THEN 'ended_by_billing_activation' ELSE 'exhausted' END)::text,
        (trial.eligible AND NOT (cohort.awaiting AND NOT cohort.active))::boolean,
        (CASE WHEN cohort.awaiting THEN 'trial' ELSE 'legacy_trial' END)::text,
-       (CASE WHEN cohort.awaiting THEN (SELECT p.low_credit_threshold_usd FROM billing_trial_policy p WHERE p.singleton) END)::numeric
+       NULL::numeric
 FROM get_team_trial_balance($1) AS trial, cohort
 WHERE NOT EXISTS (SELECT 1 FROM plan)
 `
 
 type GetTeamTrialBalanceRow struct {
-	GrantUsd              pgtype.Numeric `json:"grant_usd"`
-	ConsumedUsd           pgtype.Numeric `json:"consumed_usd"`
-	RemainingUsd          pgtype.Numeric `json:"remaining_usd"`
-	State                 string         `json:"state"`
-	Eligible              bool           `json:"eligible"`
-	Kind                  string         `json:"kind"`
-	LowCreditThresholdUsd pgtype.Numeric `json:"low_credit_threshold_usd"`
+	GrantUsd     pgtype.Numeric `json:"grant_usd"`
+	ConsumedUsd  pgtype.Numeric `json:"consumed_usd"`
+	RemainingUsd pgtype.Numeric `json:"remaining_usd"`
+	State        string         `json:"state"`
+	Eligible     bool           `json:"eligible"`
+	Kind         string         `json:"kind"`
+	LowCreditUsd pgtype.Numeric `json:"low_credit_usd"`
 }
 
 // Teams on a prepaid-funded subscription report their funded credit instead
@@ -2016,8 +2016,8 @@ type GetTeamTrialBalanceRow struct {
 // top-off, and eligible only while positive and not topped up automatically.
 // A trial awaiting its first plan reports exhausted once it has ended, or
 // ended_by_billing_activation while a paid checkout settles.
-// low_credit_threshold_usd is where messaging calls the credit low; it is
-// null where no setting applies.
+// low_credit_usd is the funded balance below which messaging calls it too
+// low; it is null for trials, which are only warned when they end.
 func (q *Queries) GetTeamTrialBalance(ctx context.Context, teamID uuid.UUID) (GetTeamTrialBalanceRow, error) {
 	row := q.db.QueryRow(ctx, getTeamTrialBalance, teamID)
 	var i GetTeamTrialBalanceRow
@@ -2028,7 +2028,7 @@ func (q *Queries) GetTeamTrialBalance(ctx context.Context, teamID uuid.UUID) (Ge
 		&i.State,
 		&i.Eligible,
 		&i.Kind,
-		&i.LowCreditThresholdUsd,
+		&i.LowCreditUsd,
 	)
 	return i, err
 }
@@ -3039,7 +3039,7 @@ WHERE EXISTS (
     LEFT JOIN billing_prepaid_auto_recharge r ON r.team_id = f.team_id
     WHERE f.observe
       AND f.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-      AND f.credit_usd * 100 < (a.terms->'topoff'->>'threshold_cents')::numeric
+      AND f.credit_usd * 100 < (SELECT p.low_credit_warning_cents FROM billing_funding_policy p WHERE p.singleton)
       AND NOT COALESCE(r.enabled AND r.amount_cents <= 1000000 AND r.threshold_cents <= 1000000, false)
       AND NOT EXISTS (
           SELECT 1 FROM trial_credit_warning_state w

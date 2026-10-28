@@ -3572,7 +3572,7 @@ components:
           description: Whether `balance_cents` is a current observation. It is false before funding observation starts, once the observation is stale, and beyond the observation capacity; a 0 balance then means unknown, not used up.
         low_balance:
           type: boolean
-          description: The observed balance is below the plan's top-off threshold (a fixed $5 on the legacy prepaid plan) and auto-recharge is off. Never true while `balance_observed` is false, or on a prepaid-funded plan without a top-off.
+          description: Auto-recharge is off and the balance is below the configured low-credit level on a prepaid-funded subscription (once the period's included grant and any top-off since have been observed), or below $5 on the legacy prepaid plan. Never true while `balance_observed` is false.
         has_saved_card:
           type: boolean
         auto_recharge:
@@ -4159,7 +4159,7 @@ components:
 
     BillingTrialBalance:
       type: object
-      required: [grant_usd, consumed_usd, remaining_usd, state, eligible, low_credit_threshold_usd]
+      required: [grant_usd, consumed_usd, remaining_usd, state, eligible]
       properties:
         grant_usd:
           type: number
@@ -4176,11 +4176,6 @@ components:
           description: "On a prepaid-funded plan this describes the funded credit: `auto_topoff` while Auto Topoff is on, `unknown` until the balance has been observed after the period's included grant and any later top-off. A trial awaiting its first plan is `exhausted` once it has ended, or `ended_by_billing_activation` while a paid checkout settles."
         eligible:
           type: boolean
-        low_credit_threshold_usd:
-          type: number
-          format: double
-          nullable: true
-          description: Remaining credit below which it is shown as low (or a trial as almost used up). It is the plan's top-off threshold on a prepaid-funded plan and the trial setting on a trial awaiting its first plan; null where no setting applies.
 
     BillingExportPreviewItem:
       type: object

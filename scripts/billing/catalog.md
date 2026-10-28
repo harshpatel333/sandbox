@@ -69,8 +69,9 @@ YC coupon.
   fee still matches it, that price is used instead.
 - Teams already on the family keep the terms frozen into their assignment.
   Nothing moves them to the new version.
-- The low-credit email and banner use the frozen top-off threshold of the
-  team's assignment.
+- Auto Topoff uses the top-off amount and threshold frozen into the team's
+  assignment. The low-credit email and banner use the configured
+  `billing_funding_policy.low_credit_warning_cents`, not the catalog.
 
 ## Stripe coupons tied to a version
 

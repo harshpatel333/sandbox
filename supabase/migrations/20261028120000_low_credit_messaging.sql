@@ -1,9 +1,3 @@
--- The remaining trial credit below which the console shows the trial as almost
--- used up. It is configuration and only affects messaging; unset hides that
--- state.
-ALTER TABLE billing_trial_policy
- ADD COLUMN low_credit_threshold_usd numeric(12,6) CHECK(low_credit_threshold_usd>0);
-
 -- Each warning lifecycle sends at most one email. A trial awaiting its first
 -- plan gets one when the trial ends. A prepaid-funded subscription re-arms
 -- whenever a period grant or top-off is issued, in the order they land rather
@@ -25,12 +19,15 @@ RETURNS text LANGUAGE sql STABLE AS $$
   AND a.kind='subscription' AND a.terms->>'funding_policy'='prepaid';
 $$;
 
--- How long a prepaid-funded period may run without its included grant before
--- low-credit messaging stops waiting for it. A renewal grant lands only after
--- the closing invoice is finalized, paid and its webhook processed, so this is
--- a backstop for renewals that stall without failing. It is configuration.
+-- A prepaid-funded subscription's balance below low_credit_warning_cents is
+-- shown and emailed as too low. low_credit_grant_grace is how long a period
+-- may run without its included grant before that messaging stops waiting for
+-- it: a renewal grant lands only after the closing invoice is finalized, paid
+-- and its webhook processed, so it is a backstop for renewals that stall
+-- without failing. Both are configuration.
 ALTER TABLE billing_funding_policy
- ADD COLUMN low_credit_grant_grace interval NOT NULL DEFAULT interval '24 hours' CHECK(low_credit_grant_grace>interval '0');
+ ADD COLUMN low_credit_grant_grace interval NOT NULL DEFAULT interval '24 hours' CHECK(low_credit_grant_grace>interval '0'),
+ ADD COLUMN low_credit_warning_cents bigint NOT NULL DEFAULT 100 CHECK(low_credit_warning_cents>0);
 
 -- A prepaid-funded balance is worth warning about once it was read after the
 -- period's included grant and after every top-off paid since: the grant lands

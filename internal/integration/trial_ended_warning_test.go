@@ -20,7 +20,6 @@ import (
 func TestIntegration_NewTeamTrialEmailsOnceWhenItEnds(t *testing.T) {
 	pool, system, actor := cohortFixture(t)
 	cohortRelease(t, pool, system)
-	rolloutExec(t, pool, `UPDATE billing_trial_policy SET low_credit_threshold_usd=0.03 WHERE singleton`)
 	team := cohortCreate(t, pool, actor)
 	rolloutExec(t, pool, `INSERT INTO team_memberships(team_id,user_id,status) VALUES($1,$2,'active') ON CONFLICT DO NOTHING`, team, actor)
 	rolloutExec(t, pool, `INSERT INTO user_role_assignments(user_id,role_id,scope_type,team_id) SELECT $2,id,'team',$1 FROM roles WHERE name='team_owner'
@@ -57,9 +56,8 @@ func TestIntegration_NewTeamTrialEmailsOnceWhenItEnds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	threshold, err := b.LowCreditThresholdUsd.Float64Value()
-	if err != nil || b.Kind != "trial" || b.State != "active" || threshold.Float64 != 0.03 {
-		t.Fatalf("running trial balance = %+v threshold=%v", b, threshold)
+	if b.Kind != "trial" || b.State != "active" || b.LowCreditUsd.Valid {
+		t.Fatalf("running trial balance = %+v", b)
 	}
 	api.ProcessTrialCreditWarningForTest(h, ctx, team)
 	var runway int
