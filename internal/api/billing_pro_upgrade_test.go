@@ -184,3 +184,45 @@ func TestProFirstCycleCreditExpiryRequiresFrozenFullMonth(t *testing.T) {
 }
 
 func ptrProCreditUnit(n int64) *int64 { return &n }
+
+func TestProUpgradeCheckoutAsksForTopoffAndReadsTheAnswer(t *testing.T) {
+	for _, def := range []bool{true, false} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]string{"custom_fields[0][key]": checkoutTopoffField, "custom_fields[0][type]": "dropdown",
+				"custom_fields[0][dropdown][options][0][value]": checkoutTopoffOn, "custom_fields[0][dropdown][options][1][value]": checkoutTopoffOff,
+				"custom_fields[0][dropdown][default_value]": map[bool]string{true: checkoutTopoffOn, false: checkoutTopoffOff}[def]}
+			for key, v := range want {
+				if r.Form.Get(key) != v {
+					t.Errorf("%s=%q want %q", key, r.Form.Get(key), v)
+				}
+			}
+			if r.Form.Has("custom_fields[0][optional]") {
+				t.Error("top-off answer became optional")
+			}
+			if got := r.Form.Get("custom_text[after_submit][message]"); !strings.Contains(got, "$7.25") {
+				t.Errorf("top-off copy lost the frozen amount: %q", got)
+			}
+			_, _ = w.Write([]byte(`{"id":"cs_example","url":"https://checkout.stripe.com/example"}`))
+		}))
+		c := &stripeHTTPClient{baseURL: srv.URL, apiVersion: "2026-07-29.dahlia", httpClient: srv.Client()}
+		if _, err := c.CreateCheckoutSession(t.Context(), StripeCreateCheckoutSessionParams{OneOffAmount: 3100, OneOffProduct: "prod_dev", OneOffName: "first month", CustomerID: "cus_example", Topoff: &StripeCheckoutTopoff{AmountCents: 725, DefaultEnabled: def}}); err != nil {
+			t.Fatal(err)
+		}
+		srv.Close()
+	}
+	for raw, want := range map[string]bool{checkoutTopoffOn: true, checkoutTopoffOff: false} {
+		var s StripeRetrievedCheckoutSession
+		if err := json.Unmarshal([]byte(`{"custom_fields":[{"key":"other","dropdown":{"value":"autotopoff"}},{"key":"autotopoff","dropdown":{"value":"`+raw+`"}}]}`), &s); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := s.topoffChosen(); err != nil || got != want {
+			t.Fatalf("%s read as %v %v", raw, got, err)
+		}
+	}
+	if _, err := (StripeRetrievedCheckoutSession{}).topoffChosen(); err == nil {
+		t.Fatal("a session without the answer settled as Off")
+	}
+}

@@ -86,7 +86,7 @@ func testProRepeatAcceptanceCredit(t *testing.T, monthlyCredit int64) {
 	c, _ := gin.CreateTestContext(response)
 	c.Request = httptest.NewRequest(http.MethodPost, "/stripe/pro-checkout", nil)
 	f.h.createProUpgrade(c, f.team, f.actor, offer, params, admission)
-	if response.Code != http.StatusAccepted {
+	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("repeat paid acceptance: %d %s", response.Code, response.Body.String())
 	}
 	accepted, err := f.h.proUpgrade(t.Context(), f.team)
@@ -109,7 +109,7 @@ func testProRepeatAcceptanceCredit(t *testing.T, monthlyCredit int64) {
 	for _, tc := range []struct {
 		actor, operation uuid.UUID
 		status           int
-	}{{f.actor, op, http.StatusAccepted}, {f.actor, uuid.New(), http.StatusConflict}, {uuid.New(), op, http.StatusConflict}} {
+	}{{f.actor, op, http.StatusServiceUnavailable}, {f.actor, uuid.New(), http.StatusConflict}, {uuid.New(), op, http.StatusConflict}} {
 		response = httptest.NewRecorder()
 		c, _ = gin.CreateTestContext(response)
 		c.Request = httptest.NewRequest(http.MethodPost, "/stripe/pro-checkout", nil)

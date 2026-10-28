@@ -5,11 +5,16 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 // tcpPair returns a connected pair of TCP loopback conns: the dialer side and
@@ -76,53 +81,43 @@ func TestRelayCountsBytesBothDirections(t *testing.T) {
 	}
 }
 
-func TestFlowParams(t *testing.T) {
+func TestAppendFlowRow(t *testing.T) {
 	sb := uuid.New()
 	team := uuid.New()
+	var rows db.InsertNetFlowsParams
 
-	t.Run("full event maps every field", func(t *testing.T) {
-		ev := FlowEvent{
-			Protocol: "tls", Host: "api.example.com", DstIP: "1.2.3.4",
-			DstPort: 443, Verdict: "allowed", MatchRule: "domain",
-			BytesSent: 100, BytesRecv: 200, DurationMs: 12,
-		}
-		p, ok := flowParams(ev, sb, team)
-		if !ok {
-			t.Fatal("flowParams returned !ok for valid event")
-		}
-		if p.TeamID != team || p.SandboxID != sb || p.Protocol != "tls" ||
-			p.DstPort != 443 || p.Verdict != "allowed" {
-			t.Errorf("scalar fields mismatch: %+v", p)
-		}
-		if p.Host == nil || *p.Host != "api.example.com" {
-			t.Errorf("host = %v, want api.example.com", p.Host)
-		}
-		if p.DstIp.String() != "1.2.3.4" {
-			t.Errorf("dst_ip = %s, want 1.2.3.4", p.DstIp)
-		}
-		if p.BytesSent == nil || *p.BytesSent != 100 || p.DurationMs == nil || *p.DurationMs != 12 {
-			t.Errorf("byte/duration pointers wrong: %+v", p)
-		}
-	})
+	full := FlowEvent{
+		Protocol: "tls", Host: "api.example.com", DstIP: "192.0.2.4",
+		DstPort: 443, Verdict: "allowed", MatchRule: "domain",
+		BytesSent: 100, BytesRecv: 200, DurationMs: 12,
+	}
+	if !appendFlowRow(&rows, full, sb, team) {
+		t.Fatal("valid event rejected")
+	}
+	if !appendFlowRow(&rows, FlowEvent{Protocol: "other", DstIP: "10.0.0.1", DstPort: 22, Verdict: "blocked", BytesSent: -1}, sb, team) {
+		t.Fatal("valid blocked event rejected")
+	}
+	if appendFlowRow(&rows, FlowEvent{Protocol: "tls", DstIP: "not-an-ip", DstPort: 443, Verdict: "allowed"}, sb, team) {
+		t.Fatal("malformed dst ip accepted")
+	}
+	want := db.InsertNetFlowsParams{
+		TeamIds: []uuid.UUID{team, team}, SandboxIds: []uuid.UUID{sb, sb},
+		Protocols: []string{"tls", "other"}, Hosts: []string{"api.example.com", ""},
+		DstIps:   []netip.Addr{netip.MustParseAddr("192.0.2.4"), netip.MustParseAddr("10.0.0.1")},
+		DstPorts: []int32{443, 22}, Verdicts: []string{"allowed", "blocked"}, MatchRules: []string{"domain", ""},
+		BytesSent: []int64{100, 0}, BytesRecv: []int64{200, 0}, DurationMs: []int32{12, 0},
+	}
+	if !reflect.DeepEqual(rows, want) {
+		t.Fatalf("rows = %+v, want %+v", rows, want)
+	}
+}
 
-	t.Run("empty host and zero metrics become nil", func(t *testing.T) {
-		ev := FlowEvent{Protocol: "other", DstIP: "10.0.0.1", DstPort: 22, Verdict: "blocked"}
-		p, ok := flowParams(ev, sb, team)
-		if !ok {
-			t.Fatal("!ok for valid blocked event")
-		}
-		if p.Host != nil || p.MatchRule != nil || p.BytesSent != nil ||
-			p.BytesRecv != nil || p.DurationMs != nil {
-			t.Errorf("expected nil optionals, got %+v", p)
-		}
-	})
-
-	t.Run("bad dst ip rejected", func(t *testing.T) {
-		ev := FlowEvent{Protocol: "tls", DstIP: "not-an-ip", DstPort: 443, Verdict: "allowed"}
-		if _, ok := flowParams(ev, sb, team); ok {
-			t.Error("expected !ok for malformed dst ip")
-		}
-	})
+func TestAppendFlowRowStoresSandboxTextPostgresAccepts(t *testing.T) {
+	var rows db.InsertNetFlowsParams
+	appendFlowRow(&rows, FlowEvent{Protocol: "http", Host: "bad\x00host\xff.example", DstIP: "192.0.2.6", DstPort: 80, Verdict: "blocked"}, uuid.New(), uuid.New())
+	if got := rows.Hosts[0]; got != "badhost\uFFFD.example" || !utf8.ValidString(got) {
+		t.Fatalf("host = %q", got)
+	}
 }
 
 func TestTeamCacheResolvesAndBounds(t *testing.T) {

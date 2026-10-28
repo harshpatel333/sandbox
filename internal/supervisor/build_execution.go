@@ -65,7 +65,7 @@ func (s *BuildSupervisor) reconcileExecution(ctx context.Context, id uuid.UUID) 
 			return s.failExecution(ctx, id, nil, expired)
 		}
 		if e.Attempts >= 3 {
-			return s.failExecution(ctx, id, nil, "infrastructure retries exhausted (three total attempts)")
+			return s.failExecution(ctx, id, nil, "infrastructure_failed: the build failed on our side three times; retry it")
 		}
 		aid, err := s.q.ClaimBuildAttempt(ctx, id, s.cfg.Cell, s.cfg.GlobalMaxConcurrentBuilds)
 		if err != nil || aid == nil {
@@ -111,7 +111,7 @@ func (s *BuildSupervisor) reconcileExecution(ctx context.Context, id uuid.UUID) 
 	// Publication is independent of a producer's continued availability.
 	if e.Publication {
 		if s.publishedLate(ctx, e, a) {
-			return s.failExecution(ctx, id, &a.ID, "build execution deadline exceeded; producer completed outside the budget")
+			return s.failExecution(ctx, id, &a.ID, "build_timed_out: the build did not finish within its time budget; retry it")
 		}
 		accepted, err := s.q.AcceptBuildPublication(ctx, id, a.ID)
 		if accepted {
@@ -182,7 +182,7 @@ func (s *BuildSupervisor) reconcileExecution(ctx context.Context, id uuid.UUID) 
 	switch result.Status {
 	case "ready":
 		if completedLate(e, result) {
-			err = s.failExecution(ctx, id, &a.ID, "build execution deadline exceeded; producer completed outside the budget")
+			err = s.failExecution(ctx, id, &a.ID, "build_timed_out: the build did not finish within its time budget; retry it")
 			break
 		}
 		err = s.finalizeExecution(ctx, id, a, result)
@@ -241,6 +241,8 @@ func (s *BuildSupervisor) publishedLate(ctx context.Context, e db.BuildExecution
 	return completedLate(e, result)
 }
 
+// failExecution's reason becomes the build's error message, which clients
+// read as "code: message".
 func (s *BuildSupervisor) failExecution(ctx context.Context, id uuid.UUID, attempt *uuid.UUID, reason string) error {
 	changed, err := s.q.TransitionBuildAttempt(ctx, id, attempt, "fail", reason)
 	if err == nil && changed {
@@ -300,10 +302,10 @@ func completedLate(e db.BuildExecution, result vmdclient.BuildStatusResult) bool
 func executionExpired(e db.BuildExecution, created, now time.Time) string {
 	if e.FirstStartedAt == nil {
 		if !now.Before(created.Add(2 * time.Minute)) {
-			return "no eligible host/capacity before initial queue deadline"
+			return "capacity_unavailable: no build capacity was free in time; retry the build"
 		}
 	} else if !now.Before(e.FirstStartedAt.Add(executionBudget)) {
-		return "build execution deadline exceeded; no eligible replacement within budget"
+		return "build_timed_out: the build did not finish within its time budget; retry it"
 	}
 	return ""
 }
