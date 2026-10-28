@@ -261,6 +261,12 @@ func TestProFirstCycleQuotePaymentAndUsageSettlement(t *testing.T) {
 			if tc.offer == "developer_monthly" && (settled != "developer_monthly/prepaid" || recharge != "true/1500/1000") {
 				t.Fatalf("Developer did not settle with its funding and Auto Topoff: plan=%s recharge=%s", settled, recharge)
 			}
+			if tc.offer == "developer_monthly" {
+				current, e := h.DB.GetCurrentCommercialPlan(t.Context(), team)
+				if e != nil || billingPlanFromContract(current).Name != "Developer Monthly" {
+					t.Fatalf("Developer contract shows %q %v", billingPlanFromContract(current).Name, e)
+				}
+			}
 			if tc.offer == "pro_monthly" && (settled != "pro_monthly/postpaid" || recharge != "none") {
 				t.Fatalf("Pro settled with prepaid funding: plan=%s recharge=%s", settled, recharge)
 			}
