@@ -209,8 +209,9 @@ type StripeCheckoutSession struct {
 }
 
 type StripeCreateCustomerPortalSessionParams struct {
-	CustomerID string
-	ReturnURL  string
+	CustomerID    string
+	ReturnURL     string
+	Configuration string
 }
 
 type StripePortalSession struct {
@@ -592,6 +593,9 @@ func (c *stripeHTTPClient) CreateCustomerPortalSession(ctx context.Context, para
 	form := url.Values{}
 	form.Set("customer", params.CustomerID)
 	form.Set("return_url", params.ReturnURL)
+	if params.Configuration != "" {
+		form.Set("configuration", params.Configuration)
+	}
 	var resp struct {
 		URL string `json:"url"`
 	}
@@ -2062,6 +2066,12 @@ func (h *Handlers) EstablishBillingCutover(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"cutover_at": cutover, "teams_updated": count})
 }
 
+// portalWithoutCancellation selects teams with a live contract for a catalog
+// plan, or a paid upgrade still committing one. Managed offers such as YC and
+// sponsored usage are not catalog plans.
+const portalWithoutCancellation = `SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=$1 AND status<>'ended' AND offer_key IN ` + paidPlanOffers + `)
+ OR EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=$1 AND state IN ('paid','credited','active'))`
+
 func (h *Handlers) CreateStripeCustomerPortalSession(c *gin.Context) {
 	teamID, err := customerContextTeamID(c)
 	if err != nil {
@@ -2125,9 +2135,29 @@ func (h *Handlers) CreateStripeCustomerPortalSession(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "team does not have an active Stripe subscription", http.StatusConflict)
 		return
 	}
+	// Cancelling a catalog plan in the portal would skip the plan change that
+	// ends its contract and returns the team to Free, so those teams get a
+	// portal without cancellation and never the default one.
+	var catalogPlan bool
+	if err = h.Pool.QueryRow(c.Request.Context(), portalWithoutCancellation, teamID).Scan(&catalogPlan); err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read portal plan contract failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	configuration := ""
+	if catalogPlan {
+		if h.Config != nil {
+			configuration = h.Config.StripePortalNoCancelConfiguration
+		}
+		if configuration == "" {
+			respondErrorMsg(c, "service_unavailable", "Stripe customer portal is not configured for plan subscriptions", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	session, err := h.Stripe.CreateCustomerPortalSession(c.Request.Context(), StripeCreateCustomerPortalSessionParams{
-		CustomerID: *account.StripeCustomerID,
-		ReturnURL:  returnURL,
+		CustomerID:    *account.StripeCustomerID,
+		ReturnURL:     returnURL,
+		Configuration: configuration,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("create Stripe portal session failed")

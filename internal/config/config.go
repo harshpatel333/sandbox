@@ -47,6 +47,10 @@ type Config struct {
 	BillingResources              []BillingResourceConfig
 	AppAllowedOrigins             []string // APP_ALLOWED_ORIGINS, comma-separated browser origins allowed in billing redirects
 
+	// STRIPE_PORTAL_NO_CANCEL_CONFIGURATION, the customer portal configuration
+	// for teams on a catalog plan, whose cancellation goes through plan changes
+	StripePortalNoCancelConfiguration string
+
 	// SandboxAccessTokenSeed is the HMAC seed shared with the edge
 	// proxy. Both sides derive per-sandbox access tokens as
 	// HMAC-SHA256(seed, sandboxID). Loaded from SANDBOX_ACCESS_TOKEN_SEED
@@ -195,6 +199,7 @@ func Load() (*Config, error) {
 		OTelExportInterval:            exportInterval,
 		BackupGCServiceAccount:        strings.TrimSpace(os.Getenv("BACKUP_GC_SERVICE_ACCOUNT")),
 	}
+	cfg.StripePortalNoCancelConfiguration = strings.TrimSpace(os.Getenv("STRIPE_PORTAL_NO_CANCEL_CONFIGURATION"))
 	if cfg.ComputeRestrictionsSource != "file" && cfg.ComputeRestrictionsSource != "database" {
 		return nil, fmt.Errorf("COMPUTE_RESTRICTIONS_SOURCE must be file or database")
 	}
