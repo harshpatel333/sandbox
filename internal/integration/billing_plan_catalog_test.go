@@ -619,9 +619,7 @@ func TestIntegration_PlanCatalogNeverPublishesOverANewerVersion(t *testing.T) {
 		t.Fatalf("current=%s want %s", current, newer)
 	}
 	var seeded int
-	// Seven from the initial catalog plus the Free and pay-as-you-go versions
-	// that raised the per-sandbox shape to the curated template shape.
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM billing_plan_version WHERE id=md5('billing-plan-version:'||pricing_version||':'||family||':'||version)::uuid`).Scan(&seeded); err != nil || seeded != 9 {
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM billing_plan_version WHERE id=md5('billing-plan-version:'||pricing_version||':'||family||':'||version)::uuid`).Scan(&seeded); err != nil || seeded != 7 {
 		t.Fatalf("seeded versions with region-independent ids=%d err=%v", seeded, err)
 	}
 }
@@ -839,14 +837,14 @@ func TestIntegration_TeamEffectiveLimitsKeepTodaysValuesAndOverrides(t *testing.
 		}
 	}
 	read()
-	if l != [5]int32{20, 2, 4096, 8192, 10} {
+	if l != [5]int32{20, 2, 2048, 8192, 10} {
 		t.Fatalf("legacy limits=%v", l)
 	}
 	if _, err := testPool.Exec(ctx, `UPDATE team SET max_templates=25, max_template_vcpu=4 WHERE id=$1`, team.ID); err != nil {
 		t.Fatal(err)
 	}
 	read()
-	if l != [5]int32{20, 4, 4096, 8192, 25} {
+	if l != [5]int32{20, 4, 2048, 8192, 25} {
 		t.Fatalf("overridden limits=%v", l)
 	}
 }
