@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"golang.org/x/sync/errgroup"
 )
 
 // These backend-validated terms travel with the immutable Checkout request.
@@ -27,21 +28,24 @@ func (h *Handlers) freezeProResourceTerms(ctx context.Context, team uuid.UUID, p
 	if err != nil {
 		return nil, err
 	}
-	var terms []StripeCheckoutResourceTerms
-	seenPrices, seenEvents, seenMeters := map[string]bool{}, map[string]bool{}, map[string]bool{}
-	for _, id := range prices {
-		var resource, event string
+	type lookup struct {
+		resource, event, meter string
+		expected               *big.Rat
+		price                  storagePrice
+	}
+	lookups := make([]lookup, len(prices))
+	for i, id := range prices {
+		l := &lookups[i]
 		for _, r := range h.billingConfiguredResources() {
 			if r.StripePriceID == id {
-				resource, event = r.ResourceKey, r.StripeEventName
+				l.resource, l.event = r.ResourceKey, r.StripeEventName
 			}
 		}
-		if resource == "" || event == "" {
+		if l.resource == "" || l.event == "" {
 			return nil, errors.New("resource mapping is incomplete")
 		}
-		var expected *big.Rat
 		for _, rate := range rates {
-			if rate.Resource == resource && rate.Unit == "second" {
+			if rate.Resource == l.resource && rate.Unit == "second" {
 				v, e := rate.PriceUsd.Value()
 				if e != nil {
 					return nil, e
@@ -50,29 +54,41 @@ func (h *Handlers) freezeProResourceTerms(ctx context.Context, team uuid.UUID, p
 				if !ok {
 					return nil, errors.New("invalid usage rate")
 				}
-				expected = new(big.Rat).Mul(value, big.NewRat(360000, 1))
+				l.expected = new(big.Rat).Mul(value, big.NewRat(360000, 1))
 			}
 		}
-		var p storagePrice
-		if err = client.doForm(ctx, http.MethodGet, "/v1/prices/"+url.PathEscape(id), nil, &p, ""); err != nil {
-			return nil, err
-		}
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	for i, id := range prices {
+		l := &lookups[i]
+		g.Go(func() error {
+			return client.doForm(gctx, http.MethodGet, "/v1/prices/"+url.PathEscape(id), nil, &l.price, "")
+		})
+		g.Go(func() error {
+			var e error
+			l.meter, e = client.ActiveMeterID(gctx, l.event)
+			return e
+		})
+	}
+	if err = g.Wait(); err != nil {
+		return nil, err
+	}
+	var terms []StripeCheckoutResourceTerms
+	seenPrices, seenEvents, seenMeters := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for i, id := range prices {
+		l, p := lookups[i], lookups[i].price
 		actual, e := meterDecimal(p.UnitAmountDecimal)
-		if p.ID != id || !p.Active || expected == nil || e != nil || actual.Cmp(expected) != 0 || !proResourceShape(p) {
+		if p.ID != id || !p.Active || l.expected == nil || e != nil || actual.Cmp(l.expected) != 0 || !proResourceShape(p) {
 			return nil, errors.New("configured Pro resource price differs from PAYG terms")
 		}
-		meter, e := client.ActiveMeterID(ctx, event)
-		if e != nil {
-			return nil, e
-		}
-		if meter != p.Recurring.Meter {
+		if l.meter != p.Recurring.Meter {
 			return nil, errors.New("configured resource meter differs from its price")
 		}
-		if seenPrices[id] || seenEvents[event] || seenMeters[meter] {
+		if seenPrices[id] || seenEvents[l.event] || seenMeters[l.meter] {
 			return nil, errors.New("configured resource prices, events, and meters must be unique")
 		}
-		seenPrices[id], seenEvents[event], seenMeters[meter] = true, true, true
-		terms = append(terms, StripeCheckoutResourceTerms{ResourceKey: resource, PriceID: id, UnitAmountDecimal: p.UnitAmountDecimal, MeterID: meter, EventName: event})
+		seenPrices[id], seenEvents[l.event], seenMeters[l.meter] = true, true, true
+		terms = append(terms, StripeCheckoutResourceTerms{ResourceKey: l.resource, PriceID: id, UnitAmountDecimal: p.UnitAmountDecimal, MeterID: l.meter, EventName: l.event})
 	}
 	return terms, nil
 }
