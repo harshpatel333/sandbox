@@ -5937,8 +5937,16 @@ components:
           nullable: true
     BillingPlanResponse:
       type: object
-      required: [plan, period, pending_change]
+      required: [plan, entry_state, period, pending_change]
       properties:
+        entry_state:
+          type: string
+          enum: [trial, trial_ended, payment_failed, active]
+          description: >-
+            Whether the team has paid for a plan. A new team is on its trial
+            with compute until the trial credit runs out (trial_ended), or a
+            checkout still needs a usable card (payment_failed); active covers
+            every team with a plan.
         plan:
           type: object
           nullable: true
