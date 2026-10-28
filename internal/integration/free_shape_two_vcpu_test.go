@@ -60,7 +60,7 @@ func TestFreeShapeTwoVCPUTransition(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE team_id=$1 AND effective_to IS NULL`, team); err != nil {
 		t.Fatal(err)
 	}
-	signedUp := time.Now().Add(-time.Hour).UTC()
+	signedUp := time.Now().Add(-time.Hour).UTC().Truncate(time.Microsecond) // timestamptz precision
 	var old uuid.UUID
 	if err := testPool.QueryRow(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
 	 VALUES($1,'free','free',md5('billing-plan-version:v2:free:1')::uuid,
