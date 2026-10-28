@@ -37,7 +37,7 @@ func (h *Handlers) refreshFreeAllowances(ctx context.Context) {
 	// A team that kept its plan caps while a purchase was in flight moves to
 	// the current shape once that purchase has settled.
 	if h.Pool != nil {
-		if _, err := h.Pool.Exec(ctx, `SELECT billing_raise_plan_shape()`); err != nil {
+		if _, err := h.Pool.Exec(ctx, `SELECT billing_raise_plan_shape(true)`); err != nil {
 			log.Error().Err(err).Msg("billing: raise plan shape failed")
 		}
 	}

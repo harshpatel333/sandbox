@@ -10,17 +10,30 @@
 --  3. Open Free and legacy pay-as-you-go assignments: existing teams carry
 --     frozen caps, so each one still below the shape closes and reopens on the
 --     new version of its plan (billing_raise_plan_shape). A team with a
---     purchase in flight keeps its assignment, since the checkout names it;
---     the Free allowance sweep calls the same function so such a team moves
---     once the purchase settles. Teams whose limits staff customized keep
+--     purchase in flight keeps its assignment, since the checkout names it,
+--     and is recorded as deferred; the Free allowance sweep retries only
+--     those teams, so each one moves once its purchase settles. Teams whose limits staff customized keep
 --     their team row untouched (apply_assignment_limits).
---  4. The new-team gate release pins the Free shape it expects; it now expects
---     this one.
+--  4. A configured trial below the shape is raised to it, so trial teams can
+--     start the curated templates.
+--  5. The new-team gate release requires Free or the trial to admit the shape.
+-- Teams that kept a below-shape assignment because a purchase was in flight.
+CREATE TABLE IF NOT EXISTS billing_plan_shape_deferred (
+ team_id uuid PRIMARY KEY REFERENCES team(id) ON DELETE CASCADE
+);
+ALTER TABLE billing_plan_shape_deferred ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON billing_plan_shape_deferred FROM PUBLIC;
+DO $$ DECLARE r text; BEGIN
+ FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON billing_plan_shape_deferred FROM %I',r); END IF;
+ END LOOP;
+END $$;
+
 -- Moves every open Free or legacy pay-as-you-go assignment still below the
 -- curated template shape onto the published version of its plan. Safe to
--- call repeatedly; the Free allowance sweep does, so a team that kept its
--- assignment while a purchase was in flight moves once that settles.
-CREATE OR REPLACE FUNCTION billing_raise_plan_shape(OUT moved integer, OUT skipped integer)
+-- call repeatedly. With p_deferred_only it retries only deferred teams, which
+-- is what the Free allowance sweep does every cycle.
+CREATE OR REPLACE FUNCTION billing_raise_plan_shape(p_deferred_only boolean DEFAULT false, OUT moved integer, OUT skipped integer)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE
  free_id uuid; free_version integer;
@@ -30,12 +43,20 @@ DECLARE
  in_flight boolean;
 BEGIN
  moved:=0; skipped:=0;
+ IF p_deferred_only THEN
+  DELETE FROM billing_plan_shape_deferred d WHERE NOT EXISTS(SELECT 1 FROM team_plan_assignment p
+   WHERE p.team_id=d.team_id AND p.kind IN ('free','legacy_payg') AND p.effective_to IS NULL AND p.contract_id IS NULL
+    AND (billing_json_cap(p.limits->'max_vcpu')<2 OR billing_json_cap(p.limits->'max_memory_mib')<4096
+     OR billing_json_cap(p.limits->'max_disk_mib')<8192));
+  IF NOT EXISTS(SELECT 1 FROM billing_plan_shape_deferred) THEN RETURN; END IF;
+ END IF;
  SELECT id,version INTO free_id,free_version FROM billing_plan_version
   WHERE family='free' AND pricing_version='v2' AND state='published';
  SELECT id,version INTO payg_id,payg_version FROM billing_plan_version
   WHERE family='payg' AND pricing_version='legacy' AND kind='legacy_payg' AND state='published';
  FOR a IN SELECT p.* FROM team_plan_assignment p
   WHERE p.kind IN ('free','legacy_payg') AND p.effective_to IS NULL AND p.contract_id IS NULL
+   AND (NOT p_deferred_only OR p.team_id IN (SELECT team_id FROM billing_plan_shape_deferred))
    -- An absent or null cap is no cap: it already admits the shape.
    AND (billing_json_cap(p.limits->'max_vcpu')<2
     OR billing_json_cap(p.limits->'max_memory_mib')<4096
@@ -61,6 +82,7 @@ BEGIN
     OR EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=a.team_id AND state IN ('scheduled','applied'))
    INTO in_flight;
    IF in_flight THEN
+    INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT DO NOTHING;
     skipped:=skipped+1;
     CONTINUE;
    END IF;
@@ -80,24 +102,19 @@ BEGIN
      'max_memory_mib',CASE WHEN billing_json_cap(a.limits->'max_memory_mib')<4096 THEN 4096 END,
      'max_disk_mib',CASE WHEN billing_json_cap(a.limits->'max_disk_mib')<8192 THEN 8192 END)),
     at_time,'migration','Plan shape raised to 2 vCPU / 4096 MiB / 8192 MiB','free-shape-2-4-8:'||a.id);
+   DELETE FROM billing_plan_shape_deferred WHERE team_id=a.team_id;
    moved:=moved+1;
   EXCEPTION WHEN OTHERS THEN
    RAISE WARNING 'free shape: team % kept its plan caps: %',a.team_id,SQLERRM;
   END;
  END LOOP;
 END $$;
--- The allowance sweep retries the raise for teams skipped mid-purchase; this
--- keeps each retry to the rows still below the shape.
-CREATE INDEX IF NOT EXISTS team_plan_assignment_below_shape ON team_plan_assignment(team_id)
- WHERE effective_to IS NULL AND contract_id IS NULL AND kind IN ('free','legacy_payg')
-  AND (billing_json_cap(limits->'max_vcpu')<2 OR billing_json_cap(limits->'max_memory_mib')<4096
-   OR billing_json_cap(limits->'max_disk_mib')<8192);
-REVOKE ALL ON FUNCTION billing_raise_plan_shape() FROM PUBLIC;
+REVOKE ALL ON FUNCTION billing_raise_plan_shape(boolean) FROM PUBLIC;
 DO $$ DECLARE r text; BEGIN
  FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN
-   EXECUTE format('REVOKE ALL ON FUNCTION billing_raise_plan_shape() FROM %I',r);
-   IF r='service_role' THEN EXECUTE format('GRANT EXECUTE ON FUNCTION billing_raise_plan_shape() TO %I',r); END IF;
+   EXECUTE format('REVOKE ALL ON FUNCTION billing_raise_plan_shape(boolean) FROM %I',r);
+   IF r='service_role' THEN EXECUTE format('GRANT EXECUTE ON FUNCTION billing_raise_plan_shape(boolean) TO %I',r); END IF;
   END IF;
  END LOOP;
 END $$;
@@ -109,6 +126,14 @@ DECLARE
  payg_id uuid; payg_version integer;
  moved integer; skipped integer;
 BEGIN
+ -- A configured trial below the shape would freeze caps the curated templates
+ -- exceed; raise only the caps that are set.
+ UPDATE billing_trial_policy SET
+  max_vcpu=CASE WHEN max_vcpu<2 THEN 2 ELSE max_vcpu END,
+  max_memory_mib=CASE WHEN max_memory_mib<4096 THEN 4096 ELSE max_memory_mib END,
+  max_disk_mib=CASE WHEN max_disk_mib<8192 THEN 8192 ELSE max_disk_mib END
+ WHERE singleton AND (max_vcpu<2 OR max_memory_mib<4096 OR max_disk_mib<8192);
+
  -- Once the new-team cohort is live, every catalog write must leave a
  -- zero-template Free published unless paid-first signup has replaced it
  -- (billing_keep_cohort_free_catalog). Say so up front instead of failing at

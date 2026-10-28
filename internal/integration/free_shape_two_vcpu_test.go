@@ -232,20 +232,31 @@ func TestFreeShapeTwoVCPUKeepsInFlightCheckout(t *testing.T) {
 	if assignments != 1 || !stillOpen {
 		t.Fatalf("in-flight checkout team must keep its assignment: assignments=%d open=%v", assignments, stillOpen)
 	}
+	deferred := func() bool {
+		t.Helper()
+		var ok bool
+		if err := testPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_plan_shape_deferred WHERE team_id=$1)`, team).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if !deferred() {
+		t.Fatal("skipped team was not recorded for the sweep")
+	}
 	// Once the purchase settles, the sweep's call moves the team.
 	if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET checkout_may_exist=false WHERE team_id=$1`, team); err != nil {
 		t.Fatal(err)
 	}
 	var moved int
-	if err := testPool.QueryRow(ctx, `SELECT moved FROM billing_raise_plan_shape()`).Scan(&moved); err != nil {
+	if err := testPool.QueryRow(ctx, `SELECT moved FROM billing_raise_plan_shape(true)`).Scan(&moved); err != nil {
 		t.Fatal(err)
 	}
 	var mem int
 	if err := testPool.QueryRow(ctx, `SELECT (limits->>'max_memory_mib')::int FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, team).Scan(&mem); err != nil {
 		t.Fatal(err)
 	}
-	if moved < 1 || mem < 4096 {
-		t.Fatalf("settled team must move on the next call: moved=%d memory=%d", moved, mem)
+	if moved < 1 || mem < 4096 || deferred() {
+		t.Fatalf("settled team must move on the sweep's next call: moved=%d memory=%d deferred=%v", moved, mem, deferred())
 	}
 }
 
@@ -265,6 +276,7 @@ func TestFreeShapeTwoVCPUAfterFreeRetired(t *testing.T) {
 	 SELECT $1,'free','free',v.id,jsonb_build_object('pricing_version','v2','version_id',v.id,'version',v.version),'{"max_concurrent":1,"max_vcpu":1,"max_templates":0}',clock_timestamp()-interval '1 hour','signup','new team'
 	 FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published'`, team)
 	cohortRelease(t, pool, system)
+	rolloutExec(t, pool, `UPDATE billing_trial_policy SET max_memory_mib=3072 WHERE singleton`)
 	rolloutExec(t, pool, `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'),NULL)`)
 	if _, err := pool.Exec(ctx, string(migration)); err != nil {
 		t.Fatal("migration refused a valid paid-first catalog without Free:", err)
@@ -274,5 +286,9 @@ func TestFreeShapeTwoVCPUAfterFreeRetired(t *testing.T) {
 	 FROM team_plan_assignment n JOIN team_plan_assignment o ON o.team_id=n.team_id AND o.effective_to IS NOT NULL AND o.source='signup'
 	 WHERE n.team_id=$1 AND n.effective_to IS NULL AND n.source='migration'`, team).Scan(&frozen); err != nil || !frozen {
 		t.Fatal("raise without a published Free lost the frozen version keys", frozen, err)
+	}
+	var trialMemory int
+	if err := pool.QueryRow(ctx, `SELECT max_memory_mib FROM billing_trial_policy WHERE singleton`).Scan(&trialMemory); err != nil || trialMemory != 4096 {
+		t.Fatal("an undersized trial on a released cell was not raised to the shape", trialMemory, err)
 	}
 }
