@@ -1017,6 +1017,7 @@ type BillingPlanVersion struct {
 	TopoffAmountCents         *int64             `json:"topoff_amount_cents"`
 	TopoffThresholdCents      *int64             `json:"topoff_threshold_cents"`
 	TopoffDefaultEnabled      *bool              `json:"topoff_default_enabled"`
+	MaxSnapshots              *int32             `json:"max_snapshots"`
 }
 
 type BillingPrepaidAutoRecharge struct {
