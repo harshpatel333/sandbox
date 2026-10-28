@@ -21,6 +21,7 @@ const (
 	freeAllowanceLeaseSeconds           = 120
 	freeAllowanceExhaustedCode          = "free_allowance_exhausted"
 	teamPauseReasonPlanSwitchFree       = "plan_switch_free"
+	freeShapeCatchUpBudget              = 2 * time.Second
 )
 
 func (h *Handlers) refreshFreeAllowances(ctx context.Context) {
@@ -35,10 +36,19 @@ func (h *Handlers) refreshFreeAllowances(ctx context.Context) {
 		return
 	}
 	// A team that kept its plan caps while a purchase was in flight moves to
-	// the current shape once that purchase has settled.
+	// the current shape once that purchase has settled. It gets its own short
+	// budget so allowance enforcement below always runs.
 	if h.Pool != nil {
-		if _, err := h.Pool.Exec(ctx, `SELECT billing_raise_plan_shape(true)`); err != nil {
-			log.Error().Err(err).Msg("billing: raise plan shape failed")
+		budget := freeShapeCatchUpBudget
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline)/4 < budget {
+			budget = time.Until(deadline) / 4
+		}
+		if budget > 0 {
+			shapeCtx, cancel := context.WithTimeout(ctx, budget)
+			if _, err := h.Pool.Exec(shapeCtx, `SELECT billing_raise_plan_shape(true)`); err != nil {
+				log.Error().Err(err).Msg("billing: raise plan shape failed")
+			}
+			cancel()
 		}
 	}
 	retryBudget := time.Second

@@ -31,8 +31,9 @@ END $$;
 
 -- Moves every open Free or legacy pay-as-you-go assignment still below the
 -- curated template shape onto the published version of its plan. Safe to
--- call repeatedly. With p_deferred_only it retries only deferred teams, which
--- is what the Free allowance sweep does every cycle.
+-- call repeatedly. With p_deferred_only it retries a bounded batch of
+-- deferred teams, which is what the Free allowance sweep does every cycle. It
+-- never waits on a lock: a busy team stays deferred for the next call.
 CREATE OR REPLACE FUNCTION billing_raise_plan_shape(p_deferred_only boolean DEFAULT false, OUT moved integer, OUT skipped integer)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE
@@ -56,7 +57,7 @@ BEGIN
   WHERE family='payg' AND pricing_version='legacy' AND kind='legacy_payg' AND state='published';
  FOR a IN SELECT p.* FROM team_plan_assignment p
   WHERE p.kind IN ('free','legacy_payg') AND p.effective_to IS NULL AND p.contract_id IS NULL
-   AND (NOT p_deferred_only OR p.team_id IN (SELECT team_id FROM billing_plan_shape_deferred))
+   AND (NOT p_deferred_only OR p.team_id IN (SELECT team_id FROM billing_plan_shape_deferred ORDER BY team_id LIMIT 20))
    -- An absent or null cap is no cap: it already admits the shape.
    AND (billing_json_cap(p.limits->'max_vcpu')<2
     OR billing_json_cap(p.limits->'max_memory_mib')<4096
@@ -67,8 +68,18 @@ BEGIN
   -- caps for now and the sweep retries it.
   BEGIN
    -- Same order as financial operations: invoice serialization, then team.
-   PERFORM pg_advisory_xact_lock(hashtextextended('invoice:'||a.team_id::text,0));
-   PERFORM 1 FROM team WHERE id=a.team_id FOR UPDATE;
+   -- A team busy with either is deferred rather than waited on.
+   IF NOT pg_try_advisory_xact_lock(hashtextextended('invoice:'||a.team_id::text,0)) THEN
+    INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT DO NOTHING;
+    skipped:=skipped+1;
+    CONTINUE;
+   END IF;
+   PERFORM 1 FROM team WHERE id=a.team_id FOR UPDATE SKIP LOCKED;
+   IF NOT FOUND THEN
+    INSERT INTO billing_plan_shape_deferred(team_id) VALUES(a.team_id) ON CONFLICT DO NOTHING;
+    skipped:=skipped+1;
+    CONTINUE;
+   END IF;
    PERFORM 1 FROM team_plan_assignment WHERE id=a.id AND effective_to IS NULL;
    IF NOT FOUND THEN CONTINUE; END IF;
    -- A purchase in flight snapshots the current assignment id and refuses to
