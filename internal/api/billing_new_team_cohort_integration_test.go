@@ -67,10 +67,12 @@ func newTeamCohortTestFixture(t *testing.T) newTeamCohortFixture {
 	}
 	f.old = old.ID
 	exec(`INSERT INTO profile(id,email) VALUES($1,'cohort-api@example.invalid')`, f.actor)
+	// Production runs the zero-template Free step on the catalog's Free.
 	var free uuid.UUID
-	err = pool.QueryRow(ctx, `INSERT INTO billing_plan_version(family,version,pricing_version,kind,display_name,public,allowance_period,allowance_on_exhausted,allowance_compute_seconds,allowance_compute_vcpu,allowance_compute_memory_gib,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates)
- VALUES('free',(SELECT max(version)+1 FROM billing_plan_version WHERE family='free'),'v2','free','Free',true,'day_window','pause',7200,1,1,1,1,1024,4096,0) RETURNING id`).Scan(&free)
-	if err != nil {
+	if err = pool.QueryRow(ctx, `INSERT INTO billing_plan_version SELECT (jsonb_populate_record(NULL::billing_plan_version,to_jsonb(v)||jsonb_build_object(
+  'id',gen_random_uuid(),'version',(SELECT max(version)+1 FROM billing_plan_version WHERE family='free'),'state','draft','max_templates',0,
+  'created_by',NULL,'published_by',NULL,'published_at',NULL,'retired_by',NULL,'retired_at',NULL))).*
+ FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published' RETURNING id`).Scan(&free); err != nil {
 		t.Fatal(err)
 	}
 	exec(`SELECT publish_billing_plan_version($1,NULL)`, free)

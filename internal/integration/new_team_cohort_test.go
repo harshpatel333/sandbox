@@ -20,10 +20,12 @@ func cohortFixture(t *testing.T) (*pgxpool.Pool, uuid.UUID, uuid.UUID) {
 	system, actor := uuid.New(), uuid.New()
 	rolloutExec(t, pool, `INSERT INTO team(id,name) VALUES($1,'cohort-system')`, system)
 	rolloutExec(t, pool, `INSERT INTO profile(id,email) VALUES($1,'cohort@example.invalid')`, actor)
+	// Production runs the zero-template Free step on the catalog's Free.
 	var free uuid.UUID
-	err := pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version(family,version,pricing_version,kind,display_name,public,allowance_period,allowance_on_exhausted,allowance_compute_seconds,allowance_compute_vcpu,allowance_compute_memory_gib,max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates)
- VALUES('free',(SELECT max(version)+1 FROM billing_plan_version WHERE family='free'),'v2','free','Free',true,'day_window','pause',7200,1,1,1,1,1024,4096,0) RETURNING id`).Scan(&free)
-	if err != nil {
+	if err := pool.QueryRow(t.Context(), `INSERT INTO billing_plan_version SELECT (jsonb_populate_record(NULL::billing_plan_version,to_jsonb(v)||jsonb_build_object(
+  'id',gen_random_uuid(),'version',(SELECT max(version)+1 FROM billing_plan_version WHERE family='free'),'state','draft','max_templates',0,
+  'created_by',NULL,'published_by',NULL,'published_at',NULL,'retired_by',NULL,'retired_at',NULL))).*
+ FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published' RETURNING id`).Scan(&free); err != nil {
 		t.Fatal(err)
 	}
 	rolloutExec(t, pool, `SELECT publish_billing_plan_version($1,NULL)`, free)
@@ -251,12 +253,14 @@ func TestIntegration_NewTeamCohortPaidFirstNeedsSellableSubscriptions(t *testing
 	if err := pool.QueryRow(t.Context(), `SELECT a.kind,billing_team_awaiting_plan($1),(SELECT count(*) FROM team_credit_grant WHERE team_id=$1) FROM team_plan_assignment a WHERE a.team_id=$1 AND a.effective_to IS NULL`, onFree).Scan(&kind, &pending, &trialGrants); err != nil || kind != "free" || pending || trialGrants != 0 {
 		t.Fatalf("retiring Developer did not stop trial signups (want today's Free): %s awaiting=%v grants=%d %v", kind, pending, trialGrants, err)
 	}
+	cohortRequireCatalogFree(t, pool, onFree)
 	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=NULL WHERE singleton`)
 	cohortPublishSubscription(t, pool, "developer")
 	unconfigured := cohortCreate(t, pool, actor)
 	if err := pool.QueryRow(t.Context(), `SELECT a.kind,billing_team_awaiting_plan($1) FROM team_plan_assignment a WHERE a.team_id=$1 AND a.effective_to IS NULL`, unconfigured).Scan(&kind, &pending); err != nil || kind != "free" || pending {
 		t.Fatalf("signup without a configured trial was not kept on Free: %s %v %v", kind, pending, err)
 	}
+	cohortRequireCatalogFree(t, pool, unconfigured)
 	rolloutExec(t, pool, `UPDATE billing_trial_policy SET credit_usd=0.07 WHERE singleton`)
 	rolloutExec(t, pool, retire, "developer")
 	if _, err := pool.Exec(t.Context(), retire, "free"); pgCode(err) != "55000" {
@@ -319,5 +323,22 @@ func TestIntegration_NewTeamCohortReleaseNeedsFreeOrSellableTrial(t *testing.T) 
 	rolloutExec(t, pool, retire, "developer")
 	if _, err := cohortTryRelease(t, pool, system); pgCode(err) != "55000" {
 		t.Fatalf("gate opened with neither Free nor a sellable trial: %v", err)
+	}
+}
+
+// cohortRequireCatalogFree checks a signup got today's Free: the published v2
+// Free version and its caps, whatever shape the catalog currently has.
+func cohortRequireCatalogFree(t *testing.T, pool *pgxpool.Pool, team uuid.UUID) {
+	t.Helper()
+	var same bool
+	if err := pool.QueryRow(t.Context(), `SELECT a.plan_version_id=v.id
+  AND (a.limits->>'max_concurrent')::int IS NOT DISTINCT FROM v.max_sandboxes
+  AND (a.limits->>'max_vcpu')::int IS NOT DISTINCT FROM v.max_template_vcpu
+  AND (a.limits->>'max_memory_mib')::int IS NOT DISTINCT FROM v.max_template_memory_mib
+  AND (a.limits->>'max_disk_mib')::int IS NOT DISTINCT FROM v.max_template_disk_mib
+  AND (a.limits->>'max_templates')::int IS NOT DISTINCT FROM v.max_templates
+ FROM team_plan_assignment a, billing_plan_version v
+ WHERE a.team_id=$1 AND a.effective_to IS NULL AND v.family='free' AND v.pricing_version='v2' AND v.state='published'`, team).Scan(&same); err != nil || !same {
+		t.Fatalf("signup did not get the catalog's published Free: %v %v", same, err)
 	}
 }
