@@ -129,6 +129,48 @@ func TestFreeShapeTwoVCPUTransition(t *testing.T) {
 	}
 }
 
+// A cap the frozen limits leave out is no cap, so the raise neither selects
+// such an assignment nor writes a floor over the missing key.
+func TestFreeShapeTwoVCPUKeepsMissingCaps(t *testing.T) {
+	ctx := t.Context()
+	migration, err := os.ReadFile("../../supabase/migrations/20261028003000_free_shape_two_vcpu.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assign := func(limits string) uuid.UUID {
+		t.Helper()
+		team := uuid.New()
+		if _, err := testPool.Exec(ctx, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "free-shape-"+team.String()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM team WHERE id=$1`, team) })
+		if _, err := testPool.Exec(ctx, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE team_id=$1 AND effective_to IS NULL`, team); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testPool.Exec(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
+	 VALUES($1,'free','free',md5('billing-plan-version:v2:free:1')::uuid,'{"pricing_version":"v2","version":1}',$2::jsonb,clock_timestamp()-interval '1 hour','signup','new team')`, team, limits); err != nil {
+			t.Fatal(err)
+		}
+		return team
+	}
+	uncapped := assign(`{"max_concurrent":1,"max_vcpu":null,"max_templates":0}`)
+	partial := assign(`{"max_concurrent":1,"max_vcpu":1,"max_templates":0}`)
+	if _, err := testPool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
+	var replaced bool
+	if err := testPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_plan_assignment WHERE team_id=$1 AND source='migration')`, uncapped).Scan(&replaced); err != nil || replaced {
+		t.Fatalf("an uncapped assignment was replaced: %v %v", replaced, err)
+	}
+	var limits string
+	if err := testPool.QueryRow(ctx, `SELECT limits::text FROM team_plan_assignment WHERE team_id=$1 AND effective_to IS NULL`, partial).Scan(&limits); err != nil {
+		t.Fatal(err)
+	}
+	if limits != `{"max_vcpu": 2, "max_templates": 0, "max_concurrent": 1}` {
+		t.Fatalf("raise wrote floors over missing caps: %s", limits)
+	}
+}
+
 // admitShape attempts a sandbox insert at the given shape inside a rolled-back
 // transaction and returns the SQLSTATE that rejected it, or "" when admitted.
 func admitShape(t *testing.T, team uuid.UUID, vcpu, memoryMiB, diskMiB int) string {

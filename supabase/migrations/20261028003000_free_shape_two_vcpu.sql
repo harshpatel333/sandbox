@@ -36,9 +36,10 @@ BEGIN
   WHERE family='payg' AND pricing_version='legacy' AND kind='legacy_payg' AND state='published';
  FOR a IN SELECT p.* FROM team_plan_assignment p
   WHERE p.kind IN ('free','legacy_payg') AND p.effective_to IS NULL AND p.contract_id IS NULL
-   AND (COALESCE(billing_json_cap(p.limits->'max_vcpu'),0)<2
-    OR COALESCE(billing_json_cap(p.limits->'max_memory_mib'),0)<4096
-    OR COALESCE(billing_json_cap(p.limits->'max_disk_mib'),0)<8192)
+   -- An absent or null cap is no cap: it already admits the shape.
+   AND (billing_json_cap(p.limits->'max_vcpu')<2
+    OR billing_json_cap(p.limits->'max_memory_mib')<4096
+    OR billing_json_cap(p.limits->'max_disk_mib')<8192)
   ORDER BY p.team_id
  LOOP
   -- One team's frozen invoice history must not hold back every other team;
@@ -71,10 +72,11 @@ BEGIN
     a.terms||CASE a.kind
      WHEN 'free' THEN COALESCE(jsonb_build_object('version_id',free_id,'version',free_version),'{}'::jsonb)
      ELSE COALESCE(jsonb_build_object('version_id',payg_id,'version',payg_version),'{}'::jsonb) END,
-    a.limits||jsonb_build_object(
-     'max_vcpu',GREATEST(COALESCE(billing_json_cap(a.limits->'max_vcpu'),0),2),
-     'max_memory_mib',GREATEST(COALESCE(billing_json_cap(a.limits->'max_memory_mib'),0),4096),
-     'max_disk_mib',GREATEST(COALESCE(billing_json_cap(a.limits->'max_disk_mib'),0),8192)),
+    -- GREATEST ignores NULL, so a missing cap must stay missing explicitly.
+    a.limits||jsonb_strip_nulls(jsonb_build_object(
+     'max_vcpu',CASE WHEN billing_json_cap(a.limits->'max_vcpu')<2 THEN 2 END,
+     'max_memory_mib',CASE WHEN billing_json_cap(a.limits->'max_memory_mib')<4096 THEN 4096 END,
+     'max_disk_mib',CASE WHEN billing_json_cap(a.limits->'max_disk_mib')<8192 THEN 8192 END)),
     at_time,'migration','Plan shape raised to 2 vCPU / 4096 MiB / 8192 MiB','free-shape-2-4-8:'||a.id);
    moved:=moved+1;
   EXCEPTION WHEN OTHERS THEN
