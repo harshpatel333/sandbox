@@ -414,3 +414,27 @@ func TestIntegration_NewTeamCohortPaidFirstUsesCheckoutSellability(t *testing.T)
 	}
 	cohortRequireCatalogFree(t, pool, team)
 }
+
+func TestIntegration_NewTeamCohortOpenCheckoutDoesNotExtendTrial(t *testing.T) {
+	pool, system, actor := cohortFixture(t)
+	cohortRelease(t, pool, system)
+	team := cohortCreate(t, pool, actor)
+	rolloutExec(t, pool, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status) VALUES($1,'cus_trial','sub_unpaid','active')
+ ON CONFLICT(team_id) DO UPDATE SET stripe_customer_id='cus_trial',stripe_subscription_id='sub_unpaid',stripe_subscription_status='active'`, team)
+	var state string
+	var remaining float64
+	var refreshed bool
+	if err := pool.QueryRow(t.Context(), `SELECT b.state,b.remaining_usd::float8,refresh_team_trial_eligibility($1) FROM get_team_trial_balance($1) b`, team).Scan(&state, &remaining, &refreshed); err != nil {
+		t.Fatal(err)
+	}
+	if state != "active" || remaining != 0.07 || !refreshed {
+		t.Fatalf("an unpaid checkout subscription changed the trial: state=%s remaining=%v eligible=%v", state, remaining, refreshed)
+	}
+	rolloutExec(t, pool, `UPDATE team_credit_grant SET expires_at=now()-interval '1 second' WHERE team_id=$1 AND reason='signup trial credit'`, team)
+	if err := pool.QueryRow(t.Context(), `SELECT b.state,refresh_team_trial_eligibility($1) FROM get_team_trial_balance($1) b`, team).Scan(&state, &refreshed); err != nil {
+		t.Fatal(err)
+	}
+	if state == "ended_by_billing_activation" || refreshed {
+		t.Fatalf("an unpaid checkout subscription kept an expired trial eligible: state=%s eligible=%v", state, refreshed)
+	}
+}
