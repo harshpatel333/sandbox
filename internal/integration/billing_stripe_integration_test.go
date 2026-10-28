@@ -2130,6 +2130,18 @@ func TestIntegration_CustomerPortalSessionWithoutCancellationForCatalogPlans(t *
 		VALUES ($1, 'pro_monthly', $4, $2, $3, 'price_pro', 120000, 1, 100000, $4)`, teamID, customer, subscription, anchor); err != nil {
 		t.Fatalf("seed plan contract: %v", err)
 	}
+	upgradeTeam, upgradeKey, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	upgradeCustomer, upgradeSubscription := "cus_"+upgradeTeam.String(), "sub_"+upgradeTeam.String()
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'billing_export_enabled', true) ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled`, upgradeTeam); err != nil {
+		t.Fatalf("enable billing export: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status) VALUES ($1, $2, $3, 'active')`, upgradeTeam, upgradeCustomer, upgradeSubscription); err != nil {
+		t.Fatalf("seed upgrading account: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,subscription_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence)
+		VALUES (gen_random_uuid(),$1,gen_random_uuid(),$2,$3,'pro_monthly','{}',$4::timestamptz,$4,$4::timestamptz+interval '1 month',$4,120000,'paid','{"invoice":"in_paid"}')`, upgradeTeam, upgradeCustomer, upgradeSubscription, anchor); err != nil {
+		t.Fatalf("seed paid upgrade: %v", err)
+	}
 	for _, configuration := range []string{"", "bpc_no_cancel"} {
 		t.Setenv("INTERNAL_API_TOKEN", internalRBACToken)
 		cfg := &config.Config{
@@ -2148,15 +2160,18 @@ func TestIntegration_CustomerPortalSessionWithoutCancellationForCatalogPlans(t *
 		h.Pool = testPool
 		h.Stripe = stripe
 		r := api.SetupRouter(t.Context(), h, testPool)
-		w := do(r, "POST", "/stripe/customer-portal-session", apiKey, `{"return_url":"https://app.superserve.test/billing"}`)
-		if configuration == "" {
-			if w.Code != http.StatusServiceUnavailable || len(stripe.portalCalls) != 0 {
-				t.Fatalf("unconfigured plan portal opened the default portal: %d %s calls=%d", w.Code, w.Body.String(), len(stripe.portalCalls))
+		for _, key := range []string{apiKey, upgradeKey} {
+			before := len(stripe.portalCalls)
+			w := do(r, "POST", "/stripe/customer-portal-session", key, `{"return_url":"https://app.superserve.test/billing"}`)
+			if configuration == "" {
+				if w.Code != http.StatusServiceUnavailable || len(stripe.portalCalls) != before {
+					t.Fatalf("unconfigured plan portal opened the default portal: %d %s calls=%d", w.Code, w.Body.String(), len(stripe.portalCalls))
+				}
+				continue
 			}
-			continue
-		}
-		if w.Code != http.StatusOK || len(stripe.portalCalls) != 1 || stripe.portalCalls[0].Configuration != configuration {
-			t.Fatalf("plan portal did not use the configuration without cancellation: %d %s %+v", w.Code, w.Body.String(), stripe.portalCalls)
+			if w.Code != http.StatusOK || len(stripe.portalCalls) != before+1 || stripe.portalCalls[before].Configuration != configuration {
+				t.Fatalf("plan portal did not use the configuration without cancellation: %d %s %+v", w.Code, w.Body.String(), stripe.portalCalls)
+			}
 		}
 	}
 }

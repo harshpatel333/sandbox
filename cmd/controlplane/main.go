@@ -90,6 +90,9 @@ func run() error {
 		defer sentry.Flush(2 * time.Second)
 		log.Info().Msg("sentry initialized")
 	}
+	if cfg.StripeSecretKey != "" && cfg.StripePortalNoCancelConfiguration == "" {
+		log.Error().Msg("STRIPE_PORTAL_NO_CANCEL_CONFIGURATION unset — teams on a catalog plan cannot open the Stripe customer portal")
+	}
 
 	// Root context — cancelled on shutdown so background goroutines
 	// (rate limiter cleanup, etc.) exit cleanly.
