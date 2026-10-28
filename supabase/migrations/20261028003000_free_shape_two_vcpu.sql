@@ -69,9 +69,11 @@ BEGIN
    INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason,idempotency_key)
    VALUES(a.team_id,a.plan_key,a.kind,
     CASE a.kind WHEN 'free' THEN COALESCE(free_id,a.plan_version_id) ELSE COALESCE(payg_id,a.plan_version_id) END,
-    a.terms||CASE a.kind
-     WHEN 'free' THEN COALESCE(jsonb_build_object('version_id',free_id,'version',free_version),'{}'::jsonb)
-     ELSE COALESCE(jsonb_build_object('version_id',payg_id,'version',payg_version),'{}'::jsonb) END,
+    -- Without a published replacement the frozen version keys stay as they are.
+    a.terms||CASE
+     WHEN a.kind='free' AND free_id IS NOT NULL THEN jsonb_build_object('version_id',free_id,'version',free_version)
+     WHEN a.kind<>'free' AND payg_id IS NOT NULL THEN jsonb_build_object('version_id',payg_id,'version',payg_version)
+     ELSE '{}'::jsonb END,
     -- GREATEST ignores NULL, so a missing cap must stay missing explicitly.
     a.limits||jsonb_strip_nulls(jsonb_build_object(
      'max_vcpu',CASE WHEN billing_json_cap(a.limits->'max_vcpu')<2 THEN 2 END,
@@ -102,9 +104,11 @@ DECLARE
  moved integer; skipped integer;
 BEGIN
  -- Once the new-team cohort is live, every catalog write must leave a
- -- zero-template Free published (cohort_free_catalog_retained). Say so up
- -- front instead of failing at commit.
+ -- zero-template Free published unless paid-first signup has replaced it
+ -- (billing_keep_cohort_free_catalog). Say so up front instead of failing at
+ -- commit.
  IF (billing_new_team_ready() OR EXISTS(SELECT 1 FROM billing_new_team_enrollment))
+  AND NOT (billing_paid_first_sellable() AND billing_trial_configured())
   AND NOT EXISTS(SELECT 1 FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2'
    AND v.state='published' AND v.kind='free' AND v.max_templates=0) THEN
   RAISE EXCEPTION 'publish the zero-template Free catalog before raising the Free shape' USING ERRCODE='55000';

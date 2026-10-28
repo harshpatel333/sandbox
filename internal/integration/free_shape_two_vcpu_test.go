@@ -248,3 +248,31 @@ func TestFreeShapeTwoVCPUKeepsInFlightCheckout(t *testing.T) {
 		t.Fatalf("settled team must move on the next call: moved=%d memory=%d", moved, mem)
 	}
 }
+
+// With Free retired (paid-first live), the raise keeps an assignment's frozen
+// version keys instead of nulling them, and the migration still applies.
+func TestFreeShapeTwoVCPUAfterFreeRetired(t *testing.T) {
+	ctx := t.Context()
+	migration, err := os.ReadFile("../../supabase/migrations/20261028003000_free_shape_two_vcpu.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, system, _ := cohortFixture(t)
+	team := uuid.New()
+	rolloutExec(t, pool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "free-shape-"+team.String())
+	rolloutExec(t, pool, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE team_id=$1 AND effective_to IS NULL`, team)
+	rolloutExec(t, pool, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
+	 SELECT $1,'free','free',v.id,jsonb_build_object('pricing_version','v2','version_id',v.id,'version',v.version),'{"max_concurrent":1,"max_vcpu":1,"max_templates":0}',clock_timestamp()-interval '1 hour','signup','new team'
+	 FROM billing_plan_version v WHERE v.family='free' AND v.pricing_version='v2' AND v.state='published'`, team)
+	cohortRelease(t, pool, system)
+	rolloutExec(t, pool, `SELECT retire_billing_plan_version((SELECT id FROM billing_plan_version WHERE family='free' AND pricing_version='v2' AND state='published'),NULL)`)
+	if _, err := pool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal("migration refused a valid paid-first catalog without Free:", err)
+	}
+	var frozen bool
+	if err := pool.QueryRow(ctx, `SELECT n.terms->'version_id'=o.terms->'version_id' AND n.terms->'version'=o.terms->'version' AND n.terms->>'version_id' IS NOT NULL
+	 FROM team_plan_assignment n JOIN team_plan_assignment o ON o.team_id=n.team_id AND o.effective_to IS NOT NULL AND o.source='signup'
+	 WHERE n.team_id=$1 AND n.effective_to IS NULL AND n.source='migration'`, team).Scan(&frozen); err != nil || !frozen {
+		t.Fatal("raise without a published Free lost the frozen version keys", frozen, err)
+	}
+}
