@@ -1152,7 +1152,7 @@ WHERE team_id = sqlc.arg(team_id)
 WITH plan AS (
     SELECT a.terms FROM team_plan_assignment a
     WHERE a.team_id = sqlc.arg(team_id) AND a.effective_to IS NULL
-      AND a.kind = 'subscription' AND a.terms->>'funding_policy' = 'prepaid'
+      AND a.kind = 'subscription' AND billing_assignment_prepaid_funded(a)
 ), funding AS (
     SELECT billing_prepaid_warning_balance_ready(sqlc.arg(team_id)) AS ready,
            GREATEST(COALESCE(f.credit_usd, 0), 0) AS credit,
@@ -1438,7 +1438,7 @@ WHERE EXISTS (
     SELECT f.team_id
     FROM billing_funding_account f
     JOIN team_plan_assignment a ON a.team_id = f.team_id AND a.effective_to IS NULL
-     AND a.kind = 'subscription' AND a.terms->>'funding_policy' = 'prepaid'
+     AND a.kind = 'subscription' AND billing_assignment_prepaid_funded(a)
     LEFT JOIN billing_prepaid_auto_recharge r ON r.team_id = f.team_id
     WHERE f.observe
       AND f.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
