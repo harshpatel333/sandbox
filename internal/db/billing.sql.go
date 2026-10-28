@@ -1968,7 +1968,7 @@ WITH plan AS (
     WHERE a.team_id = $1 AND a.effective_to IS NULL
       AND a.kind = 'subscription' AND a.terms->>'funding_policy' = 'prepaid'
 ), funding AS (
-    SELECT COALESCE(f.observe AND f.observed_generation = f.generation AND f.credit_valid_until > now(), false) AS fresh,
+    SELECT billing_prepaid_warning_balance_ready($1) AS ready,
            GREATEST(COALESCE(f.credit_usd, 0), 0) AS credit,
            COALESCE(r.enabled AND r.amount_cents <= 1000000 AND r.threshold_cents <= 1000000, false) AS topoff
     FROM (SELECT $1::uuid AS team_id) t
@@ -1976,14 +1976,15 @@ WITH plan AS (
     LEFT JOIN billing_prepaid_auto_recharge r USING (team_id)
 ), cohort AS (
     SELECT billing_team_awaiting_plan($1) AS awaiting,
-           billing_team_trial_active($1) AS active
+           billing_team_trial_active($1) AS active,
+           EXISTS (SELECT 1 FROM billing_pro_upgrade u WHERE u.team_id = $1 AND u.state IN ('paid', 'credited', 'active')) AS settling
 )
 SELECT 0::numeric AS grant_usd,
        0::numeric AS consumed_usd,
-       (CASE WHEN funding.fresh THEN round(funding.credit, 6) ELSE 0 END)::numeric AS remaining_usd,
-       (CASE WHEN funding.topoff THEN 'auto_topoff' WHEN NOT funding.fresh THEN 'unknown'
+       (CASE WHEN funding.ready THEN round(funding.credit, 6) ELSE 0 END)::numeric AS remaining_usd,
+       (CASE WHEN funding.topoff THEN 'auto_topoff' WHEN NOT funding.ready THEN 'unknown'
              WHEN funding.credit > 0 THEN 'active' ELSE 'exhausted' END)::text AS state,
-       (NOT funding.topoff AND funding.fresh AND funding.credit > 0)::boolean AS eligible,
+       (NOT funding.topoff AND funding.ready AND funding.credit > 0)::boolean AS eligible,
        'prepaid'::text AS kind,
        ((plan.terms->'topoff'->>'threshold_cents')::numeric / 100)::numeric AS low_credit_threshold_usd
 FROM plan, funding
@@ -1991,7 +1992,8 @@ UNION ALL
 SELECT trial.grant_usd::numeric,
        trial.consumed_usd::numeric,
        (CASE WHEN cohort.awaiting AND NOT cohort.active THEN 0 ELSE trial.remaining_usd END)::numeric,
-       (CASE WHEN cohort.awaiting AND NOT cohort.active AND trial.state <> 'no_grant' THEN 'exhausted' ELSE trial.state END)::text,
+       (CASE WHEN NOT cohort.awaiting OR cohort.active OR trial.state = 'no_grant' THEN trial.state
+             WHEN cohort.settling THEN 'ended_by_billing_activation' ELSE 'exhausted' END)::text,
        (trial.eligible AND NOT (cohort.awaiting AND NOT cohort.active))::boolean,
        (CASE WHEN cohort.awaiting THEN 'trial' ELSE 'legacy_trial' END)::text,
        (CASE WHEN cohort.awaiting THEN (SELECT p.low_credit_threshold_usd FROM billing_trial_policy p WHERE p.singleton) END)::numeric
@@ -2010,10 +2012,12 @@ type GetTeamTrialBalanceRow struct {
 }
 
 // Teams on a prepaid-funded subscription report their funded credit instead
-// of a trial: eligible only while it is observed, positive and not topped up
-// automatically. A trial awaiting its first plan reports exhausted once the
-// trial has ended. low_credit_threshold_usd is where messaging calls the
-// credit low; it is null where no setting applies.
+// of a trial: unknown until a reading after the period's grant and any later
+// top-off, and eligible only while positive and not topped up automatically.
+// A trial awaiting its first plan reports exhausted once it has ended, or
+// ended_by_billing_activation while a paid checkout settles.
+// low_credit_threshold_usd is where messaging calls the credit low; it is
+// null where no setting applies.
 func (q *Queries) GetTeamTrialBalance(ctx context.Context, teamID uuid.UUID) (GetTeamTrialBalanceRow, error) {
 	row := q.db.QueryRow(ctx, getTeamTrialBalance, teamID)
 	var i GetTeamTrialBalanceRow
@@ -3013,16 +3017,18 @@ WHERE EXISTS (
 ), ended_trials AS (
     -- Trials awaiting a first plan are warned once, when they end. Their
     -- sandboxes are paused by then, so they are found without running work.
+    -- The warned check comes first so abandoned trials cost one index probe.
     SELECT e.team_id
     FROM billing_new_team_enrollment e
     WHERE e.initial_assignment_id IS NULL
       AND e.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-      AND billing_team_awaiting_plan(e.team_id)
-      AND EXISTS (SELECT 1 FROM team_credit_grant g WHERE g.team_id = e.team_id AND g.reason = 'signup trial credit')
-      AND NOT billing_team_trial_active(e.team_id)
       AND NOT EXISTS (
           SELECT 1 FROM trial_credit_warning_state w
-          WHERE w.team_id = e.team_id AND w.lifecycle_key = trial_credit_warning_lifecycle(e.team_id) AND w.status <> 'pending')
+          WHERE w.team_id = e.team_id AND w.lifecycle_key LIKE 'trial:%' AND w.status <> 'pending')
+      AND NOT EXISTS (SELECT 1 FROM team_plan_assignment a WHERE a.team_id = e.team_id AND a.effective_to IS NULL)
+      AND EXISTS (SELECT 1 FROM team_credit_grant g WHERE g.team_id = e.team_id AND g.reason = 'signup trial credit')
+      AND NOT EXISTS (SELECT 1 FROM billing_pro_upgrade u WHERE u.team_id = e.team_id AND u.state IN ('paid', 'credited', 'active'))
+      AND NOT billing_team_trial_active(e.team_id)
 ), low_prepaid AS (
     -- Only observed accounts have a balance to warn about. Automatic top-off
     -- keeps them funded, so it suppresses the warning.
@@ -3031,13 +3037,14 @@ WHERE EXISTS (
     JOIN team_plan_assignment a ON a.team_id = f.team_id AND a.effective_to IS NULL
      AND a.kind = 'subscription' AND a.terms->>'funding_policy' = 'prepaid'
     LEFT JOIN billing_prepaid_auto_recharge r ON r.team_id = f.team_id
-    WHERE f.observe AND f.observed_generation = f.generation AND f.credit_valid_until > now()
+    WHERE f.observe
       AND f.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
       AND f.credit_usd * 100 < (a.terms->'topoff'->>'threshold_cents')::numeric
       AND NOT COALESCE(r.enabled AND r.amount_cents <= 1000000 AND r.threshold_cents <= 1000000, false)
       AND NOT EXISTS (
           SELECT 1 FROM trial_credit_warning_state w
           WHERE w.team_id = f.team_id AND w.lifecycle_key = trial_credit_warning_lifecycle(f.team_id) AND w.status <> 'pending')
+      AND billing_prepaid_warning_balance_ready(f.team_id)
 )
 SELECT team_id FROM running
 UNION SELECT team_id FROM ended_trials

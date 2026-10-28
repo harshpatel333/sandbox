@@ -35,7 +35,6 @@ func (s *countingCreditWarningSender) sent() []float64 {
 // top-off terms.
 func TestPrepaidLowCreditWarningOnlyWithAutoTopoffOff(t *testing.T) {
 	f, contract := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: true})
-	f.issueIncludedGrant(contract)
 	sender := &countingCreditWarningSender{}
 	f.h.TrialWarningSender = sender
 	discovered := func() bool {
@@ -51,6 +50,17 @@ func TestPrepaidLowCreditWarningOnlyWithAutoTopoffOff(t *testing.T) {
 		for range 2 {
 			f.h.processTrialCreditWarning(t.Context(), f.team)
 		}
+	}
+
+	f.observe(500, true)
+	process()
+	if discovered() || len(sender.sent()) != 0 {
+		t.Fatal("warned before the period's included grant was issued")
+	}
+	f.issueIncludedGrant(contract)
+	process()
+	if discovered() || len(sender.sent()) != 0 {
+		t.Fatal("warned on a reading taken before the included grant was issued")
 	}
 
 	if err := f.applyTopoff("cs_"+uuid.NewString(), true); err != nil {
@@ -88,6 +98,10 @@ func TestPrepaidLowCreditWarningOnlyWithAutoTopoffOff(t *testing.T) {
   paid_at,payment_evidence,credit_state,credit_idempotency_key,credit_request,credit_first_attempt_at,stripe_credit_grant_id,credit_evidence,credited_at)
  VALUES($1,$2,'auto_recharge',1500,'succeeded',gen_random_uuid()::text,clock_timestamp(),clock_timestamp(),'{}','issued',gen_random_uuid()::text,'{}',clock_timestamp(),
   'cg_'||gen_random_uuid(),'{}',clock_timestamp())`, f.team, f.customer)
+	process()
+	if got := sender.sent(); len(got) != 1 {
+		t.Fatalf("warned again on a reading taken before the top-off: %v", got)
+	}
 	f.observe(800, true)
 	process()
 	if got := sender.sent(); len(got) != 2 || got[1] != 8 {
@@ -149,5 +163,31 @@ func TestPrepaidSummaryUnobservedBalanceIsNotLow(t *testing.T) {
 	f.exec(`UPDATE billing_funding_account SET credit_valid_until=clock_timestamp()-interval '1 second' WHERE team_id=$1`, f.team)
 	if observed, low := summary(); observed || low {
 		t.Fatal("a stale balance is reported as observed or low")
+	}
+}
+
+func TestPrepaidSummaryLowBalanceUsesFrozenTopoffThreshold(t *testing.T) {
+	f, _ := fundedSubscriptionFixture(t, &planTopoff{AmountCents: 1500, ThresholdCents: 1000, DefaultEnabled: false})
+	low := func() bool {
+		t.Helper()
+		raw, err := f.h.prepaidSummary(t.Context(), f.team, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var s struct {
+			Low bool `json:"low_balance"`
+		}
+		if err = json.Unmarshal(raw, &s); err != nil {
+			t.Fatal(err)
+		}
+		return s.Low
+	}
+	f.observe(999, true)
+	if !low() {
+		t.Fatal("a balance below the plan's top-off threshold is not low")
+	}
+	f.observe(1000, true)
+	if low() {
+		t.Fatal("a balance at the plan's top-off threshold is low")
 	}
 }

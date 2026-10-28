@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -75,6 +76,16 @@ func TestIntegration_NewTeamTrialEmailsOnceWhenItEnds(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT billing_team_entry_state($1)`, team).Scan(&entry); err != nil || entry != "trial_ended" {
 		t.Fatalf("entry state = %s, %v", entry, err)
 	}
+	settling := uuid.New()
+	rolloutExec(t, pool, `SET session_replication_role=replica;
+ INSERT INTO billing_pro_upgrade(id,team_id,actor_id,customer_id,offer_key,request_payload,anchor,period_start,period_end,quoted_at,amount_cents,state,payment_evidence)
+ VALUES('`+settling.String()+`','`+team.String()+`','`+actor.String()+`','cus_fixture','developer_monthly','{}',now(),now(),now()+interval '1 month',now(),100,'paid','{}');
+ RESET session_replication_role`)
+	api.ProcessTrialCreditWarningForTest(h, ctx, team)
+	if discovered() || len(subjects) != 0 {
+		t.Fatalf("told a team whose checkout is settling that its trial ended: %v", subjects)
+	}
+	rolloutExec(t, pool, `SET session_replication_role=replica; UPDATE billing_pro_upgrade SET state='expired' WHERE id='`+settling.String()+`'; RESET session_replication_role`)
 	if !discovered() {
 		t.Fatal("ended trial was not discovered")
 	}
