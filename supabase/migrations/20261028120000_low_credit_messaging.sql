@@ -24,20 +24,49 @@ RETURNS text LANGUAGE sql STABLE AS $$
   AND a.kind='subscription' AND a.terms->>'funding_policy'='prepaid';
 $$;
 
--- A prepaid-funded balance is only worth warning about once the period's
--- included grant has been issued and observed, and no top-off or grant has
--- been issued since the reading: the grant lands after checkout and after each
--- renewal invoice, so a reading in that gap shows only leftover credit.
+-- How long a prepaid-funded period may run without its included grant before
+-- low-credit messaging stops waiting for it, as when a renewal is unpaid or its
+-- grant is withheld. It is configuration.
+ALTER TABLE billing_funding_policy
+ ADD COLUMN low_credit_grant_grace interval NOT NULL DEFAULT interval '1 hour' CHECK(low_credit_grant_grace>interval '0');
+
+-- A prepaid-funded balance is worth warning about once it was read after the
+-- period's included grant and after every top-off paid since: the grant lands
+-- after checkout and after each renewal invoice, so a reading in that gap shows
+-- only leftover credit. A period whose grant has not landed within the grace
+-- is warned on its current balance.
 CREATE FUNCTION billing_prepaid_warning_balance_ready(p_team uuid) RETURNS boolean
-LANGUAGE sql STABLE AS $$
- SELECT COALESCE(bool_or(f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>now()
-  AND (EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.team_id=p_team AND e.contract_id=a.contract_id AND e.state='issued'
-        AND e.period_start<=now() AND e.period_end>now())
-   OR EXISTS(SELECT 1 FROM billing_pro_upgrade u JOIN billing_provider_credit c ON c.customer_id=u.customer_id AND c.grant_id=u.grant_id
-        WHERE u.team_id=p_team AND u.contract_id=a.contract_id AND u.state IN ('credited','active')
-        AND u.period_start<=now() AND u.period_end>now() AND c.observed_at<f.credit_checked_at))
-  AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.team_id=p_team AND e.state='issued' AND e.issued_at>=f.credit_checked_at)
-  AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=p_team AND p.credit_state='issued' AND p.credited_at>=f.credit_checked_at)),false)
- FROM team_plan_assignment a JOIN billing_funding_account f ON f.team_id=a.team_id
- WHERE a.team_id=p_team AND a.effective_to IS NULL AND a.kind='subscription' AND a.terms->>'funding_policy'='prepaid';
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+ WITH current AS (
+  SELECT a.contract_id, a.effective_from, f.credit_checked_at AS checked
+  FROM team_plan_assignment a JOIN billing_funding_account f ON f.team_id=a.team_id
+  WHERE a.team_id=p_team AND a.effective_to IS NULL AND a.kind='subscription' AND a.terms->>'funding_policy'='prepaid'
+   AND f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>now()
+ ), grants AS (
+  SELECT e.period_start, e.period_end, e.issued_at AS landed FROM billing_usage_entitlement e, current
+  WHERE e.team_id=p_team AND e.contract_id=current.contract_id AND e.state='issued'
+  UNION ALL
+  SELECT u.period_start, u.period_end, c.observed_at FROM billing_pro_upgrade u
+  JOIN billing_provider_credit c ON c.customer_id=u.customer_id AND c.grant_id=u.grant_id, current
+  WHERE u.team_id=p_team AND u.contract_id=current.contract_id AND u.state IN ('credited','active')
+ )
+ SELECT COALESCE(bool_or(
+   NOT EXISTS(SELECT 1 FROM grants g WHERE g.landed>=current.checked)
+   AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement e WHERE e.team_id=p_team AND e.state='issued' AND e.issued_at>=current.checked)
+   AND NOT EXISTS(SELECT 1 FROM billing_prepaid_purchase p WHERE p.team_id=p_team AND p.payment_state='succeeded'
+    AND (p.credit_state<>'issued' OR p.credited_at>=current.checked) AND NOT billing_prepaid_credit_withheld(p))
+   AND (EXISTS(SELECT 1 FROM grants g WHERE g.period_start<=now() AND g.period_end>now())
+    OR GREATEST(current.effective_from,(SELECT max(g.period_end) FROM grants g WHERE g.period_end<=now()))
+       +(SELECT low_credit_grant_grace FROM billing_funding_policy WHERE singleton)<current.checked)),false)
+ FROM current;
 $$;
+
+DO $$ DECLARE r text; BEGIN
+ REVOKE ALL ON FUNCTION billing_prepaid_warning_balance_ready(uuid) FROM PUBLIC;
+ FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname=r) THEN EXECUTE format('REVOKE ALL ON FUNCTION billing_prepaid_warning_balance_ready(uuid) FROM %I',r); END IF;
+ END LOOP;
+ IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
+  GRANT EXECUTE ON FUNCTION billing_prepaid_warning_balance_ready(uuid) TO service_role;
+ END IF;
+END $$;

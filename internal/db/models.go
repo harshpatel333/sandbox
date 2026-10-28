@@ -690,9 +690,10 @@ type BillingFundingAccount struct {
 }
 
 type BillingFundingPolicy struct {
-	Singleton        bool  `json:"singleton"`
-	MaxObservedTeams int32 `json:"max_observed_teams"`
-	BatchSize        int32 `json:"batch_size"`
+	Singleton           bool            `json:"singleton"`
+	MaxObservedTeams    int32           `json:"max_observed_teams"`
+	BatchSize           int32           `json:"batch_size"`
+	LowCreditGrantGrace pgtype.Interval `json:"low_credit_grant_grace"`
 }
 
 type BillingIncrementalPeriod struct {
