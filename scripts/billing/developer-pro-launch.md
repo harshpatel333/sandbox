@@ -24,9 +24,10 @@ accepts whole-dollar thresholds from $1 (amounts keep $5 steps). Publish
 Developer only after that change has merged and deployed.
 
 Internal caps are never published, so they are not written here. Pass them
-from the launch record: `<disk_mib>` (`max_disk_mib`), `<developer_templates>`
+from the launch record: `<disk_mib>` (`max_template_disk_mib` on the plan version), `<developer_templates>`
 and `<pro_templates>` (`max_templates`), and `<developer_snapshots>` and
-`<pro_snapshots>` (`max_snapshots`, once the catalog carries snapshot caps).
+`<pro_snapshots>` (`max_snapshots`, a column that arrives with the snapshot-cap
+change; deploy it before this checklist runs in any environment).
 The internal limits checklist below confirms they are set.
 
 Trial settings: `credit_usd` 0.05, `max_sandboxes` 1, and from the launch
@@ -156,12 +157,13 @@ signups.
 
 ## Internal limits checklist
 
-Run in staging and in each production region after publishing. Every column
+Run in staging and in each production region after publishing. The snapshot-cap
+change must be deployed first, since it adds `max_snapshots`. Every column
 must be non-null; fix any null with a new catalog version or trial settings
 edit before going live.
 
 ```sql
-SELECT family, version, max_disk_mib, max_templates, max_snapshots
+SELECT family, version, max_template_disk_mib, max_templates, max_snapshots
 FROM billing_plan_version
 WHERE pricing_version = 'v2' AND state = 'published' AND family IN ('developer', 'pro')
 ORDER BY family;

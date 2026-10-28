@@ -48,7 +48,8 @@ A draft body carries the whole version (placeholders in angle brackets):
 
 `funding_policy` is `postpaid` unless set; only v2 subscriptions can be
 `prepaid`. `topoff` needs `prepaid`, and its amount and threshold are multiples
-of 500 cents up to 1,000,000. The publish body may carry `expected`: the
+of 500 cents up to 1,000,000. A follow-up change relaxes the threshold to whole
+dollars from 100 cents; until it deploys, lower thresholds are rejected. The publish body may carry `expected`: the
 version's terms as last read (a full version object, or the same fields as a
 draft body, including `funding_policy` and `topoff`). A version whose terms
 differ is rejected rather than published.
