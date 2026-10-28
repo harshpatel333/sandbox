@@ -20,7 +20,7 @@ DECLARE
  payg_id uuid; payg_version integer;
  a team_plan_assignment;
  at_time timestamptz;
- moved integer := 0;
+ moved integer := 0; skipped integer := 0; in_flight boolean;
 BEGIN
  -- Once the new-team cohort is live, every catalog write must leave a
  -- zero-template Free published (cohort_free_catalog_retained). Say so up
@@ -81,6 +81,21 @@ BEGIN
   -- such a team keeps its old caps and is reported for a manual follow-up.
   BEGIN
    PERFORM 1 FROM team WHERE id=a.team_id FOR UPDATE;
+   -- A purchase in flight snapshots the current assignment id and refuses to
+   -- activate against a different one. Such a team keeps its caps until the
+   -- purchase settles; the paid plan it lands on carries larger ones.
+   SELECT EXISTS(SELECT 1 FROM billing_commercial_contract WHERE team_id=a.team_id AND status<>'ended')
+    OR EXISTS(SELECT 1 FROM billing_pro_upgrade WHERE team_id=a.team_id AND state NOT IN ('expired','ended'))
+    OR EXISTS(SELECT 1 FROM billing_signup_choice WHERE team_id=a.team_id AND state='pending' AND offer_key<>'free')
+    OR EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=a.team_id AND (checkout_initializing_at IS NOT NULL OR checkout_may_exist))
+    OR EXISTS(SELECT 1 FROM billing_prepaid_purchase WHERE team_id=a.team_id AND (payment_state IN ('pending','uncertain','processing') OR credit_state IN ('pending','uncertain')))
+    OR EXISTS(SELECT 1 FROM team_plan_change WHERE team_id=a.team_id AND state IN ('scheduled','applied'))
+   INTO in_flight;
+   IF in_flight THEN
+    skipped:=skipped+1;
+    RAISE WARNING 'free shape: team % has a purchase in flight; caps unchanged',a.team_id;
+    CONTINUE;
+   END IF;
    at_time:=clock_timestamp();
    UPDATE team_plan_assignment SET effective_to=at_time WHERE id=a.id;
    INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason,idempotency_key)
@@ -99,7 +114,7 @@ BEGIN
    RAISE WARNING 'free shape: team % kept its plan caps: %',a.team_id,SQLERRM;
   END;
  END LOOP;
- RAISE NOTICE 'free shape: % open assignments moved to the new shape',moved;
+ RAISE NOTICE 'free shape: % open assignments moved to the new shape, % skipped for a purchase in flight',moved,skipped;
 END $$;
 
 -- 4. The new-team gate release validates the published Free shape; it now

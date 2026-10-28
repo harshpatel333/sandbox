@@ -146,3 +146,42 @@ func admitShape(t *testing.T, team uuid.UUID, vcpu, memoryMiB, diskMiB int) stri
 	}
 	return pe.Code
 }
+
+// A team mid-purchase keeps its assignment: the checkout snapshot names the
+// open assignment and would refuse to activate against a replacement.
+func TestFreeShapeTwoVCPUKeepsInFlightCheckout(t *testing.T) {
+	ctx := t.Context()
+	migration, err := os.ReadFile("../../supabase/migrations/20261028003000_free_shape_two_vcpu.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	team := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "free-shape-checkout-"+team.String()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM team WHERE id=$1`, team) })
+	if _, err := testPool.Exec(ctx, `UPDATE team_plan_assignment SET effective_to=clock_timestamp() WHERE team_id=$1 AND effective_to IS NULL`, team); err != nil {
+		t.Fatal(err)
+	}
+	var old uuid.UUID
+	if err := testPool.QueryRow(ctx, `INSERT INTO team_plan_assignment(team_id,plan_key,kind,plan_version_id,terms,limits,effective_from,source,reason)
+	 VALUES($1,'free','free',md5('billing-plan-version:v2:free:1')::uuid,'{"pricing_version":"v2","version":1}',
+	  '{"max_concurrent":1,"max_vcpu":1,"max_memory_mib":1024,"max_disk_mib":4096,"max_templates":10}',
+	  clock_timestamp()-interval '1 hour','signup','new team') RETURNING id`, team).Scan(&old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account(team_id,checkout_may_exist) VALUES($1,true)`, team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, string(migration)); err != nil {
+		t.Fatal(err)
+	}
+	var assignments int
+	var stillOpen bool
+	if err := testPool.QueryRow(ctx, `SELECT count(*),bool_or(id=$2 AND effective_to IS NULL) FROM team_plan_assignment WHERE team_id=$1`, team, old).Scan(&assignments, &stillOpen); err != nil {
+		t.Fatal(err)
+	}
+	if assignments != 1 || !stillOpen {
+		t.Fatalf("in-flight checkout team must keep its assignment: assignments=%d open=%v", assignments, stillOpen)
+	}
+}
