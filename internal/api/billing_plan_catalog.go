@@ -256,8 +256,8 @@ func (v planVersion) validate() error {
 	if v.prepaidFunded() && (v.Kind != "subscription" || v.PricingVersion != "v2") {
 		return errors.New("only v2 subscription plans take a prepaid funding policy")
 	}
-	if t := v.Topoff; t != nil && (!v.prepaidFunded() || !validNewPrepaidAmount(t.AmountCents) || !validNewPrepaidAmount(t.ThresholdCents)) {
-		return errors.New("top-off needs a prepaid funding policy, and its amount and threshold must be multiples of $5 up to $10,000")
+	if t := v.Topoff; t != nil && (!v.prepaidFunded() || !validNewPrepaidAmount(t.AmountCents) || !validRechargeThreshold(t.ThresholdCents)) {
+		return errors.New("top-off needs a prepaid funding policy, an amount in multiples of $5 and a threshold in whole dollars, both up to $10,000")
 	}
 	if v.DisplayOnly {
 		if v.hasFee() || v.SelfServe || len(v.CreditSchedule) != 0 || v.Matching != nil || v.Allowance != nil {

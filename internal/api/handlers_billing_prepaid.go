@@ -303,8 +303,8 @@ func (h *Handlers) PutPrepaidAutoRecharge(c *gin.Context) {
 		return
 	}
 	if req.Enabled {
-		if !validNewPrepaidAmount(req.ThresholdCents) || !validNewPrepaidAmount(req.AmountCents) {
-			respondErrorMsg(c, "bad_request", "threshold_cents and amount_cents must be multiples of 500 between 500 and 1000000", http.StatusBadRequest)
+		if !validRechargeThreshold(req.ThresholdCents) || !validNewPrepaidAmount(req.AmountCents) {
+			respondErrorMsg(c, "bad_request", "threshold_cents must be whole dollars from 100 and amount_cents a multiple of 500 from 500, both up to 1000000", http.StatusBadRequest)
 			return
 		}
 	}
