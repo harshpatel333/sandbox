@@ -23,10 +23,6 @@ Take the values from the approved launch record. Public values:
 | `max_concurrent` | 100 | 2000 |
 | `max_vcpu` / `max_memory_mib` | 4 / 16384 | 16 / 65536 |
 
-The Developer top-off threshold of 200 cents only validates once the catalog
-accepts whole-dollar thresholds from $1 (amounts keep $5 steps). Publish
-Developer only after that change has merged and deployed.
-
 Internal caps are never published, so they are not written here. Pass them
 from the launch record: `<disk_mib>` (`max_template_disk_mib` on the plan version), `<developer_templates>`
 and `<pro_templates>` (`max_templates`), and `<developer_snapshots>` and
@@ -73,7 +69,6 @@ Production preconditions:
 - The end-to-end test passed in the dev environment and the publish is
   authorized.
 - The catalog carries snapshot caps, and the Developer and Pro drafts set them.
-- The catalog accepts the Developer top-off threshold (whole dollars from $1).
 
 ## End-to-end test
 
