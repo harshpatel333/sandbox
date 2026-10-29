@@ -36,6 +36,15 @@ adds nothing. `event_credit.py` then exits with status 2, so the mismatch cannot
 pass silently. Run directly, the SQL prints the same row and a WARNING. Either
 way, fix the CSV, or decide explicitly on a new label.
 
+The check does not depend on the team's current route. Before routing, the
+script looks for the team's trial event grant under this label. Paid activation
+keeps that row and only zeroes its balance. So a team credited during its trial
+that later checks out into Developer/Pro reports `already granted as trial credit`
+on rerun, or is refused if the amount differs. It does not get a second grant
+in Stripe. The row also shows the trial grant's remaining balance, which paid
+activation zeroes. The reverse case cannot arise: paid activation sets
+`trial_ended_at`, which makes the trial SQL refuse the team.
+
 ## Before executing
 
 1. Get approval for the exact environment, label, and team and amount list. Keep
@@ -119,11 +128,14 @@ These trial teams are refused:
 - claim still pending, because a claim rewrites every signup grant's amount
 - no existing signup trial grant
 
-The script locks the team rows and then the billing account rows. Paid
-activation zeroes signup grants and sets `trial_ended_at` under the billing
-account lock. Holding that lock means a grant cannot land beside a paid
-activation. On contention the transaction stops at the 5 second lock timeout and
-can be rerun.
+The script locks the billing account rows and then the team rows, the same
+order checkout and paid activation use. Paid activation zeroes signup grants and
+sets `trial_ended_at` under the billing account lock. Holding that lock means a
+grant cannot land beside a paid activation. On contention the transaction stops
+at the 5 second lock timeout and can be rerun. Staff YC approval and sponsored
+apply lock the team first. If one of them runs against a listed team at the same
+moment, Postgres aborts one side as a deadlock within about a second, and that
+side can be rerun.
 
 ## Stripe path
 
@@ -150,9 +162,13 @@ Before creating a grant, `--apply` checks three things:
 - the customer's `team_id` metadata, if present, names the team
 - whether a grant, voided or not, already carries the same `event_label`
 
-The request carries an idempotency key built from team, customer, label and
-amount. After creating the grant, the script reads it back and checks it
-against the terms above.
+The request carries an idempotency key built from team, customer and label only.
+If two runs overlap with different amounts, Stripe rejects the second request
+because its parameters differ, and the script reports that team as REFUSED.
+Stripe keeps idempotency keys for 24 hours. After that, the label lookup is what
+refuses a different amount.
+After creating the grant, the script reads it back and checks it against the
+terms above.
 
 To undo a Stripe grant, void it in Stripe
 (`POST /v1/billing/credit_grants/<id>/void`). A rerun then refuses that team's

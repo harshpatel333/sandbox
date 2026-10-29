@@ -35,8 +35,9 @@ BEGIN
  END IF;
  -- Paid activation zeroes signup grants and sets trial_ended_at under the
  -- billing account lock; holding it keeps a grant from landing after that.
- PERFORM 1 FROM team x WHERE x.id = ANY(p_teams) ORDER BY x.id FOR NO KEY UPDATE;
+ -- Checkout locks the billing account before the team; keep that order.
  PERFORM 1 FROM team_billing_account a WHERE a.team_id = ANY(p_teams) ORDER BY a.team_id FOR UPDATE;
+ PERFORM 1 FROM team x WHERE x.id = ANY(p_teams) ORDER BY x.id FOR NO KEY UPDATE;
  FOR i IN SELECT o FROM unnest(p_teams) WITH ORDINALITY u(id, o) ORDER BY u.id LOOP
   t := p_teams[i];
   team_id := t;

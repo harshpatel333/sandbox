@@ -33,17 +33,23 @@ SELECT COALESCE(json_agg(json_build_object(
   'awaiting_plan', x.id IS NOT NULL AND billing_team_awaiting_plan(t.id),
   'kind', p.kind, 'plan_key', p.plan_key, 'family', COALESCE(p.terms->>'family', v.family),
   'contract_offer', c.offer_key, 'contract', p.contract_id IS NOT NULL, 'contract_customer', c.customer_id,
-  'customer', a.stripe_customer_id, 'subscription_status', a.stripe_subscription_status) ORDER BY t.id), '[]')
+  'customer', a.stripe_customer_id, 'subscription_status', a.stripe_subscription_status,
+  'trial_event_usd', e.amount_usd, 'trial_event_remaining_usd', e.remaining_usd) ORDER BY t.id), '[]')
 FROM unnest(string_to_array(:'teams', ',')::uuid[]) t(id)
 LEFT JOIN team x ON x.id = t.id
 LEFT JOIN team_plan_assignment p ON p.team_id = t.id AND p.effective_to IS NULL
 LEFT JOIN billing_plan_version v ON v.id = p.plan_version_id
 LEFT JOIN billing_commercial_contract c ON c.id = p.contract_id
-LEFT JOIN team_billing_account a ON a.team_id = t.id;
+LEFT JOIN team_billing_account a ON a.team_id = t.id
+LEFT JOIN team_credit_grant e ON e.id = md5('trial-credit-topup:' || :'label' || ':' || t.id::text)::uuid AND e.team_id = t.id;
 """
 
 
 class SetupError(Exception):
+    pass
+
+
+class IdempotencyConflict(Exception):
     pass
 
 
@@ -87,8 +93,8 @@ def psql(database_url, sql, variables, read_only):
                           input=sql if read_only else None, capture_output=True, text=True, env=env, check=False)
 
 
-def load_routes(database_url, teams):
-    result = psql(database_url, ROUTING_SQL, {"teams": ",".join(teams)}, read_only=True)
+def load_routes(database_url, teams, label):
+    result = psql(database_url, ROUTING_SQL, {"teams": ",".join(teams), "label": label}, read_only=True)
     if result.returncode != 0:
         raise SetupError("routing query failed: " + result.stderr.strip())
     return json.loads(result.stdout.strip().splitlines()[-1])
@@ -123,6 +129,13 @@ class Stripe:
         except urllib.error.HTTPError as exc:
             if exc.code == 404 and method == "GET":
                 return None
+            if method == "POST" and exc.code in (400, 409):
+                try:
+                    kind = (json.load(exc).get("error") or {}).get("type")
+                except (ValueError, AttributeError):
+                    kind = None
+                if kind == "idempotency_error" or exc.code == 409:
+                    raise IdempotencyConflict(f"Stripe {path}: HTTP {exc.code} {kind or 'conflict'}") from None
             # Provider error bodies can echo request details; keep output to the status.
             raise SetupError(f"Stripe {method} {path}: HTTP {exc.code}; inspect Stripe request logs, then rerun") from None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
@@ -157,8 +170,8 @@ def grant_form(team, customer, label, cents):
             "metadata[event_label]": label, "metadata[team_id]": team}
 
 
-def grant_key(team, customer, label, cents):
-    return "event-credit-" + hashlib.sha256(json.dumps([team, customer, label, cents]).encode()).hexdigest()
+def grant_key(team, customer, label):
+    return "event-credit-" + hashlib.sha256(json.dumps([team, customer, label]).encode()).hexdigest()
 
 
 def curl_command(form, key, api_version):
@@ -182,7 +195,7 @@ def check_grant(grant, customer, cents, live):
 
 def stripe_team(stripe, row, label, cents, api_version):
     team, customer = row["team_id"], row["customer"]
-    form, key = grant_form(team, customer, label, cents), grant_key(team, customer, label, cents)
+    form, key = grant_form(team, customer, label, cents), grant_key(team, customer, label)
     result = {"team_id": team, "route": "stripe", "plan": row["plan_key"], "customer": customer,
               "subscription_status": row["subscription_status"], "amount_cents": cents}
     if stripe is None:
@@ -211,7 +224,11 @@ def stripe_team(stripe, row, label, cents, api_version):
         return {**result, "outcome": "already granted", "grant_id": existing[0]["id"]}
     if not stripe.apply:
         return {**result, "outcome": "would grant", "command": curl_command(form, key, api_version)}
-    created = stripe.request("POST", "/v1/billing/credit_grants", form, key)
+    try:
+        created = stripe.request("POST", "/v1/billing/credit_grants", form, key)
+    except IdempotencyConflict:
+        return {**result, "outcome": "REFUSED: another request for this team and label used different terms or is in flight; "
+                "rerun to see the grant", "conflict": True}
     # An idempotent replay returns the creation response; read the grant's current state.
     created = stripe.request("GET", "/v1/billing/credit_grants/" + urllib.parse.quote(created["id"]))
     check_grant(created or {}, customer, cents, stripe.live)
@@ -273,9 +290,18 @@ def main():
         if not args.database_url:
             raise SetupError("Set DATABASE_URL or --database-url")
         trial, stripe_rows = [], []
-        for row in load_routes(args.database_url, sorted(grants)):
+        for row in load_routes(args.database_url, sorted(grants), args.label):
             target, why = route(row)
-            if target != "refused" and args.only not in ("all", target):
+            prior = row["trial_event_usd"]
+            if prior is not None and target != "trial":
+                prior_cents = int(Decimal(str(prior)) * 100)
+                same = prior_cents == grants[row["team_id"]]
+                report.append({"team_id": row["team_id"], "route": target, "plan": row["plan_key"],
+                               "amount_cents": grants[row["team_id"]], "conflict": not same,
+                               "trial_grant_remaining_usd": row["trial_event_remaining_usd"],
+                               "outcome": "already granted as trial credit" if same else
+                               f"REFUSED: label already granted {prior_cents} cents as trial credit, not {grants[row['team_id']]}"})
+            elif target != "refused" and args.only not in ("all", target):
                 report.append({"team_id": row["team_id"], "route": target, "outcome": f"skipped: --only {args.only}"})
             elif target == "trial":
                 trial.append(row["team_id"])
