@@ -57,12 +57,12 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh trial eligibility failed")
 			return false
 		}
-		h.pauseBillingTeam(ctx, teamID)
 		return true
 	})
 	if advance {
 		h.advanceSweepCursor(ctx, trialEligibilitySweepName, next)
 	}
+	// Refreshed teams are paused here, behind the consecutive-sweep gate.
 	h.reconcileBillingPauses(ctx)
 }
 

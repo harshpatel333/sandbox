@@ -478,6 +478,21 @@ func validateFundingDraftCoverage(inv StripeInvoiceAmounts, p billing.ExportPeri
 		if inv.Customer != a.Customer || inv.Currency != "usd" || inv.BillingReason != "subscription_cycle" || inv.Parent.SubscriptionDetails == nil || inv.Parent.SubscriptionDetails.Subscription != a.Subscription || inv.Lines.HasMore {
 			return errors.New("draft credit accounting identity changed")
 		}
+		start, end := meterObservationWindow(p.Start, p.End)
+		seen := map[string]bool{}
+		for _, line := range inv.Lines.Data {
+			d, parent := line.Pricing.PriceDetails, line.Parent.SubscriptionItemDetails
+			if d != nil && a.Base.Price != "" && d.Price == a.Base.Price {
+				continue
+			}
+			if d == nil || parent == nil || parent.Proration || parent.Subscription != a.Subscription || line.Currency != "usd" || len(line.Discounts) != 0 || seen[d.Price] {
+				return errors.New("draft line does not match supported resource set")
+			}
+			seen[d.Price] = true
+			if d.Price != a.Price && (line.Period.Start > start.Unix() || line.Period.End < end.Unix()) {
+				return errors.New("draft line does not cover usage window")
+			}
+		}
 	} else {
 		if err := validateInvoiceDocument(inv, invoicePlanPeriod(p, *plan), a, *plan); err != nil {
 			return err
@@ -493,6 +508,9 @@ func validateFundingDraftCoverage(inv StripeInvoiceAmounts, p billing.ExportPeri
 	gross := new(big.Int)
 	lineCredits := new(big.Int)
 	for _, line := range inv.Lines.Data {
+		if line.Pricing.PriceDetails == nil {
+			return errors.New("draft line has no price")
+		}
 		id := line.Pricing.PriceDetails.Price
 		credits := new(big.Int)
 		for _, credit := range line.PretaxCredits {

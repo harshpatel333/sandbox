@@ -133,6 +133,19 @@ func TestIntegrationFundingCreditAcceptsRenewalDraftBeforeClosePlan(t *testing.T
 	if err != nil || observation.SpendableUSD != "6.400000" {
 		t.Fatalf("unplanned renewal draft rejected or double counted: %+v %v", observation, err)
 	}
+	planned := inv
+	for _, mutate := range []func(*StripeInvoiceAmounts){
+		func(d *StripeInvoiceAmounts) { d.Lines.Data[0].Parent.SubscriptionItemDetails = nil },
+		func(d *StripeInvoiceAmounts) { d.Lines.Data[0].Pricing.PriceDetails = nil },
+	} {
+		inv = planned
+		inv.Lines.Data = append([]StripeInvoiceAmountLine(nil), planned.Lines.Data...)
+		mutate(&inv)
+		if _, err = h.observeFundingCredit(t.Context(), team, account, at); err == nil {
+			t.Fatal("unplanned draft line outside the subscription resources treated as owned usage")
+		}
+	}
+	inv = planned
 	inv.PeriodEnd = at.Add(time.Hour).Unix()
 	if _, err = h.observeFundingCredit(t.Context(), team, account, at); err == nil {
 		t.Fatal("draft for an unknown local period treated as owned usage")
