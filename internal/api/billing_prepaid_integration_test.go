@@ -282,9 +282,12 @@ func (f *prepaidFixture) serve(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"data":[]}`)
 	case path == "/v1/billing/credit_balance_summary" && r.URL.Query().Get("filter[type]") == "applicability_scope":
 		f.aggregateReads++
+		// As Stripe does: every live metered-scope grant, expiring or not, and
+		// never a price-scoped one.
 		total := int64(0)
 		for id, g := range f.grants {
-			if g.VoidedAt == 0 {
+			scope := g.Applicability.Scope
+			if g.VoidedAt == 0 && (g.ExpiresAt == 0 || g.ExpiresAt > time.Now().Unix()) && scope.PriceType == "metered" && len(scope.Prices) == 0 {
 				total += f.balances[id]
 			}
 		}
@@ -822,7 +825,7 @@ func TestPrepaidObservationScalesPastEightGrants(t *testing.T) {
 	}
 	f.mu.Unlock()
 	if _, _, _, _, _, err = f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now()); err == nil {
-		t.Fatal("a price-scoped grant did not fall back to the bounded per-grant observation")
+		t.Fatal("a grant with unknown applicability was counted")
 	}
 }
 
@@ -975,7 +978,7 @@ func TestFundingObservationUnchangedForTeamsWithoutPrepaidCredit(t *testing.T) {
 	}
 }
 
-func TestPrepaidObservationFallsBackForExpiringGrants(t *testing.T) {
+func TestPrepaidObservationCountsExpiringMeteredGrantsOnce(t *testing.T) {
 	f := newPrepaidFixture(t)
 	f.enableAutoRecharge(5000, 500)
 	f.observe(0, true)
@@ -995,9 +998,91 @@ func TestPrepaidObservationFallsBackForExpiringGrants(t *testing.T) {
 	f.balances[promo.ID] = 1000
 	f.mu.Unlock()
 	reads := f.aggregateReads
-	total, _, _, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
-	if err != nil || total != 1500 || f.aggregateReads != reads {
-		t.Fatal("an expiring grant was not observed exactly once through the per-grant path", total, err, f.aggregateReads-reads)
+	total, _, expiry, _, verify, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+	if err != nil || total != 1500 || f.aggregateReads != reads+1 {
+		t.Fatal("an expiring metered grant was not counted once through the metered summary", total, err, f.aggregateReads-reads)
+	}
+	if !expiry.Valid || expiry.Time.Unix() != promo.ExpiresAt {
+		t.Fatal("observation outlives the expiring grant", expiry)
+	}
+	f.mu.Lock()
+	promo.ExpiresAt = time.Now().Add(time.Hour).Unix()
+	f.grants[promo.ID] = promo
+	f.mu.Unlock()
+	if verify == nil || verify(nil) == nil {
+		t.Fatal("a shortened grant expiry did not invalidate the observation")
+	}
+}
+
+// A prepaid-funded subscription holds its expiring, price-scoped monthly grant
+// alongside one grant per top-off: all of them count, past the per-grant bound.
+func TestPrepaidObservationAddsPriceScopedGrantToManyTopOffs(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(5000, 500)
+	f.observe(0, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	terms := []StripeCheckoutResourceTerms{{ResourceKey: "vcpu", PriceID: "price_vcpu_fixture"}, {ResourceKey: "memory_gib", PriceID: "price_memory_fixture"}}
+	payload, err := json.Marshal(StripeCreateCheckoutSessionParams{BasePriceID: "price_base_fixture", ResourceTerms: terms})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.exec(`INSERT INTO billing_signup_choice(team_id,offer_key,state,subscription_id,generation,actor_id,base_price_id,request_payload)
+	 VALUES($1,'pro_monthly','committed',$2,clock_timestamp(),gen_random_uuid(),'price_base_fixture',$3)
+	 ON CONFLICT(team_id) DO UPDATE SET offer_key=EXCLUDED.offer_key,state=EXCLUDED.state,subscription_id=EXCLUDED.subscription_id,
+	  generation=EXCLUDED.generation,actor_id=EXCLUDED.actor_id,base_price_id=EXCLUDED.base_price_id,request_payload=EXCLUDED.request_payload`, f.team, f.sub, payload)
+	required, err := f.h.fundingCreditResourcePrices(t.Context(), f.team, f.customer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	var seed entitlementGrant
+	for _, g := range f.grants {
+		seed = g
+	}
+	for i := 0; i < 11; i++ {
+		g := seed
+		g.ID = "credgr_" + uuid.NewString()
+		f.grants[g.ID] = g
+		f.balances[g.ID] = 500
+	}
+	topOffs := int64(len(f.grants)) * 500
+	monthly := seed
+	monthly.ID = "credgr_" + uuid.NewString()
+	monthly.Category = "promotional"
+	monthly.Amount.Monetary.Value = 2000
+	monthly.ExpiresAt = time.Now().Add(20 * 24 * time.Hour).Unix()
+	monthly.Applicability.Scope.PriceType = ""
+	monthly.Applicability.Scope.Prices = nil
+	for _, id := range required {
+		monthly.Applicability.Scope.Prices = append(monthly.Applicability.Scope.Prices, struct {
+			ID string `json:"id"`
+		}{ID: id})
+	}
+	f.grants[monthly.ID] = monthly
+	f.balances[monthly.ID] = 2000
+	f.mu.Unlock()
+	reads := f.aggregateReads
+	total, _, expiry, _, verify, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+	if err != nil {
+		t.Fatal("a funded subscription with many top-offs could not be observed", err)
+	}
+	if total != topOffs+2000 || f.aggregateReads != reads+1 {
+		t.Fatalf("balance %d, want %d top-offs + 2000 monthly (summary reads %d)", total, topOffs, f.aggregateReads-reads)
+	}
+	if !expiry.Valid || expiry.Time.Unix() != monthly.ExpiresAt {
+		t.Fatal("observation outlives the monthly grant", expiry)
+	}
+	if verify == nil || verify(nil) != nil {
+		t.Fatal("observation is not stable", verify == nil)
+	}
+	f.mu.Lock()
+	monthly.ExpiresAt = time.Now().Add(time.Hour).Unix()
+	f.grants[monthly.ID] = monthly
+	f.mu.Unlock()
+	if verify(nil) == nil {
+		t.Fatal("a shortened monthly grant expiry did not invalidate the observation")
 	}
 }
 

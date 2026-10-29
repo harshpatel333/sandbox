@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -169,11 +171,11 @@ func (h *Handlers) prepaidCapacityAvailable(ctx context.Context, team uuid.UUID)
 	return ok, err
 }
 
-// Prepaid teams accumulate one grant per purchase, so when every active grant
-// is non-expiring and metered the balance is read once for the customer: the
-// same metered-scope number Stripe applies to usage. Any other active grant
-// sends the team back to the per-grant observation, so no grant is counted
-// twice. Finalized, released periods have already debited the ledger, so the
+// Prepaid teams accumulate one grant per purchase, so every metered-scope grant
+// is read once for the customer through Stripe's metered-scope summary, which
+// counts expiring metered grants too but never price-scoped ones. A few
+// price-scoped grants, such as a subscription's monthly grant, are read one by
+// one and added, so no grant is counted twice or missed. Finalized, released periods have already debited the ledger, so the
 // reconciliation window starts no earlier than invoice enrolment (Stripe
 // invoiced earlier periods itself) and the end of the unbroken run of
 // reconciled, released periods since then.
@@ -194,7 +196,7 @@ func (h *Handlers) aggregateFundingGrants(ctx context.Context, client *stripeHTT
 		return fundingGrantSnapshot{}, false, err
 	}
 	inv, err := client.meteredGrantInventory(ctx, customer, at)
-	if err != nil || len(inv.Others) > 0 {
+	if err != nil || len(inv.Others) > fundingSeparateGrantLimit {
 		return fundingGrantSnapshot{}, false, err
 	}
 	metered := fundingGrantBalance{}
@@ -207,20 +209,82 @@ func (h *Handlers) aggregateFundingGrants(ctx context.Context, client *stripeHTT
 	if inv.Metered > 0 && inv.MeteredStart.Before(start) {
 		start = inv.MeteredStart
 	}
+	expiry := inv.MeteredExpiry
+	total, reserved := metered.Ledger, metered.Ledger-metered.Available
+	separate := map[string]fundingGrantBalance{}
+	grantsByID := map[string]entitlementGrant{}
+	var prices []string
+	for _, g := range inv.Others {
+		if g.Applicability.Scope.PriceType != "metered" && prices == nil {
+			if prices, err = h.fundingCreditResourcePrices(ctx, team, customer); err != nil {
+				return fundingGrantSnapshot{}, false, err
+			}
+		}
+		if !fundingGrantCoversResources(g, prices) {
+			return fundingGrantSnapshot{}, false, errors.New("funding credit applicability is unknown")
+		}
+		b, err := fundingProviderGrantBalance(ctx, client, customer, g.ID)
+		if err != nil {
+			return fundingGrantSnapshot{}, false, err
+		}
+		if b.Ledger > g.Amount.Monetary.Value || total > int64(^uint64(0)>>1)-b.Ledger {
+			return fundingGrantSnapshot{}, false, errors.New("invalid funding credit ledger total")
+		}
+		separate[g.ID], grantsByID[g.ID] = b, g
+		if b.Ledger == 0 {
+			continue
+		}
+		total += b.Ledger
+		reserved += b.Ledger - b.Available
+		effective := g.EffectiveAt
+		if effective == 0 {
+			effective = g.Created
+		}
+		if effective <= 0 {
+			return fundingGrantSnapshot{}, false, errors.New("funding credit has no effective boundary")
+		}
+		if time.Unix(effective, 0).Before(start) {
+			start = time.Unix(effective, 0)
+		}
+		if g.ExpiresAt > 0 && (!expiry.Valid || time.Unix(g.ExpiresAt, 0).Before(expiry.Time)) {
+			expiry = pgtype.Timestamptz{Valid: true, Time: time.Unix(g.ExpiresAt, 0)}
+		}
+	}
 	if floor != nil && start.Before(*floor) {
 		start = *floor
 	}
 	return fundingGrantSnapshot{
-		Total: metered.Ledger, Start: start,
-		Evidence: map[string]any{"metered_ledger_cents": metered.Ledger, "metered_available_cents": metered.Available, "metered_grants": inv.Metered},
-		Reserved: func() *big.Int { return big.NewInt(metered.Ledger - metered.Available) },
+		Total: total, Start: start, Expiry: expiry,
+		Evidence: map[string]any{"metered_ledger_cents": metered.Ledger, "metered_available_cents": metered.Available, "metered_grants": inv.Metered, "separate_grants": separate},
+		Reserved: func() *big.Int { return big.NewInt(reserved) },
 		Stable: func(ctx context.Context) error {
 			current, err := client.meteredGrantInventory(ctx, customer, at)
 			if err != nil {
 				return err
 			}
-			if current.Head != inv.Head || current.Metered != inv.Metered || len(current.Others) != 0 {
+			// Start and expiry come from the grants themselves, so a changed
+			// effective or expiry time must fail the observation too.
+			if current.Head != inv.Head || current.Metered != inv.Metered || len(current.Others) != len(inv.Others) ||
+				!current.MeteredStart.Equal(inv.MeteredStart) || current.MeteredExpiry != inv.MeteredExpiry {
 				return errors.New("funding credit grants changed during observation")
+			}
+			for _, g := range current.Others {
+				before, ok := separate[g.ID]
+				if !ok {
+					return errors.New("funding credit grants changed during observation")
+				}
+				a, _ := json.Marshal(g)
+				b, _ := json.Marshal(grantsByID[g.ID])
+				if string(a) != string(b) {
+					return errors.New("funding credit grant changed during observation")
+				}
+				after, err := fundingProviderGrantBalance(ctx, client, customer, g.ID)
+				if err != nil {
+					return err
+				}
+				if after != before {
+					return errors.New("funding credit ledger changed during observation")
+				}
 			}
 			if inv.Metered > 0 {
 				after, err := client.meteredCreditBalance(ctx, customer)
@@ -236,11 +300,16 @@ func (h *Handlers) aggregateFundingGrants(ctx context.Context, client *stripeHTT
 	}, true, nil
 }
 
+// Price-scoped grants are read one by one, within the same budget as the
+// per-grant observation.
+const fundingSeparateGrantLimit = 8
+
 type meteredInventory struct {
-	Head         string
-	Metered      int
-	MeteredStart time.Time
-	Others       []entitlementGrant
+	Head          string
+	Metered       int
+	MeteredStart  time.Time
+	MeteredExpiry pgtype.Timestamptz
+	Others        []entitlementGrant
 }
 
 func (c *stripeHTTPClient) meteredGrantInventory(ctx context.Context, customer string, at time.Time) (meteredInventory, error) {
@@ -268,11 +337,14 @@ func (c *stripeHTTPClient) meteredGrantInventory(ctx context.Context, customer s
 			if g.VoidedAt != 0 || g.EffectiveAt > at.Unix() || (g.ExpiresAt != 0 && g.ExpiresAt <= at.Unix()) {
 				continue
 			}
-			if g.ExpiresAt != 0 || g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Amount.Monetary.Currency != "usd" {
+			if g.Applicability.Scope.PriceType != "metered" || len(g.Applicability.Scope.Prices) != 0 || g.Amount.Monetary.Currency != "usd" {
 				inv.Others = append(inv.Others, g)
 				continue
 			}
 			inv.Metered++
+			if g.ExpiresAt != 0 && (!inv.MeteredExpiry.Valid || time.Unix(g.ExpiresAt, 0).Before(inv.MeteredExpiry.Time)) {
+				inv.MeteredExpiry = pgtype.Timestamptz{Valid: true, Time: time.Unix(g.ExpiresAt, 0)}
+			}
 			effective := g.EffectiveAt
 			if effective == 0 {
 				effective = g.Created
