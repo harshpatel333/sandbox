@@ -316,3 +316,26 @@ func TestSponsoredRollAbsenceIsSerializedWithInvoiceClose(t *testing.T) {
 		}
 	})
 }
+
+func TestSponsoredRollAbsenceWaitsForFinalizedPeriod(t *testing.T) {
+	f := newSponsoredRollFixture(t, 2*time.Hour)
+	conn, err := f.h.Pool.Acquire(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	if _, err = conn.Exec(t.Context(), `SET session_replication_role=replica`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(context.WithoutCancel(t.Context()), `RESET session_replication_role`)
+	// Export and finalization are running late for the ended period.
+	if _, err = conn.Exec(t.Context(), `UPDATE team_billing_period SET status='open',finalized_at=NULL,gross_charges_usd=NULL,credits_applied_usd=NULL,net_invoice_amount_usd=NULL WHERE team_id=$1 AND period_end=$2`, f.c.TeamID, f.start); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err == nil || f.grants.Load() != 0 || f.absentRecorded() {
+		t.Fatal("unfinalized period recorded absent", err)
+	}
+	if !f.eligible() {
+		t.Fatal("team paused while its period finalizes")
+	}
+}

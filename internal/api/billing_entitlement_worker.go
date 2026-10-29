@@ -538,9 +538,11 @@ func (h *Handlers) sponsoredCycleInvoiceAbsent(ctx context.Context, c db.Billing
 		return true, nil
 	}
 	// A close row means an invoice was found, so it must close normally. The
-	// calendar row is written by the close worker once it starts looking.
+	// calendar row is written by the close worker once it starts looking, and
+	// the period must be finalized first: a recorded absence leaves the close
+	// queue, which is what would otherwise finalize it.
 	var periodStart, invoiceStart, invoiceEnd time.Time
-	err := h.Pool.QueryRow(ctx, `SELECT k.period_start,k.invoice_start,k.invoice_end FROM billing_invoice_calendar k WHERE k.team_id=$1 AND k.period_end=$2 AND k.customer_id=$3 AND k.subscription_id=$4
+	err := h.Pool.QueryRow(ctx, `SELECT k.period_start,k.invoice_start,k.invoice_end FROM billing_invoice_calendar k JOIN team_billing_period p USING(team_id,period_start,period_end) WHERE k.team_id=$1 AND k.period_end=$2 AND k.customer_id=$3 AND k.subscription_id=$4 AND p.finalized_at IS NOT NULL
  AND NOT EXISTS(SELECT 1 FROM billing_invoice_close j WHERE j.team_id=k.team_id AND j.period_start=k.period_start AND j.period_end=k.period_end)`, c.TeamID, start, c.CustomerID, c.SubscriptionID).Scan(&periodStart, &invoiceStart, &invoiceEnd)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
