@@ -150,6 +150,14 @@ func TestIntegrationFundingCreditAcceptsRenewalDraftBeforeClosePlan(t *testing.T
 	if _, err = h.observeFundingCredit(t.Context(), team, account, at); err == nil {
 		t.Fatal("draft for an unknown local period treated as owned usage")
 	}
+	// A provider cycle offset from the local period drafts over its own window.
+	offset := start.Add(30 * time.Minute)
+	exec(`INSERT INTO billing_invoice_calendar(team_id,period_start,period_end,customer_id,subscription_id,invoice_start,invoice_end,billing_cycle_anchor) VALUES($1,$2,$3,$4,$5,$6,$3,$7)`, team, start, at, customer, subscription, offset, offset.Unix())
+	inv, _ = fundingOwnedDraftFixture(billing.ExportPeriod{TeamID: team, Start: offset, End: at}, customer, subscription)
+	inv.ID = "in_" + team.String()
+	if observation, err = h.observeFundingCredit(t.Context(), team, account, at); err != nil || observation.SpendableUSD != "6.400000" {
+		t.Fatalf("offset-calendar renewal draft rejected: %+v %v", observation, err)
+	}
 }
 
 func TestIntegrationFundingCreditPreservesReleasedPriceScope(t *testing.T) {

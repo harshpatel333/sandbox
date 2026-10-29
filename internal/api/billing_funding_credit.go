@@ -478,7 +478,8 @@ func validateFundingDraftCoverage(inv StripeInvoiceAmounts, p billing.ExportPeri
 		if inv.Customer != a.Customer || inv.Currency != "usd" || inv.BillingReason != "subscription_cycle" || inv.Parent.SubscriptionDetails == nil || inv.Parent.SubscriptionDetails.Subscription != a.Subscription || inv.Lines.HasMore {
 			return errors.New("draft credit accounting identity changed")
 		}
-		start, end := meterObservationWindow(p.Start, p.End)
+		// Lines cover the provider window, which may start after the local period.
+		start, end := meterObservationWindow(time.Unix(inv.PeriodStart, 0), time.Unix(inv.PeriodEnd, 0))
 		seen := map[string]bool{}
 		for _, line := range inv.Lines.Data {
 			d, parent := line.Pricing.PriceDetails, line.Parent.SubscriptionItemDetails
