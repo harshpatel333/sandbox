@@ -555,7 +555,27 @@ func (h *Handlers) sponsoredCycleInvoiceAbsent(ctx context.Context, c db.Billing
 	if err != nil || found {
 		return false, err
 	}
-	if _, err = h.Pool.Exec(ctx, `INSERT INTO billing_sponsored_absent_close(contract_id,team_id,period_start,period_end,invoice_start,invoice_end,customer_id,subscription_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, c.ID, c.TeamID, periodStart, start, invoiceStart, invoiceEnd, c.CustomerID, c.SubscriptionID); err != nil {
+	// The invoice close may have found a draft during the listing. Decide
+	// under its lock so a period is never both closing and absent.
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	var locked, closing bool
+	if err = tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "invoice:"+c.TeamID.String()).Scan(&locked); err != nil {
+		return false, err
+	}
+	if !locked {
+		return false, errors.New("invoice reconciliation already running")
+	}
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_invoice_close WHERE team_id=$1 AND period_start=$2 AND period_end=$3)`, c.TeamID, periodStart, start).Scan(&closing); err != nil || closing {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO billing_sponsored_absent_close(contract_id,team_id,period_start,period_end,invoice_start,invoice_end,customer_id,subscription_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, c.ID, c.TeamID, periodStart, start, invoiceStart, invoiceEnd, c.CustomerID, c.SubscriptionID); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	log.Error().Str("contract_id", c.ID.String()).Str("team_id", c.TeamID.String()).Time("period_end", start).

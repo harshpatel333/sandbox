@@ -42,6 +42,8 @@ type entitlementFixture struct {
 	requests           []string
 	// subscriptionInvoices is what the provider lists for the subscription.
 	subscriptionInvoices []map[string]any
+	// onSubscriptionInvoices runs while the provider is listing them.
+	onSubscriptionInvoices func()
 }
 
 func newEntitlementFixture(t *testing.T, annual ...bool) *entitlementFixture {
@@ -233,6 +235,9 @@ func newEntitlementFixtureAt(t *testing.T, at time.Time, annual ...bool) *entitl
 				return
 			}
 			if r.URL.Query().Get("subscription") != "" {
+				if f.onSubscriptionInvoices != nil {
+					f.onSubscriptionInvoices()
+				}
 				f.mu.Lock()
 				defer f.mu.Unlock()
 				json.NewEncoder(w).Encode(map[string]any{"data": f.subscriptionInvoices, "has_more": false})

@@ -149,8 +149,11 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 		// Stripe creates the renewal draft at the cycle boundary, so one still
 		// missing an hour later needs a person; a sponsored team's next grant
 		// may have been issued without it.
-		if errors.Is(resultErr, errRenewalInvoiceMissing) && time.Since(p.End) > sponsoredRenewalInvoiceSettle {
-			log.Error().Str("team_id", p.TeamID.String()).Time("period_end", p.End).Msg("renewal invoice still missing after its cycle ended")
+		if errors.Is(resultErr, errRenewalInvoiceMissing) {
+			var invoiceEnd time.Time
+			if h.Pool.QueryRow(ack, `SELECT invoice_end FROM billing_invoice_calendar WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End).Scan(&invoiceEnd) == nil && time.Since(invoiceEnd) > sponsoredRenewalInvoiceSettle {
+				log.Error().Str("team_id", p.TeamID.String()).Time("invoice_end", invoiceEnd).Msg("renewal invoice still missing after its cycle ended")
+			}
 		}
 		if resultErr != nil {
 			_, _ = h.Pool.Exec(ack, `UPDATE billing_invoice_close SET last_error=$4,updated_at=clock_timestamp() WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End, resultErr.Error())
@@ -162,9 +165,6 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 	}
 	if !enrolled || !a.EnrolledAt.Before(p.End) {
 		return nil
-	}
-	if absent, e := h.invoicePeriodAbsent(ctx, p); e != nil || absent {
-		return e
 	}
 	client, ok := h.Stripe.(*stripeHTTPClient)
 	if !ok {
@@ -187,6 +187,10 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 	}
 	if !locked {
 		return fmt.Errorf("invoice reconciliation already running")
+	}
+	// Absence is recorded under this lock, so this check cannot race it.
+	if absent, e := h.invoicePeriodAbsent(ctx, p); e != nil || absent {
+		return e
 	}
 	// Enrollment could have changed while this attempt was acquiring ownership.
 	a, enrolled, err = h.invoiceAccountForPeriod(ctx, p)

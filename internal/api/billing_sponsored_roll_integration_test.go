@@ -256,3 +256,63 @@ func TestSponsoredRollGraceWaitsForSuccessfulCreditRead(t *testing.T) {
 		t.Fatal("grace outlived a successful read showing no credit")
 	}
 }
+
+func TestSponsoredRollAbsenceIsSerializedWithInvoiceClose(t *testing.T) {
+	closeKey := func(f *sponsoredRollFixture) string { return "invoice:" + f.c.TeamID.String() }
+	t.Run("close found during listing", func(t *testing.T) {
+		f := newSponsoredRollFixture(t, 2*time.Hour)
+		// The invoice close finds a draft and commits under its lock while the
+		// entitlement worker is still listing invoices.
+		f.onSubscriptionInvoices = func() {
+			f.onSubscriptionInvoices = nil
+			tx, err := f.h.Pool.Begin(context.Background())
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer tx.Rollback(context.Background())
+			if _, err = tx.Exec(context.Background(), `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, closeKey(f)); err != nil {
+				t.Error(err)
+				return
+			}
+			if _, err = tx.Exec(context.Background(), `INSERT INTO billing_invoice_close(team_id,period_start,period_end,invoice_id,plan) VALUES($1,$2,$3,$4,'{}')`, f.c.TeamID, f.prior, f.start, "in_found_"+f.c.TeamID.String()); err != nil {
+				t.Error(err)
+				return
+			}
+			if err = tx.Commit(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}
+		if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err == nil || f.grants.Load() != 0 || f.absentRecorded() {
+			t.Fatal("period recorded absent although its close was created", err, f.grants.Load())
+		}
+	})
+	t.Run("close running during decision", func(t *testing.T) {
+		f := newSponsoredRollFixture(t, 2*time.Hour)
+		tx, err := f.h.Pool.Begin(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(context.WithoutCancel(t.Context()))
+		if _, err = tx.Exec(t.Context(), `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, closeKey(f)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err == nil || f.grants.Load() != 0 || f.absentRecorded() {
+			t.Fatal("absence decided while the invoice close held its lock", err)
+		}
+	})
+	t.Run("close after absence", func(t *testing.T) {
+		f := newSponsoredRollFixture(t, 2*time.Hour)
+		if _, err := f.h.reconcileUsageEntitlement(t.Context(), f.c.ID); err != nil || !f.absentRecorded() {
+			t.Fatal(err)
+		}
+		f.subscriptionInvoices = []map[string]any{f.invoice("in_late", "subscription_cycle", "draft")}
+		if err := f.h.reconcileInvoicePeriod(t.Context(), billing.ExportPeriod{TeamID: f.c.TeamID, Start: f.prior, End: f.start}); err != nil {
+			t.Fatal(err)
+		}
+		var closing bool
+		if err := f.h.Pool.QueryRow(t.Context(), `SELECT EXISTS(SELECT 1 FROM billing_invoice_close WHERE team_id=$1 AND period_end=$2)`, f.c.TeamID, f.start).Scan(&closing); err != nil || closing {
+			t.Fatal("absent period was also closed", closing, err)
+		}
+	})
+}
