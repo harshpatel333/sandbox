@@ -555,7 +555,7 @@ func (h *Handlers) sponsoredCycleInvoiceAbsent(ctx context.Context, c db.Billing
 	if err != nil || found {
 		return false, err
 	}
-	if _, err = h.Pool.Exec(ctx, `INSERT INTO billing_sponsored_absent_close(contract_id,period_start,period_end,invoice_start,invoice_end,customer_id,subscription_id) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, c.ID, periodStart, start, invoiceStart, invoiceEnd, c.CustomerID, c.SubscriptionID); err != nil {
+	if _, err = h.Pool.Exec(ctx, `INSERT INTO billing_sponsored_absent_close(contract_id,team_id,period_start,period_end,invoice_start,invoice_end,customer_id,subscription_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, c.ID, c.TeamID, periodStart, start, invoiceStart, invoiceEnd, c.CustomerID, c.SubscriptionID); err != nil {
 		return false, err
 	}
 	log.Error().Str("contract_id", c.ID.String()).Str("team_id", c.TeamID.String()).Time("period_end", start).

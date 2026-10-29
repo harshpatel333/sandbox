@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/superserve-ai/sandbox/internal/billing"
 )
 
 // sponsoredRollFixture is a sponsored team without a payment method whose
@@ -122,6 +123,15 @@ func TestSponsoredRollWithoutRenewalInvoice(t *testing.T) {
 			}
 			if f.grants.Load() != 1 || !f.absentRecorded() {
 				t.Fatal("absent renewal invoice not recorded with one grant", f.grants.Load(), f.absentRecorded())
+			}
+			// Issuing the grant moved the funding generation; the funding worker
+			// has not observed it yet.
+			if !f.eligible() {
+				t.Fatal("team paused before the issued grant was observed")
+			}
+			// The absent period must not hold the next period's invoice close.
+			if err := f.h.requireEarlierInvoicePeriodsReleased(t.Context(), billing.ExportPeriod{TeamID: f.c.TeamID, Start: f.start, End: f.end}, f.prior); err != nil {
+				t.Fatal("recorded absent period still holds later closes:", err)
 			}
 			// A cycle invoice that turns up later changes nothing already decided.
 			f.subscriptionInvoices = append(f.subscriptionInvoices, f.invoice("in_late", "subscription_cycle", "draft"))

@@ -108,11 +108,19 @@ func (h *Handlers) invoiceReconciliationTick(ctx context.Context) (bool, error) 
 	return true, nil
 }
 
+// invoicePeriodAbsent reports whether the period was recorded as having no
+// renewal invoice, so there is nothing to close.
+func (h *Handlers) invoicePeriodAbsent(ctx context.Context, p billing.ExportPeriod) (bool, error) {
+	var absent bool
+	err := h.Pool.QueryRow(ctx, `SELECT billing_invoice_period_absent($1,$2,$3)`, p.TeamID, p.Start, p.End).Scan(&absent)
+	return absent, err
+}
+
 func invoicePlanKey(invoiceID string) string { return "invoice-cent:" + invoiceID }
 
 func (h *Handlers) requireEarlierInvoicePeriodsReleased(ctx context.Context, p billing.ExportPeriod, enrolledAt time.Time) error {
 	var older bool
-	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p LEFT JOIN billing_invoice_close j USING(team_id,period_start,period_end) WHERE p.team_id=$1 AND p.period_end>$2 AND p.period_end<=$3 AND COALESCE(j.state,'')<>'released')`, p.TeamID, enrolledAt, p.Start).Scan(&older); err != nil {
+	if err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_period p LEFT JOIN billing_invoice_close j USING(team_id,period_start,period_end) WHERE p.team_id=$1 AND p.period_end>$2 AND p.period_end<=$3 AND COALESCE(j.state,'')<>'released' AND NOT billing_invoice_period_absent(p.team_id,p.period_start,p.period_end))`, p.TeamID, enrolledAt, p.Start).Scan(&older); err != nil {
 		return err
 	}
 	if older {
@@ -153,6 +161,9 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 	}
 	if !enrolled || !a.EnrolledAt.Before(p.End) {
 		return nil
+	}
+	if absent, e := h.invoicePeriodAbsent(ctx, p); e != nil || absent {
+		return e
 	}
 	client, ok := h.Stripe.(*stripeHTTPClient)
 	if !ok {

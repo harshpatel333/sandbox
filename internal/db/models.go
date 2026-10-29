@@ -1356,6 +1356,7 @@ type BillingSignupChoice struct {
 
 type BillingSponsoredAbsentClose struct {
 	ContractID     uuid.UUID `json:"contract_id"`
+	TeamID         uuid.UUID `json:"team_id"`
 	PeriodStart    time.Time `json:"period_start"`
 	PeriodEnd      time.Time `json:"period_end"`
 	InvoiceStart   time.Time `json:"invoice_start"`
