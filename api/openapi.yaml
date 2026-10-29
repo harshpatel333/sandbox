@@ -4688,7 +4688,7 @@ components:
           description: Environment variables for the command.
         working_dir:
           type: string
-          description: Working directory (default the template's working directory, else the user's home).
+          description: Working directory (default the template's working directory, else the user's home, which is `/home/user` for root).
         timeout_s:
           type: integer
           default: 30
