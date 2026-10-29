@@ -1,7 +1,7 @@
 {
   "name": "superserve/openclaw",
   "vcpu": 2,
-  "memory_mib": 2048,
+  "memory_mib": 4096,
   "disk_mib": 8192,
   "build_spec": {
     "from": "ubuntu:24.04",

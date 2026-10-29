@@ -123,7 +123,7 @@ func (h *Handlers) recordAutoRecharges(ctx context.Context) error {
  JOIN billing_funding_account f USING(team_id)
  JOIN team_billing_account b USING(team_id)
  WHERE a.enabled AND a.amount_cents BETWEEN 500 AND $2 AND a.amount_cents%500=0
- AND a.threshold_cents BETWEEN 500 AND $2 AND a.threshold_cents%500=0 AND EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=a.team_id AND p.effective_to IS NULL AND billing_assignment_prepaid_funded(p))
+ AND a.threshold_cents BETWEEN 100 AND $2 AND a.threshold_cents%100=0 AND EXISTS(SELECT 1 FROM team_plan_assignment p WHERE p.team_id=a.team_id AND p.effective_to IS NULL AND billing_assignment_prepaid_funded(p))
  AND f.observe AND f.payment_method_ready AND f.payment_method_id IS NOT NULL
   AND f.observed_generation=f.generation AND f.customer_id=b.stripe_customer_id
   AND f.credit_checked_at>clock_timestamp()-interval '2 minutes' AND f.credit_usd*100<a.threshold_cents

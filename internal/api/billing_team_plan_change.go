@@ -68,6 +68,7 @@ type teamPlanChange struct {
 	CompletedAt        *time.Time      `json:"completed_at"`
 	Failures           int             `json:"-"`
 	LastError          *string         `json:"last_error"`
+	ProviderEnded      bool            `json:"provider_ended"`
 	terminalUndoOf     *uuid.UUID
 	leaseHeldElsewhere bool
 	lease              uuid.UUID
@@ -75,7 +76,7 @@ type teamPlanChange struct {
 
 // Undoable reports whether the change can still be undone.
 func (c teamPlanChange) Undoable(now time.Time) bool {
-	return c.State == "scheduled" && now.Before(c.EffectiveAt.Add(-planChangeUndoCutoff))
+	return c.State == "scheduled" && !c.ProviderEnded && now.Before(c.EffectiveAt.Add(-planChangeUndoCutoff))
 }
 
 func (c teamPlanChange) needsUndoReconciliation() bool {
@@ -84,14 +85,14 @@ func (c teamPlanChange) needsUndoReconciliation() bool {
 
 const teamPlanChangeColumns = `id,team_id,from_assignment_id,target_plan_key,target_kind,target_terms,target_limits,effective_at,pauses_running,subscription_id,
 requested_by,requested_via,reason,idempotency_key,requested_at,state,provider_cancel_requested_at,provider_cancel_preexisting,provider_cancel_at,provider_renewed_at,
-undone_at,undone_by,undo_reason,applied_at,applied_assignment_id,completed_at,failures,last_error,lease_until IS NOT NULL AND lease_until>clock_timestamp(),terminal_undo_of`
+undone_at,undone_by,undo_reason,applied_at,applied_assignment_id,completed_at,failures,last_error,lease_until IS NOT NULL AND lease_until>clock_timestamp(),terminal_undo_of,provider_ended`
 
 func scanTeamPlanChange(row pgx.Row) (teamPlanChange, error) {
 	var c teamPlanChange
 	var terms, limits []byte
 	err := row.Scan(&c.ID, &c.Team, &c.FromAssignment, &c.TargetPlanKey, &c.TargetKind, &terms, &limits, &c.EffectiveAt, &c.PausesRunning, &c.Subscription,
 		&c.RequestedBy, &c.RequestedVia, &c.Reason, &c.Key, &c.RequestedAt, &c.State, &c.CancelRequestedAt, &c.CancelPreexisting, &c.ProviderCancelAt, &c.ProviderRenewedAt,
-		&c.UndoneAt, &c.UndoneBy, &c.UndoReason, &c.AppliedAt, &c.AppliedPlan, &c.CompletedAt, &c.Failures, &c.LastError, &c.leaseHeldElsewhere, &c.terminalUndoOf)
+		&c.UndoneAt, &c.UndoneBy, &c.UndoReason, &c.AppliedAt, &c.AppliedPlan, &c.CompletedAt, &c.Failures, &c.LastError, &c.leaseHeldElsewhere, &c.terminalUndoOf, &c.ProviderEnded)
 	if err != nil {
 		return c, err
 	}
@@ -505,6 +506,17 @@ func subscriptionWillEnd(sub invoiceSubscription) bool {
 	return subscriptionEnded(sub) || sub.CancelAtPeriodEnd || sub.CancelAt != 0
 }
 
+// subscriptionStopAt is when a live subscription stops within its current
+// period: its cancellation time when one falls before the period ends,
+// otherwise the period end.
+func subscriptionStopAt(sub invoiceSubscription) time.Time {
+	end := subscriptionPeriodEnd(sub)
+	if sub.CancelAt != 0 && time.Unix(sub.CancelAt, 0).Before(end) {
+		return time.Unix(sub.CancelAt, 0).UTC()
+	}
+	return end
+}
+
 func subscriptionStopsBy(sub invoiceSubscription, boundary time.Time) bool {
 	if subscriptionEnded(sub) {
 		return true
@@ -575,7 +587,7 @@ func (h *Handlers) advanceTeamPlanChange(ctx context.Context, c teamPlanChange) 
 	switch {
 	case c.State == "undone":
 		return now, h.restorePlanChangeRenewal(ctx, c)
-	case c.State == "scheduled" && c.Subscription != nil && (c.ProviderCancelAt == nil || now.Before(c.EffectiveAt)):
+	case c.State == "scheduled" && c.Subscription != nil && (c.ProviderEnded || c.ProviderCancelAt == nil || now.Before(c.EffectiveAt)):
 		next, err := h.stopPlanChangeRenewal(ctx, c, now)
 		if err != nil {
 			return now, err
@@ -585,6 +597,9 @@ func (h *Handlers) advanceTeamPlanChange(ctx context.Context, c teamPlanChange) 
 			c, err = getTeamPlanChange(ctx, h.Pool, c.ID)
 			if err != nil {
 				return now, err
+			}
+			if c.State != "scheduled" {
+				return now, nil
 			}
 			c.lease = lease
 			return h.applyTeamPlanChange(ctx, c)
@@ -598,6 +613,15 @@ func (h *Handlers) advanceTeamPlanChange(ctx context.Context, c teamPlanChange) 
 	case c.State == "scheduled":
 		return h.applyTeamPlanChange(ctx, c)
 	case c.State == "applied":
+		if c.TargetKind == planKindFree && c.Subscription != nil {
+			client, ok := h.Stripe.(*stripeHTTPClient)
+			if !ok {
+				return now, errors.New("plan changes require the Stripe provider")
+			}
+			if err := voidUnspentBridgeCredit(ctx, h.Pool, client, c.Team, *c.Subscription); err != nil {
+				return now, err
+			}
+		}
 		if err := h.waitForPlanChangePauses(ctx, c.Team); err != nil {
 			return now, err
 		}
@@ -660,8 +684,17 @@ func (h *Handlers) stopPlanChangeRenewal(ctx context.Context, c teamPlanChange, 
 	if c.terminalUndoOf != nil && !subscriptionEnded(sub) {
 		return now, errors.New("terminal undo settlement cannot cancel a live subscription")
 	}
+	if c.ProviderEnded && (!subscriptionWillEnd(sub) || !subscriptionEnded(sub) && (!subscriptionStopAt(sub).Equal(c.EffectiveAt) || !subscriptionStopsBy(sub, c.EffectiveAt))) {
+		if err = fencedPlanChangeUpdate(ctx, tx, c, `state='undone',undone_at=clock_timestamp(),undo_reason='the subscription cancellation changed in Stripe',provider_renewed_at=clock_timestamp()`); err != nil {
+			return now, err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return now, err
+		}
+		return now, h.scheduleProviderEndedFreeChange(ctx, sub.Customer, sub.ID)
+	}
 	if !subscriptionEnded(sub) {
-		end := subscriptionPeriodEnd(sub)
+		end := subscriptionStopAt(sub)
 		if end.After(c.EffectiveAt) {
 			if err = fencedPlanChangeUpdate(ctx, tx, c, `effective_at=$3`, end); err != nil {
 				return now, err
@@ -686,7 +719,7 @@ func (h *Handlers) stopPlanChangeRenewal(ctx context.Context, c teamPlanChange, 
 	if !subscriptionWillEnd(sub) {
 		return now, errors.New("subscription cancellation was not confirmed")
 	}
-	if end := subscriptionPeriodEnd(sub); !subscriptionEnded(sub) && end.After(c.EffectiveAt) {
+	if end := subscriptionStopAt(sub); !subscriptionEnded(sub) && end.After(c.EffectiveAt) {
 		if err = fencedPlanChangeUpdate(ctx, tx, c, `effective_at=$3`, end); err != nil {
 			return now, err
 		}
@@ -788,13 +821,17 @@ func (h *Handlers) applyTeamPlanChange(ctx context.Context, c teamPlanChange) (t
 		if c.ProviderCancelAt == nil || !subscriptionWillEnd(sub) {
 			return now, errors.New("the subscription would still renew; not applying the plan change")
 		}
-		if end := subscriptionPeriodEnd(sub); !subscriptionEnded(sub) && end.After(c.EffectiveAt) {
+		if end := subscriptionStopAt(sub); !subscriptionEnded(sub) && end.After(c.EffectiveAt) {
 			return end, fencedPlanChangeUpdate(ctx, h.Pool, c, `effective_at=$3`, end)
 		}
 		if !subscriptionEnded(sub) {
 			return now.Add(time.Minute), nil
 		}
-		closed, err := h.proInvoicesClosed(ctx, client, c.Team, sub.Customer, sub.ID, nil)
+		paid, err := verifiedContractInvoices(ctx, h.Pool, c.Team, sub.ID)
+		if err != nil {
+			return now, err
+		}
+		closed, err := h.proInvoicesClosed(ctx, client, c.Team, sub.Customer, sub.ID, paid)
 		if err != nil {
 			return now, err
 		}
@@ -935,6 +972,7 @@ func (h *Handlers) respondTeamPlanChange(c *gin.Context, team uuid.UUID, change 
 }
 
 func teamPlanChangeJSON(c teamPlanChange, now time.Time) gin.H {
+	c.TargetLimits.MaxSnapshots = nil
 	return gin.H{"id": c.ID, "target_plan_key": c.TargetPlanKey, "target_display_name": c.TargetTerms.DisplayName, "target_kind": c.TargetKind,
 		"effective_at": c.EffectiveAt, "pauses_running": c.PausesRunning, "state": c.State, "undoable": c.Undoable(now), "limits": c.TargetLimits}
 }

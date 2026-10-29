@@ -4,6 +4,7 @@ import (
 	"math/big"
 	"strings"
 	"testing"
+	"time"
 )
 
 func int32p(v int32) *int32 { return &v }
@@ -100,6 +101,7 @@ func TestPlanVersionValidate(t *testing.T) {
 		"zero fee":             func(v *planVersion) { v.MonthlyFeeCents = int64p(0) },
 		"limits":               func(v *planVersion) { v.Limits.MaxConcurrent = nil },
 		"zero templates":       func(v *planVersion) { v.Limits.MaxTemplates = int32p(0) },
+		"zero snapshots":       func(v *planVersion) { v.Limits.MaxSnapshots = int32p(0) },
 		"memory below minimum": func(v *planVersion) { v.Limits.MaxMemoryMiB = int32p(255) },
 		"disk below minimum":   func(v *planVersion) { v.Limits.MaxDiskMiB = int32p(1023) },
 		"payg without caps": func(v *planVersion) {
@@ -121,6 +123,9 @@ func TestPlanVersionValidate(t *testing.T) {
 		"unknown funding policy": func(v *planVersion) { v.FundingPolicy = "credit" },
 		"legacy prepaid funding": func(v *planVersion) { v.PricingVersion, v.FundingPolicy = "legacy", fundingPolicyPrepaid },
 		"top-off while postpaid": func(v *planVersion) { v.Topoff = &planTopoff{AmountCents: 500, ThresholdCents: 500} },
+		"top-off threshold in cents": func(v *planVersion) {
+			v.FundingPolicy, v.Topoff = fundingPolicyPrepaid, &planTopoff{AmountCents: 500, ThresholdCents: 150}
+		},
 		"top-off checkout refuses": func(v *planVersion) {
 			v.FundingPolicy, v.Topoff = fundingPolicyPrepaid, &planTopoff{AmountCents: 750, ThresholdCents: 500}
 		},
@@ -144,7 +149,7 @@ func TestPlanVersionValidate(t *testing.T) {
 		"starter":       {PricingVersion: "v2", Family: "starter", Kind: "prepaid", Public: true, DisplayName: "Starter", Limits: planLimits{MaxConcurrent: int32p(100)}},
 		"matching deal": {PricingVersion: "v2", Family: "custom_example", Kind: "custom", DisplayName: "Example", Matching: &planMatching{MatchingBps: 10000, CapCents: 8000000}},
 		"prepaid-funded subscription": {PricingVersion: "v2", Family: "funded", Kind: "subscription", DisplayName: "Funded", MonthlyFeeCents: int64p(700),
-			Limits: planLimits{MaxConcurrent: int32p(3)}, FundingPolicy: fundingPolicyPrepaid, Topoff: &planTopoff{AmountCents: 1500, ThresholdCents: 1000}},
+			Limits: planLimits{MaxConcurrent: int32p(3)}, FundingPolicy: fundingPolicyPrepaid, Topoff: &planTopoff{AmountCents: 1500, ThresholdCents: 100}},
 	} {
 		if err := v.validate(); err != nil {
 			t.Errorf("%s: %v", name, err)
@@ -156,6 +161,12 @@ func TestPlanVersionValidate(t *testing.T) {
 	}
 	if card := (&Handlers{}).planCard(planVersion{Kind: planKindPrepaid}, nil); card.FundingPolicy != fundingPolicyPrepaid {
 		t.Fatal("prepaid plan card reported", card.FundingPolicy)
+	}
+	if card := (&Handlers{}).planCard(planVersion{Kind: planKindSubscription, Limits: planLimits{MaxSnapshots: int32p(3)}}, nil); card.Limits.MaxSnapshots != nil {
+		t.Fatal("plan card published the internal snapshot cap")
+	}
+	if change := teamPlanChangeJSON(teamPlanChange{TargetLimits: planLimits{MaxSnapshots: int32p(3)}}, time.Now()); change["limits"].(planLimits).MaxSnapshots != nil {
+		t.Fatal("plan change response published the internal snapshot cap")
 	}
 	starter := planVersion{PricingVersion: "v2", Family: "starter", Kind: "prepaid", DisplayName: "Starter", Limits: planLimits{MaxConcurrent: int32p(1)}, FundingPolicy: fundingPolicyPrepaid}
 	if starter.validate() == nil {

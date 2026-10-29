@@ -67,6 +67,12 @@ func validNewPrepaidAmount(amount int64) bool {
 	return validPrepaidAmount(amount) && amount <= prepaidPurchaseMaxCents
 }
 
+// validRechargeThreshold accepts whole dollars from $1; recharge amounts stay
+// in $5 steps.
+func validRechargeThreshold(cents int64) bool {
+	return cents >= 100 && cents%100 == 0 && cents <= prepaidPurchaseMaxCents
+}
+
 func validPrepaidAmount(amount int64) bool {
 	return amount >= 500 && amount%500 == 0 && amount <= 100000000
 }

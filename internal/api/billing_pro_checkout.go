@@ -263,6 +263,13 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 	}
 	client := h.Stripe.(*stripeHTTPClient)
 	var product string
+	var terms []StripeCheckoutResourceTerms
+	var termsErr error
+	termsDone := make(chan struct{})
+	go func() {
+		defer close(termsDone)
+		terms, termsErr = h.freezeProResourceTerms(c.Request.Context(), team, prices, client)
+	}()
 	// A resumed purchase keeps the price it was started with.
 	if resuming {
 		err = client.validateProPrice(c.Request.Context(), offer)
@@ -272,12 +279,12 @@ func (h *Handlers) createProCheckout(c *gin.Context, team, actor uuid.UUID, req 
 		offer.Price = price.ID
 		product = price.Product
 	}
+	<-termsDone
 	if err != nil {
 		respondErrorMsg(c, "service_unavailable", "Pro price configuration requires verification", 503)
 		return
 	}
-	terms, err := h.freezeProResourceTerms(c.Request.Context(), team, prices, client)
-	if err != nil {
+	if termsErr != nil {
 		respondErrorMsg(c, "service_unavailable", "Pro resource configuration requires verification", 503)
 		return
 	}
@@ -602,6 +609,11 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 	var upgradeTeam uuid.UUID
 	upgradeErr := h.Pool.QueryRow(ctx, `UPDATE billing_pro_upgrade SET next_check_at=clock_timestamp() WHERE customer_id=$1 AND team_id IS NOT NULL AND state NOT IN ('expired','ended') RETURNING team_id`, obj.Customer).Scan(&upgradeTeam)
 	if upgradeErr == nil {
+		if strings.HasPrefix(event.Type, "customer.subscription.") {
+			if err := h.scheduleProviderEndedFreeChange(ctx, obj.Customer, subscription); err != nil {
+				return true, err
+			}
+		}
 		if strings.HasPrefix(event.Type, "invoice.") {
 			if _, err := h.Pool.Exec(ctx, `UPDATE billing_invoice_collection SET next_attempt_at=LEAST(next_attempt_at,clock_timestamp()) WHERE invoice_id=$1 AND customer_id=$2 AND state NOT IN ('paid','void')`, obj.ID, obj.Customer); err != nil {
 				return true, err
@@ -643,6 +655,11 @@ func (h *Handlers) processProWebhook(ctx context.Context, event stripeEventEnvel
 	}
 	if err != nil {
 		return false, err
+	}
+	if strings.HasPrefix(event.Type, "customer.subscription.") {
+		if err = h.scheduleProviderEndedFreeChange(ctx, obj.Customer, subscription); err != nil {
+			return true, err
+		}
 	}
 	_, err = h.reconcileProCheckout(ctx, team, false)
 	if err != nil {

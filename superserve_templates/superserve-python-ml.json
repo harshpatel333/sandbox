@@ -1,8 +1,8 @@
 {
   "name": "superserve/python-ml",
   "vcpu": 2,
-  "memory_mib": 2048,
-  "disk_mib": 4096,
+  "memory_mib": 4096,
+  "disk_mib": 8192,
   "build_spec": {
     "from": "python:3.11",
     "steps": [

@@ -1122,7 +1122,7 @@ var desktopHelperPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin
 func (s *desktopService) commandContext(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
 	display := s.displayName()
 
-	resolved, err := lookPathIn(name, desktopHelperPath)
+	resolved, err := lookPathIn(name, desktopHelperPath, "/")
 	if err != nil {
 		return nil, err
 	}

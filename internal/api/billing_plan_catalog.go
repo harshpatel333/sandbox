@@ -36,13 +36,15 @@ type planMatching struct {
 
 // planLimits are the limits a plan grants. MaxConcurrent is the number of
 // sandboxes a team may run at once (paused ones do not count); the size caps
-// bound each sandbox's template.
+// bound each sandbox's template. MaxSnapshots caps the team's snapshots and is
+// never shown to customers.
 type planLimits struct {
 	MaxConcurrent *int32 `json:"max_concurrent"`
 	MaxVCPU       *int32 `json:"max_vcpu"`
 	MaxMemoryMiB  *int32 `json:"max_memory_mib"`
 	MaxDiskMiB    *int32 `json:"max_disk_mib"`
 	MaxTemplates  *int32 `json:"max_templates"`
+	MaxSnapshots  *int32 `json:"max_snapshots,omitempty"`
 }
 
 // planCompute prices an allowance as Seconds of a sandbox with VCPU vCPUs and
@@ -120,7 +122,7 @@ type planVersion struct {
 const planVersionColumns = `id,pricing_version,family,version,state,kind,public,display_name,price_label,tagline,features,sort_order,display_only,self_serve,
 monthly_fee_cents,annual_fee_cents,credit_schedule,matching_bps,cap_cents,
 allowance_period,allowance_on_exhausted,allowance_cents,allowance_compute_seconds,allowance_compute_vcpu,allowance_compute_memory_gib,
-max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates,
+max_sandboxes,max_template_vcpu,max_template_memory_mib,max_template_disk_mib,max_templates,max_snapshots,
 funding_policy,topoff_amount_cents,topoff_threshold_cents,topoff_default_enabled,
 created_by,created_at,updated_at,published_by,published_at,retired_by,retired_at`
 
@@ -136,7 +138,7 @@ func scanPlanVersion(row pgx.Row) (planVersion, error) {
 	err := row.Scan(&v.ID, &v.PricingVersion, &v.Family, &v.Version, &v.State, &v.Kind, &v.Public, &v.DisplayName, &v.PriceLabel, &v.Tagline, &v.Features,
 		&v.SortOrder, &v.DisplayOnly, &v.SelfServe, &v.MonthlyFeeCents, &v.AnnualFeeCents, &schedule, &bps, &capCents,
 		&period, &onExhausted, &allowanceCents, &seconds, &vcpu, &memory,
-		&v.Limits.MaxConcurrent, &v.Limits.MaxVCPU, &v.Limits.MaxMemoryMiB, &v.Limits.MaxDiskMiB, &v.Limits.MaxTemplates,
+		&v.Limits.MaxConcurrent, &v.Limits.MaxVCPU, &v.Limits.MaxMemoryMiB, &v.Limits.MaxDiskMiB, &v.Limits.MaxTemplates, &v.Limits.MaxSnapshots,
 		&v.FundingPolicy, &topoffAmount, &topoffThreshold, &topoffDefault,
 		&v.CreatedBy, &v.CreatedAt, &v.UpdatedAt, &v.PublishedBy, &v.PublishedAt, &v.RetiredBy, &v.RetiredAt)
 	if err != nil {
@@ -215,7 +217,7 @@ func (v planVersion) validate() error {
 			return errors.New("fees must be positive")
 		}
 	}
-	for _, limit := range []*int32{v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB} {
+	for _, limit := range []*int32{v.Limits.MaxConcurrent, v.Limits.MaxVCPU, v.Limits.MaxMemoryMiB, v.Limits.MaxDiskMiB, v.Limits.MaxSnapshots} {
 		if limit != nil && *limit <= 0 {
 			return errors.New("limits must be positive")
 		}
@@ -256,8 +258,8 @@ func (v planVersion) validate() error {
 	if v.prepaidFunded() && (v.Kind != "subscription" || v.PricingVersion != "v2") {
 		return errors.New("only v2 subscription plans take a prepaid funding policy")
 	}
-	if t := v.Topoff; t != nil && (!v.prepaidFunded() || !validNewPrepaidAmount(t.AmountCents) || !validNewPrepaidAmount(t.ThresholdCents)) {
-		return errors.New("top-off needs a prepaid funding policy, and its amount and threshold must be multiples of $5 up to $10,000")
+	if t := v.Topoff; t != nil && (!v.prepaidFunded() || !validNewPrepaidAmount(t.AmountCents) || !validRechargeThreshold(t.ThresholdCents)) {
+		return errors.New("top-off needs a prepaid funding policy, an amount in multiples of $5 and a threshold in whole dollars, both up to $10,000")
 	}
 	if v.DisplayOnly {
 		if v.hasFee() || v.SelfServe || len(v.CreditSchedule) != 0 || v.Matching != nil || v.Allowance != nil {

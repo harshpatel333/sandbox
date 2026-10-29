@@ -970,6 +970,11 @@ type BillingPlanRelease struct {
 	PlanChangeID     pgtype.UUID `json:"plan_change_id"`
 }
 
+type BillingPlanShapeDeferred struct {
+	TeamID  uuid.UUID `json:"team_id"`
+	TriedAt time.Time `json:"tried_at"`
+}
+
 type BillingPlanVersion struct {
 	ID                        uuid.UUID          `json:"id"`
 	PricingVersion            string             `json:"pricing_version"`
@@ -1012,6 +1017,7 @@ type BillingPlanVersion struct {
 	TopoffAmountCents         *int64             `json:"topoff_amount_cents"`
 	TopoffThresholdCents      *int64             `json:"topoff_threshold_cents"`
 	TopoffDefaultEnabled      *bool              `json:"topoff_default_enabled"`
+	MaxSnapshots              *int32             `json:"max_snapshots"`
 }
 
 type BillingPrepaidAutoRecharge struct {
@@ -2541,6 +2547,7 @@ type TeamPlanChange struct {
 	LastError                 *string            `json:"last_error"`
 	AdmissionSource           *string            `json:"admission_source"`
 	AdmissionEpoch            pgtype.UUID        `json:"admission_epoch"`
+	ProviderEnded             bool               `json:"provider_ended"`
 }
 
 type TeamPricingPlan struct {
