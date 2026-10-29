@@ -375,6 +375,25 @@ func TestPrepaidAutoRechargeChargesOnceAndIssuesPaidCredit(t *testing.T) {
 	}
 }
 
+func TestPrepaidAutoRechargeWholeDollarThreshold(t *testing.T) {
+	f := newPrepaidFixture(t)
+	f.enableAutoRecharge(100, 500)
+	f.observe(150, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.intentPosts) != 0 {
+		t.Fatal("recharged above a $1 threshold")
+	}
+	f.observe(50, true)
+	if err := f.tick(); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.rows(); len(r) != 1 || r[0].Amount != 500 || r[0].Credit != "issued" {
+		t.Fatalf("a $1 threshold did not top up $5: %+v", r)
+	}
+}
+
 func TestPrepaidAutoRechargeReplaysLostChargeWithSameKey(t *testing.T) {
 	f := newPrepaidFixture(t)
 	f.enableAutoRecharge(2000, 5000)
