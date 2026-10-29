@@ -38,6 +38,19 @@ const prepaidPurchaseJSON = `jsonb_build_object('id',p.id,'team_id',p.team_id,'s
      'revoke_closed_unexecuted',d.revoked_at IS NULL AND d.revoke_retry_after IS NOT DISTINCT FROM 'infinity') ORDER BY d.version),'[]') FROM billing_prepaid_reversal_decision d WHERE d.purchase_id=r.purchase_id))
   FROM billing_prepaid_reversal r WHERE r.purchase_id=p.id))`
 
+// prepaidBalanceObservedSQL is whether balance_cents is a current observation;
+// before enrolment, once stale, or beyond the observation cap it is not, and a
+// zero balance then means unknown rather than used up.
+const prepaidBalanceObservedSQL = `COALESCE(f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp(),false)`
+
+// prepaidLowBalanceSQL compares a prepaid-funded subscription's balance, once
+// low-credit messaging may read it, with the configured low-credit level, and
+// the legacy prepaid kind's observed balance with its fixed level.
+const prepaidLowBalanceSQL = `(SELECT CASE WHEN bool_or(p.kind='subscription' AND billing_assignment_prepaid_funded(p))
+  THEN billing_prepaid_warning_balance_ready(t.team_id) AND f.credit_usd*100<(SELECT low_credit_warning_cents FROM billing_funding_policy WHERE singleton)
+  ELSE ` + prepaidBalanceObservedSQL + ` AND floor(f.credit_usd*100)<500 END
+ FROM team_plan_assignment p WHERE p.team_id=t.team_id AND p.effective_to IS NULL)`
+
 const prepaidAutoRechargeCapExceededSQL = `(a.amount_cents>1000000 OR a.threshold_cents>1000000)`
 const prepaidAutoRechargeEnabledSQL = `(COALESCE(a.enabled,false) AND NOT ` + prepaidAutoRechargeCapExceededSQL + `)`
 
@@ -49,8 +62,9 @@ func (h *Handlers) prepaidSummary(ctx context.Context, team uuid.UUID, purchases
 	var raw []byte
 	err := h.Pool.QueryRow(ctx, `SELECT jsonb_build_object(
  'checkout_idempotency_supported',true,
- 'balance_cents',CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END,
- 'low_balance',(CASE WHEN f.observe AND f.observed_generation=f.generation AND f.credit_valid_until>clock_timestamp() THEN floor(f.credit_usd*100)::bigint ELSE 0 END)<500 AND NOT `+prepaidAutoRechargeEnabledSQL+`,
+ 'balance_cents',CASE WHEN `+prepaidBalanceObservedSQL+` THEN floor(f.credit_usd*100)::bigint ELSE 0 END,
+ 'balance_observed',`+prepaidBalanceObservedSQL+`,
+ 'low_balance',COALESCE(`+prepaidLowBalanceSQL+` AND NOT `+prepaidAutoRechargeEnabledSQL+`,false),
  'auto_recharge',`+prepaidAutoRechargeJSON+`,
  'has_saved_card',COALESCE(f.payment_method_ready,false),
  'purchases',(SELECT COALESCE(jsonb_agg(`+prepaidPurchaseJSON+` ORDER BY p.created_at DESC),'[]') FROM
