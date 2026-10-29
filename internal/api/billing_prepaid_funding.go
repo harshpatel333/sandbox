@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"net/http"
@@ -211,6 +212,7 @@ func (h *Handlers) aggregateFundingGrants(ctx context.Context, client *stripeHTT
 	expiry := inv.MeteredExpiry
 	total, reserved := metered.Ledger, metered.Ledger-metered.Available
 	separate := map[string]fundingGrantBalance{}
+	grantsByID := map[string]entitlementGrant{}
 	var prices []string
 	for _, g := range inv.Others {
 		if g.Applicability.Scope.PriceType != "metered" && prices == nil {
@@ -228,7 +230,7 @@ func (h *Handlers) aggregateFundingGrants(ctx context.Context, client *stripeHTT
 		if b.Ledger > g.Amount.Monetary.Value || total > int64(^uint64(0)>>1)-b.Ledger {
 			return fundingGrantSnapshot{}, false, errors.New("invalid funding credit ledger total")
 		}
-		separate[g.ID] = b
+		separate[g.ID], grantsByID[g.ID] = b, g
 		if b.Ledger == 0 {
 			continue
 		}
@@ -260,13 +262,21 @@ func (h *Handlers) aggregateFundingGrants(ctx context.Context, client *stripeHTT
 			if err != nil {
 				return err
 			}
-			if current.Head != inv.Head || current.Metered != inv.Metered || len(current.Others) != len(inv.Others) {
+			// Start and expiry come from the grants themselves, so a changed
+			// effective or expiry time must fail the observation too.
+			if current.Head != inv.Head || current.Metered != inv.Metered || len(current.Others) != len(inv.Others) ||
+				!current.MeteredStart.Equal(inv.MeteredStart) || current.MeteredExpiry != inv.MeteredExpiry {
 				return errors.New("funding credit grants changed during observation")
 			}
 			for _, g := range current.Others {
 				before, ok := separate[g.ID]
 				if !ok {
 					return errors.New("funding credit grants changed during observation")
+				}
+				a, _ := json.Marshal(g)
+				b, _ := json.Marshal(grantsByID[g.ID])
+				if string(a) != string(b) {
+					return errors.New("funding credit grant changed during observation")
 				}
 				after, err := fundingProviderGrantBalance(ctx, client, customer, g.ID)
 				if err != nil {

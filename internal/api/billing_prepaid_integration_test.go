@@ -998,12 +998,19 @@ func TestPrepaidObservationCountsExpiringMeteredGrantsOnce(t *testing.T) {
 	f.balances[promo.ID] = 1000
 	f.mu.Unlock()
 	reads := f.aggregateReads
-	total, _, expiry, _, _, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
+	total, _, expiry, _, verify, err := f.h.observeProviderFundingGrants(t.Context(), f.client, f.team, f.customer, time.Now())
 	if err != nil || total != 1500 || f.aggregateReads != reads+1 {
 		t.Fatal("an expiring metered grant was not counted once through the metered summary", total, err, f.aggregateReads-reads)
 	}
 	if !expiry.Valid || expiry.Time.Unix() != promo.ExpiresAt {
 		t.Fatal("observation outlives the expiring grant", expiry)
+	}
+	f.mu.Lock()
+	promo.ExpiresAt = time.Now().Add(time.Hour).Unix()
+	f.grants[promo.ID] = promo
+	f.mu.Unlock()
+	if verify == nil || verify(nil) == nil {
+		t.Fatal("a shortened grant expiry did not invalidate the observation")
 	}
 }
 
@@ -1069,6 +1076,13 @@ func TestPrepaidObservationAddsPriceScopedGrantToManyTopOffs(t *testing.T) {
 	}
 	if verify == nil || verify(nil) != nil {
 		t.Fatal("observation is not stable", verify == nil)
+	}
+	f.mu.Lock()
+	monthly.ExpiresAt = time.Now().Add(time.Hour).Unix()
+	f.grants[monthly.ID] = monthly
+	f.mu.Unlock()
+	if verify(nil) == nil {
+		t.Fatal("a shortened monthly grant expiry did not invalidate the observation")
 	}
 }
 
