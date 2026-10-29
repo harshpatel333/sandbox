@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/rs/zerolog/log"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -136,6 +137,12 @@ func (h *Handlers) reconcileInvoicePeriod(ctx context.Context, p billing.ExportP
 			message = &v
 		}
 		_, _ = h.Pool.Exec(ack, `UPDATE billing_invoice_account SET last_attempt_at=clock_timestamp(),last_error=$2 WHERE team_id=$1`, p.TeamID, message)
+		// Stripe creates the renewal draft at the cycle boundary, so one still
+		// missing an hour later needs a person; a sponsored team's next grant
+		// may have been issued without it.
+		if errors.Is(resultErr, errRenewalInvoiceMissing) && time.Since(p.End) > sponsoredRenewalInvoiceSettle {
+			log.Error().Str("team_id", p.TeamID.String()).Time("period_end", p.End).Msg("renewal invoice still missing after its cycle ended")
+		}
 		if resultErr != nil {
 			_, _ = h.Pool.Exec(ack, `UPDATE billing_invoice_close SET last_error=$4,updated_at=clock_timestamp() WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End, resultErr.Error())
 		}
