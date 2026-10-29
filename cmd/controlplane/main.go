@@ -238,7 +238,7 @@ func run() error {
 	handlers.MachineCredentials = machineAuthority
 	handlers.EmailTransport = api.EmailTransport{SMTPAddr: cfg.SMTPAddr}
 	if sender, from := handlers.EmailTransport.Sender(os.Getenv("RESEND_API_KEY")), os.Getenv("QUOTA_EMAIL_FROM"); sender != nil && from != "" {
-		handlers.TrialWarningSender = api.NewEmailTrialCreditWarningSender(sender, from, queries)
+		handlers.TrialWarningSender = api.NewEmailTrialCreditWarningSender(sender, from, handlers.ConsoleOrigin(), queries)
 	}
 	handlers.Pool = dbPool
 	handlers.PromotionAuthPool = newPromotionAuthPool(ctx, os.Getenv("PROMOTION_AUTH_DATABASE_URL"))

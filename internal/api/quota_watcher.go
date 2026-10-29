@@ -329,9 +329,15 @@ func quotaEmailHTML(a QuotaAlert) string {
 <li>a brief description of your use case</li>
 </ul>
 <p style="color:#a3a3a3;font-size:14px;line-height:24px;margin:0 0 16px 0;">We review every request and aim to respond within 48 hours. Our goal is to provide infinite compute to power your agents, and this verification helps us allocate capacity safely and responsibly across all our customers.</p>
-<a href="%s" style="background-color:#e5e5e5;color:#0a0a0a;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:14px 24px;margin:28px 0 0 0;">Book a Meeting</a>`,
-		a.Limit, emailMeetingURL)
+%s`,
+		a.Limit, emailButton("Book a Meeting", emailMeetingURL))
 	return emailShell("Verify your team on Superserve", body)
+}
+
+// emailButton renders the shell's full-width call-to-action link.
+func emailButton(label, href string) string {
+	return fmt.Sprintf(`<a href="%s" style="background-color:#e5e5e5;color:#0a0a0a;font-family:'Geist Mono',monospace;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;text-decoration:none;text-align:center;display:block;padding:14px 24px;margin:28px 0 0 0;">%s</a>`,
+		html.EscapeString(href), html.EscapeString(label))
 }
 
 // emailShell wraps body HTML in the shared Superserve email chrome — logo header,
