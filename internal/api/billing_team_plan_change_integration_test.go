@@ -987,6 +987,10 @@ func TestTeamPlanChangeStaffSwitchToFreeAtPeriodEnd(t *testing.T) {
 	if c = f.reload(t, c.ID); c.State != "scheduled" || c.ProviderCancelAt == nil || c.CancelPreexisting || !f.stripe.cancel || len(f.stripe.writes) != 1 || f.stripe.writes[0] != "cancel_at_period_end=true" {
 		t.Fatalf("renewal not stopped: %+v %v", c, f.stripe.writes)
 	}
+	var enabled bool
+	if err = f.h.Pool.QueryRow(t.Context(), `SELECT enabled FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&enabled); err != nil || !enabled {
+		t.Fatalf("Auto Topoff turned off before the period end: %v %v", enabled, err)
+	}
 	f.reachEffective(t, c.ID)
 	c = f.reload(t, c.ID)
 	ended := c.EffectiveAt.Truncate(time.Second)
@@ -997,7 +1001,6 @@ func TestTeamPlanChangeStaffSwitchToFreeAtPeriodEnd(t *testing.T) {
 	if c.State != "applied" || plan.PlanKey != "free" || plan.Source != planSourcePlanChange || plan.ID != *c.AppliedPlan {
 		t.Fatalf("free not applied at the period end: %+v %+v", c, plan)
 	}
-	var enabled bool
 	if err = f.h.Pool.QueryRow(t.Context(), `SELECT enabled FROM billing_prepaid_auto_recharge WHERE team_id=$1`, f.team).Scan(&enabled); err != nil || enabled {
 		t.Fatalf("Auto Topoff stayed on after the move to Free: %v %v", enabled, err)
 	}
@@ -1016,7 +1019,7 @@ func TestTeamPlanChangeStaffSwitchToFreeAtPeriodEnd(t *testing.T) {
 	if c = f.reload(t, c.ID); c.State != "completed" {
 		t.Fatalf("change did not complete after durable pause requests settled: %+v", c)
 	}
-	if !f.stripe.cancel || f.stripe.status != "canceled" || len(f.stripe.writes) != 1 {
+	if c.ProviderRenewedAt != nil || len(f.stripe.writes) != 1 {
 		t.Fatalf("the ended subscription was renewed or written to after apply: %v", f.stripe.writes)
 	}
 }
