@@ -84,6 +84,61 @@ func TestIntegrationFundingCreditOwnedDraftReservesUsageOnce(t *testing.T) {
 	}
 }
 
+func TestIntegrationFundingCreditAcceptsRenewalDraftBeforeClosePlan(t *testing.T) {
+	h, team := fundingTransitionFixture(t)
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := h.Pool.Exec(t.Context(), sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	start := at.Add(-time.Hour)
+	customer, subscription := "cus_"+team.String(), "sub_"+team.String()
+	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status,commercial_billing_anchor) VALUES($1,$2,$3,'active',$4)`, team, customer, subscription, start)
+	exec(`INSERT INTO billing_invoice_account(team_id,customer_id,subscription_id,adjustment_price_id,adjustment_event_name,adjustment_meter_id,enrolled_at) VALUES($1,$2,$3,'price_rounding','rounding','meter_rounding',$4)`, team, customer, subscription, start)
+	exec(`INSERT INTO team_billing_period(team_id,period_start,period_end) VALUES($1,$2,$3)`, team, start, at)
+	exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_hourly_rollups',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, team)
+	exec(`INSERT INTO team_billing_usage_hourly(team_id,hour_start,hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds) VALUES($1,$2,$3,3600,0,0)`, team, start, at)
+	planKey := "renewal-" + team.String()
+	exec(`INSERT INTO pricing_plan(key,name) VALUES($1,'Renewal funding')`, planKey)
+	exec(`INSERT INTO pricing_rate(plan_key,resource,unit,price_usd,effective_from) VALUES($1,'vcpu','second',0.001,$2),($1,'memory_gib','second',0,$2)`, planKey, start.Add(-time.Hour))
+	exec(`INSERT INTO team_pricing_plan(team_id,plan_key,effective_from) VALUES($1,$2,$3)`, team, planKey, start.Add(-time.Hour))
+	// The provider has drafted the renewal invoice; the close worker has not
+	// planned it yet, so no close row exists.
+	inv, _ := fundingOwnedDraftFixture(billing.ExportPeriod{TeamID: team, Start: start, End: at}, customer, subscription)
+	inv.ID = "in_" + team.String()
+	g := entitlementGrant{ID: "credgr_" + team.String(), Customer: customer, Created: start.Unix(), EffectiveAt: start.Unix(), ExpiresAt: at.Add(time.Hour).Unix()}
+	g.Amount.Type, g.Amount.Monetary.Currency, g.Amount.Monetary.Value = "monetary", "usd", 1000
+	g.Applicability.Scope.PriceType = "metered"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/billing/credit_grants":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []entitlementGrant{g}})
+		case "/v1/billing/credit_grants/" + g.ID:
+			_ = json.NewEncoder(w).Encode(g)
+		case "/v1/billing/credit_balance_summary":
+			_, _ = w.Write([]byte(`{"balances":[{"ledger_balance":{"monetary":{"currency":"usd","value":1000}},"available_balance":{"monetary":{"currency":"usd","value":640}}}]}`))
+		case "/v1/invoices":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": []StripeInvoiceAmounts{inv}})
+		default:
+			t.Errorf("unexpected provider request %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	h.Stripe = &stripeHTTPClient{baseURL: server.URL, httpClient: server.Client(), apiVersion: "2026-07-29.dahlia"}
+	account := db.TeamBillingAccount{TeamID: team, StripeCustomerID: &customer, StripeSubscriptionID: &subscription}
+	observation, err := h.observeFundingCredit(t.Context(), team, account, at)
+	if err != nil || observation.SpendableUSD != "6.400000" {
+		t.Fatalf("unplanned renewal draft rejected or double counted: %+v %v", observation, err)
+	}
+	inv.PeriodEnd = at.Add(time.Hour).Unix()
+	if _, err = h.observeFundingCredit(t.Context(), team, account, at); err == nil {
+		t.Fatal("draft for an unknown local period treated as owned usage")
+	}
+}
+
 func TestIntegrationFundingCreditPreservesReleasedPriceScope(t *testing.T) {
 	h, team := fundingTransitionFixture(t)
 	exec := func(sql string, args ...any) {

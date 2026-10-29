@@ -445,33 +445,50 @@ func (h *Handlers) validateFundingDraft(ctx context.Context, team uuid.UUID, inv
 	err := h.Pool.QueryRow(ctx, `SELECT p.period_start,p.period_end,j.plan FROM billing_invoice_close j JOIN team_billing_period p USING(team_id,period_start,period_end)
  WHERE j.team_id=$1 AND j.invoice_id=$2 AND j.state IN ('prepared','adjusted','finalizing') AND p.finalized_at IS NULL
  AND j.plan->>'customer'=$3 AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(j.plan->'resources') r WHERE r->'snapshot' IS DISTINCT FROM billing_meter_accounting_snapshot(j.team_id,j.period_start,j.period_end,r->>'resource'))`, team, inv.ID, inv.Customer).Scan(&p.Start, &p.End, &raw)
-	if err != nil {
-		return err
+	var plan *billing.InvoiceClosePlan
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The provider drafts a renewal invoice as soon as its period ends,
+		// before the close worker plans it. Accept it against the local period
+		// it bills, which must still be open and unplanned.
+		err = h.Pool.QueryRow(ctx, `SELECT p.period_start,p.period_end FROM team_billing_period p LEFT JOIN billing_invoice_calendar c USING(team_id,period_start,period_end)
+ WHERE p.team_id=$1 AND p.finalized_at IS NULL AND COALESCE(c.invoice_start,p.period_start)=to_timestamp($2) AND COALESCE(c.invoice_end,p.period_end)=to_timestamp($3)
+ AND NOT EXISTS(SELECT 1 FROM billing_invoice_close j WHERE j.team_id=p.team_id AND j.period_start=p.period_start AND j.period_end=p.period_end)`, team, inv.PeriodStart, inv.PeriodEnd).Scan(&p.Start, &p.End)
+	} else if err == nil {
+		plan = new(billing.InvoiceClosePlan)
+		err = json.Unmarshal(raw, plan)
 	}
-	var plan billing.InvoiceClosePlan
-	if err = json.Unmarshal(raw, &plan); err != nil {
+	if err != nil {
 		return err
 	}
 	a, ok, err := h.invoiceAccountForPeriod(ctx, p)
 	if err != nil {
 		return err
 	}
-	if !ok || a.Customer != plan.Customer || a.Subscription != plan.Subscription {
+	if !ok || plan != nil && (a.Customer != plan.Customer || a.Subscription != plan.Subscription) {
 		return errors.New("draft credit accounting identity changed")
 	}
 	return validateFundingDraftCoverage(inv, p, a, plan, coverage)
 }
 
-func validateFundingDraftCoverage(inv StripeInvoiceAmounts, p billing.ExportPeriod, a invoiceAccount, plan billing.InvoiceClosePlan, coverage []fundingPeriodReserve) error {
-	if err := validateInvoiceDocument(inv, invoicePlanPeriod(p, plan), a, plan); err != nil {
-		return err
-	}
-	amounts := map[string]int64{a.Price: max(plan.AdjustmentCents, 0)}
-	for _, r := range plan.Resources {
-		if r.ProviderCents < 0 {
-			return errors.New("negative planned draft usage")
+// A nil plan means the draft predates its close plan: line amounts cannot be
+// matched yet, so only the identity and the local usage reserve bound them.
+func validateFundingDraftCoverage(inv StripeInvoiceAmounts, p billing.ExportPeriod, a invoiceAccount, plan *billing.InvoiceClosePlan, coverage []fundingPeriodReserve) error {
+	var amounts map[string]int64
+	if plan == nil {
+		if inv.Customer != a.Customer || inv.Currency != "usd" || inv.BillingReason != "subscription_cycle" || inv.Parent.SubscriptionDetails == nil || inv.Parent.SubscriptionDetails.Subscription != a.Subscription || inv.Lines.HasMore {
+			return errors.New("draft credit accounting identity changed")
 		}
-		amounts[r.PriceID] = r.ProviderCents
+	} else {
+		if err := validateInvoiceDocument(inv, invoicePlanPeriod(p, *plan), a, *plan); err != nil {
+			return err
+		}
+		amounts = map[string]int64{a.Price: max(plan.AdjustmentCents, 0)}
+		for _, r := range plan.Resources {
+			if r.ProviderCents < 0 {
+				return errors.New("negative planned draft usage")
+			}
+			amounts[r.PriceID] = r.ProviderCents
+		}
 	}
 	gross := new(big.Int)
 	lineCredits := new(big.Int)
@@ -492,7 +509,7 @@ func validateFundingDraftCoverage(inv StripeInvoiceAmounts, p billing.ExportPeri
 			}
 			continue
 		}
-		if line.Amount != amounts[id] || credits.Cmp(big.NewInt(line.Amount)) > 0 {
+		if (plan != nil && line.Amount != amounts[id]) || line.Amount < 0 || credits.Cmp(big.NewInt(line.Amount)) > 0 {
 			return errors.New("draft resource amount differs from accounted usage")
 		}
 		gross.Add(gross, big.NewInt(line.Amount))

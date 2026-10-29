@@ -2858,14 +2858,16 @@ WITH active_teams AS MATERIALIZED (
       AND s.status = 'active'
       AND s.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 )
-SELECT a.team_id
-FROM active_teams a
-WHERE NOT team_sandbox_billing_eligible(a.team_id)
-   OR EXISTS (
-       SELECT 1 FROM billing_team_pause_target t
-       WHERE t.team_id = a.team_id AND t.done_at IS NULL
-   )
-ORDER BY a.team_id
+SELECT d.team_id, d.targeted
+FROM (
+    SELECT a.team_id, EXISTS (
+        SELECT 1 FROM billing_team_pause_target t
+        WHERE t.team_id = a.team_id AND t.done_at IS NULL
+    ) AS targeted
+    FROM active_teams a
+) d
+WHERE d.targeted OR NOT team_sandbox_billing_eligible(d.team_id)
+ORDER BY d.team_id
 LIMIT $1
 `
 
@@ -2874,24 +2876,29 @@ type ListTeamsWithBillingPauseDueParams struct {
 	AfterTeamID pgtype.UUID `json:"after_team_id"`
 }
 
+type ListTeamsWithBillingPauseDueRow struct {
+	TeamID   uuid.UUID `json:"team_id"`
+	Targeted bool      `json:"targeted"`
+}
+
 // MATERIALIZED fence, same reason as the rollup's interval_team_set: dedupe
 // the active-team set first so team_sandbox_billing_eligible() runs once per
 // team. Inlined in the WHERE clause the planner may evaluate it per active
 // sandbox row — the function does three reads, and this sweep runs on a
 // timer against every control-plane instance.
-func (q *Queries) ListTeamsWithBillingPauseDue(ctx context.Context, arg ListTeamsWithBillingPauseDueParams) ([]uuid.UUID, error) {
+func (q *Queries) ListTeamsWithBillingPauseDue(ctx context.Context, arg ListTeamsWithBillingPauseDueParams) ([]ListTeamsWithBillingPauseDueRow, error) {
 	rows, err := q.db.Query(ctx, listTeamsWithBillingPauseDue, arg.BatchLimit, arg.AfterTeamID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []uuid.UUID{}
+	items := []ListTeamsWithBillingPauseDueRow{}
 	for rows.Next() {
-		var team_id uuid.UUID
-		if err := rows.Scan(&team_id); err != nil {
+		var i ListTeamsWithBillingPauseDueRow
+		if err := rows.Scan(&i.TeamID, &i.Targeted); err != nil {
 			return nil, err
 		}
-		items = append(items, team_id)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
