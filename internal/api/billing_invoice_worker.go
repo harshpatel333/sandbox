@@ -94,6 +94,7 @@ func (h *Handlers) invoiceReconciliationTick(ctx context.Context) (bool, error) 
 	var p billing.ExportPeriod
 	err := h.Pool.QueryRow(ctx, `SELECT p.team_id,p.period_start,p.period_end FROM team_billing_period p JOIN billing_invoice_account a USING(team_id) LEFT JOIN billing_invoice_close j USING(team_id,period_start,period_end)
      WHERE a.enrolled_at<p.period_end AND p.period_end<=now() AND p.status IN ('exporting','exported','finalized') AND COALESCE(j.state,'')<>'released'
+      AND NOT billing_invoice_period_absent(p.team_id,p.period_start,p.period_end)
      ORDER BY a.last_attempt_at NULLS FIRST,p.period_end LIMIT 1`).Scan(&p.TeamID, &p.Start, &p.End)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil

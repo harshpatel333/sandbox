@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -224,5 +225,34 @@ func TestSponsoredRollGraceEndsWithContract(t *testing.T) {
 	}
 	if f.eligible() {
 		t.Fatal("grace extended past the end of the sponsorship")
+	}
+}
+
+func TestSponsoredRollGraceWaitsForSuccessfulCreditRead(t *testing.T) {
+	f := newSponsoredRollFixture(t, 2*time.Hour)
+	ctx := t.Context()
+	if _, err := f.h.reconcileUsageEntitlement(ctx, f.c.ID); err != nil || f.grants.Load() != 1 {
+		t.Fatal("next grant not issued", err)
+	}
+	publish := func(credit *fundingCreditObservation, workErr error) {
+		t.Helper()
+		j, s := claimFundingTestJob(t, f.h, f.c.TeamID)
+		if err := f.h.publishFundingObservation(ctx, j, s, credit, nil, workErr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A failed read advances the observed generation without reading credit.
+	publish(nil, errors.New("provider temporarily unavailable"))
+	if !f.eligible() {
+		t.Fatal("failed credit read ended the grace")
+	}
+	publish(&fundingCreditObservation{SpendableUSD: "30000", ValidUntil: time.Now().Add(time.Minute), Evidence: []byte(`{"fixture":"credit"}`)}, nil)
+	if !f.eligible() {
+		t.Fatal("observed next grant left the team paused")
+	}
+	// After a successful read, real exhaustion pauses the team as before.
+	publish(&fundingCreditObservation{SpendableUSD: "0", ValidUntil: time.Now().Add(time.Minute), Evidence: []byte(`{"fixture":"credit"}`)}, nil)
+	if f.eligible() {
+		t.Fatal("grace outlived a successful read showing no credit")
 	}
 }

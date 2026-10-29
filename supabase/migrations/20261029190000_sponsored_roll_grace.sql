@@ -9,7 +9,8 @@
 --
 -- The grace is checked before the funding generation, so the generation bump
 -- from issuing the next grant cannot pause the team before the funding worker
--- observes it. It lasts until that observation catches up.
+-- observes it. It lasts until a successful credit read after that grant was
+-- issued; a failed read also advances the generation, so it is not enough.
 --
 -- Usage in the grace is billed on the new period's invoice, which the next
 -- grant applies to. The invoice close verifies what Stripe applied before it
@@ -48,9 +49,10 @@ CREATE OR REPLACE FUNCTION billing_invoice_period_absent(p_team_id uuid,p_start 
  SELECT EXISTS(SELECT 1 FROM billing_sponsored_absent_close WHERE team_id=p_team_id AND period_start=p_start AND period_end=p_end);
 $$;
 
--- p_observed is whether the funding observation is current; until it is, an
--- issued next grant does not end the grace.
-CREATE OR REPLACE FUNCTION billing_sponsored_roll_grace(p_team_id uuid,p_observed boolean) RETURNS boolean LANGUAGE sql STABLE AS $$
+-- p_credit_checked_at is when the current funding observation last read
+-- credit successfully, or NULL; until it postdates the next grant's issuance,
+-- that grant does not end the grace.
+CREATE OR REPLACE FUNCTION billing_sponsored_roll_grace(p_team_id uuid,p_credit_checked_at timestamptz) RETURNS boolean LANGUAGE sql STABLE AS $$
  SELECT EXISTS(SELECT 1 FROM billing_sponsored_operation o
   JOIN billing_commercial_contract c ON c.id=o.contract_id AND c.status='active'
   JOIN team_billing_account a ON a.team_id=o.team_id AND a.stripe_customer_id=c.customer_id AND a.stripe_subscription_id=c.subscription_id
@@ -58,7 +60,7 @@ CREATE OR REPLACE FUNCTION billing_sponsored_roll_grace(p_team_id uuid,p_observe
   WHERE o.team_id=p_team_id AND o.state='active' AND o.revoked_at IS NULL
    AND e.period_end<=now() AND e.period_end>now()-interval '6 hours'
    AND (c.ends_at IS NULL OR c.ends_at>e.period_end)
-   AND (NOT p_observed OR NOT EXISTS(SELECT 1 FROM billing_usage_entitlement n WHERE n.team_id=o.team_id AND n.contract_id=c.id AND n.period_start=e.period_end AND n.state='issued'))
+   AND NOT EXISTS(SELECT 1 FROM billing_usage_entitlement n WHERE n.team_id=o.team_id AND n.contract_id=c.id AND n.period_start=e.period_end AND n.state='issued' AND n.issued_at<=p_credit_checked_at)
    AND NOT EXISTS(SELECT 1 FROM billing_entitlement_debt d WHERE d.contract_id=c.id AND d.period_start>=e.period_end)
    AND NOT EXISTS(SELECT 1 FROM billing_entitlement_withheld w WHERE w.contract_id=c.id AND w.period_start>=e.period_end AND w.evidence ? 'unpaid_invoice'));
 $$;
@@ -71,7 +73,7 @@ CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid) RETURNS
  WHEN billing_team_awaiting_plan(p_team_id) THEN billing_team_trial_active(p_team_id)
  WHEN EXISTS(SELECT 1 FROM billing_free_plan(p_team_id)) THEN NOT billing_free_allowance_blocked(p_team_id)
  WHEN NOT COALESCE(f.enforce,false) THEN team_sandbox_billing_eligible_legacy(p_team_id)
- WHEN billing_sponsored_roll_grace(p_team_id,f.observed_generation IS NOT DISTINCT FROM f.generation) THEN true
+ WHEN billing_sponsored_roll_grace(p_team_id,CASE WHEN f.observed_generation IS NOT DISTINCT FROM f.generation THEN f.credit_checked_at END) THEN true
  WHEN f.observed_generation IS DISTINCT FROM f.generation
  OR (f.customer_id,f.subscription_id) IS DISTINCT FROM (a.stripe_customer_id,a.stripe_subscription_id) THEN false
  WHEN f.prepaid THEN f.credit_usd>0 AND f.credit_valid_until>now()
