@@ -89,10 +89,12 @@ func (h *Handlers) reconcileBillingPauses(ctx context.Context) {
 		}
 		due := make([]uuid.UUID, 0, len(teams))
 		for _, t := range teams {
-			if _, again := h.billingPauseSeen[t.TeamID]; t.Targeted || again {
+			if _, again := h.billingPauseSeen[t.TeamID]; t.Targeted || again && t.Ineligible {
 				due = append(due, t.TeamID)
 			}
-			seen[t.TeamID] = struct{}{}
+			if t.Ineligible {
+				seen[t.TeamID] = struct{}{}
+			}
 		}
 		dispatchBounded(ctx, due, 10, func(teamID uuid.UUID) {
 			h.pauseBillingTeam(ctx, teamID)

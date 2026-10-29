@@ -128,6 +128,12 @@ func TestIntegrationFundingCreditAcceptsRenewalDraftBeforeClosePlan(t *testing.T
 	}))
 	defer server.Close()
 	h.Stripe = &stripeHTTPClient{baseURL: server.URL, httpClient: server.Client(), apiVersion: "2026-07-29.dahlia"}
+	cfg := config.Config{}
+	if h.Config != nil {
+		cfg = *h.Config
+	}
+	cfg.BillingResources = []config.BillingResourceConfig{{ResourceKey: "vcpu", StripePriceID: "price_cpu", CheckoutEnabled: true}, {ResourceKey: "memory_gib", StripePriceID: "price_memory", CheckoutEnabled: true}}
+	h.Config = &cfg
 	account := db.TeamBillingAccount{TeamID: team, StripeCustomerID: &customer, StripeSubscriptionID: &subscription}
 	observation, err := h.observeFundingCredit(t.Context(), team, account, at)
 	if err != nil || observation.SpendableUSD != "6.400000" {
@@ -137,6 +143,11 @@ func TestIntegrationFundingCreditAcceptsRenewalDraftBeforeClosePlan(t *testing.T
 	for _, mutate := range []func(*StripeInvoiceAmounts){
 		func(d *StripeInvoiceAmounts) { d.Lines.Data[0].Parent.SubscriptionItemDetails = nil },
 		func(d *StripeInvoiceAmounts) { d.Lines.Data[0].Pricing.PriceDetails = nil },
+		func(d *StripeInvoiceAmounts) {
+			price := *d.Lines.Data[0].Pricing.PriceDetails
+			price.Price = "price_manual"
+			d.Lines.Data[0].Pricing.PriceDetails = &price
+		},
 	} {
 		inv = planned
 		inv.Lines.Data = append([]StripeInvoiceAmountLine(nil), planned.Lines.Data...)

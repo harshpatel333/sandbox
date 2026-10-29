@@ -2858,15 +2858,16 @@ WITH active_teams AS MATERIALIZED (
       AND s.status = 'active'
       AND s.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 )
-SELECT d.team_id, d.targeted
+SELECT d.team_id, d.targeted, d.ineligible
 FROM (
     SELECT a.team_id, EXISTS (
         SELECT 1 FROM billing_team_pause_target t
         WHERE t.team_id = a.team_id AND t.done_at IS NULL
-    ) AS targeted
+    ) AS targeted, (NOT COALESCE(team_sandbox_billing_eligible(a.team_id), true))::boolean AS ineligible
     FROM active_teams a
+    OFFSET 0 -- keeps the subquery unflattened so eligibility runs once per team
 ) d
-WHERE d.targeted OR NOT team_sandbox_billing_eligible(d.team_id)
+WHERE d.targeted OR d.ineligible
 ORDER BY d.team_id
 LIMIT $1
 `
@@ -2877,8 +2878,9 @@ type ListTeamsWithBillingPauseDueParams struct {
 }
 
 type ListTeamsWithBillingPauseDueRow struct {
-	TeamID   uuid.UUID `json:"team_id"`
-	Targeted bool      `json:"targeted"`
+	TeamID     uuid.UUID `json:"team_id"`
+	Targeted   bool      `json:"targeted"`
+	Ineligible bool      `json:"ineligible"`
 }
 
 // MATERIALIZED fence, same reason as the rollup's interval_team_set: dedupe
@@ -2895,7 +2897,7 @@ func (q *Queries) ListTeamsWithBillingPauseDue(ctx context.Context, arg ListTeam
 	items := []ListTeamsWithBillingPauseDueRow{}
 	for rows.Next() {
 		var i ListTeamsWithBillingPauseDueRow
-		if err := rows.Scan(&i.TeamID, &i.Targeted); err != nil {
+		if err := rows.Scan(&i.TeamID, &i.Targeted, &i.Ineligible); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

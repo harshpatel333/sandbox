@@ -754,11 +754,25 @@ func TestIntegration_BillingPauseSweepNeedsTwoIneligibleSweeps(t *testing.T) {
 	now := time.Now()
 	assignFreePlan(t, team, now.Add(-48*time.Hour))
 	sandbox := seedActiveSandbox(t, team, "sweep-debounce")
+	h := pauseHandlers(t, &stubVMD{})
+	// An explicit target pauses at once but is not ineligibility history.
+	if _, err := testQueries.RequestTeamPauseAll(ctx, db.RequestTeamPauseAllParams{TeamID: team, Reason: "plan_switch_free"}); err != nil {
+		t.Fatal(err)
+	}
+	api.RefreshActiveTrialEligibilityForTest(h, ctx)
+	if state := readPauseOp(t, sandbox); state.status != "paused" {
+		t.Fatalf("targeted sweep status = %s, want paused", state.status)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status='active' WHERE id=$1`, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := testQueries.SettleTeamPauseTargets(ctx, team); err != nil || n != 1 {
+		t.Fatalf("settled targets = %d, %v; want 1", n, err)
+	}
 	seedComputeInterval(t, team, sandbox, 1, 1024, now.Add(-3*time.Hour), nil)
 	if blocked, err := testQueries.RefreshFreeAllowance(ctx, team); err != nil || !blocked {
 		t.Fatalf("refresh = %v, %v; want blocked", blocked, err)
 	}
-	h := pauseHandlers(t, &stubVMD{})
 	api.RefreshActiveTrialEligibilityForTest(h, ctx)
 	if state := readPauseOp(t, sandbox); state.status != "active" {
 		t.Fatalf("first ineligible sweep status = %s, want active", state.status)

@@ -467,34 +467,54 @@ func (h *Handlers) validateFundingDraft(ctx context.Context, team uuid.UUID, inv
 	if !ok || plan != nil && (a.Customer != plan.Customer || a.Subscription != plan.Subscription) {
 		return errors.New("draft credit accounting identity changed")
 	}
+	if plan == nil {
+		if err = h.validateUnplannedFundingDraft(ctx, team, inv, p, a); err != nil {
+			return err
+		}
+	}
 	return validateFundingDraftCoverage(inv, p, a, plan, coverage)
 }
 
-// A nil plan means the draft predates its close plan: line amounts cannot be
-// matched yet, so only the identity and the local usage reserve bound them.
+// Without a plan, line amounts cannot be matched yet; the draft must still be
+// our subscription's cycle invoice over only the configured resource prices.
+func (h *Handlers) validateUnplannedFundingDraft(ctx context.Context, team uuid.UUID, inv StripeInvoiceAmounts, p billing.ExportPeriod, a invoiceAccount) error {
+	if inv.Customer != a.Customer || inv.Currency != "usd" || inv.BillingReason != "subscription_cycle" || inv.Parent.SubscriptionDetails == nil || inv.Parent.SubscriptionDetails.Subscription != a.Subscription || inv.Lines.HasMore {
+		return errors.New("draft credit accounting identity changed")
+	}
+	storage, err := db.New(h.Pool).IsStorageBillingActivatedForWindow(ctx, db.IsStorageBillingActivatedForWindowParams{TeamID: team, PeriodEnd: p.End})
+	if err != nil {
+		return err
+	}
+	allowed := map[string]bool{a.Price: true}
+	for _, resource := range h.billingResourceStates(storage) {
+		if resource.SubscriptionIncluded() && resource.StripePriceID != "" {
+			allowed[resource.StripePriceID] = true
+		}
+	}
+	// Lines cover the provider window, which may start after the local period.
+	start, end := meterObservationWindow(time.Unix(inv.PeriodStart, 0), time.Unix(inv.PeriodEnd, 0))
+	seen := map[string]bool{}
+	for _, line := range inv.Lines.Data {
+		d, parent := line.Pricing.PriceDetails, line.Parent.SubscriptionItemDetails
+		if d != nil && a.Base.Price != "" && d.Price == a.Base.Price {
+			continue
+		}
+		if d == nil || !allowed[d.Price] || parent == nil || parent.Proration || parent.Subscription != a.Subscription || line.Currency != "usd" || len(line.Discounts) != 0 || seen[d.Price] {
+			return errors.New("draft line does not match supported resource set")
+		}
+		seen[d.Price] = true
+		if d.Price != a.Price && (line.Period.Start > start.Unix() || line.Period.End < end.Unix()) {
+			return errors.New("draft line does not cover usage window")
+		}
+	}
+	return nil
+}
+
+// A nil plan means the draft predates its close plan; the caller has checked
+// its lines, and only the local usage reserve bounds their amounts.
 func validateFundingDraftCoverage(inv StripeInvoiceAmounts, p billing.ExportPeriod, a invoiceAccount, plan *billing.InvoiceClosePlan, coverage []fundingPeriodReserve) error {
 	var amounts map[string]int64
-	if plan == nil {
-		if inv.Customer != a.Customer || inv.Currency != "usd" || inv.BillingReason != "subscription_cycle" || inv.Parent.SubscriptionDetails == nil || inv.Parent.SubscriptionDetails.Subscription != a.Subscription || inv.Lines.HasMore {
-			return errors.New("draft credit accounting identity changed")
-		}
-		// Lines cover the provider window, which may start after the local period.
-		start, end := meterObservationWindow(time.Unix(inv.PeriodStart, 0), time.Unix(inv.PeriodEnd, 0))
-		seen := map[string]bool{}
-		for _, line := range inv.Lines.Data {
-			d, parent := line.Pricing.PriceDetails, line.Parent.SubscriptionItemDetails
-			if d != nil && a.Base.Price != "" && d.Price == a.Base.Price {
-				continue
-			}
-			if d == nil || parent == nil || parent.Proration || parent.Subscription != a.Subscription || line.Currency != "usd" || len(line.Discounts) != 0 || seen[d.Price] {
-				return errors.New("draft line does not match supported resource set")
-			}
-			seen[d.Price] = true
-			if d.Price != a.Price && (line.Period.Start > start.Unix() || line.Period.End < end.Unix()) {
-				return errors.New("draft line does not cover usage window")
-			}
-		}
-	} else {
+	if plan != nil {
 		if err := validateInvoiceDocument(inv, invoicePlanPeriod(p, *plan), a, *plan); err != nil {
 			return err
 		}
