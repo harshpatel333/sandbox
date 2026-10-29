@@ -156,19 +156,54 @@ carry an offer key such as `pro_monthly` and a contract. A contract qualifies
 only when its offer is that family's monthly or annual offer, and its customer
 is the team's billing customer.
 
-Before creating a grant, `--apply` checks three things:
+Before creating a grant, `--apply` checks these:
 
-- the customer exists in the key's mode
-- the customer's `team_id` metadata, if present, names the team
-- whether a grant, voided or not, already carries the same `event_label`
+- the current customer exists in the key's mode
+- the current customer's `team_id` metadata, if present, names the team
+- whether any customer the team has used already holds a grant, voided or not,
+  carrying the same `event_label`
 
-The request carries an idempotency key built from team, customer and label only.
-If two runs overlap with different amounts, Stripe rejects the second request
-because its parameters differ, and the script reports that team as REFUSED.
-Stripe keeps idempotency keys for 24 hours. After that, the label lookup is what
-refuses a different amount.
-After creating the grant, the script reads it back and checks it against the
-terms above.
+A team whose billing customer was replaced after it was credited is not credited
+again. The customers searched are the union of two sources:
+
+- every customer the database recorded for the team. The script finds every
+  public table with a `team_id` uuid column and a text `customer_id` or
+  `stripe_customer_id` column: the billing account, contracts, invoice accounts,
+  usage exports, upgrades, purchases and so on.
+- every Stripe customer whose `team_id` metadata names the team, found with
+  Stripe customer search
+
+Only grants whose `team_id` metadata names the team count. A grant on the
+current customer with the same amount reports `already granted`. A different
+amount is REFUSED. A grant on a previous customer is also REFUSED, with exit
+status 2. Credit only applies to its own customer's invoices, so the team cannot
+use it. To re-grant, void it and use a new label.
+
+The idempotency key is built from team and label only, not the customer or
+amount. A second request for the same team and label with any different
+parameters is rejected by Stripe and reported as REFUSED. That covers overlapping
+runs with different amounts, and a customer replaced between overlapping runs.
+Stripe keeps idempotency keys for 24 hours; after that, the label lookup above
+is what prevents a second grant. After creating the grant, the script reads it
+back and checks it against the terms above.
+
+The database keeps no history of `team_billing_account.stripe_customer_id`;
+replacing it overwrites the old value. So the database alone cannot list every
+past customer. A replaced customer can still be missed when no other billing
+table ever recorded it, and either:
+
+- it lacks `team_id` metadata (the API sets it on every customer it creates), or
+- that metadata was set within about a minute of the run (Stripe search is
+  eventually consistent)
+
+A grant this script created within the last 24 hours is still caught. Its
+team-and-label idempotency key makes Stripe reject a request for a different
+customer, which is reported as REFUSED.
+
+If a team in the list is known to have changed customers through a path
+outside the API, check by hand before `--apply`. In the Stripe dashboard, open
+each of the team's customers and look under credit grants for the event label.
+The `customers_checked` field of each report row lists what the script searched.
 
 To undo a Stripe grant, void it in Stripe
 (`POST /v1/billing/credit_grants/<id>/void`). A rerun then refuses that team's

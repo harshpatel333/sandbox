@@ -14,6 +14,7 @@ import event_credit
 ACCOUNT = "acct_example"
 TEAM = "00000000-0000-4000-8000-000000000006"
 CUSTOMER = "cus_example"
+OLD_CUSTOMER = "cus_example_old"
 LABEL = "event-example"
 
 
@@ -22,20 +23,23 @@ def response(body):
 
 
 class FakeStripe:
-    def __init__(self, list_barrier=None):
+    def __init__(self, list_barrier=None, searchable=()):
         self.grants, self.keys, self.posts = {}, {}, 0
-        self.lock, self.list_barrier = threading.Lock(), list_barrier
+        self.lock, self.list_barrier, self.searchable = threading.Lock(), list_barrier, list(searchable)
 
     def __call__(self, req, timeout):
         url = urllib.parse.urlparse(req.full_url)
         method = req.get_method()
         if url.path == "/v1/account":
             return response({"id": ACCOUNT})
+        if url.path == "/v1/customers/search":
+            return response({"data": [{"id": c} for c in self.searchable], "has_more": False})
         if url.path == "/v1/customers/" + CUSTOMER:
             return response({"id": CUSTOMER, "livemode": False, "metadata": {"team_id": TEAM}})
         if url.path == "/v1/billing/credit_grants" and method == "GET":
+            customer = urllib.parse.parse_qs(url.query)["customer"][0]
             with self.lock:
-                snapshot = {"data": list(self.grants.values()), "has_more": False}
+                snapshot = {"data": [g for g in self.grants.values() if g["customer"] == customer], "has_more": False}
             if self.list_barrier:
                 self.list_barrier.wait(timeout=5)
             return response(snapshot)
@@ -69,7 +73,8 @@ def paid_row(trial_event_usd=None):
     return {"team_id": TEAM, "exists": True, "managed": False, "awaiting_plan": False, "kind": "subscription",
             "plan_key": "developer_monthly", "family": "developer", "contract_offer": "developer_monthly",
             "contract": True, "contract_customer": CUSTOMER, "customer": CUSTOMER,
-            "subscription_status": "active", "trial_event_usd": trial_event_usd, "trial_event_remaining_usd": 0}
+            "subscription_status": "active", "trial_event_usd": trial_event_usd, "trial_event_remaining_usd": 0,
+            "known_customers": [CUSTOMER]}
 
 
 def stripe():
@@ -98,6 +103,29 @@ class EventCreditTest(unittest.TestCase):
         code, team = self.run_main(paid_row(trial_event_usd=100), "80", fake)
         self.assertEqual((code, fake.posts), (2, 0))
         self.assertTrue(team["outcome"].startswith("REFUSED"))
+
+    def credit_old_customer(self, fake):
+        old = event_credit.grant_form(TEAM, OLD_CUSTOMER, LABEL, 10000)
+        with patch("urllib.request.urlopen", fake):
+            stripe().request("POST", "/v1/billing/credit_grants", old, "earlier-run")
+        fake.posts = 0
+
+    def test_customer_replaced_after_grant_rerun_does_not_grant_again(self):
+        fake = FakeStripe()
+        self.credit_old_customer(fake)
+        row = paid_row()
+        row["known_customers"] = [OLD_CUSTOMER, CUSTOMER]
+        code, team = self.run_main(row, "100", fake)
+        self.assertEqual((code, team["grant_customer"], fake.posts, len(fake.grants)), (2, OLD_CUSTOMER, 0, 1))
+        self.assertIn("previous customer", team["outcome"])
+        code, team = self.run_main(row, "80", fake)
+        self.assertEqual((code, fake.posts, len(fake.grants)), (2, 0, 1))
+
+    def test_replaced_customer_found_only_through_stripe_search(self):
+        fake = FakeStripe(searchable=[OLD_CUSTOMER])
+        self.credit_old_customer(fake)
+        code, team = self.run_main(paid_row(), "100", fake)
+        self.assertEqual((code, team["grant_customer"], fake.posts, len(fake.grants)), (2, OLD_CUSTOMER, 0, 1))
 
     def test_overlapping_runs_with_different_amounts_grant_once(self):
         fake = FakeStripe(threading.Barrier(2))

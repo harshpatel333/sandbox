@@ -45,6 +45,17 @@ LEFT JOIN team_credit_grant e ON e.id = md5('trial-credit-topup:' || :'label' ||
 """
 
 
+CUSTOMER_COLUMNS_SQL = """
+SELECT COALESCE(json_agg(json_build_array(c.table_name, c.column_name) ORDER BY c.table_name, c.column_name), '[]')
+FROM information_schema.columns c
+JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE'
+WHERE c.table_schema = 'public' AND c.column_name IN ('customer_id', 'stripe_customer_id') AND c.data_type = 'text'
+  AND EXISTS(SELECT 1 FROM information_schema.columns k WHERE k.table_schema = 'public' AND k.table_name = c.table_name
+             AND k.column_name = 'team_id' AND k.data_type = 'uuid');
+"""
+IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]*")
+
+
 class SetupError(Exception):
     pass
 
@@ -93,11 +104,33 @@ def psql(database_url, sql, variables, read_only):
                           input=sql if read_only else None, capture_output=True, text=True, env=env, check=False)
 
 
-def load_routes(database_url, teams, label):
-    result = psql(database_url, ROUTING_SQL, {"teams": ",".join(teams), "label": label}, read_only=True)
+def read_json(database_url, sql, variables):
+    result = psql(database_url, sql, variables, read_only=True)
     if result.returncode != 0:
-        raise SetupError("routing query failed: " + result.stderr.strip())
+        raise SetupError("read-only query failed: " + result.stderr.strip())
     return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def customers_sql(columns):
+    parts = []
+    for table, column in columns:
+        if not (IDENTIFIER.fullmatch(table) and IDENTIFIER.fullmatch(column)):
+            raise SetupError(f"unexpected customer column {table}.{column}")
+        parts.append(f'SELECT team_id, "{column}" AS customer FROM public."{table}" '
+                     f"WHERE team_id = ANY(string_to_array(:'teams', ',')::uuid[]) AND \"{column}\" IS NOT NULL")
+    return ("SELECT COALESCE(json_object_agg(team_id, customers), '{}') FROM (SELECT team_id, "
+            "array_agg(DISTINCT customer ORDER BY customer) AS customers FROM (" + " UNION ALL ".join(parts) +
+            ") s GROUP BY team_id) g;")
+
+
+def load_routes(database_url, teams, label):
+    variables = {"teams": ",".join(teams), "label": label}
+    rows = read_json(database_url, ROUTING_SQL, variables)
+    columns = read_json(database_url, CUSTOMER_COLUMNS_SQL, {})
+    known = read_json(database_url, customers_sql(columns), variables) if columns else {}
+    for row in rows:
+        row["known_customers"] = known.get(row["team_id"], [])
+    return rows
 
 
 class Stripe:
@@ -127,13 +160,14 @@ class Stripe:
             with urllib.request.urlopen(req, timeout=30) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
-            if exc.code == 404 and method == "GET":
+            try:
+                error = json.load(exc).get("error") or {}
+                kind, code = error.get("type"), error.get("code")
+            except (ValueError, AttributeError):
+                kind = code = None
+            if method == "GET" and (exc.code == 404 or code == "resource_missing"):
                 return None
             if method == "POST" and exc.code in (400, 409):
-                try:
-                    kind = (json.load(exc).get("error") or {}).get("type")
-                except (ValueError, AttributeError):
-                    kind = None
                 if kind == "idempotency_error" or exc.code == 409:
                     raise IdempotencyConflict(f"Stripe {path}: HTTP {exc.code} {kind or 'conflict'}") from None
             # Provider error bodies can echo request details; keep output to the status.
@@ -152,6 +186,8 @@ class Stripe:
             if cursor:
                 params["starting_after"] = cursor
             page = self.request("GET", "/v1/billing/credit_grants", params)
+            if page is None:
+                return found
             for grant in page["data"]:
                 if grant.get("customer") != customer:
                     raise SetupError(f"Stripe returned a credit grant for another customer than {customer}")
@@ -162,6 +198,19 @@ class Stripe:
             cursor = page["data"][-1]["id"]
         raise SetupError(f"Credit grants for {customer} exceed the inspection bound")
 
+    def team_customers(self, team):
+        found, page = set(), None
+        for _ in range(20):
+            params = {"query": f"metadata['team_id']:'{team}'", "limit": 100}
+            if page:
+                params["page"] = page
+            result = self.request("GET", "/v1/customers/search", params)
+            found |= {c["id"] for c in result["data"]}
+            if not result.get("has_more"):
+                return found
+            page = result["next_page"]
+        raise SetupError(f"Customers for team {team} exceed the inspection bound")
+
 
 def grant_form(team, customer, label, cents):
     return {"customer": customer, "category": "promotional", "name": "Event credit",
@@ -170,8 +219,8 @@ def grant_form(team, customer, label, cents):
             "metadata[event_label]": label, "metadata[team_id]": team}
 
 
-def grant_key(team, customer, label):
-    return "event-credit-" + hashlib.sha256(json.dumps([team, customer, label]).encode()).hexdigest()
+def grant_key(team, label):
+    return "event-credit-" + hashlib.sha256(json.dumps([team, label]).encode()).hexdigest()
 
 
 def curl_command(form, key, api_version):
@@ -195,12 +244,15 @@ def check_grant(grant, customer, cents, live):
 
 def stripe_team(stripe, row, label, cents, api_version):
     team, customer = row["team_id"], row["customer"]
-    form, key = grant_form(team, customer, label, cents), grant_key(team, customer, label)
+    form, key = grant_form(team, customer, label, cents), grant_key(team, label)
+    known = sorted(set(row.get("known_customers") or []) | {customer})
     result = {"team_id": team, "route": "stripe", "plan": row["plan_key"], "customer": customer,
               "subscription_status": row["subscription_status"], "amount_cents": cents}
     if stripe is None:
-        return {**result, "outcome": "preview: run the command after checking for an existing grant with this event_label",
-                "check": f'curl -sS -G https://api.stripe.com/v1/billing/credit_grants -u "$STRIPE_SECRET_KEY:" -d customer={shlex.quote(customer)} -d limit=100',
+        return {**result, "outcome": "preview: run the command only if no customer of this team has a grant with this event_label",
+                "checks": [f'curl -sS -G https://api.stripe.com/v1/billing/credit_grants -u "$STRIPE_SECRET_KEY:" -d customer={shlex.quote(c)} -d limit=100'
+                           for c in known] + [f'curl -sS -G https://api.stripe.com/v1/customers/search -u "$STRIPE_SECRET_KEY:" '
+                                              f'--data-urlencode {shlex.quote(f"query=metadata[{chr(39)}team_id{chr(39)}]:{chr(39)}{team}{chr(39)}")}'],
                 "command": curl_command(form, key, api_version)}
     found = stripe.request("GET", "/v1/customers/" + urllib.parse.quote(customer))
     if not found or found.get("deleted") or found.get("livemode") is not stripe.live:
@@ -208,20 +260,28 @@ def stripe_team(stripe, row, label, cents, api_version):
     owner = (found.get("metadata") or {}).get("team_id")
     if owner and owner != team:
         return {**result, "outcome": f"refused: customer belongs to team {owner}"}
-    labelled = stripe.label_grants(customer, label)
+    customers = sorted(set(known) | stripe.team_customers(team))
+    labelled = [g for c in customers for g in stripe.label_grants(c, label)
+                if (g.get("metadata") or {}).get("team_id") == team]
     existing = [g for g in labelled if not g.get("voided_at")]
+    result["customers_checked"] = customers
     if len(existing) > 1:
         return {**result, "outcome": "refused: several grants carry this label; reconcile in Stripe"}
     if labelled and not existing:
         return {**result, "outcome": "REFUSED: this label's grant was voided; use a new label", "conflict": True,
                 "grant_id": labelled[0]["id"]}
     if existing:
-        granted = ((existing[0].get("amount") or {}).get("monetary") or {}).get("value")
+        grant = existing[0]
+        granted = ((grant.get("amount") or {}).get("monetary") or {}).get("value")
         if granted != cents:
             return {**result, "outcome": f"REFUSED: label already granted {granted} cents, not {cents}", "conflict": True,
-                    "grant_id": existing[0]["id"]}
-        check_grant(existing[0], customer, cents, stripe.live)
-        return {**result, "outcome": "already granted", "grant_id": existing[0]["id"]}
+                    "grant_id": grant["id"], "grant_customer": grant["customer"]}
+        check_grant(grant, grant["customer"], cents, stripe.live)
+        if grant["customer"] != customer:
+            return {**result, "outcome": f"REFUSED: already granted on previous customer {grant['customer']}, which the current "
+                    "customer's invoices cannot use; void it and use a new label to re-grant", "conflict": True,
+                    "grant_id": grant["id"], "grant_customer": grant["customer"]}
+        return {**result, "outcome": "already granted", "grant_id": grant["id"], "grant_customer": grant["customer"]}
     if not stripe.apply:
         return {**result, "outcome": "would grant", "command": curl_command(form, key, api_version)}
     try:
