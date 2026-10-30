@@ -223,3 +223,119 @@ label, so granting again needs a new label.
 To undo a trial grant, delete its row before any usage is billed against it.
 Deleting the row frees the label: a later rerun with the same label inserts the
 grant again.
+
+## Credit forfeited by upgrading during the trial
+
+When a trial team pays for Developer or Pro, paid activation ends the trial. It
+sets `trial_ended_at` and zeroes `remaining_usd` on every signup trial grant,
+including event and manual top-up grants. Whatever trial credit was left is
+forfeited.
+The event copy tells participants that upgrading during the trial drops leftover
+trial credit and that staff restore it. Developer participants who check out
+with the event's 100%-off first-month code pay the 20 USD monthly fee from their
+second month. That is intended: the restored credit pays for usage, not the fee.
+
+### Report
+
+```sh
+python3 scripts/billing/event_credit.py --report [--label event-2026-11-01] [--min-forfeit-usd 1]
+```
+
+The report is read-only and makes no Stripe calls. It scans every team that has
+a `signup trial credit` grant and whose trial ended through paid activation
+(`trial_ended_at` set). For each team it computes the total trial credit
+forfeited at activation, then keeps the teams whose forfeit is strictly above
+`--min-forfeit-usd` (default 1 USD). A forfeit of exactly 1.00 USD is left out
+and 1.01 USD is kept. Ordinary signup trials (0.05 USD) fall below the
+threshold, so the report shows teams credited for an event and teams given a
+manual top-up alike. The event label does not decide who is found. A team that
+paid while `trial_ended_at` stayed NULL, which no current activation path does,
+would not appear.
+
+`--label` adds a `holds_label_grant` column: whether the team holds that event's
+trial grant (the deterministic ID above). `--label-holders-only` limits the
+report to those teams. Each row also shows:
+
+- the trial grants and the usage charged against them
+- the forfeited amount in cents
+- the current plan, subscription status and Stripe customer
+
+The forfeit is the trial balance as it stood at activation, computed by
+`trial-forfeit.sql`. It uses the same accounting inputs as
+`get_team_trial_balance`, but evaluates every one of them at `trial_ended_at`.
+That includes the pricing plan and its rates, chosen by effective dates alone.
+Unlike the live helper, it ignores a plan's current `active` flag, which has no
+history, so deactivating a plan later does not change the forfeit. It does
+not call the live-balance helper, which filters grants by expiry at `now()`. With
+that filter, a grant that expired after activation would drop out of the
+forfeit.
+
+```text
+T         = trial_ended_at
+pool      = signup trial credit grants with created_at <= T
+            and (expires_at IS NULL or expires_at > T)
+grant_usd = sum(pool.amount_usd)
+start     = min(pool.created_at)
+consumed  = round(cpu_seconds * vcpu_rate + memory_gib_seconds * memory_rate
+                  + storage_gib_seconds * storage_rate, 6)
+            usage: compute intervals clipped to [start, T]; storage counted only if
+            storage billing was active before T
+            rates: the team's pricing plan and its rates effective at T
+forfeited_cents = floor(max(0, grant_usd - consumed) * 100)
+included when forfeited_cents > min_forfeit_usd * 100
+```
+
+For example, take a 0.05 USD signup grant and a 100 USD event grant, with 0.07
+USD of usage before activation. The team forfeits 99.98 USD.
+
+### Restore
+
+```sh
+python3 scripts/billing/event_credit.py --restore --label event-2026-11-01
+# Inspect, then:
+python3 scripts/billing/event_credit.py --restore --label event-2026-11-01 \
+  --environment production --expected-account acct_... --apply
+```
+
+Restore recomputes the report with the same threshold and filters. It grants
+each team its forfeited amount as a Stripe credit grant on the team's current
+customer. The label is the idempotency key: `<label>-restore`, or an explicit
+`--restore-label`. Use the same restore label for every run of an event.
+
+A trial ends once, so a team's forfeit is restored once, whatever the label.
+Restore grants carry `trial_forfeit_restore` metadata. A team that already holds
+an unvoided restore grant under another label is REFUSED (exit 2) and not paid
+again. A grant under the restore label without that marker, such as an ordinary
+event grant that reused the name, is an idempotency conflict and is also
+REFUSED. The reverse holds as well: an event grant run (`--grants`) is refused
+if its label holds a restore grant. A forfeit above 1000 USD is refused and must
+be restored by hand. Never run two restores at the same time: overlapping runs
+under different labels can both grant before either sees the other.
+
+Restore uses the Stripe route above with all its guards:
+
+- the team-and-label idempotency key
+- the check across the team's previous customers
+- preview by default
+- the account and live-key checks
+
+It refuses any team not on a Developer or Pro subscription that is active,
+trialing or past due. Forfeits at or below the threshold are never granted. A
+rerun reports `already granted`. Every input is evaluated at `trial_ended_at`,
+so a team's forfeit only changes if its historical records change, for example
+compute intervals recorded late. Just before each create, restore recomputes that
+team's forfeit, after re-checking its route. If the amount differs from the one
+loaded at the start, the team is REFUSED with "forfeit changed during the run;
+rerun" (exit 2) and nothing is granted. A rerun under the same label with a
+different amount is also REFUSED rather than granting the difference.
+
+### Event-day routine
+
+Once a day during the event, and once after it ends:
+
+1. Run `--report` and check the list. A team on Free or a canceled subscription
+   shows up but cannot be restored until it is on Developer or Pro.
+2. Run `--restore` as a preview, then with `--apply`, using the same restore
+   label every time.
+3. Rerun `--restore` and confirm every row reads `already granted` or a refusal
+   you expect.
